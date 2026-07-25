@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stt-to-subtitle"
+version = "0.1.0"
+description = "Local Kotoba-Whisper transcription test pipeline"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+dependencies = []
+
+[project.scripts]
+stt-transcribe = "stt_to_subtitle.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

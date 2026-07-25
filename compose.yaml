@@ -1,0 +1,17 @@
+services:
+  stt:
+    platform: linux/arm64
+    build:
+      context: .
+    image: stt-to-subtitle:kotoba-m1
+    init: true
+    environment:
+      HF_TOKEN: ${HF_TOKEN:-}
+    volumes:
+      - ./media:/data:ro
+      - ./output:/output
+      - model-cache:/cache
+    command: ["--help"]
+
+volumes:
+  model-cache:

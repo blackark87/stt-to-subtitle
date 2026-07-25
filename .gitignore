@@ -1313,3 +1313,23 @@ tags
 # Persistent undo
 [._]*.un~
 
+# Repository source and container definitions
+!/.dockerignore
+!/AGENTS.md
+!/Dockerfile
+!/compose.yaml
+!/Makefile
+!/pyproject.toml
+!/requirements.txt
+!/src/
+!/src/**
+!/tests/
+!/tests/**
+
+# Local media, transcripts, and model data
+/media/
+/output/
+
+# Generated Python files
+**/__pycache__/
+*.py[cod]
