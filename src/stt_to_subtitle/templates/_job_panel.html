@@ -1,0 +1,31 @@
+<section class="card">
+  <dl class="details">
+    <dt>상태</dt><dd><span class="status status-{{ job.status }}">{{ job.status }}</span></dd>
+    <dt>작업 ID</dt><dd><code>{{ job.id }}</code></dd>
+    <dt>생성</dt><dd>{{ job.created_at|datetime }}</dd>
+    <dt>갱신</dt><dd>{{ job.updated_at|datetime }}</dd>
+    {% if job.blocked_stage %}<dt>중단 단계</dt><dd>{{ job.blocked_stage }}</dd>{% endif %}
+    {% if job.error %}<dt>오류</dt><dd class="error-text">{{ job.error }}</dd>{% endif %}
+    {% if job.srt_path %}<dt>SRT</dt><dd>{{ job.srt_path }}</dd>{% endif %}
+  </dl>
+  <div class="actions">
+    {% if job.transcript_path %}<a class="button secondary" href="/jobs/{{ job.id }}/artifacts/transcript">일본어 전사 JSON</a>{% endif %}
+    {% if job.translation_path %}<a class="button secondary" href="/jobs/{{ job.id }}/artifacts/translation">한국어 번역 JSON</a>{% endif %}
+    {% if job.status in ["blocked", "failed"] %}
+      <form method="post" action="/jobs/{{ job.id }}/retry">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button type="submit">수동 재시도</button>
+      </form>
+    {% endif %}
+  </div>
+</section>
+<section class="card">
+  <h2>진행 로그</h2>
+  <ol class="events">
+    {% for event in events %}
+      <li class="event-{{ event.level }}"><time>{{ event.created_at|datetime }}</time> {{ event.message }}</li>
+    {% else %}
+      <li class="muted">로그가 없습니다.</li>
+    {% endfor %}
+  </ol>
+</section>

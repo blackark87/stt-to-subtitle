@@ -1,6 +1,8 @@
 # syntax=docker/dockerfile:1
 
-FROM python:3.11-slim-bookworm AS builder
+ARG PYTHON_IMAGE=python:3.11.15-slim-bookworm@sha256:b18992999dbe963a45a8a4da40ac2b1975be1a776d939d098c647482bcad5cba
+
+FROM ${PYTHON_IMAGE} AS builder
 
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1
@@ -13,14 +15,16 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
-COPY requirements.txt pyproject.toml README.md ./
+COPY requirements.txt ./
+
+RUN python -m pip install --prefix=/install -r requirements.txt
+
+COPY pyproject.toml README.md ./
 COPY src ./src
 
-RUN python -m pip install --upgrade pip setuptools wheel \
-    && python -m pip install --prefix=/install -r requirements.txt \
-    && python -m pip install --prefix=/install --no-deps .
+RUN python -m pip install --prefix=/install --no-deps .
 
-FROM python:3.11-slim-bookworm AS runtime
+FROM ${PYTHON_IMAGE} AS runtime
 
 ARG APP_UID=10001
 ARG APP_GID=10001
@@ -28,6 +32,7 @@ ARG APP_GID=10001
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     HF_HOME=/cache/huggingface \
+    PYANNOTE_CACHE=/cache/pyannote \
     XDG_CACHE_HOME=/cache \
     TORCH_HOME=/cache/torch \
     HF_HUB_DISABLE_TELEMETRY=1 \
@@ -44,7 +49,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid "${APP_GID}" app \
     && useradd --uid "${APP_UID}" --gid "${APP_GID}" --create-home app \
-    && mkdir -p /cache/huggingface /cache/torch /output \
+    && mkdir -p /cache/huggingface /cache/pyannote /cache/torch /output \
     && chown -R app:app /cache /output
 
 COPY --from=builder /install /usr/local

@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block title %}{{ job.source_rel }} · STT to Subtitle{% endblock %}
+{% block head %}
+  {% if job.status not in ["completed", "blocked", "failed"] %}
+    <meta http-equiv="refresh" content="15">
+  {% endif %}
+{% endblock %}
+{% block content %}
+  <p><a href="/">← 대시보드</a></p>
+  <h1>{{ job.source_rel }}</h1>
+  <div data-poll-url="/jobs/{{ job.id }}/panel" data-poll-seconds="5">
+    {% include "_job_panel.html" %}
+  </div>
+{% endblock %}
