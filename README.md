@@ -67,27 +67,26 @@ Hugging Face에서 다음 gated 모델의 이용 조건을 승인합니다.
 - [pyannote/segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0)
 - [pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1)
 
-터미널에서 저장소를 받고 Python 3.11 환경과 네이티브 의존성을 설치합니다. Homebrew가 없다면 먼저 [brew.sh](https://brew.sh/)의 설치 안내를 따릅니다.
+터미널에서 저장소를 받고 Python 3.11과 네이티브 의존성을 설치합니다. Homebrew가 없다면 먼저 [brew.sh](https://brew.sh/)의 설치 안내를 따릅니다. 저장소는 소스와 업데이트 용도로만 사용하고, 실제 가상환경·환경 변수·모델 캐시는 Git 작업 트리 밖의 별도 실행 폴더에 둡니다.
 
 ```bash
 git clone https://github.com/blackark87/stt-to-subtitle.git
 cd stt-to-subtitle
 
 brew install python@3.11 ffmpeg libsndfile portaudio
-/opt/homebrew/bin/python3.11 -m venv .venv-macos
-.venv-macos/bin/python -m pip install --upgrade pip
-.venv-macos/bin/python -m pip install -r requirements-macos.txt
-.venv-macos/bin/python -m pip install --no-deps -e .
+/opt/homebrew/bin/python3.11 \
+  scripts/create_macos_runtime.py \
+  ../stt-to-subtitle-python
 ```
 
-환경 파일을 만들고 Hugging Face 토큰을 교체합니다.
+생성된 실행 폴더는 저장소와 독립적이며 원하는 위치에 둘 수 있습니다. 그 폴더로 이동해 가상환경과 의존성을 설치합니다.
 
 ```bash
-cp .env.macos.example .env.macos
-chmod 600 .env.macos
+cd ../stt-to-subtitle-python
+./setup.sh
 ```
 
-`.env.macos`에서 다음 값을 확인합니다.
+`setup.sh`는 실행 폴더 안에 `.venv-macos`, `.env`, `var/`를 생성합니다. `run.sh`는 복사된 `src/`의 코드를 직접 로드하므로 editable install은 필요하지 않고, 실행 폴더에서 Python 코드를 수정했다면 서버만 재시작하면 반영됩니다. `.env`에서 다음 값을 확인합니다.
 
 ```dotenv
 HF_TOKEN=hf_replace_me
@@ -100,13 +99,13 @@ STT_DIARIZATION_DEVICE=cpu
 
 `HF_TOKEN`은 gated 모델 다운로드에 필수입니다. Hugging Face 설정에서 read 권한 토큰을 발급해 `hf_replace_me`를 교체하십시오. 신뢰하는 내부망에서 서비스 간 인증이 필요 없다면 `STT_API_TOKEN`은 비워 둡니다. 값을 설정하면 작업 API에 Bearer 인증이 자동으로 활성화되며 NAS에도 같은 값을 설정해야 합니다.
 
+실행 폴더를 다른 위치나 다른 Mac으로 복사할 수 있습니다. 단, Python 가상환경에는 생성 당시의 절대 경로가 포함될 수 있으므로 폴더를 옮긴 뒤에는 대상 위치에서 `./setup.sh`를 다시 실행하십시오. `.env`에는 토큰이 있으므로 복사와 백업 시 노출되지 않도록 주의합니다.
+
 ### 실행
 
 ```bash
-set -a
-. ./.env.macos
-set +a
-./scripts/run-macos-stt.sh
+cd /path/to/stt-to-subtitle-python
+./run.sh
 ```
 
 스크립트는 `caffeinate`와 함께 Uvicorn 단일 worker를 실행합니다. 이 터미널을 닫거나 `Ctrl-C`를 누르면 전사 API도 종료됩니다. Whisper는 `mps`, Pyannote는 `cpu`로 로드되고 모델 인스턴스는 최초 작업 때 한 번만 생성됩니다. MPS를 사용할 수 없으면 `/readyz`가 503을 반환하며 CPU로 조용히 전환하지 않습니다.
@@ -132,7 +131,7 @@ curl http://MACBOOK_IP:8100/readyz
 
 macOS 방화벽이 Python 또는 포트 `8100`의 수신 연결 허용 여부를 묻는다면 신뢰하는 내부망에서 허용합니다. 절전 상태에서는 처리를 받을 수 없으므로 작업 중에는 MacBook이 전원에 연결되어 있고 네트워크 접속이 유지되어야 합니다.
 
-모델 캐시는 기본적으로 `var/macos-cache/`에 유지되므로 `config.yaml`, `pytorch_model.bin` 등을 매번 다시 받지 않습니다. 이 경로와 API 작업 DB는 Git에서 제외됩니다.
+모델 캐시는 실행 폴더의 `var/macos-cache/`에 유지되므로 `config.yaml`, `pytorch_model.bin` 등을 매번 다시 받지 않습니다. 작업 DB와 전사 결과는 `var/macos-stt/`에 저장됩니다. 두 경로 모두 Git 저장소 밖에 있으므로 실행 중 생성되는 파일이 원본 저장소의 `git status`에 나타나지 않습니다.
 
 주요 API:
 
@@ -146,18 +145,22 @@ macOS 방화벽이 Python 또는 포트 `8100`의 수신 연결 허용 여부를
 
 ### MacBook 업데이트
 
-실행 중인 서버를 `Ctrl-C`로 중지한 다음 코드를 받고 의존성을 동기화한 뒤 다시 실행합니다.
+실행 중인 서버를 `Ctrl-C`로 중지합니다. 원본 Git 저장소에서 최신 코드를 받은 뒤 `--update`로 실행 폴더의 애플리케이션 파일만 갱신합니다. `.env`, `.venv-macos`, `var/`는 유지됩니다.
 
 ```bash
+cd /path/to/stt-to-subtitle
 git pull --ff-only
-.venv-macos/bin/python -m pip install -r requirements-macos.txt
-.venv-macos/bin/python -m pip install --no-deps -e .
+/opt/homebrew/bin/python3.11 \
+  scripts/create_macos_runtime.py \
+  --update \
+  /path/to/stt-to-subtitle-python
 
-set -a
-. ./.env.macos
-set +a
-./scripts/run-macos-stt.sh
+cd /path/to/stt-to-subtitle-python
+./setup.sh
+./run.sh
 ```
+
+`--update`는 내보내기 도구가 만든 `.stt-macos-runtime` 표식이 있는 폴더에서만 동작하므로 다른 디렉터리를 실수로 덮어쓰지 않습니다.
 
 ## 2. 별도 PC의 LM Studio
 
