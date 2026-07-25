@@ -1,0 +1,17 @@
+<div class="table-scroll">
+  <table>
+    <thead><tr><th>파일</th><th>상태</th><th>갱신</th><th></th></tr></thead>
+    <tbody>
+      {% for job in jobs %}
+        <tr>
+          <td>{{ job.source_rel }}</td>
+          <td><span class="status status-{{ job.status }}">{{ job.status }}</span></td>
+          <td>{{ job.updated_at|datetime }}</td>
+          <td><a href="/jobs/{{ job.id }}">상세</a></td>
+        </tr>
+      {% else %}
+        <tr><td colspan="4" class="muted">아직 작업이 없습니다.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>

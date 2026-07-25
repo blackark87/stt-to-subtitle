@@ -1,0 +1,430 @@
+"""HTTP clients for the independent STT and LM Studio services."""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Mapping, Sequence
+import json
+import logging
+from pathlib import Path
+import time
+from typing import Any
+
+import requests
+
+from .contracts import validate_transcript, validate_translation_items
+
+LOGGER = logging.getLogger(__name__)
+
+
+class ExternalServiceError(RuntimeError):
+    """An external stage cannot currently make progress."""
+
+
+def _safe_error(response: requests.Response) -> str:
+    try:
+        body = response.json()
+    except (ValueError, requests.JSONDecodeError):
+        body = response.text.strip()
+    return str(body)[:1000] or f"HTTP {response.status_code}"
+
+
+class RetryingJSONClient:
+    def __init__(
+        self,
+        *,
+        token: str,
+        connect_timeout: float = 10.0,
+        read_timeout: float = 120.0,
+        attempts: int = 3,
+    ) -> None:
+        if attempts < 1:
+            raise ValueError("attempts must be at least 1")
+        self.token = token
+        self.timeout = (connect_timeout, read_timeout)
+        self.attempts = attempts
+        self.session = requests.Session()
+
+    @property
+    def headers(self) -> dict[str, str]:
+        headers = {"Accept": "application/json"}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        return headers
+
+    def request(self, method: str, url: str, **kwargs: Any) -> requests.Response:
+        transient_statuses = {408, 429, 500, 502, 503, 504}
+        last_error: BaseException | None = None
+        for attempt in range(1, self.attempts + 1):
+            try:
+                response = self.session.request(
+                    method,
+                    url,
+                    timeout=self.timeout,
+                    **kwargs,
+                )
+                if (
+                    response.status_code not in transient_statuses
+                    or attempt == self.attempts
+                ):
+                    return response
+            except requests.RequestException as error:
+                last_error = error
+                if attempt == self.attempts:
+                    break
+            delay = float(2 ** (attempt - 1))
+            LOGGER.warning(
+                "external request failed; retrying in %.0fs (%d/%d)",
+                delay,
+                attempt,
+                self.attempts,
+            )
+            time.sleep(delay)
+        raise ExternalServiceError(
+            f"external service is unavailable after {self.attempts} attempts: "
+            f"{last_error}"
+        ) from last_error
+
+
+class STTAPIClient(RetryingJSONClient):
+    def __init__(
+        self,
+        base_url: str,
+        token: str,
+        *,
+        poll_interval: float = 5.0,
+        attempts: int = 3,
+    ) -> None:
+        super().__init__(
+            token=token,
+            read_timeout=300.0,
+            attempts=attempts,
+        )
+        self.base_url = base_url.rstrip("/")
+        self.poll_interval = poll_interval
+
+    def transcribe(
+        self,
+        audio_path: Path,
+        *,
+        options: Mapping[str, Any],
+        idempotency_key: str,
+        existing_job_id: str | None = None,
+        on_job_created: Callable[[str], None] | None = None,
+    ) -> dict[str, Any]:
+        job_id = existing_job_id
+        may_requeue_existing = existing_job_id is not None
+        while True:
+            if job_id is None:
+                job_id = self._submit(
+                    audio_path,
+                    options=options,
+                    idempotency_key=idempotency_key,
+                )
+                if on_job_created is not None:
+                    on_job_created(job_id)
+
+            response = self.request(
+                "GET",
+                f"{self.base_url}/v1/transcriptions/{job_id}",
+                headers=self.headers,
+            )
+            if response.status_code != 200:
+                raise ExternalServiceError(
+                    "transcription status request failed: "
+                    f"HTTP {response.status_code}: {_safe_error(response)}"
+                )
+            try:
+                status_payload = response.json()
+                remote_status = str(status_payload["status"])
+            except (KeyError, TypeError, ValueError) as error:
+                raise ExternalServiceError(
+                    "transcription API returned an invalid status response"
+                ) from error
+            if remote_status == "completed":
+                break
+            if remote_status == "failed":
+                if may_requeue_existing:
+                    may_requeue_existing = False
+                    job_id = None
+                    continue
+                raise ExternalServiceError(
+                    "transcription job failed: "
+                    f"{status_payload.get('error', 'unknown remote error')}"
+                )
+            if remote_status not in {"queued", "running"}:
+                raise ExternalServiceError(
+                    f"transcription job returned unknown status {remote_status}"
+                )
+            time.sleep(self.poll_interval)
+
+        response = self.request(
+            "GET",
+            f"{self.base_url}/v1/transcriptions/{job_id}/result",
+            headers=self.headers,
+        )
+        if response.status_code != 200:
+            raise ExternalServiceError(
+                "transcription result request failed: "
+                f"HTTP {response.status_code}: {_safe_error(response)}"
+            )
+        try:
+            payload = response.json()
+        except ValueError as error:
+            raise ExternalServiceError(
+                "transcription API returned invalid result JSON"
+            ) from error
+        validate_transcript(payload)
+        return payload
+
+    def _submit(
+        self,
+        audio_path: Path,
+        *,
+        options: Mapping[str, Any],
+        idempotency_key: str,
+    ) -> str:
+        try:
+            from requests_toolbelt.multipart.encoder import MultipartEncoder
+        except ImportError as error:
+            raise RuntimeError(
+                "requests-toolbelt is required for streaming WAV uploads"
+            ) from error
+
+        response: requests.Response | None = None
+        last_error: requests.RequestException | None = None
+        transient_statuses = {408, 429, 500, 502, 503, 504}
+        for attempt in range(1, self.attempts + 1):
+            response = None
+            try:
+                with audio_path.open("rb") as audio_stream:
+                    multipart = MultipartEncoder(
+                        fields={
+                            "audio": (
+                                audio_path.name,
+                                audio_stream,
+                                "audio/wav",
+                            ),
+                            "options": json.dumps(dict(options), sort_keys=True),
+                        }
+                    )
+                    headers = {
+                        **self.headers,
+                        "Content-Type": multipart.content_type,
+                        "Idempotency-Key": idempotency_key,
+                    }
+                    response = self.session.request(
+                        "POST",
+                        f"{self.base_url}/v1/transcriptions",
+                        headers=headers,
+                        data=multipart,
+                        timeout=self.timeout,
+                    )
+            except requests.RequestException as error:
+                last_error = error
+            if response is not None and (
+                response.status_code not in transient_statuses
+                or attempt == self.attempts
+            ):
+                break
+            if attempt < self.attempts:
+                delay = float(2 ** (attempt - 1))
+                LOGGER.warning(
+                    "WAV upload failed; retrying in %.0fs (%d/%d)",
+                    delay,
+                    attempt,
+                    self.attempts,
+                )
+                time.sleep(delay)
+        if response is None:
+            raise ExternalServiceError(
+                "transcription API is unavailable after "
+                f"{self.attempts} upload attempts: {last_error}"
+            ) from last_error
+        if response.status_code != 202:
+            raise ExternalServiceError(
+                "transcription submission failed: "
+                f"HTTP {response.status_code}: {_safe_error(response)}"
+            )
+        try:
+            return str(response.json()["id"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ExternalServiceError(
+                "transcription API returned an invalid job response"
+            ) from error
+
+
+def batch_segments(
+    segments: Sequence[Mapping[str, Any]],
+    *,
+    max_segments: int,
+    max_characters: int,
+) -> list[list[Mapping[str, Any]]]:
+    if max_segments < 1 or max_characters < 1:
+        raise ValueError("translation batch limits must be positive")
+    batches: list[list[Mapping[str, Any]]] = []
+    current: list[Mapping[str, Any]] = []
+    current_characters = 0
+    for segment in segments:
+        characters = len(str(segment["text"]))
+        if current and (
+            len(current) >= max_segments
+            or current_characters + characters > max_characters
+        ):
+            batches.append(current)
+            current = []
+            current_characters = 0
+        current.append(segment)
+        current_characters += characters
+    if current:
+        batches.append(current)
+    return batches
+
+
+class LMStudioClient(RetryingJSONClient):
+    def __init__(
+        self,
+        base_url: str,
+        token: str,
+        model: str,
+        *,
+        max_segments: int = 30,
+        max_characters: int = 6000,
+        attempts: int = 3,
+    ) -> None:
+        super().__init__(
+            token=token,
+            read_timeout=600.0,
+            attempts=attempts,
+        )
+        if not model.strip():
+            raise ValueError("LM Studio model name is required")
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self.max_segments = max_segments
+        self.max_characters = max_characters
+
+    def translate(
+        self,
+        segments: Sequence[Mapping[str, Any]],
+        *,
+        existing: Mapping[str, str] | None = None,
+        on_batch: Callable[[list[dict[str, str]]], None] | None = None,
+    ) -> list[dict[str, str]]:
+        expected_ids = [str(segment["id"]) for segment in segments]
+        known = dict(existing or {})
+        unknown_existing = set(known) - set(expected_ids)
+        if unknown_existing:
+            raise ValueError("partial translation contains unknown segment ids")
+
+        pending = [
+            segment for segment in segments if str(segment["id"]) not in known
+        ]
+        for batch in batch_segments(
+            pending,
+            max_segments=self.max_segments,
+            max_characters=self.max_characters,
+        ):
+            translated = self._translate_batch(batch)
+            for item in translated:
+                known[item["id"]] = item["text"]
+            if on_batch is not None:
+                on_batch(
+                    [
+                        {"id": segment_id, "text": known[segment_id]}
+                        for segment_id in expected_ids
+                        if segment_id in known
+                    ]
+                )
+
+        result = [
+            {"id": segment_id, "text": known[segment_id]}
+            for segment_id in expected_ids
+            if segment_id in known
+        ]
+        return validate_translation_items(result, expected_ids)
+
+    def _translate_batch(
+        self,
+        segments: Sequence[Mapping[str, Any]],
+    ) -> list[dict[str, str]]:
+        expected_ids = [str(segment["id"]) for segment in segments]
+        schema = {
+            "type": "object",
+            "properties": {
+                "translations": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string"},
+                            "text": {"type": "string"},
+                        },
+                        "required": ["id", "text"],
+                        "additionalProperties": False,
+                    },
+                }
+            },
+            "required": ["translations"],
+            "additionalProperties": False,
+        }
+        request_payload = {
+            "model": self.model,
+            "temperature": 0,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "Translate Japanese subtitle segments into natural Korean. "
+                        "Preserve every id exactly and in the same order. "
+                        "Return only the requested structured JSON. Do not add "
+                        "speaker names, timestamps, commentary, or omitted lines."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "segments": [
+                                {
+                                    "id": str(segment["id"]),
+                                    "text": str(segment["text"]),
+                                }
+                                for segment in segments
+                            ]
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+            ],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "subtitle_translation",
+                    "strict": True,
+                    "schema": schema,
+                },
+            },
+        }
+        response = self.request(
+            "POST",
+            f"{self.base_url}/chat/completions",
+            headers={**self.headers, "Content-Type": "application/json"},
+            json=request_payload,
+        )
+        if response.status_code != 200:
+            raise ExternalServiceError(
+                "LM Studio translation failed: "
+                f"HTTP {response.status_code}: {_safe_error(response)}"
+            )
+        try:
+            content = response.json()["choices"][0]["message"]["content"]
+            decoded = json.loads(content) if isinstance(content, str) else content
+            translations = decoded["translations"]
+        except (KeyError, IndexError, TypeError, ValueError) as error:
+            raise ExternalServiceError(
+                "LM Studio returned invalid structured translation JSON"
+            ) from error
+        try:
+            return validate_translation_items(translations, expected_ids)
+        except ValueError as error:
+            raise ExternalServiceError(str(error)) from error

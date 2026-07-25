@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Protocol
 
 MODEL_ID = "kotoba-tech/kotoba-whisper-v2.2"
 MODEL_REVISION = "9d33482a0eb9b57f1ad80708e8ac5538246d8355"
@@ -48,31 +48,55 @@ class TranscriptionOptions:
             raise ValueError("min_speakers cannot exceed max_speakers")
 
 
-def transcribe(
-    audio_path: Path,
+class SpeechPipeline(Protocol):
+    def __call__(self, audio_path: str, **kwargs: Any) -> Mapping[str, Any]: ...
+
+
+def load_pipeline(
     token: str,
-    options: TranscriptionOptions,
-) -> Mapping[str, Any]:
-    """Load the pinned Kotoba pipeline and transcribe one WAV file on CPU."""
-    options.validate()
+    *,
+    batch_size: int = 1,
+    device: str = "cpu",
+    diarization_device: str | None = None,
+    threads: int | None = None,
+) -> SpeechPipeline:
+    """Load the pinned pipeline with independently selected model devices."""
     if not token.strip():
         raise ValueError("HF_TOKEN is required for gated Pyannote models")
+    if batch_size < 1:
+        raise ValueError("batch_size must be at least 1")
+    if threads is not None and threads < 1:
+        raise ValueError("threads must be at least 1")
 
     import torch
     from transformers import pipeline
 
-    if options.threads is not None:
-        torch.set_num_threads(options.threads)
+    if threads is not None:
+        torch.set_num_threads(threads)
 
-    speech_pipeline = pipeline(
-        model=MODEL_ID,
-        revision=MODEL_REVISION,
-        token=token,
-        torch_dtype=torch.float32,
-        device="cpu",
-        batch_size=options.batch_size,
-        trust_remote_code=True,
-    )
+    torch_dtype = torch.float16 if device == "mps" else torch.float32
+    pipeline_options: dict[str, Any] = {
+        "model": MODEL_ID,
+        "revision": MODEL_REVISION,
+        "token": token,
+        "torch_dtype": torch_dtype,
+        "device": device,
+        "batch_size": batch_size,
+        "trust_remote_code": True,
+    }
+    if diarization_device is not None:
+        pipeline_options["device_pyannote"] = diarization_device
+
+    return pipeline(**pipeline_options)
+
+
+def run_pipeline(
+    speech_pipeline: SpeechPipeline,
+    audio_path: Path,
+    options: TranscriptionOptions,
+) -> Mapping[str, Any]:
+    """Run one validated transcription against an already loaded pipeline."""
+    options.validate()
     return speech_pipeline(
         str(audio_path),
         chunk_length_s=options.chunk_length_seconds,
@@ -81,6 +105,22 @@ def transcribe(
         min_speakers=options.min_speakers,
         max_speakers=options.max_speakers,
     )
+
+
+def transcribe(
+    audio_path: Path,
+    token: str,
+    options: TranscriptionOptions,
+) -> Mapping[str, Any]:
+    """Load the pinned Kotoba pipeline and transcribe one WAV file on CPU."""
+    options.validate()
+    speech_pipeline = load_pipeline(
+        token=token,
+        batch_size=options.batch_size,
+        device="cpu",
+        threads=options.threads,
+    )
+    return run_pipeline(speech_pipeline, audio_path, options)
 
 
 def normalize_segments(

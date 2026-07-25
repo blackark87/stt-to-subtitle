@@ -2,6 +2,8 @@
 .github
 .idea
 .venv
+.env
+.env.*
 __pycache__
 *.py[cod]
 .pytest_cache
@@ -9,5 +11,7 @@ __pycache__
 .ruff_cache
 media
 output
+var
+model-cache
 tests
 AGENTS.md

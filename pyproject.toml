@@ -1,17 +1,22 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools==75.2.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "stt-to-subtitle"
 version = "0.1.0"
-description = "Local Kotoba-Whisper transcription test pipeline"
+description = "Distributed local transcription, translation, and SRT pipeline"
 readme = "README.md"
 requires-python = ">=3.11,<3.12"
 dependencies = []
 
 [project.scripts]
 stt-transcribe = "stt_to_subtitle.cli:main"
+stt-macos-api = "stt_to_subtitle.macos_api:main"
+stt-nas-web = "stt_to_subtitle.nas_app:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+stt_to_subtitle = ["templates/*.html", "static/*.css", "static/*.js"]

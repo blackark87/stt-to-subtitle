@@ -8,6 +8,7 @@ from stt_to_subtitle.kotoba import (
     MODEL_ID,
     MODEL_REVISION,
     TranscriptionOptions,
+    load_pipeline,
     normalize_segments,
     speaker_transcripts,
     transcribe,
@@ -77,6 +78,37 @@ class TranscriptionOptionsTests(unittest.TestCase):
 
 
 class TranscribeTests(unittest.TestCase):
+    def test_loads_whisper_on_mps_and_pyannote_on_cpu(self) -> None:
+        pipeline_factory = Mock(return_value=Mock())
+        fake_torch = SimpleNamespace(
+            float16="float16",
+            float32="float32",
+            set_num_threads=Mock(),
+        )
+        fake_transformers = SimpleNamespace(pipeline=pipeline_factory)
+
+        with patch.dict(
+            sys.modules,
+            {"torch": fake_torch, "transformers": fake_transformers},
+        ):
+            load_pipeline(
+                "test-token",
+                batch_size=1,
+                device="mps",
+                diarization_device="cpu",
+            )
+
+        pipeline_factory.assert_called_once_with(
+            model=MODEL_ID,
+            revision=MODEL_REVISION,
+            token="test-token",
+            torch_dtype="float16",
+            device="mps",
+            batch_size=1,
+            trust_remote_code=True,
+            device_pyannote="cpu",
+        )
+
     def test_loads_pinned_model_on_cpu_and_forwards_speaker_options(self) -> None:
         speech_pipeline = Mock(return_value={"chunks": []})
         pipeline_factory = Mock(return_value=speech_pipeline)
