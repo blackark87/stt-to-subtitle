@@ -1,0 +1,41 @@
+# macOS STT Runtime
+
+이 폴더는 Git 작업 트리 밖에서 MPS 전사 API를 실행하기 위한 독립 실행 환경입니다. 애플리케이션 소스, Python 가상환경, 환경 변수, 모델 캐시와 작업 DB가 모두 이 폴더 안에 유지됩니다.
+
+## 최초 설치
+
+Homebrew 의존성을 설치한 다음 이 폴더에서 설치 스크립트를 실행합니다.
+
+```bash
+brew install python@3.11 ffmpeg libsndfile portaudio
+./setup.sh
+```
+
+생성된 `.env`에서 `HF_TOKEN`을 실제 Hugging Face read 토큰으로 교체합니다. 신뢰할 수 있는 LAN에서 인증 없이 사용할 때는 `STT_API_TOKEN`을 비워 둡니다.
+
+```bash
+./run.sh
+```
+
+상태 확인:
+
+```bash
+curl http://127.0.0.1:8100/healthz
+curl http://127.0.0.1:8100/readyz
+```
+
+## 폴더 이동 및 복사
+
+설치 전의 실행 폴더는 원하는 위치로 복사할 수 있습니다. Python 가상환경에는 생성 당시의 절대 경로가 포함될 수 있으므로, 이미 `setup.sh`를 실행한 폴더를 이동하거나 다른 Mac으로 복사했다면 `.venv-macos`를 그대로 신뢰하지 말고 대상 위치에서 `setup.sh`를 다시 실행하십시오.
+
+`.env`에는 Hugging Face 토큰이 들어 있으므로 다른 장비로 복사할 때 노출되지 않도록 주의합니다. `var/macos-cache`를 함께 복사하면 모델 다운로드를 줄일 수 있지만 용량이 클 수 있습니다.
+
+## 구성
+
+- `.venv-macos/` — Python 3.11 가상환경
+- `.env` — 로컬 환경 변수와 토큰
+- `var/macos-cache/` — Hugging Face, Pyannote, Torch 모델 캐시
+- `var/macos-stt/` — 작업 DB와 전사 결과
+- `src/stt_to_subtitle/` — 실행 시 직접 로드되는 애플리케이션 소스
+
+`run.sh`는 이 폴더의 `src/`를 `PYTHONPATH`로 직접 사용합니다. 소스를 수정했다면 서버만 재시작하면 변경이 반영되며 editable install은 필요하지 않습니다. 실행 폴더는 Git 저장소가 아니므로 여기서 생성되는 파일은 원본 저장소의 `git status`에 나타나지 않습니다.
