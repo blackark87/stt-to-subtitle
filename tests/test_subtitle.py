@@ -188,7 +188,7 @@ class SubtitleTests(unittest.TestCase):
         webvtt = render_webvtt(segments, translations)
 
         self.assertIn("[V4+ Styles]", ass)
-        self.assertIn("Noto Sans CJK KR", ass)
+        self.assertIn("Noto Sans KR", ass)
         self.assertIn(r"{\c&H00F9E867&}안녕하세요", ass)
         self.assertIn("<c.speaker-1>안녕하세요</c>", webvtt)
         self.assertNotIn("화자 1", ass)

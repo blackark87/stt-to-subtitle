@@ -181,16 +181,21 @@ class NASAppTests(unittest.TestCase):
                 player_script = client.get("/static/player.js")
 
             self.assertEqual(page.status_code, 200)
+            self.assertEqual(
+                page.headers["permissions-policy"],
+                "xr-spatial-tracking=(self)",
+            )
             self.assertIn("KST", page.text)
             self.assertIn('class="result-player"', page.text)
             self.assertIn('data-video-type="video/mp4"', page.text)
             self.assertIn("data-subtitle-src=", page.text)
             self.assertIn('data-player-mode="vr180"', page.text)
-            self.assertIn("VR 180 SBS", page.text)
+            self.assertIn("180° 미리보기", page.text)
             self.assertIn("data-vr180-canvas", page.text)
             self.assertIn("data-vr180-subtitles", page.text)
-            self.assertIn("data-vr-eye=\"dual\"", page.text)
-            self.assertIn("data-vr-eye=\"left\"", page.text)
+            self.assertNotIn("data-vr-eye", page.text)
+            self.assertIn("data-vr-headset", page.text)
+            self.assertIn("WebXR", page.text)
             self.assertIn("data-vr-volume", page.text)
             self.assertIn("Space: 재생/일시정지", page.text)
             self.assertIn("vr180-player.js", page.text)
@@ -219,9 +224,28 @@ class NASAppTests(unittest.TestCase):
                 "window.createVR180Renderer",
                 vr_renderer.text,
             )
+            self.assertIn(
+                'requestSession("immersive-vr"',
+                vr_renderer.text,
+            )
+            self.assertIn(
+                "frame.getViewerPose",
+                vr_renderer.text,
+            )
+            self.assertIn(
+                'view.eye === "right"',
+                vr_renderer.text,
+            )
+            self.assertIn("XRWebGLLayer", vr_renderer.text)
+            self.assertIn("setSubtitleLines", vr_renderer.text)
+            self.assertNotIn("u_stereo_mode", vr_renderer.text)
             self.assertNotIn(
                 'canvas.addEventListener("keydown"',
                 vr_renderer.text,
+            )
+            self.assertIn(
+                "window.isImmersiveVRSupported",
+                player_script.text,
             )
             self.assertIn('event.code === "Space"', player_script.text)
             self.assertIn('event.key === "ArrowLeft"', player_script.text)
