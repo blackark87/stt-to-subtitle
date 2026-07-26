@@ -29,6 +29,16 @@
     {% if job.translation_path and editable %}
       <a class="button secondary" href="/jobs/{{ job.id }}/artifacts/translation/edit" title="{{ artifact_names.translation }}">한국어 결과 JSON 편집</a>
     {% endif %}
+    {% if job.status == "completed" and job.transcript_path %}
+      <form
+        method="post"
+        action="/jobs/{{ job.id }}/restart-translation"
+        data-confirm-message="기존 번역 결과를 초기화하고 번역부터 다시 시작하시겠습니까? 일본어 전사 결과는 유지됩니다."
+      >
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button type="submit" class="secondary" title="일본어 전사는 다시 실행하지 않습니다">번역부터 다시 시작</button>
+      </form>
+    {% endif %}
     {% if job.status in ["blocked", "failed"] %}
       <form method="post" action="/jobs/{{ job.id }}/retry">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">

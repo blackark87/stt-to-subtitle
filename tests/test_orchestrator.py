@@ -233,7 +233,8 @@ class NASOrchestratorTests(unittest.TestCase):
                 encoding="utf-8"
             )
             self.assertIn("[V4+ Styles]", styled)
-            self.assertIn("화자 1:", styled)
+            self.assertNotIn("화자 1", styled)
+            self.assertIn("안녕하세요", styled)
 
     def test_editing_translation_json_regenerates_the_srt(self) -> None:
         with TemporaryDirectory() as directory:
@@ -322,3 +323,133 @@ class NASOrchestratorTests(unittest.TestCase):
                 "수정된 번역",
                 (media_root / "movie.ko.ass").read_text(encoding="utf-8"),
             )
+
+    def test_restart_translation_preserves_transcript_and_rerenders(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            source = media_root / "movie.mkv"
+            source.write_bytes(b"media")
+            orchestrator = self.make_orchestrator(root, media_root)
+            job = orchestrator.create_job(
+                "movie.mkv",
+                force_overwrite=False,
+                options={},
+            )
+            artifact_dir = root / "state" / "jobs" / job.id
+            artifact_dir.mkdir(parents=True)
+            transcript_path = artifact_dir / "movie_translate.json"
+            translation_path = artifact_dir / "movie_result_ko.json"
+            transcript_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "job_id": "remote-job",
+                        "segments": [
+                            {
+                                "id": "segment-000001",
+                                "start": 0,
+                                "end": 1,
+                                "speaker": "SPEAKER_00",
+                                "text": "こんにちは",
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            translation_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "status": "completed",
+                        "transcript_job_id": "remote-job",
+                        "translations": [
+                            {
+                                "id": "segment-000001",
+                                "text": "이전 번역",
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            srt_path = media_root / "movie.ko.srt"
+            ass_path = media_root / "movie.ko.ass"
+            srt_path.write_text("old srt", encoding="utf-8")
+            ass_path.write_text("old ass", encoding="utf-8")
+            orchestrator.store.update(
+                job.id,
+                status="completed",
+                transcript_path=str(transcript_path),
+                translation_path=str(translation_path),
+                srt_path=str(srt_path),
+                ass_path=str(ass_path),
+            )
+            original_transcript = transcript_path.read_bytes()
+            orchestrator.lm_client.translate = Mock(
+                return_value=[
+                    {
+                        "id": "segment-000001",
+                        "text": "새 번역",
+                    }
+                ]
+            )
+
+            try:
+                restarted = orchestrator.restart_translation(job.id)
+                checkpoint = json.loads(
+                    translation_path.read_text(encoding="utf-8")
+                )
+                orchestrator._translate(restarted)
+                orchestrator._render(orchestrator.store.get(job.id))
+                completed = orchestrator.store.get(job.id)
+                messages = [
+                    event["message"]
+                    for event in orchestrator.store.events(job.id)
+                ]
+            finally:
+                orchestrator.stop()
+
+            self.assertEqual(restarted.status, "transcribed")
+            self.assertEqual(checkpoint["status"], "partial")
+            self.assertEqual(checkpoint["translations"], [])
+            self.assertEqual(
+                transcript_path.read_bytes(),
+                original_transcript,
+            )
+            self.assertEqual(completed.status, "completed")
+            self.assertIn("새 번역", srt_path.read_text(encoding="utf-8"))
+            self.assertIn("새 번역", ass_path.read_text(encoding="utf-8"))
+            self.assertNotIn("old srt", srt_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                orchestrator.lm_client.translate.call_args.kwargs["existing"],
+                {},
+            )
+            self.assertTrue(
+                any(
+                    "transcript preserved" in message
+                    for message in messages
+                )
+            )
+
+    def test_restart_translation_rejects_an_incomplete_job(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            (media_root / "movie.mkv").write_bytes(b"media")
+            orchestrator = self.make_orchestrator(root, media_root)
+            job = orchestrator.create_job(
+                "movie.mkv",
+                force_overwrite=False,
+                options={},
+            )
+            try:
+                with self.assertRaisesRegex(ValueError, "completed jobs"):
+                    orchestrator.restart_translation(job.id)
+            finally:
+                orchestrator.stop()

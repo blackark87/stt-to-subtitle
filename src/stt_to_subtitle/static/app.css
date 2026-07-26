@@ -242,6 +242,9 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 .table-scroll { overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; }
 th, td { border-bottom: 1px solid var(--line); padding: 10px 8px; text-align: left; }
+.table-actions { display: flex; align-items: center; gap: 10px; white-space: nowrap; }
+.table-actions form { margin: 0; }
+.table-actions button { padding: 6px 9px; font-size: .82rem; }
 .status { display: inline-block; border-radius: 999px; padding: 2px 9px; background: var(--line); font-size: .88rem; }
 .status-completed, .status-translated, .status-transcribed, .status-audio_ready { background: #abefc6; color: #05603a; }
 .status-blocked, .status-failed { background: #fecdca; color: #912018; }
