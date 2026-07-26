@@ -1324,7 +1324,6 @@ tags
 !/Dockerfile
 !/Dockerfile.nas
 !/compose.yaml
-!/compose.nas.yaml
 !/Makefile
 !/pyproject.toml
 !/requirements.txt

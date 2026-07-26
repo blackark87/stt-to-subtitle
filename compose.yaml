@@ -1,17 +1,30 @@
 services:
-  stt:
-    platform: linux/arm64
-    build:
-      context: .
-    image: stt-to-subtitle:kotoba-m1
+  orchestrator:
+    platform: linux/amd64
+    image: ${NAS_IMAGE:-ghcr.io/blackark87/stt-to-subtitle:nas-latest}
+    user: "${PUID:-1000}:${PGID:-1000}"
     init: true
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      - "${NAS_WEB_PORT:-8080}:8080"
     environment:
-      HF_TOKEN: ${HF_TOKEN:-}
+      MEDIA_ROOT: /media
+      NAS_STATE_DIR: /var/lib/stt
+      NAS_ADMIN_PASSWORD: ${NAS_ADMIN_PASSWORD:-}
+      NAS_SESSION_SECRET: ${NAS_SESSION_SECRET:-}
+      NAS_SECURE_COOKIE: ${NAS_SECURE_COOKIE:-false}
+      STT_BASE_URL: ${STT_BASE_URL:?set STT_BASE_URL}
+      STT_API_TOKEN: ${STT_API_TOKEN:-}
+      LM_STUDIO_BASE_URL: ${LM_STUDIO_BASE_URL:?set LM_STUDIO_BASE_URL}
+      LM_STUDIO_TOKEN: ${LM_STUDIO_TOKEN:-}
+      LM_STUDIO_MODEL: ${LM_STUDIO_MODEL:?set LM_STUDIO_MODEL}
+      TRANSLATION_BATCH_SEGMENTS: ${TRANSLATION_BATCH_SEGMENTS:-30}
+      TRANSLATION_BATCH_CHARACTERS: ${TRANSLATION_BATCH_CHARACTERS:-6000}
     volumes:
-      - ./media:/data:ro
-      - ./output:/output
-      - model-cache:/cache
-    command: ["--help"]
-
-volumes:
-  model-cache:
+      - ${MEDIA_PATH:-./media}:/media:rw
+      - ${STATE_PATH:-./var/nas-state}:/var/lib/stt:rw
+    tmpfs:
+      - /tmp:size=256m,mode=1777
