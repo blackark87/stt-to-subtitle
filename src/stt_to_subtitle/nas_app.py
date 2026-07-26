@@ -24,6 +24,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
 
+from .artifacts import artifact_filename
 from .media_preview import (
     guess_media_type,
     iter_file_range,
@@ -105,6 +106,30 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="invalid CSRF token",
             )
+
+    def artifact_details(
+        job: Any,
+        kind: str,
+    ) -> tuple[str | None, str, str]:
+        details = {
+            "transcript": (
+                job.transcript_path,
+                artifact_filename(job.source_rel, "transcript"),
+                "일본어 전사 JSON",
+            ),
+            "translation": (
+                job.translation_path,
+                artifact_filename(job.source_rel, "translation"),
+                "한국어 결과 JSON",
+            ),
+        }
+        try:
+            return details[kind]
+        except KeyError as error:
+            raise HTTPException(
+                status_code=404,
+                detail="artifact not found",
+            ) from error
 
     def dashboard_context(
         request: Request,
@@ -402,6 +427,16 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
                 "events": service.store.events(job_id),
                 "csrf_token": request.session.get("csrf_token", ""),
                 "video_mime_type": guess_media_type(job.source_rel),
+                "artifact_names": {
+                    "transcript": artifact_filename(
+                        job.source_rel,
+                        "transcript",
+                    ),
+                    "translation": artifact_filename(
+                        job.source_rel,
+                        "translation",
+                    ),
+                },
             },
         )
 
@@ -421,6 +456,16 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
                 "events": service.store.events(job_id),
                 "csrf_token": request.session.get("csrf_token", ""),
                 "video_mime_type": guess_media_type(job.source_rel),
+                "artifact_names": {
+                    "transcript": artifact_filename(
+                        job.source_rel,
+                        "transcript",
+                    ),
+                    "translation": artifact_filename(
+                        job.source_rel,
+                        "translation",
+                    ),
+                },
             },
         )
 
@@ -442,6 +487,90 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
             status_code=status.HTTP_303_SEE_OTHER,
         )
 
+    @app.get(
+        "/jobs/{job_id}/artifacts/{kind}/edit",
+        response_class=HTMLResponse,
+        name="edit_artifact",
+    )
+    def edit_artifact(
+        request: Request,
+        job_id: str,
+        kind: str,
+        saved: int = 0,
+    ) -> Any:
+        if not is_authenticated(request):
+            return login_redirect()
+        service = orchestrator(request)
+        job = service.store.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="job not found")
+        artifact_path, filename, label = artifact_details(job, kind)
+        if not artifact_path or not Path(artifact_path).is_file():
+            raise HTTPException(status_code=404, detail="artifact not found")
+        try:
+            content = Path(artifact_path).read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as error:
+            raise HTTPException(
+                status_code=500,
+                detail="artifact could not be read",
+            ) from error
+        return TEMPLATES.TemplateResponse(
+            request,
+            "artifact_editor.html",
+            {
+                "job": job,
+                "kind": kind,
+                "filename": filename,
+                "label": label,
+                "content": content,
+                "csrf_token": request.session.get("csrf_token", ""),
+                "error": None,
+                "saved": bool(saved),
+            },
+        )
+
+    @app.post(
+        "/jobs/{job_id}/artifacts/{kind}/edit",
+        response_class=HTMLResponse,
+    )
+    def save_artifact(
+        request: Request,
+        job_id: str,
+        kind: str,
+        content: str = Form(...),
+        csrf_token: str = Form(""),
+    ) -> Any:
+        if not is_authenticated(request):
+            return login_redirect()
+        validate_csrf(request, csrf_token)
+        service = orchestrator(request)
+        job = service.store.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="job not found")
+        _artifact_path, filename, label = artifact_details(job, kind)
+        try:
+            service.save_artifact(job_id, kind, content)
+        except (OSError, UnicodeError, ValueError) as error:
+            return TEMPLATES.TemplateResponse(
+                request,
+                "artifact_editor.html",
+                {
+                    "job": service.store.get(job_id) or job,
+                    "kind": kind,
+                    "filename": filename,
+                    "label": label,
+                    "content": content,
+                    "csrf_token": request.session.get("csrf_token", ""),
+                    "error": str(error),
+                    "saved": False,
+                },
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+        return RedirectResponse(
+            f"/jobs/{job_id}/artifacts/{kind}/edit?saved=1",
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+
     @app.get("/jobs/{job_id}/artifacts/{kind}")
     def download_artifact(request: Request, job_id: str, kind: str) -> Any:
         if not is_authenticated(request):
@@ -449,13 +578,7 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
         job = orchestrator(request).store.get(job_id)
         if job is None:
             raise HTTPException(status_code=404, detail="job not found")
-        artifacts = {
-            "transcript": (job.transcript_path, "transcript.json"),
-            "translation": (job.translation_path, "translation.json"),
-        }
-        if kind not in artifacts:
-            raise HTTPException(status_code=404, detail="artifact not found")
-        artifact_path, filename = artifacts[kind]
+        artifact_path, filename, _label = artifact_details(job, kind)
         if not artifact_path or not Path(artifact_path).is_file():
             raise HTTPException(status_code=404, detail="artifact not found")
         return FileResponse(

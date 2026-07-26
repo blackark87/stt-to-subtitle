@@ -10,6 +10,7 @@ import threading
 from typing import Any, Callable, Mapping, Sequence
 from uuid import uuid4
 
+from .artifacts import artifact_path
 from .audio import AudioExtraction, extract_audio
 from .contracts import (
     TRANSLATION_SCHEMA_VERSION,
@@ -24,6 +25,7 @@ from .service_clients import ExternalServiceError, LMStudioClient, STTAPIClient
 from .subtitle import write_srt_atomic
 
 LOGGER = logging.getLogger(__name__)
+MAX_EDITABLE_JSON_BYTES = 20 * 1024 * 1024
 
 
 class NASOrchestrator:
@@ -215,6 +217,8 @@ class NASOrchestrator:
                 translation_payload = json.loads(
                     Path(job.translation_path).read_text(encoding="utf-8")
                 )
+                if not isinstance(translation_payload, Mapping):
+                    raise ValueError("translation JSON document must be an object")
                 validate_translation_items(
                     translation_payload["translations"],
                     [str(segment["id"]) for segment in transcript_segments],
@@ -229,12 +233,19 @@ class NASOrchestrator:
         ):
             target_status = "audio_ready"
 
-        self.store.update(
-            job.id,
-            status=target_status,
-            blocked_stage=None,
-            error=None,
-        )
+        retry_fields: dict[str, Any] = {
+            "status": target_status,
+            "blocked_stage": None,
+            "error": None,
+        }
+        if target_status in {"queued", "audio_ready"}:
+            retry_fields.update(
+                {
+                    "chunks_created": 0,
+                    "chunks_completed": 0,
+                }
+            )
+        self.store.update(job.id, **retry_fields)
         self.store.add_event(
             job.id,
             "info",
@@ -244,6 +255,101 @@ class NASOrchestrator:
         if retried is None:
             raise RuntimeError("retried NAS job could not be read")
         return retried
+
+    def save_artifact(
+        self,
+        job_id: str,
+        kind: str,
+        content: str,
+    ) -> Path:
+        job = self.store.get(job_id)
+        if job is None:
+            raise ValueError("job not found")
+        if job.status not in {"completed", "blocked", "failed"}:
+            raise ValueError(
+                "완료되거나 중단된 작업의 JSON만 편집할 수 있습니다."
+            )
+        if len(content.encode("utf-8")) > MAX_EDITABLE_JSON_BYTES:
+            raise ValueError("JSON 편집 내용이 20 MiB 제한을 초과했습니다.")
+
+        paths = {
+            "transcript": job.transcript_path,
+            "translation": job.translation_path,
+        }
+        if kind not in paths:
+            raise ValueError("unsupported artifact kind")
+        selected_path = paths[kind]
+        if not selected_path or not Path(selected_path).is_file():
+            raise ValueError("artifact not found")
+
+        try:
+            payload = json.loads(content)
+        except json.JSONDecodeError as error:
+            raise ValueError(
+                f"JSON syntax error at line {error.lineno}, "
+                f"column {error.colno}: {error.msg}"
+            ) from error
+        if not isinstance(payload, Mapping):
+            raise ValueError("JSON document must be an object")
+
+        if kind == "transcript":
+            segments = validate_transcript(payload)
+            if job.translation_path and Path(job.translation_path).is_file():
+                translation_payload = json.loads(
+                    Path(job.translation_path).read_text(encoding="utf-8")
+                )
+                if not isinstance(translation_payload, Mapping):
+                    raise ValueError(
+                        "translation JSON document must be an object"
+                    )
+                validate_translation_items(
+                    translation_payload.get("translations"),
+                    [str(segment["id"]) for segment in segments],
+                )
+        else:
+            if payload.get("schema_version") != TRANSLATION_SCHEMA_VERSION:
+                raise ValueError("unsupported translation schema_version")
+            if not job.transcript_path or not Path(job.transcript_path).is_file():
+                raise ValueError("transcript artifact is unavailable")
+            transcript_payload = json.loads(
+                Path(job.transcript_path).read_text(encoding="utf-8")
+            )
+            if not isinstance(transcript_payload, Mapping):
+                raise ValueError("transcript JSON document must be an object")
+            segments = validate_transcript(transcript_payload)
+            translations = validate_translation_items(
+                payload.get("translations"),
+                [str(segment["id"]) for segment in segments],
+            )
+            payload = {
+                **dict(payload),
+                "status": "completed",
+                "translations": translations,
+            }
+
+        artifact = Path(selected_path)
+        write_json_atomic(artifact, payload)
+
+        refreshed = self.store.get(job.id)
+        if (
+            refreshed is not None
+            and refreshed.transcript_path
+            and refreshed.translation_path
+            and Path(refreshed.transcript_path).is_file()
+            and Path(refreshed.translation_path).is_file()
+        ):
+            self._render_artifacts(
+                refreshed,
+                overwrite=refreshed.force_overwrite or bool(refreshed.srt_path),
+            )
+            self.store.add_event(
+                job.id,
+                "info",
+                f"{kind} JSON edited; subtitle regenerated",
+            )
+        else:
+            self.store.add_event(job.id, "info", f"{kind} JSON edited")
+        return artifact
 
     def _scheduler_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -387,15 +493,36 @@ class NASOrchestrator:
                 f"remote transcription job accepted: {remote_job_id}",
             )
 
-        def log_chunk_progress(progress: Mapping[str, int]) -> None:
-            self.store.add_event(
+        def update_chunk_progress(progress: Mapping[str, Any]) -> None:
+            current = self.store.get(job.id)
+            previous_created = current.chunks_created if current else 0
+            previous_completed = current.chunks_completed if current else 0
+            created = int(progress["created"])
+            completed = int(progress["completed"])
+            in_progress = max(0, created - completed)
+            report_every = int(progress.get("report_every", 10))
+            final = bool(progress.get("final", False))
+            self.store.update(
                 job.id,
-                "info",
-                "transcription chunks: "
-                f"created {progress['created']}, "
-                f"completed {progress['completed']}, "
-                f"in progress {progress['in_progress']}",
+                chunks_created=created,
+                chunks_completed=completed,
+                chunk_progress_every=report_every,
             )
+            should_log = (
+                (previous_created == 0 and created > 0)
+                or completed // report_every
+                > previous_completed // report_every
+                or final
+            )
+            if should_log:
+                self.store.add_event(
+                    job.id,
+                    "info",
+                    "transcription chunks: "
+                    f"created {created}, "
+                    f"completed {completed}, "
+                    f"in progress {in_progress}",
+                )
 
         payload = self.stt_client.transcribe(
             Path(job.audio_path),
@@ -403,7 +530,7 @@ class NASOrchestrator:
             idempotency_key=f"nas-{job.id}",
             existing_job_id=job.stt_job_id,
             on_job_created=save_remote_job,
-            on_progress=log_chunk_progress,
+            on_progress=update_chunk_progress,
         )
         offset = float(job.options["start_seconds"])
         if offset:
@@ -415,7 +542,12 @@ class NASOrchestrator:
             "offset_seconds": offset,
         }
         validate_transcript(payload)
-        transcript_path = self.settings.state_dir / "jobs" / job.id / "transcript.json"
+        transcript_path = artifact_path(
+            self.settings.state_dir,
+            job.id,
+            job.source_rel,
+            "transcript",
+        )
         write_json_atomic(transcript_path, payload)
         self.store.update(
             job.id,
@@ -438,24 +570,41 @@ class NASOrchestrator:
         translation_path = (
             Path(job.translation_path)
             if job.translation_path
-            else self.settings.state_dir
-            / "jobs"
-            / job.id
-            / "translation.json"
+            else artifact_path(
+                self.settings.state_dir,
+                job.id,
+                job.source_rel,
+                "translation",
+            )
         )
         self.store.update(job.id, translation_path=str(translation_path))
 
         existing: dict[str, str] = {}
+        expected_ids = {str(segment["id"]) for segment in segments}
+        ignored_checkpoint_ids = 0
         if translation_path.is_file():
             try:
                 partial = json.loads(translation_path.read_text(encoding="utf-8"))
+                if not isinstance(partial, Mapping):
+                    raise ValueError(
+                        "translation checkpoint must be an object"
+                    )
                 for item in partial.get("translations", []):
                     segment_id = str(item["id"])
                     text = str(item["text"]).strip()
-                    if segment_id and text:
+                    if segment_id in expected_ids and text:
                         existing[segment_id] = text
+                    elif segment_id:
+                        ignored_checkpoint_ids += 1
             except (KeyError, TypeError, ValueError, json.JSONDecodeError):
                 existing = {}
+        if ignored_checkpoint_ids:
+            self.store.add_event(
+                job.id,
+                "warning",
+                "ignored "
+                f"{ignored_checkpoint_ids} stale translation checkpoint id(s)",
+            )
 
         def save_batch(items: list[dict[str, str]]) -> None:
             write_json_atomic(
@@ -496,6 +645,22 @@ class NASOrchestrator:
         )
 
     def _render(self, job: NASJob) -> None:
+        self._render_artifacts(job, overwrite=job.force_overwrite)
+        refreshed = self.store.get(job.id)
+        if refreshed is None or not refreshed.srt_path:
+            raise RuntimeError("rendered subtitle job could not be read")
+        self.store.add_event(
+            job.id,
+            "info",
+            f"subtitle written: {Path(refreshed.srt_path).name}",
+        )
+
+    def _render_artifacts(
+        self,
+        job: NASJob,
+        *,
+        overwrite: bool,
+    ) -> None:
         if not job.transcript_path or not job.translation_path:
             raise RuntimeError("subtitle artifacts are unavailable")
         transcript_payload = json.loads(
@@ -504,6 +669,10 @@ class NASOrchestrator:
         translation_payload = json.loads(
             Path(job.translation_path).read_text(encoding="utf-8")
         )
+        if not isinstance(transcript_payload, Mapping):
+            raise ValueError("transcript JSON document must be an object")
+        if not isinstance(translation_payload, Mapping):
+            raise ValueError("translation JSON document must be an object")
         segments = validate_transcript(transcript_payload)
         translations = validate_translation_items(
             translation_payload.get("translations"),
@@ -515,14 +684,15 @@ class NASOrchestrator:
             srt_path,
             segments,
             translations,
-            overwrite=job.force_overwrite,
+            overwrite=overwrite,
         )
         self.store.update(
             job.id,
             status="completed",
             srt_path=str(srt_path),
+            blocked_stage=None,
+            error=None,
         )
-        self.store.add_event(job.id, "info", f"subtitle written: {srt_path.name}")
 
     def _sanitize_error(self, message: str) -> str:
         sanitized = message

@@ -59,6 +59,7 @@ class ChunkProgress:
 
     created: int
     completed: int
+    final: bool = False
 
     @property
     def in_progress(self) -> int:
@@ -82,27 +83,25 @@ class _ChunkProgressTracker:
         self.report_every = report_every
         self.created = 0
         self.completed = 0
-        self._last_reported: tuple[int, int] | None = None
+        self._last_emitted: tuple[int, int] | None = None
 
     def chunk_created(self) -> None:
         self.created += 1
+        self._emit()
 
     def chunks_completed(self, count: int) -> None:
         self.completed = min(self.created, self.completed + count)
-        if self.completed // self.report_every > (
-            (self.completed - count) // self.report_every
-        ):
-            self._report()
+        self._emit()
 
     def finish(self) -> None:
-        self._report()
+        self._emit(final=True)
 
-    def _report(self) -> None:
+    def _emit(self, *, final: bool = False) -> None:
         current = (self.created, self.completed)
-        if current == self._last_reported:
+        if current == self._last_emitted and not final:
             return
-        self._last_reported = current
-        self.callback(ChunkProgress(*current))
+        self._last_emitted = current
+        self.callback(ChunkProgress(*current, final=final))
 
 
 def _model_input_count(model_inputs: Any) -> int:

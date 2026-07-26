@@ -372,11 +372,23 @@ class TranscriptionService:
         job_id: str,
         progress: ChunkProgress,
     ) -> None:
+        previous = self.store.get(job_id)
         self.store.update_chunk_progress(
             job_id,
             created=progress.created,
             completed=progress.completed,
         )
+        previous_created = previous.chunks_created if previous else 0
+        previous_completed = previous.chunks_completed if previous else 0
+        report_every = self.settings.chunk_progress_every
+        should_log = (
+            (previous_created == 0 and progress.created > 0)
+            or progress.completed // report_every
+            > previous_completed // report_every
+            or progress.final
+        )
+        if not should_log:
+            return
         LOGGER.info(
             "transcription job %s chunks: created %d, completed %d, "
             "in progress %d (reporting every %d chunks)",
@@ -384,7 +396,7 @@ class TranscriptionService:
             progress.created,
             progress.completed,
             progress.in_progress,
-            self.settings.chunk_progress_every,
+            report_every,
         )
 
     def _log_heartbeat(
@@ -507,7 +519,9 @@ def create_app(
                 detail=str(error),
             ) from error
         return {
-            **job.public_dict(),
+            **job.public_dict(
+                report_every=service.settings.chunk_progress_every,
+            ),
             "status_url": str(request.url_for("get_transcription", job_id=job.id)),
             "result_url": str(
                 request.url_for("get_transcription_result", job_id=job.id)
@@ -526,7 +540,9 @@ def create_app(
         job = service.store.get(job_id)
         if job is None:
             raise HTTPException(status_code=404, detail="job not found")
-        return job.public_dict()
+        return job.public_dict(
+            report_every=service.settings.chunk_progress_every,
+        )
 
     @app.get(
         "/v1/transcriptions/{job_id}/result",

@@ -233,12 +233,40 @@ th, td { border-bottom: 1px solid var(--line); padding: 10px 8px; text-align: le
 .details { display: grid; grid-template-columns: max-content 1fr; gap: 8px 18px; }
 .details dt { color: var(--muted); }
 .details dd { margin: 0; overflow-wrap: anywhere; }
+.chunk-progress {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.chunk-progress strong { color: var(--accent); font-size: 1.05rem; }
 .error-text { color: var(--danger); }
 .actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 18px; }
 .events { padding-left: 24px; }
 .events li { margin: 8px 0; overflow-wrap: anywhere; }
 .events time { color: var(--muted); margin-right: 8px; }
 .event-error { color: var(--danger); }
+.editor-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 18px; }
+.editor-heading h1 { margin: 0; overflow-wrap: anywhere; }
+.editor-kicker { margin: 0 0 4px; color: var(--muted); font-size: .88rem; font-weight: 700; }
+.editor-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.editor-toolbar > div { display: grid; gap: 2px; }
+.json-editor {
+  width: 100%;
+  min-height: 62vh;
+  resize: vertical;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 14px;
+  background: color-mix(in srgb, var(--bg) 72%, var(--card));
+  color: var(--text);
+  font: 13px/1.55 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  tab-size: 2;
+  white-space: pre;
+}
+.json-editor:focus { outline: 2px solid color-mix(in srgb, var(--accent) 45%, transparent); border-color: var(--accent); }
+.editor-status { min-height: 1.5em; margin: 0; }
+.editor-note { font-size: .88rem; }
 code { overflow-wrap: anywhere; }
 @media (max-width: 520px) {
   .container { padding-right: 14px; padding-left: 14px; }
