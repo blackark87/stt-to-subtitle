@@ -322,7 +322,7 @@ docker compose --env-file .env.nas down
 
 ## GHCR 이미지 게시 및 NAS에서 받기
 
-[`.github/workflows/publish-ghcr.yaml`](.github/workflows/publish-ghcr.yaml)은 `Dockerfile.nas`와 애플리케이션 소스를 GitHub Actions에서 빌드해, 테스트를 통과한 NAS용 `linux/amd64` 이미지를 `ghcr.io/blackark87/stt-to-subtitle`에 게시합니다. 이 빌드 파일들은 CI에만 필요하며 NAS로 복사하지 않습니다. 다음 경우 실행됩니다.
+[`.github/workflows/publish-ghcr.yaml`](.github/workflows/publish-ghcr.yaml)은 `Dockerfile`과 애플리케이션 소스를 GitHub Actions에서 빌드해, 테스트를 통과한 NAS용 `linux/amd64` 이미지를 `ghcr.io/blackark87/stt-to-subtitle`에 게시합니다. 이 빌드 파일들은 CI에만 필요하며 NAS로 복사하지 않습니다. 다음 경우 실행됩니다.
 
 - `main` 브랜치 push
 - `v*` 태그 push
