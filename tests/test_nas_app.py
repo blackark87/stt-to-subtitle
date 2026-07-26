@@ -163,12 +163,19 @@ class NASAppTests(unittest.TestCase):
                     headers={"Range": "bytes=99-"},
                 )
                 captions = client.get(f"/jobs/{job.id}/subtitles.vtt")
+                vr_renderer = client.get("/static/vr180-player.js")
 
             self.assertEqual(page.status_code, 200)
             self.assertIn("KST", page.text)
             self.assertIn('class="result-player"', page.text)
             self.assertIn('data-video-type="video/mp4"', page.text)
             self.assertIn("data-subtitle-src=", page.text)
+            self.assertIn('data-player-mode="vr180"', page.text)
+            self.assertIn("VR 180 SBS", page.text)
+            self.assertIn("data-vr180-canvas", page.text)
+            self.assertIn("data-vr180-subtitles", page.text)
+            self.assertIn("data-vr-eye=\"left\"", page.text)
+            self.assertIn("vr180-player.js", page.text)
             self.assertNotIn("<source", page.text)
             self.assertEqual(video.status_code, 206)
             self.assertEqual(video.content, b"2345")
@@ -189,6 +196,11 @@ class NASAppTests(unittest.TestCase):
                 captions.text,
             )
             self.assertIn("처리 결과", captions.text)
+            self.assertEqual(vr_renderer.status_code, 200)
+            self.assertIn(
+                "window.createVR180Renderer",
+                vr_renderer.text,
+            )
 
     def test_edits_source_named_json_and_shows_chunk_progress(self) -> None:
         with TemporaryDirectory() as directory:
