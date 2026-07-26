@@ -57,6 +57,8 @@ class NASOrchestratorTests(unittest.TestCase):
                 orchestrator.stop()
 
             self.assertIsNone(job.options["duration_seconds"])
+            self.assertEqual(job.options["chunk_length_seconds"], 60)
+            self.assertTrue(job.options["noise_filter"])
 
     def test_creates_one_job_for_each_selected_media_file(self) -> None:
         with TemporaryDirectory() as directory:
@@ -177,6 +179,12 @@ class NASOrchestratorTests(unittest.TestCase):
                     return {
                         "schema_version": 1,
                         "job_id": "remote-job",
+                        "noise_filter": {
+                            "enabled": True,
+                            "trigger_level": 7.0,
+                            "removed_count": 2,
+                            "removed_spans": [],
+                        },
                         "segments": [
                             {
                                 "id": "segment-000001",
@@ -216,6 +224,15 @@ class NASOrchestratorTests(unittest.TestCase):
                 "transcription chunks: created 20, completed 10, in progress 10",
                 progress_messages,
             )
+            self.assertIn(
+                "noise filter removed 2 non-speech diarization span(s)",
+                progress_messages,
+            )
+            sent_options = (
+                orchestrator.stt_client.transcribe.call_args.kwargs["options"]
+            )
+            self.assertEqual(sent_options["chunk_length_seconds"], 60)
+            self.assertTrue(sent_options["noise_filter"])
             self.assertEqual(completed_job.status, "completed")
             self.assertEqual(
                 Path(completed_job.transcript_path).name,

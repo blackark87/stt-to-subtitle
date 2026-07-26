@@ -124,7 +124,7 @@
         <input name="duration_seconds" type="number" min="0" step="0.1" placeholder="비우거나 0 = 끝까지">
       </label>
       <label>청크(초)
-        <input name="chunk_length_seconds" type="number" min="1" value="15" required>
+        <input name="chunk_length_seconds" type="number" min="1" value="60" required>
       </label>
       <label>화자 수
         <input name="num_speakers" type="number" min="1" placeholder="자동">
@@ -137,6 +137,11 @@
       </label>
       <div class="option-checks wide">
         <label class="check"><input name="add_punctuation" type="checkbox"><span>일본어 구두점 모델 사용</span></label>
+        <label class="check">
+          <input name="noise_filter" type="hidden" value="false">
+          <input name="noise_filter" type="checkbox" value="true" checked>
+          <span>소음 오인식 필터 사용</span>
+        </label>
         <label class="check"><input name="force_overwrite" type="checkbox"><span>기존 <code>.ko.srt/.ko.ass</code> 강제 덮어쓰기</span></label>
       </div>
       <div class="wide submit-row">

@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 import importlib
+import logging
 from pathlib import Path
 from types import MethodType
 from typing import Any, Mapping, Protocol, Sequence
@@ -12,16 +13,21 @@ from typing import Any, Mapping, Protocol, Sequence
 MODEL_ID = "kotoba-tech/kotoba-whisper-v2.2"
 MODEL_REVISION = "9d33482a0eb9b57f1ad80708e8ac5538246d8355"
 TIMESTAMP_POSTPROCESSOR = "stt-to-subtitle/kotoba-speaker-span-v1"
+DEFAULT_CHUNK_LENGTH_SECONDS = 60
+DEFAULT_NOISE_FILTER_TRIGGER_LEVEL = 7.0
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
 class TranscriptionOptions:
     batch_size: int = 1
-    chunk_length_seconds: int = 15
+    chunk_length_seconds: int = DEFAULT_CHUNK_LENGTH_SECONDS
     num_speakers: int | None = None
     min_speakers: int | None = None
     max_speakers: int | None = None
     add_punctuation: bool = False
+    noise_filter: bool = True
+    noise_filter_trigger_level: float = DEFAULT_NOISE_FILTER_TRIGGER_LEVEL
     threads: int | None = None
 
     def validate(self) -> None:
@@ -29,6 +35,8 @@ class TranscriptionOptions:
             raise ValueError("batch_size must be at least 1")
         if self.chunk_length_seconds < 1:
             raise ValueError("chunk_length_seconds must be at least 1")
+        if self.noise_filter_trigger_level <= 0:
+            raise ValueError("noise_filter_trigger_level must be positive")
         if self.threads is not None and self.threads < 1:
             raise ValueError("threads must be at least 1")
         speaker_values = (
@@ -54,6 +62,232 @@ class TranscriptionOptions:
 
 class SpeechPipeline(Protocol):
     def __call__(self, audio_path: str, **kwargs: Any) -> Mapping[str, Any]: ...
+
+
+def corrected_kotoba_chunk_iter(
+    inputs: Any,
+    feature_extractor: Any,
+    chunk_len: int,
+    stride_left: int,
+    stride_right: int,
+    dtype: Any = None,
+) -> Iterator[dict[str, Any]]:
+    """Keep chunks longer than 30 seconds intact for Whisper long-form mode."""
+    inputs_len = int(inputs.shape[0])
+    step = chunk_len - stride_left - stride_right
+    if step <= 0:
+        raise ValueError("chunk length must exceed combined stride length")
+
+    for chunk_start in range(0, inputs_len, step):
+        chunk_end = chunk_start + chunk_len
+        chunk = inputs[chunk_start:chunk_end]
+        extractor_options: dict[str, Any] = {
+            "sampling_rate": feature_extractor.sampling_rate,
+            "return_tensors": "pt",
+            "return_attention_mask": True,
+        }
+        maximum_samples = int(
+            getattr(feature_extractor, "n_samples", chunk.shape[0])
+        )
+        if int(chunk.shape[0]) > maximum_samples:
+            extractor_options.update(
+                {
+                    "truncation": False,
+                    "padding": "longest",
+                }
+            )
+        processed = feature_extractor(chunk, **extractor_options)
+        if dtype is not None:
+            processed = processed.to(dtype=dtype)
+
+        actual_length = int(chunk.shape[0])
+        current_stride_left = 0 if chunk_start == 0 else stride_left
+        is_last = chunk_end >= inputs_len
+        current_stride_right = 0 if is_last else stride_right
+        if actual_length > current_stride_left:
+            yield {
+                "is_last": is_last,
+                "stride": (
+                    actual_length,
+                    current_stride_left,
+                    current_stride_right,
+                ),
+                **processed,
+            }
+        if is_last:
+            break
+
+
+def _contains_voice(
+    samples: Any,
+    sampling_rate: int,
+    trigger_level: float,
+) -> bool:
+    """Use the pinned Torchaudio cepstral VAD as a second speech gate."""
+    import numpy as np
+    import torch
+    from torch.nn import functional as torch_functional
+    from torchaudio.functional import vad
+
+    audio = np.asarray(samples, dtype=np.float32).reshape(-1)
+    if audio.size == 0:
+        return False
+    audio = np.nan_to_num(audio, copy=True)
+    if float(np.max(np.abs(audio))) < 1e-5:
+        return False
+
+    waveform = torch.from_numpy(audio)
+    padding_samples = max(1, round(sampling_rate * 0.25))
+    padded = torch_functional.pad(
+        waveform,
+        (padding_samples, padding_samples),
+    )
+    detected = vad(
+        padded,
+        sampling_rate,
+        trigger_level=trigger_level,
+        trigger_time=0.15,
+        search_time=0.25,
+        allowed_gap=0.1,
+        boot_time=0.1,
+    )
+    return int(detected.numel()) > 0
+
+
+class NoiseFilteringSpeakerDiarization:
+    """Drop diarized spans that an independent voice detector rejects."""
+
+    def __init__(
+        self,
+        delegate: Any,
+        *,
+        detector: Callable[[Any, int, float], bool] = _contains_voice,
+    ) -> None:
+        self.delegate = delegate
+        self.detector = detector
+        self.enabled = True
+        self.trigger_level = DEFAULT_NOISE_FILTER_TRIGGER_LEVEL
+        self.removed_spans: list[dict[str, Any]] = []
+
+    def __call__(
+        self,
+        audio: Any,
+        sampling_rate: int,
+        **kwargs: Any,
+    ) -> Any:
+        flags = getattr(audio, "flags", None)
+        if flags is not None and not bool(getattr(flags, "writeable", True)):
+            audio = audio.copy()
+        annotation = self.delegate(
+            audio,
+            sampling_rate=sampling_rate,
+            **kwargs,
+        )
+        self.removed_spans = []
+        if not self.enabled:
+            return annotation
+
+        filtered = annotation.empty()
+        total_samples = int(audio.shape[-1])
+        for segment, track, speaker in annotation.itertracks(
+            yield_label=True
+        ):
+            start_sample = max(
+                0,
+                min(total_samples, round(float(segment.start) * sampling_rate)),
+            )
+            end_sample = max(
+                start_sample,
+                min(total_samples, round(float(segment.end) * sampling_rate)),
+            )
+            try:
+                contains_voice = self.detector(
+                    audio[..., start_sample:end_sample],
+                    sampling_rate,
+                    self.trigger_level,
+                )
+            except (RuntimeError, TypeError, ValueError) as error:
+                LOGGER.warning(
+                    "noise filter could not inspect %.3f-%.3f; keeping span: %s",
+                    float(segment.start),
+                    float(segment.end),
+                    error,
+                )
+                contains_voice = True
+            if contains_voice:
+                filtered[segment, track] = speaker
+                continue
+            self.removed_spans.append(
+                {
+                    "start": round(float(segment.start), 3),
+                    "end": round(float(segment.end), 3),
+                    "speaker": str(speaker),
+                }
+            )
+
+        if self.removed_spans:
+            LOGGER.info(
+                "noise filter removed %d of %d diarized speech spans",
+                len(self.removed_spans),
+                len(self.removed_spans) + sum(1 for _ in filtered.itertracks()),
+            )
+        return filtered
+
+    def configure(
+        self,
+        *,
+        enabled: bool,
+        trigger_level: float,
+    ) -> None:
+        self.enabled = enabled
+        self.trigger_level = trigger_level
+        self.removed_spans = []
+
+    def public_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "trigger_level": self.trigger_level,
+            "removed_count": len(self.removed_spans),
+            "removed_spans": list(self.removed_spans),
+        }
+
+
+def install_corrected_kotoba_chunk_iter(speech_pipeline: Any) -> None:
+    """Replace the remote iterator so 60-second inputs are not truncated."""
+    module = importlib.import_module(type(speech_pipeline).__module__)
+    if callable(getattr(module, "chunk_iter", None)):
+        module.chunk_iter = corrected_kotoba_chunk_iter
+
+
+def install_noise_filter(speech_pipeline: Any) -> None:
+    """Wrap the remote diarizer without editing the model cache."""
+    diarizer = getattr(speech_pipeline, "__dict__", {}).get(
+        "model_speaker_diarization"
+    )
+    if not callable(diarizer) or isinstance(
+        diarizer,
+        NoiseFilteringSpeakerDiarization,
+    ):
+        return
+    speech_pipeline.model_speaker_diarization = (
+        NoiseFilteringSpeakerDiarization(diarizer)
+    )
+
+
+def _configure_noise_filter(
+    speech_pipeline: Any,
+    options: TranscriptionOptions,
+) -> NoiseFilteringSpeakerDiarization | None:
+    diarizer = getattr(speech_pipeline, "__dict__", {}).get(
+        "model_speaker_diarization"
+    )
+    if not isinstance(diarizer, NoiseFilteringSpeakerDiarization):
+        return None
+    diarizer.configure(
+        enabled=options.noise_filter,
+        trigger_level=options.noise_filter_trigger_level,
+    )
+    return diarizer
 
 
 def _speaker_group_key(output: Mapping[str, Any]) -> tuple[str, float, float]:
@@ -405,6 +639,8 @@ def load_pipeline(
         pipeline_options["device_pyannote"] = diarization_device
 
     speech_pipeline = pipeline(**pipeline_options)
+    install_corrected_kotoba_chunk_iter(speech_pipeline)
+    install_noise_filter(speech_pipeline)
     install_corrected_kotoba_postprocess(speech_pipeline)
     return speech_pipeline
 
@@ -421,22 +657,29 @@ def run_pipeline(
     options.validate()
     if progress_every not in {10, 100}:
         raise ValueError("progress_every must be either 10 or 100")
+    noise_filter = _configure_noise_filter(speech_pipeline, options)
     if progress_callback is not None:
-        return _run_with_chunk_progress(
+        result = _run_with_chunk_progress(
             speech_pipeline,
             audio_path,
             options,
             progress_callback,
             progress_every,
         )
-    return speech_pipeline(
-        str(audio_path),
-        chunk_length_s=options.chunk_length_seconds,
-        add_punctuation=options.add_punctuation,
-        num_speakers=options.num_speakers,
-        min_speakers=options.min_speakers,
-        max_speakers=options.max_speakers,
-    )
+    else:
+        result = speech_pipeline(
+            str(audio_path),
+            chunk_length_s=options.chunk_length_seconds,
+            add_punctuation=options.add_punctuation,
+            num_speakers=options.num_speakers,
+            min_speakers=options.min_speakers,
+            max_speakers=options.max_speakers,
+        )
+    if noise_filter is None:
+        return result
+    enriched_result = dict(result)
+    enriched_result["noise_filter"] = noise_filter.public_dict()
+    return enriched_result
 
 
 def transcribe(

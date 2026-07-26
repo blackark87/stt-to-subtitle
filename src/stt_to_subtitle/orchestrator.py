@@ -18,7 +18,7 @@ from .contracts import (
     validate_translation_items,
 )
 from .files import sha256_file, write_json_atomic
-from .kotoba import TranscriptionOptions
+from .kotoba import DEFAULT_CHUNK_LENGTH_SECONDS, TranscriptionOptions
 from .nas_config import MediaLibrary, NASSettings, probe_media_duration
 from .nas_store import NASJob, NASStore
 from .service_clients import ExternalServiceError, LMStudioClient, STTAPIClient
@@ -165,7 +165,12 @@ class NASOrchestrator:
             ),
         )
         transcription = TranscriptionOptions(
-            chunk_length_seconds=int(options.get("chunk_length_seconds", 15)),
+            chunk_length_seconds=int(
+                options.get(
+                    "chunk_length_seconds",
+                    DEFAULT_CHUNK_LENGTH_SECONDS,
+                )
+            ),
             num_speakers=(
                 int(options["num_speakers"])
                 if options.get("num_speakers") not in (None, "")
@@ -182,6 +187,7 @@ class NASOrchestrator:
                 else None
             ),
             add_punctuation=bool(options.get("add_punctuation", False)),
+            noise_filter=bool(options.get("noise_filter", True)),
         )
         extraction.validate()
         transcription.validate()
@@ -194,6 +200,7 @@ class NASOrchestrator:
             "min_speakers": transcription.min_speakers,
             "max_speakers": transcription.max_speakers,
             "add_punctuation": transcription.add_punctuation,
+            "noise_filter": transcription.noise_filter,
         }
         return normalized_options
 
@@ -562,6 +569,7 @@ class NASOrchestrator:
             "min_speakers": job.options["min_speakers"],
             "max_speakers": job.options["max_speakers"],
             "add_punctuation": job.options["add_punctuation"],
+            "noise_filter": job.options.get("noise_filter", True),
         }
 
         def save_remote_job(remote_job_id: str) -> None:
@@ -638,6 +646,16 @@ class NASOrchestrator:
             "info",
             f"transcription completed ({len(payload['segments'])} segments)",
         )
+        noise_filter = payload.get("noise_filter")
+        if isinstance(noise_filter, Mapping):
+            removed_count = int(noise_filter.get("removed_count", 0))
+            if removed_count > 0:
+                self.store.add_event(
+                    job.id,
+                    "info",
+                    "noise filter removed "
+                    f"{removed_count} non-speech diarization span(s)",
+                )
 
     def _translate(self, job: NASJob) -> None:
         if not job.transcript_path:

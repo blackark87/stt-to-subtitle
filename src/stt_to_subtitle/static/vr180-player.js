@@ -19,11 +19,24 @@
     uniform float u_yaw;
     uniform float u_pitch;
     uniform float u_eye_offset;
+    uniform float u_stereo_mode;
     varying vec2 v_position;
 
     void main() {
+      float screen_x = v_position.x;
+      float view_aspect = u_aspect;
+      float eye_offset = u_eye_offset;
+      if (u_stereo_mode > 0.5) {
+        bool right_eye = v_position.x >= 0.0;
+        screen_x = right_eye
+          ? v_position.x * 2.0 - 1.0
+          : v_position.x * 2.0 + 1.0;
+        view_aspect = u_aspect * 0.5;
+        eye_offset = right_eye ? 0.5 : 0.0;
+      }
+
       vec3 view_direction = normalize(vec3(
-        v_position.x * u_aspect * u_tan_half_fov,
+        screen_x * view_aspect * u_tan_half_fov,
         v_position.y * u_tan_half_fov,
         -1.0
       ));
@@ -52,7 +65,7 @@
 
       float latitude = asin(clamp(direction.y, -1.0, 1.0));
       float eye_u = longitude / PI + 0.5;
-      float video_u = u_eye_offset + eye_u * 0.5;
+      float video_u = eye_offset + eye_u * 0.5;
       float video_v = 0.5 - latitude / PI;
       gl_FragColor = texture2D(u_video, vec2(video_u, video_v));
     }
@@ -124,6 +137,7 @@
       aspect: gl.getUniformLocation(program, "u_aspect"),
       eyeOffset: gl.getUniformLocation(program, "u_eye_offset"),
       pitch: gl.getUniformLocation(program, "u_pitch"),
+      stereoMode: gl.getUniformLocation(program, "u_stereo_mode"),
       tanHalfFov: gl.getUniformLocation(program, "u_tan_half_fov"),
       video: gl.getUniformLocation(program, "u_video"),
       yaw: gl.getUniformLocation(program, "u_yaw"),
@@ -176,6 +190,7 @@
     let eyeOffset = 0;
     let fieldOfView = 75;
     let pitch = 0;
+    let stereoMode = 0;
     let yaw = 0;
     let pointerId = null;
     let pointerX = 0;
@@ -218,6 +233,7 @@
       gl.uniform1f(uniforms.aspect, aspect);
       gl.uniform1f(uniforms.eyeOffset, eyeOffset);
       gl.uniform1f(uniforms.pitch, pitch);
+      gl.uniform1f(uniforms.stereoMode, stereoMode);
       gl.uniform1f(
         uniforms.tanHalfFov,
         Math.tan((fieldOfView * Math.PI) / 360)
@@ -295,37 +311,11 @@
       requestDraw();
     };
 
-    const onKeyDown = (event) => {
-      const movement = Math.PI / 90;
-      const handled = {
-        ArrowDown: () => {
-          pitch = clamp(pitch - movement, -Math.PI * 0.47, Math.PI * 0.47);
-        },
-        ArrowLeft: () => {
-          yaw = clamp(yaw - movement, -Math.PI / 2, Math.PI / 2);
-        },
-        ArrowRight: () => {
-          yaw = clamp(yaw + movement, -Math.PI / 2, Math.PI / 2);
-        },
-        ArrowUp: () => {
-          pitch = clamp(pitch + movement, -Math.PI * 0.47, Math.PI * 0.47);
-        },
-        Home: reset,
-      }[event.key];
-      if (!handled) {
-        return;
-      }
-      event.preventDefault();
-      handled();
-      requestDraw();
-    };
-
     canvas.addEventListener("pointerdown", onPointerDown);
     canvas.addEventListener("pointermove", onPointerMove);
     canvas.addEventListener("pointerup", onPointerUp);
     canvas.addEventListener("pointercancel", onPointerUp);
     canvas.addEventListener("wheel", onWheel, { passive: false });
-    canvas.addEventListener("keydown", onKeyDown);
     canvas.addEventListener(
       "webglcontextlost",
       (event) => {
@@ -353,6 +343,7 @@
       requestDraw,
       reset,
       setEye(eye) {
+        stereoMode = eye === "dual" ? 1 : 0;
         eyeOffset = eye === "right" ? 0.5 : 0;
         requestDraw();
       },

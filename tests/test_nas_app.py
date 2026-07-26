@@ -85,6 +85,13 @@ class NASAppTests(unittest.TestCase):
             self.assertIn("첫 번째 에피소드", response.text)
             self.assertIn("자막 완료", response.text)
             self.assertIn("일본어 구두점 모델 사용", response.text)
+            self.assertIn("소음 오인식 필터 사용", response.text)
+            self.assertIn('name="chunk_length_seconds"', response.text)
+            self.assertIn('value="60"', response.text)
+            self.assertIn(
+                'name="noise_filter" type="checkbox" value="true" checked',
+                response.text,
+            )
             self.assertEqual(poster.status_code, 200)
             self.assertEqual(poster.content, b"poster-bytes")
 
@@ -104,6 +111,7 @@ class NASAppTests(unittest.TestCase):
                     data={
                         "source_rels": ["one.mkv", "two.mp4"],
                         "duration_seconds": "0",
+                        "noise_filter": ["false", "true"],
                     },
                     follow_redirects=False,
                 )
@@ -120,6 +128,12 @@ class NASAppTests(unittest.TestCase):
             )
             self.assertTrue(
                 all(job["updated_at"].endswith("+09:00") for job in jobs)
+            )
+            self.assertTrue(
+                all(job["options"]["chunk_length_seconds"] == 60 for job in jobs)
+            )
+            self.assertTrue(
+                all(job["options"]["noise_filter"] for job in jobs)
             )
 
     def test_completed_job_streams_video_range_and_webvtt(self) -> None:
@@ -164,6 +178,7 @@ class NASAppTests(unittest.TestCase):
                 )
                 captions = client.get(f"/jobs/{job.id}/subtitles.vtt")
                 vr_renderer = client.get("/static/vr180-player.js")
+                player_script = client.get("/static/player.js")
 
             self.assertEqual(page.status_code, 200)
             self.assertIn("KST", page.text)
@@ -174,7 +189,10 @@ class NASAppTests(unittest.TestCase):
             self.assertIn("VR 180 SBS", page.text)
             self.assertIn("data-vr180-canvas", page.text)
             self.assertIn("data-vr180-subtitles", page.text)
+            self.assertIn("data-vr-eye=\"dual\"", page.text)
             self.assertIn("data-vr-eye=\"left\"", page.text)
+            self.assertIn("data-vr-volume", page.text)
+            self.assertIn("Space: 재생/일시정지", page.text)
             self.assertIn("vr180-player.js", page.text)
             self.assertNotIn("<source", page.text)
             self.assertEqual(video.status_code, 206)
@@ -201,6 +219,13 @@ class NASAppTests(unittest.TestCase):
                 "window.createVR180Renderer",
                 vr_renderer.text,
             )
+            self.assertNotIn(
+                'canvas.addEventListener("keydown"',
+                vr_renderer.text,
+            )
+            self.assertIn('event.code === "Space"', player_script.text)
+            self.assertIn('event.key === "ArrowLeft"', player_script.text)
+            self.assertIn('event.key === "ArrowUp"', player_script.text)
 
     def test_edits_source_named_json_and_shows_chunk_progress(self) -> None:
         with TemporaryDirectory() as directory:
