@@ -51,6 +51,10 @@ def _is_ignored_file(name: str) -> bool:
     return name.casefold() in IGNORED_FILE_NAMES
 
 
+def _is_hidden_media_file(name: str) -> bool:
+    return name.casefold().endswith("-trailer.mp4")
+
+
 def _env_bool(name: str, default: bool = False) -> bool:
     value = os.environ.get(name)
     if value is None:
@@ -245,7 +249,11 @@ class MediaLibrary:
             if child.is_symlink() or (
                 child.is_dir() and _is_ignored_directory(child.name)
             ) or (
-                child.is_file() and _is_ignored_file(child.name)
+                child.is_file()
+                and (
+                    _is_ignored_file(child.name)
+                    or _is_hidden_media_file(child.name)
+                )
             ):
                 continue
             if child.is_dir():

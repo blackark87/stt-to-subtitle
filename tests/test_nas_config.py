@@ -83,6 +83,29 @@ class MediaLibraryTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "metadata"):
                 library.resolve_file("@eaDir/Visible/thumbnail.mp4")
 
+    def test_hides_trailer_mp4_files_from_listing(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in (
+                "movie.mp4",
+                "movie-trailer.mp4",
+                "MOVIE-TRAILER.MP4",
+                "movie-trailer.mkv",
+                "movie-trailer-cut.mp4",
+            ):
+                (root / name).write_bytes(b"media")
+
+            files = MediaLibrary(root).browse()["files"]
+
+            self.assertEqual(
+                [file["name"] for file in files],
+                [
+                    "movie-trailer-cut.mp4",
+                    "movie-trailer.mkv",
+                    "movie.mp4",
+                ],
+            )
+
     def test_lists_supported_media_and_detects_subtitle(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
