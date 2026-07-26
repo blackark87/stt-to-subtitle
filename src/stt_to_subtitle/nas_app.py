@@ -52,6 +52,23 @@ TEMPLATES.env.filters["filesize"] = lambda value: (
 )
 
 
+def format_media_duration(value: object) -> str:
+    if value is None:
+        return "알 수 없음"
+    try:
+        total_seconds = max(0, round(float(value)))
+    except (TypeError, ValueError):
+        return "알 수 없음"
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes}:{seconds:02d}"
+
+
+TEMPLATES.env.filters["duration"] = format_media_duration
+
+
 def create_app(settings: NASSettings | None = None) -> FastAPI:
     configured_settings = settings or NASSettings.from_env()
     authentication_enabled = bool(configured_settings.admin_password.strip())

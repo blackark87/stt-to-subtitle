@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
 NAS_WEB_TESTS_AVAILABLE = all(
     find_spec(module) is not None
@@ -55,7 +56,10 @@ class NASAppTests(unittest.TestCase):
             (show / "poster.jpg").write_bytes(b"poster-bytes")
             (media_root / "plain.mp4").write_bytes(b"media")
 
-            with TestClient(
+            with patch(
+                "stt_to_subtitle.orchestrator.probe_media_duration",
+                return_value=6180.0,
+            ), TestClient(
                 create_app(self.settings(root, media_root))
             ) as client:
                 root_response = client.get("/")
@@ -70,6 +74,7 @@ class NASAppTests(unittest.TestCase):
             self.assertIn("show", root_response.text)
             self.assertIn("plain.mp4", root_response.text)
             self.assertIn('class="video-placeholder"', root_response.text)
+            self.assertIn("재생시간 1:43:00", root_response.text)
             self.assertIn("자막 미완료", root_response.text)
             self.assertNotIn("folder-glyph", root_response.text)
             self.assertEqual(response.status_code, 200)
