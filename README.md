@@ -183,7 +183,7 @@ Synology Package Center에서 Container Manager를 설치하고 SSH를 일시적
 ```bash
 ssh NAS_USER@NAS_IP \
   'mkdir -p /volume1/docker/stt-to-subtitle'
-scp compose.nas.yaml .env.nas.example \
+scp compose.yaml .env.nas.example \
   NAS_USER@NAS_IP:/volume1/docker/stt-to-subtitle/
 ```
 
@@ -267,11 +267,11 @@ curl http://192.168.1.30:1234/v1/models
 Compose 구성을 검증하고 GHCR 이미지를 받아 실행합니다.
 
 ```bash
-docker compose --env-file .env.nas -f compose.nas.yaml config
-docker compose --env-file .env.nas -f compose.nas.yaml pull
-docker compose --env-file .env.nas -f compose.nas.yaml up -d
-docker compose --env-file .env.nas -f compose.nas.yaml ps
-docker compose --env-file .env.nas -f compose.nas.yaml logs -f orchestrator
+docker compose --env-file .env.nas config
+docker compose --env-file .env.nas pull
+docker compose --env-file .env.nas up -d
+docker compose --env-file .env.nas ps
+docker compose --env-file .env.nas logs -f orchestrator
 ```
 
 로그 확인은 `Ctrl-C`로 빠져나와도 컨테이너를 중지하지 않습니다. 상태 API가 정상인지 NAS에서 확인합니다.
@@ -296,26 +296,26 @@ curl http://127.0.0.1:8080/healthz
 `main`에 새 이미지가 게시된 뒤에는 애플리케이션 소스를 받을 필요 없이 이미지만 갱신합니다.
 
 ```bash
-docker compose --env-file .env.nas -f compose.nas.yaml pull
-docker compose --env-file .env.nas -f compose.nas.yaml up -d
+docker compose --env-file .env.nas pull
+docker compose --env-file .env.nas up -d
 ```
 
-Compose 설정 자체가 변경된 경우에만 PC에서 새 `compose.nas.yaml`을 NAS 배포 폴더로 다시 복사합니다. `.env.nas`와 `${STATE_PATH}`는 그대로 유지합니다.
+Compose 설정 자체가 변경된 경우에만 PC에서 새 `compose.yaml`을 NAS 배포 폴더로 다시 복사합니다. `.env.nas`와 `${STATE_PATH}`는 그대로 유지합니다.
 
 자주 사용하는 운영 명령:
 
 ```bash
 # 현재 상태
-docker compose --env-file .env.nas -f compose.nas.yaml ps
+docker compose --env-file .env.nas ps
 
 # 최근 로그
-docker compose --env-file .env.nas -f compose.nas.yaml logs --tail=200 orchestrator
+docker compose --env-file .env.nas logs --tail=200 orchestrator
 
 # 재시작
-docker compose --env-file .env.nas -f compose.nas.yaml restart orchestrator
+docker compose --env-file .env.nas restart orchestrator
 
 # 중지
-docker compose --env-file .env.nas -f compose.nas.yaml down
+docker compose --env-file .env.nas down
 ```
 
 `down`을 실행해도 `${STATE_PATH}`와 미디어 파일은 삭제되지 않습니다. 작업 DB와 중간 결과를 초기화하려고 상태 폴더를 직접 삭제할 때는 컨테이너를 먼저 중지하고 대상 경로를 다시 확인하십시오.
@@ -340,41 +340,14 @@ NAS의 `.env.nas`에는 기본 이미지가 이미 설정되어 있습니다. �
 NAS_IMAGE=ghcr.io/blackark87/stt-to-subtitle:nas-latest
 ```
 
-이미지를 가져와 실행합니다. `compose.nas.yaml`에는 `build:` 항목이 없으므로 NAS에서 로컬 빌드가 실행될 수 없습니다.
+이미지를 가져와 실행합니다. `compose.yaml`에는 `build:` 항목이 없으므로 NAS에서 로컬 빌드가 실행될 수 없습니다.
 
 ```bash
-docker compose --env-file .env.nas -f compose.nas.yaml pull
-docker compose --env-file .env.nas -f compose.nas.yaml up -d
+docker compose --env-file .env.nas pull
+docker compose --env-file .env.nas up -d
 ```
 
-GHCR 이미지 자체의 기본 UID/GID는 `1000:1000`이지만 `compose.nas.yaml`이 `.env.nas`의 `PUID`/`PGID`로 런타임 사용자를 덮어씁니다. 따라서 NAS에서 UID/GID 때문에 이미지를 다시 빌드할 필요는 없습니다.
-
-## 기존 Docker CPU 전사 CLI
-
-기존 CLI는 회귀 검증과 CPU fallback용으로 유지됩니다. 번역이나 SRT 생성을 암묵적으로 수행하지 않습니다.
-
-```bash
-export HF_TOKEN=hf_xxxxxxxxxxxxxxxxxxxx
-mkdir -p media output
-make image
-docker compose run --rm stt \
-  /data/sample.mkv \
-  --output-dir /output \
-  --duration-seconds 300 \
-  --num-speakers 2 \
-  --threads 8
-```
-
-전체 파일은 `--duration-seconds` 옵션을 제거해 처리합니다. CLI에서는 `--duration-seconds 0`이 유효하지 않으므로 옵션을 생략해야 합니다.
-
-`compose.yaml`의 `model-cache:/cache` 하나가 Hugging Face, Pyannote, Torch 캐시를 모두 영속화합니다. 따라서 `config.yaml`, `pytorch_model.bin`도 컨테이너를 다시 실행할 때 재다운로드되지 않습니다. Docker named volume 대신 NAS/호스트 폴더를 직접 사용하려면 다음처럼 바꿀 수 있습니다.
-
-```yaml
-volumes:
-  - ./model-cache:/cache
-```
-
-CPU CLI는 30초마다 현재 단계와 경과 시간을 로그로 출력합니다. Docker의 Apple Silicon CPU 처리 속도는 영상 재생 시간과 비슷하거나 더 느릴 수 있으며, 이것이 MPS API를 별도 네이티브 프로세스로 둔 이유입니다.
+GHCR 이미지 자체의 기본 UID/GID는 `1000:1000`이지만 `compose.yaml`이 `.env.nas`의 `PUID`/`PGID`로 런타임 사용자를 덮어씁니다. 따라서 NAS에서 UID/GID 때문에 이미지를 다시 빌드할 필요는 없습니다.
 
 ## 개발 검증
 
@@ -383,8 +356,7 @@ CPU CLI는 30초마다 현재 단계와 경과 시간을 로그로 출력합니�
 ```bash
 make test
 make check
-docker compose config
-docker compose --env-file .env.nas.example -f compose.nas.yaml config
+docker compose --env-file .env.nas.example config
 ```
 
 실제 품질 테스트에는 합법적으로 사용할 수 있는 짧은 미디어만 사용하고, 민감한 전사문이나 모델 캐시를 커밋하지 마십시오.

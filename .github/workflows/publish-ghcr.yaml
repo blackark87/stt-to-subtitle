@@ -40,8 +40,7 @@ jobs:
         run: |
           make test
           make check
-          docker compose config
-          docker compose --env-file .env.nas.example -f compose.nas.yaml config
+          docker compose --env-file .env.nas.example config
 
   publish:
     needs: test
