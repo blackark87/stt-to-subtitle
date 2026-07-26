@@ -314,11 +314,12 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
         audio_stream: str = Form("0"),
         start_seconds: str = Form("0"),
         duration_seconds: str = Form(""),
-        chunk_length_seconds: str = Form("15"),
+        chunk_length_seconds: str = Form("60"),
         num_speakers: str = Form(""),
         min_speakers: str = Form(""),
         max_speakers: str = Form(""),
         add_punctuation: bool = Form(False),
+        noise_filter: list[bool] | None = Form(None),
     ) -> Any:
         if not is_authenticated(request):
             return login_redirect()
@@ -332,6 +333,7 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
             "min_speakers": min_speakers,
             "max_speakers": max_speakers,
             "add_punctuation": add_punctuation,
+            "noise_filter": noise_filter[-1] if noise_filter else True,
         }
         try:
             jobs = orchestrator(request).create_jobs(

@@ -66,6 +66,7 @@
       const seek = shell.querySelector("[data-vr-seek]");
       const time = shell.querySelector("[data-vr-time]");
       const muteButton = shell.querySelector("[data-vr-mute]");
+      const volume = shell.querySelector("[data-vr-volume]");
       const resetButton = shell.querySelector("[data-vr-reset]");
       const fullscreenButton = shell.querySelector("[data-vr-fullscreen]");
       const eyeButtons = shell.querySelectorAll("[data-vr-eye]");
@@ -84,6 +85,7 @@
       let mode = "flat";
       let renderer = null;
       let textTrack = null;
+      let eyeMode = "dual";
 
       const updateModeButtons = () => {
         flatButton.setAttribute(
@@ -102,15 +104,34 @@
           subtitleOverlay.hidden = true;
           return;
         }
-        for (const cue of Array.from(textTrack.activeCues)) {
-          const row = document.createElement("div");
-          row.className = "vr180-subtitle-line";
-          if (typeof cue.getCueAsHTML === "function") {
-            row.append(cue.getCueAsHTML());
-          } else {
-            row.textContent = cue.text;
+
+        const cues = Array.from(textTrack.activeCues);
+        const appendCues = (container) => {
+          for (const cue of cues) {
+            const row = document.createElement("div");
+            row.className = "vr180-subtitle-line";
+            if (typeof cue.getCueAsHTML === "function") {
+              row.append(cue.getCueAsHTML());
+            } else {
+              row.textContent = cue.text;
+            }
+            container.append(row);
           }
-          subtitleOverlay.append(row);
+        };
+        subtitleOverlay.classList.toggle(
+          "is-dual-eye",
+          eyeMode === "dual"
+        );
+        if (eyeMode === "dual") {
+          for (const eye of ["left", "right"]) {
+            const eyePanel = document.createElement("div");
+            eyePanel.className = `vr180-subtitle-eye is-${eye}`;
+            eyePanel.setAttribute("aria-hidden", eye === "right" ? "true" : "false");
+            appendCues(eyePanel);
+            subtitleOverlay.append(eyePanel);
+          }
+        } else {
+          appendCues(subtitleOverlay);
         }
         subtitleOverlay.hidden = false;
       };
@@ -149,6 +170,25 @@
             video.muted ? "true" : "false"
           );
         }
+        if (volume && !volume.matches(":active")) {
+          volume.value = String(video.volume);
+        }
+      };
+
+      const togglePlayback = () => {
+        if (video.dataset.playbackStopped === "true") {
+          return;
+        }
+        if (!video.paused) {
+          video.pause();
+          return;
+        }
+        video.play().catch(() => {
+          showMessage(
+            messageElement,
+            "브라우저가 재생 요청을 허용하지 않았습니다. 다시 눌러 재생해 주세요."
+          );
+        });
       };
 
       const activateFlatMode = () => {
@@ -213,6 +253,7 @@
         setTrackMode("vr180");
         updateModeButtons();
         updatePlaybackControls();
+        renderer.setEye(eyeMode);
         renderer.start();
         canvas.focus({ preventScroll: true });
       };
@@ -260,18 +301,57 @@
       video.append(source, track);
       video.load();
 
-      flatButton.addEventListener("click", activateFlatMode);
+      flatButton.addEventListener("click", () => {
+        activateFlatMode();
+        video.focus({ preventScroll: true });
+      });
       vrButton.addEventListener("click", activateVRMode);
-      playButton?.addEventListener("click", () => {
-        if (video.paused) {
-          video.play().catch(() => {
-            showMessage(
-              messageElement,
-              "브라우저가 재생 요청을 허용하지 않았습니다. 다시 눌러 재생해 주세요."
-            );
-          });
-        } else {
-          video.pause();
+      playButton?.addEventListener("click", togglePlayback);
+      shell.addEventListener("keydown", (event) => {
+        if (
+          event.altKey ||
+          event.ctrlKey ||
+          event.metaKey ||
+          event.shiftKey ||
+          event.target instanceof HTMLInputElement ||
+          event.target instanceof HTMLSelectElement ||
+          event.target instanceof HTMLTextAreaElement
+        ) {
+          return;
+        }
+        if (event.key === " " || event.code === "Space") {
+          if (event.target instanceof HTMLButtonElement) {
+            return;
+          }
+          event.preventDefault();
+          if (!event.repeat) {
+            togglePlayback();
+          }
+          return;
+        }
+        if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+          event.preventDefault();
+          const change = event.key === "ArrowLeft" ? -10 : 10;
+          const maximum = Number.isFinite(video.duration)
+            ? video.duration
+            : Number.POSITIVE_INFINITY;
+          video.currentTime = Math.min(
+            maximum,
+            Math.max(0, video.currentTime + change)
+          );
+          renderer?.requestDraw();
+          updatePlaybackControls();
+          return;
+        }
+        if (event.key === "ArrowUp" || event.key === "ArrowDown") {
+          event.preventDefault();
+          const change = event.key === "ArrowUp" ? 0.05 : -0.05;
+          video.volume = Math.min(
+            1,
+            Math.max(0, Number((video.volume + change).toFixed(2)))
+          );
+          video.muted = video.volume === 0;
+          updatePlaybackControls();
         }
       });
       seek?.addEventListener("input", () => {
@@ -282,6 +362,11 @@
       });
       muteButton?.addEventListener("click", () => {
         video.muted = !video.muted;
+        updatePlaybackControls();
+      });
+      volume?.addEventListener("input", () => {
+        video.volume = Math.min(1, Math.max(0, Number(volume.value)));
+        video.muted = video.volume === 0;
         updatePlaybackControls();
       });
       resetButton?.addEventListener("click", () => {
@@ -304,6 +389,7 @@
       for (const eyeButton of eyeButtons) {
         eyeButton.addEventListener("click", () => {
           const eye = eyeButton.dataset.vrEye;
+          eyeMode = eye || "left";
           renderer?.setEye(eye);
           for (const candidate of eyeButtons) {
             candidate.setAttribute(
@@ -311,6 +397,7 @@
               candidate === eyeButton ? "true" : "false"
             );
           }
+          updateSubtitles();
         });
       }
       for (const eventName of [

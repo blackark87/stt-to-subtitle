@@ -1,15 +1,19 @@
 import sys
 import unittest
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from stt_to_subtitle.kotoba import (
     ChunkProgress,
+    DEFAULT_CHUNK_LENGTH_SECONDS,
     MODEL_ID,
     MODEL_REVISION,
+    NoiseFilteringSpeakerDiarization,
     TIMESTAMP_POSTPROCESSOR,
     TranscriptionOptions,
+    corrected_kotoba_chunk_iter,
     corrected_kotoba_postprocess,
     load_pipeline,
     normalize_segments,
@@ -202,9 +206,153 @@ class NormalizeSegmentsTests(unittest.TestCase):
 
 
 class TranscriptionOptionsTests(unittest.TestCase):
+    def test_defaults_to_sixty_second_chunks_and_noise_filter(self) -> None:
+        options = TranscriptionOptions()
+
+        self.assertEqual(
+            options.chunk_length_seconds,
+            DEFAULT_CHUNK_LENGTH_SECONDS,
+        )
+        self.assertTrue(options.noise_filter)
+
     def test_exact_speaker_count_cannot_be_combined_with_range(self) -> None:
         with self.assertRaisesRegex(ValueError, "cannot be combined"):
             TranscriptionOptions(num_speakers=2, min_speakers=1).validate()
+
+
+class CorrectedChunkIteratorTests(unittest.TestCase):
+    def test_preserves_input_longer_than_whispers_native_window(self) -> None:
+        class FakeAudio:
+            def __init__(self, length: int) -> None:
+                self.shape = (length,)
+
+            def __getitem__(self, item):
+                start = item.start or 0
+                stop = min(item.stop or self.shape[0], self.shape[0])
+                return FakeAudio(max(0, stop - start))
+
+        class FakeBatch(dict):
+            def to(self, **_kwargs):
+                return self
+
+        class FakeFeatureExtractor:
+            sampling_rate = 16_000
+            n_samples = 30 * sampling_rate
+
+            def __init__(self) -> None:
+                self.calls = []
+
+            def __call__(self, audio, **kwargs):
+                self.calls.append((audio.shape[0], kwargs))
+                return FakeBatch(input_features="features")
+
+        extractor = FakeFeatureExtractor()
+        chunks = list(
+            corrected_kotoba_chunk_iter(
+                FakeAudio(60 * 16_000),
+                extractor,
+                60 * 16_000,
+                10 * 16_000,
+                10 * 16_000,
+            )
+        )
+
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(extractor.calls[0][0], 60 * 16_000)
+        self.assertEqual(
+            extractor.calls[0][1],
+            {
+                "sampling_rate": 16_000,
+                "return_tensors": "pt",
+                "return_attention_mask": True,
+                "truncation": False,
+                "padding": "longest",
+            },
+        )
+        self.assertEqual(chunks[0]["stride"], (60 * 16_000, 0, 0))
+
+
+class NoiseFilteringSpeakerDiarizationTests(unittest.TestCase):
+    @dataclass(frozen=True)
+    class Segment:
+        start: float
+        end: float
+
+    class Annotation:
+        def __init__(self, entries=()) -> None:
+            self.entries = list(entries)
+
+        def empty(self):
+            return NoiseFilteringSpeakerDiarizationTests.Annotation()
+
+        def itertracks(self, yield_label=False):
+            for segment, track, speaker in self.entries:
+                if yield_label:
+                    yield segment, track, speaker
+                else:
+                    yield segment, track
+
+        def __setitem__(self, key, speaker):
+            segment, track = key
+            self.entries.append((segment, track, speaker))
+
+    class Audio:
+        shape = (160_000,)
+
+        def __getitem__(self, _key):
+            return self
+
+    def test_removes_only_spans_rejected_by_second_voice_detector(self) -> None:
+        annotation = self.Annotation(
+            [
+                (self.Segment(0.0, 2.0), "_", "SPEAKER_00"),
+                (self.Segment(3.0, 4.0), "_", "SPEAKER_01"),
+            ]
+        )
+        decisions = iter([True, False])
+        detector = Mock(side_effect=lambda *_args: next(decisions))
+        wrapper = NoiseFilteringSpeakerDiarization(
+            Mock(return_value=annotation),
+            detector=detector,
+        )
+
+        filtered = wrapper(self.Audio(), sampling_rate=16_000)
+
+        self.assertEqual(
+            [
+                (entry[0].start, entry[0].end, entry[2])
+                for entry in filtered.entries
+            ],
+            [(0.0, 2.0, "SPEAKER_00")],
+        )
+        self.assertEqual(wrapper.public_dict()["removed_count"], 1)
+        self.assertEqual(
+            wrapper.public_dict()["removed_spans"],
+            [
+                {
+                    "start": 3.0,
+                    "end": 4.0,
+                    "speaker": "SPEAKER_01",
+                }
+            ],
+        )
+
+    def test_disabled_filter_returns_original_annotation(self) -> None:
+        annotation = self.Annotation(
+            [(self.Segment(0.0, 1.0), "_", "SPEAKER_00")]
+        )
+        detector = Mock(return_value=False)
+        wrapper = NoiseFilteringSpeakerDiarization(
+            Mock(return_value=annotation),
+            detector=detector,
+        )
+        wrapper.configure(enabled=False, trigger_level=7.0)
+
+        self.assertIs(
+            wrapper(self.Audio(), sampling_rate=16_000),
+            annotation,
+        )
+        detector.assert_not_called()
 
 
 class TranscribeTests(unittest.TestCase):
@@ -331,7 +479,7 @@ class TranscribeTests(unittest.TestCase):
         )
         speech_pipeline.assert_called_once_with(
             "/output/sample.wav",
-            chunk_length_s=15,
+            chunk_length_s=60,
             add_punctuation=False,
             num_speakers=2,
             min_speakers=None,

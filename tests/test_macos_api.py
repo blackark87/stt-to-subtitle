@@ -30,6 +30,22 @@ class MacOSAPIHelpersTests(unittest.TestCase):
         self.assertEqual(options["batch_size"], 2)
         self.assertEqual(options["chunk_length_seconds"], 20)
         self.assertEqual(options["num_speakers"], 2)
+        self.assertTrue(options["noise_filter"])
+
+    def test_defaults_to_sixty_seconds_and_accepts_disabled_filter(self) -> None:
+        settings = MacOSAPISettings(
+            state_dir=Path("/tmp/not-used"),
+            api_token="",
+            hf_token="hf-token",
+        )
+
+        defaults = _parse_options("{}", settings)
+        disabled = _parse_options('{"noise_filter": false}', settings)
+
+        self.assertEqual(defaults["chunk_length_seconds"], 60)
+        self.assertTrue(defaults["noise_filter"])
+        self.assertFalse(disabled["noise_filter"])
+        self.assertEqual(defaults["noise_filter_trigger_level"], 7.0)
 
     def test_accepts_16khz_mono_pcm_wav(self) -> None:
         with TemporaryDirectory() as directory:
@@ -53,6 +69,20 @@ class MacOSAPIHelpersTests(unittest.TestCase):
         with self.assertRaisesRegex(
             ValueError,
             "STT_CHUNK_PROGRESS_EVERY must be 10 or 100",
+        ):
+            settings.validate()
+
+    def test_noise_filter_trigger_level_must_be_positive(self) -> None:
+        settings = MacOSAPISettings(
+            state_dir=Path("/tmp/not-used"),
+            api_token="",
+            hf_token="hf-token",
+            noise_filter_trigger_level=0,
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "STT_NOISE_FILTER_TRIGGER_LEVEL must be positive",
         ):
             settings.validate()
 

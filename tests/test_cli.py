@@ -2,12 +2,24 @@ import threading
 import unittest
 from unittest.mock import Mock, patch
 
-from stt_to_subtitle.cli import _format_elapsed, _log_stage, _report_progress
+from stt_to_subtitle.cli import (
+    _format_elapsed,
+    _log_stage,
+    _report_progress,
+    build_parser,
+)
 
 
 class FormatElapsedTests(unittest.TestCase):
     def test_formats_elapsed_time_beyond_one_hour(self) -> None:
         self.assertEqual(_format_elapsed(3661.9), "01:01:01")
+
+    def test_parser_defaults_to_sixty_seconds_and_noise_filter(self) -> None:
+        args = build_parser().parse_args(["sample.mkv"])
+
+        self.assertEqual(args.chunk_length_seconds, 60)
+        self.assertFalse(args.disable_noise_filter)
+        self.assertEqual(args.noise_filter_trigger_level, 7.0)
 
 
 class ReportProgressTests(unittest.TestCase):

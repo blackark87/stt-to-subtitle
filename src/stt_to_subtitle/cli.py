@@ -13,6 +13,8 @@ from typing import Iterator
 
 from .audio import AudioExtraction, extract_audio
 from .kotoba import (
+    DEFAULT_CHUNK_LENGTH_SECONDS,
+    DEFAULT_NOISE_FILTER_TRIGGER_LEVEL,
     MODEL_ID,
     MODEL_REVISION,
     TranscriptionOptions,
@@ -94,7 +96,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--audio-stream", type=int, default=0)
     parser.add_argument("--start-seconds", type=float, default=0.0)
     parser.add_argument("--duration-seconds", type=float)
-    parser.add_argument("--chunk-length-seconds", type=int, default=15)
+    parser.add_argument(
+        "--chunk-length-seconds",
+        type=int,
+        default=DEFAULT_CHUNK_LENGTH_SECONDS,
+    )
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--threads", type=int)
     parser.add_argument("--num-speakers", type=int)
@@ -104,6 +110,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--add-punctuation",
         action="store_true",
         help="run the optional punctuation model for per-speaker text",
+    )
+    parser.add_argument(
+        "--disable-noise-filter",
+        action="store_true",
+        help="do not recheck diarized spans with the independent voice detector",
+    )
+    parser.add_argument(
+        "--noise-filter-trigger-level",
+        type=float,
+        default=DEFAULT_NOISE_FILTER_TRIGGER_LEVEL,
+        help="Torchaudio VAD trigger level (default: 7.0)",
     )
     return parser
 
@@ -131,6 +148,8 @@ def run(args: argparse.Namespace) -> tuple[Path, Path, Path]:
         min_speakers=args.min_speakers,
         max_speakers=args.max_speakers,
         add_punctuation=args.add_punctuation,
+        noise_filter=not args.disable_noise_filter,
+        noise_filter_trigger_level=args.noise_filter_trigger_level,
         threads=args.threads,
     )
     extraction.validate()
@@ -173,6 +192,11 @@ def run(args: argparse.Namespace) -> tuple[Path, Path, Path]:
             "min_speakers": transcription.min_speakers,
             "max_speakers": transcription.max_speakers,
             "add_punctuation": transcription.add_punctuation,
+            "noise_filter": transcription.noise_filter,
+            "noise_filter_trigger_level": (
+                transcription.noise_filter_trigger_level
+            ),
+            "noise_filter_result": raw_result.get("noise_filter"),
         },
         "runtime": {
             "device": "cpu",

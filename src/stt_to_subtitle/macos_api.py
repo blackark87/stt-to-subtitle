@@ -25,6 +25,8 @@ from .contracts import TRANSCRIPT_SCHEMA_VERSION, add_segment_ids
 from .files import write_json_atomic
 from .kotoba import (
     ChunkProgress,
+    DEFAULT_CHUNK_LENGTH_SECONDS,
+    DEFAULT_NOISE_FILTER_TRIGGER_LEVEL,
     MODEL_ID,
     MODEL_REVISION,
     SpeechPipeline,
@@ -51,6 +53,7 @@ class MacOSAPISettings:
     max_upload_bytes: int = 2 * 1024 * 1024 * 1024
     progress_interval: float = 30.0
     chunk_progress_every: int = 10
+    noise_filter_trigger_level: float = DEFAULT_NOISE_FILTER_TRIGGER_LEVEL
 
     @classmethod
     def from_env(cls) -> MacOSAPISettings:
@@ -79,6 +82,12 @@ class MacOSAPISettings:
             chunk_progress_every=int(
                 os.environ.get("STT_CHUNK_PROGRESS_EVERY", "10")
             ),
+            noise_filter_trigger_level=float(
+                os.environ.get(
+                    "STT_NOISE_FILTER_TRIGGER_LEVEL",
+                    str(DEFAULT_NOISE_FILTER_TRIGGER_LEVEL),
+                )
+            ),
         )
 
     def validate(self) -> None:
@@ -94,6 +103,10 @@ class MacOSAPISettings:
             raise ValueError("STT_PROGRESS_INTERVAL_SECONDS must be positive")
         if self.chunk_progress_every not in {10, 100}:
             raise ValueError("STT_CHUNK_PROGRESS_EVERY must be 10 or 100")
+        if self.noise_filter_trigger_level <= 0:
+            raise ValueError(
+                "STT_NOISE_FILTER_TRIGGER_LEVEL must be positive"
+            )
 
 
 def _parse_options(raw_options: str, settings: MacOSAPISettings) -> dict[str, Any]:
@@ -110,13 +123,22 @@ def _parse_options(raw_options: str, settings: MacOSAPISettings) -> dict[str, An
         "min_speakers",
         "max_speakers",
         "add_punctuation",
+        "noise_filter",
     }
     unknown = set(decoded) - allowed
     if unknown:
         raise ValueError(f"unsupported transcription options: {sorted(unknown)}")
+    noise_filter = decoded.get("noise_filter", True)
+    if not isinstance(noise_filter, bool):
+        raise ValueError("noise_filter must be a JSON boolean")
     options = TranscriptionOptions(
         batch_size=settings.batch_size,
-        chunk_length_seconds=int(decoded.get("chunk_length_seconds", 15)),
+        chunk_length_seconds=int(
+            decoded.get(
+                "chunk_length_seconds",
+                DEFAULT_CHUNK_LENGTH_SECONDS,
+            )
+        ),
         num_speakers=(
             int(decoded["num_speakers"])
             if decoded.get("num_speakers") is not None
@@ -133,6 +155,8 @@ def _parse_options(raw_options: str, settings: MacOSAPISettings) -> dict[str, An
             else None
         ),
         add_punctuation=bool(decoded.get("add_punctuation", False)),
+        noise_filter=noise_filter,
+        noise_filter_trigger_level=settings.noise_filter_trigger_level,
         threads=settings.threads,
     )
     options.validate()
@@ -327,6 +351,15 @@ class TranscriptionService:
                 progress_every=self.settings.chunk_progress_every,
             )
             segments = add_segment_ids(normalize_segments(raw_result))
+            noise_filter = raw_result.get(
+                "noise_filter",
+                {
+                    "enabled": options.noise_filter,
+                    "trigger_level": options.noise_filter_trigger_level,
+                    "removed_count": 0,
+                    "removed_spans": [],
+                },
+            )
             payload = {
                 "schema_version": TRANSCRIPT_SCHEMA_VERSION,
                 "job_id": job.id,
@@ -347,6 +380,7 @@ class TranscriptionService:
                     "elapsed_seconds": round(time.monotonic() - started, 3),
                 },
                 "options": job.options,
+                "noise_filter": noise_filter,
                 "segments": segments,
             }
             result_path = self.result_dir / f"{job.id}.json"
@@ -361,6 +395,16 @@ class TranscriptionService:
                 job.id,
                 len(segments),
             )
+            if (
+                isinstance(noise_filter, Mapping)
+                and int(noise_filter.get("removed_count", 0)) > 0
+            ):
+                LOGGER.info(
+                    "transcription job %s noise filter removed %d "
+                    "non-speech span(s)",
+                    job.id,
+                    int(noise_filter["removed_count"]),
+                )
         except BaseException as error:
             message = str(error).replace(self.settings.hf_token, "[redacted]")
             self.store.update(

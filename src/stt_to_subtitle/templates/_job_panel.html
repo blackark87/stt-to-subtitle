@@ -50,7 +50,14 @@
 {% if job.status == "completed" and job.srt_path %}
   <section class="card result-preview">
     <h2>결과 미리보기</h2>
-    <div class="result-player-shell" data-result-player-shell>
+    <div
+      class="result-player-shell"
+      data-result-player-shell
+      tabindex="0"
+      role="group"
+      aria-label="결과 영상 플레이어"
+      aria-keyshortcuts="Space ArrowLeft ArrowRight ArrowUp ArrowDown"
+    >
       <div class="player-mode-toolbar" aria-label="미리보기 방식">
         <span>보기 방식</span>
         <button
@@ -83,7 +90,7 @@
           class="vr180-canvas"
           data-vr180-canvas
           tabindex="0"
-          aria-label="VR 180 영상. 드래그하거나 방향키로 시점을 이동할 수 있습니다."
+          aria-label="VR 180 영상. 마우스나 터치로 드래그해 시점을 이동할 수 있습니다."
           hidden
         ></canvas>
         <div
@@ -93,7 +100,8 @@
           hidden
         ></div>
         <p class="vr180-hint" data-vr180-hint hidden>
-          드래그·방향키: 시점 이동 · 휠: 확대/축소
+          드래그: 시점 이동 · 휠: 확대/축소 · Space: 재생/일시정지 ·
+          ←/→: 10초 이동 · ↑/↓: 음량
         </p>
       </div>
       <div class="vr180-controls" data-vr180-controls hidden>
@@ -110,12 +118,30 @@
         >
         <output data-vr-time>0:00 / 0:00</output>
         <button type="button" class="secondary compact" data-vr-mute>음소거</button>
+        <label class="vr180-volume-control">
+          <span>음량</span>
+          <input
+            type="range"
+            data-vr-volume
+            min="0"
+            max="1"
+            value="1"
+            step="0.05"
+            aria-label="음량"
+          >
+        </label>
         <span class="vr180-eye-controls" aria-label="미리보기 눈 선택">
           <button
             type="button"
             class="secondary compact"
-            data-vr-eye="left"
+            data-vr-eye="dual"
             aria-pressed="true"
+          >양안</button>
+          <button
+            type="button"
+            class="secondary compact"
+            data-vr-eye="left"
+            aria-pressed="false"
           >좌안</button>
           <button
             type="button"
@@ -143,8 +169,8 @@
       전사·번역 결과를 화자별 색상 WebVTT로 렌더링해 미리보기에 표시합니다.
       실제 동시 발화는 한 cue의 여러 줄로 표시되며, 외부 플레이어에서는
       <code>.ko.ass</code>가 색상과 글꼴을 가장 안정적으로 보존합니다.
-      VR 180 SBS 모드는 좌·우 영상을 선택해 180도 반구로 펼치며,
-      마우스·터치 또는 키보드로 시점을 조작할 수 있습니다.
+      VR 180 SBS 모드는 양안 분할 또는 좌·우 단안 영상을 180도 반구로 펼치며,
+      마우스·터치 드래그로 시점을 조작할 수 있습니다.
       지원하지 않는 MIME 형식은 요청하지 않으며, 코덱 오류가 발생해도 자동 재시도하지 않습니다.
     </p>
   </section>
