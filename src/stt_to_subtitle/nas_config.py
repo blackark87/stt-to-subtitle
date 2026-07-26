@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
+import math
 import os
 from pathlib import Path
+import subprocess
 from xml.etree import ElementTree
 
 MEDIA_EXTENSIONS = {
@@ -49,6 +52,42 @@ def _is_ignored_directory(name: str) -> bool:
 
 def _is_ignored_file(name: str) -> bool:
     return name.casefold() in IGNORED_FILE_NAMES
+
+
+def _is_hidden_media_file(name: str) -> bool:
+    return name.casefold().endswith("-trailer.mp4")
+
+
+def probe_media_duration(path: Path) -> float | None:
+    """Return container duration without decoding media content."""
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(path),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        duration = float(result.stdout.strip())
+    except ValueError:
+        return None
+    if not math.isfinite(duration) or duration <= 0:
+        return None
+    return duration
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -133,9 +172,20 @@ class NASSettings:
 
 
 class MediaLibrary:
-    def __init__(self, root: Path, maximum_files: int = 5000) -> None:
+    def __init__(
+        self,
+        root: Path,
+        maximum_files: int = 5000,
+        *,
+        duration_probe: Callable[[Path], float | None] | None = None,
+    ) -> None:
         self.root = root.resolve()
         self.maximum_files = maximum_files
+        self._duration_probe = duration_probe
+        self._duration_cache: dict[
+            Path,
+            tuple[int, int, float | None],
+        ] = {}
 
     def resolve_file(self, relative_path: str) -> Path:
         if not relative_path or Path(relative_path).is_absolute():
@@ -245,7 +295,11 @@ class MediaLibrary:
             if child.is_symlink() or (
                 child.is_dir() and _is_ignored_directory(child.name)
             ) or (
-                child.is_file() and _is_ignored_file(child.name)
+                child.is_file()
+                and (
+                    _is_ignored_file(child.name)
+                    or _is_hidden_media_file(child.name)
+                )
             ):
                 continue
             if child.is_dir():
@@ -272,6 +326,7 @@ class MediaLibrary:
 
     def _describe_media(self, path: Path) -> dict[str, object]:
         relative = path.relative_to(self.root).as_posix()
+        file_stat = path.stat()
         srt_subtitle = path.with_name(f"{path.stem}.ko.srt")
         ass_subtitle = path.with_name(f"{path.stem}.ko.ass")
         nfo_path = self._find_nfo(path)
@@ -287,12 +342,28 @@ class MediaLibrary:
             "path": relative,
             "name": path.name,
             "directory": "" if relative_parent == "." else relative_parent,
-            "size": path.stat().st_size,
+            "size": file_stat.st_size,
+            "duration_seconds": self._media_duration(path, file_stat),
             "has_subtitle": srt_subtitle.is_file() or ass_subtitle.is_file(),
             "has_nfo": nfo_path is not None,
             "title": title or path.stem,
             "poster_path": poster_path,
         }
+
+    def _media_duration(
+        self,
+        path: Path,
+        file_stat: os.stat_result,
+    ) -> float | None:
+        if self._duration_probe is None:
+            return None
+        cached = self._duration_cache.get(path)
+        cache_key = (file_stat.st_size, file_stat.st_mtime_ns)
+        if cached is not None and cached[:2] == cache_key:
+            return cached[2]
+        duration = self._duration_probe(path)
+        self._duration_cache[path] = (*cache_key, duration)
+        return duration
 
     def _find_nfo(self, source_path: Path) -> Path | None:
         for candidate in (

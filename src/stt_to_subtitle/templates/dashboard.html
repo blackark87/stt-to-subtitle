@@ -90,6 +90,7 @@
                       <span class="media-directory" title="{{ file.directory }}">{{ file.directory }}</span>
                     {% endif %}
                     <span class="media-size">{{ file.size|filesize }}</span>
+                    <span class="media-duration">재생시간 {{ file.duration_seconds|duration }}</span>
                     <span class="subtitle-state {% if file.has_subtitle %}is-done{% else %}is-pending{% endif %}">
                       {% if file.has_subtitle %}자막 완료{% else %}자막 미완료{% endif %}
                     </span>
@@ -104,6 +105,7 @@
                       <span class="media-directory" title="{{ file.directory }}">{{ file.directory }}</span>
                     {% endif %}
                     <span class="media-size">{{ file.size|filesize }}</span>
+                    <span class="media-duration">재생시간 {{ file.duration_seconds|duration }}</span>
                     <span class="subtitle-state {% if file.has_subtitle %}is-done{% else %}is-pending{% endif %}">
                       {% if file.has_subtitle %}자막 완료{% else %}자막 미완료{% endif %}
                     </span>

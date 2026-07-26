@@ -19,7 +19,7 @@ from .contracts import (
 )
 from .files import sha256_file, write_json_atomic
 from .kotoba import TranscriptionOptions
-from .nas_config import MediaLibrary, NASSettings
+from .nas_config import MediaLibrary, NASSettings, probe_media_duration
 from .nas_store import NASJob, NASStore
 from .service_clients import ExternalServiceError, LMStudioClient, STTAPIClient
 from .subtitle import write_styled_subtitles_atomic
@@ -38,6 +38,7 @@ class NASOrchestrator:
         self.library = MediaLibrary(
             settings.media_root,
             settings.maximum_listed_files,
+            duration_probe=probe_media_duration,
         )
         self.store = NASStore(settings.state_dir / "jobs.sqlite3")
         self.stt_client = STTAPIClient(

@@ -1,10 +1,15 @@
 import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from stt_to_subtitle.nas_config import MediaLibrary, NASSettings
+from stt_to_subtitle.nas_config import (
+    MediaLibrary,
+    NASSettings,
+    probe_media_duration,
+)
 
 
 class MediaLibraryTests(unittest.TestCase):
@@ -82,6 +87,84 @@ class MediaLibraryTests(unittest.TestCase):
                 library.browse("@eaDir")
             with self.assertRaisesRegex(ValueError, "metadata"):
                 library.resolve_file("@eaDir/Visible/thumbnail.mp4")
+
+    def test_hides_trailer_mp4_files_from_listing(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in (
+                "movie.mp4",
+                "movie-trailer.mp4",
+                "MOVIE-TRAILER.MP4",
+                "movie-trailer.mkv",
+                "movie-trailer-cut.mp4",
+            ):
+                (root / name).write_bytes(b"media")
+
+            files = MediaLibrary(root).browse()["files"]
+
+            self.assertEqual(
+                [file["name"] for file in files],
+                [
+                    "movie-trailer-cut.mp4",
+                    "movie-trailer.mkv",
+                    "movie.mp4",
+                ],
+            )
+
+    def test_probes_and_caches_media_duration(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media = root / "movie.mkv"
+            media.write_bytes(b"media")
+            probed_paths: list[Path] = []
+
+            def probe(path: Path) -> float:
+                probed_paths.append(path)
+                return 6180.4
+
+            library = MediaLibrary(root, duration_probe=probe)
+
+            first = library.browse()["files"][0]
+            second = library.browse()["files"][0]
+
+            self.assertEqual(first["duration_seconds"], 6180.4)
+            self.assertEqual(second["duration_seconds"], 6180.4)
+            self.assertEqual(probed_paths, [media.resolve()])
+
+    def test_ffprobe_duration_failure_does_not_break_listing(self) -> None:
+        with TemporaryDirectory() as directory:
+            media = Path(directory) / "movie.mkv"
+            media.write_bytes(b"media")
+            completed = SimpleNamespace(
+                returncode=1,
+                stdout="",
+            )
+
+            with patch(
+                "stt_to_subtitle.nas_config.subprocess.run",
+                return_value=completed,
+            ):
+                duration = probe_media_duration(media)
+
+            self.assertIsNone(duration)
+
+    def test_reads_duration_from_ffprobe_output(self) -> None:
+        with TemporaryDirectory() as directory:
+            media = Path(directory) / "movie.mkv"
+            media.write_bytes(b"media")
+            completed = SimpleNamespace(
+                returncode=0,
+                stdout="6180.4\n",
+            )
+
+            with patch(
+                "stt_to_subtitle.nas_config.subprocess.run",
+                return_value=completed,
+            ) as run:
+                duration = probe_media_duration(media)
+
+            self.assertEqual(duration, 6180.4)
+            self.assertEqual(run.call_args.args[0][-1], str(media))
 
     def test_lists_supported_media_and_detects_subtitle(self) -> None:
         with TemporaryDirectory() as directory:

@@ -212,7 +212,7 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 .metadata-label { width: max-content; border-radius: 4px; padding: 1px 5px; background: color-mix(in srgb, var(--accent) 12%, transparent); color: var(--accent); font-size: .72rem; font-weight: 750; }
 .media-title { min-width: 0; font-size: .96rem; line-height: 1.4; overflow-wrap: anywhere; }
 .media-filename, .media-directory { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.media-filename, .media-directory, .media-size { color: var(--muted); font-size: .78rem; font-weight: 400; }
+.media-filename, .media-directory, .media-size, .media-duration { color: var(--muted); font-size: .78rem; font-weight: 400; }
 .subtitle-state { width: max-content; margin-top: 5px; border-radius: 999px; padding: 2px 8px; font-size: .77rem; font-weight: 750; }
 .subtitle-state.is-done { background: #abefc6; color: #05603a; }
 .subtitle-state.is-pending { background: color-mix(in srgb, var(--line) 60%, transparent); color: var(--text); }
