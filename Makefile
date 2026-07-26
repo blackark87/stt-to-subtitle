@@ -1,7 +1,4 @@
-.PHONY: image test check
-
-image:
-	docker build --platform linux/arm64 -t stt-to-subtitle:kotoba-m1 .
+.PHONY: test check
 
 test:
 	PYTHONPATH=src python3 -m unittest discover -s tests -v

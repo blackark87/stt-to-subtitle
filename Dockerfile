@@ -7,55 +7,39 @@ FROM ${PYTHON_IMAGE} AS builder
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1
 
-RUN apt-get update \
-    && apt-get install --yes --no-install-recommends \
-        build-essential \
-        git \
-        libsndfile1-dev \
-    && rm -rf /var/lib/apt/lists/*
-
 WORKDIR /build
-COPY requirements.txt ./
-
-RUN python -m pip install --prefix=/install -r requirements.txt
+COPY requirements-nas.txt ./
+RUN python -m pip install --prefix=/install -r requirements-nas.txt
 
 COPY pyproject.toml README.md ./
 COPY src ./src
-
 RUN python -m pip install --prefix=/install --no-deps .
 
 FROM ${PYTHON_IMAGE} AS runtime
 
-ARG APP_UID=10001
-ARG APP_GID=10001
+ARG APP_UID=1000
+ARG APP_GID=1000
 
 ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1 \
-    HF_HOME=/cache/huggingface \
-    PYANNOTE_CACHE=/cache/pyannote \
-    XDG_CACHE_HOME=/cache \
-    TORCH_HOME=/cache/torch \
-    HF_HUB_DISABLE_TELEMETRY=1 \
-    DO_NOT_TRACK=1 \
-    TOKENIZERS_PARALLELISM=false
+    PYTHONDONTWRITEBYTECODE=1
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
         ca-certificates \
         ffmpeg \
-        libgomp1 \
-        libportaudio2 \
-        libsndfile1 \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid "${APP_GID}" app \
-    && useradd --uid "${APP_UID}" --gid "${APP_GID}" --create-home app \
-    && mkdir -p /cache/huggingface /cache/pyannote /cache/torch /output \
-    && chown -R app:app /cache /output
+    && useradd --uid "${APP_UID}" --gid "${APP_GID}" --no-create-home app \
+    && mkdir -p /var/lib/stt \
+    && chown -R app:app /var/lib/stt
 
 COPY --from=builder /install /usr/local
 
 USER app
 WORKDIR /app
+EXPOSE 8080
 
-ENTRYPOINT ["stt-transcribe"]
-CMD ["--help"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3)"]
+
+ENTRYPOINT ["stt-nas-web"]

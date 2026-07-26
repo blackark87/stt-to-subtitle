@@ -6,15 +6,13 @@ Application code lives in `src/stt_to_subtitle/`. `audio.py` builds and runs FFm
 
 ## Architecture & Data Flow
 
-Maintain explicit boundaries between audio extraction, speech transcription, transcript normalization, translation, and subtitle rendering. The current test implementation stops after Japanese transcription and speaker diarization; do not add translation implicitly. Provider or model integrations should not leak credentials into output metadata. Docker on Apple Silicon currently runs this PyTorch pipeline on ARM64 CPU, not Metal/MPS.
+Maintain explicit boundaries between audio extraction, speech transcription, transcript normalization, translation, and subtitle rendering. The Mac transcription API runs natively with Whisper on MPS and Pyannote on CPU. The NAS Docker service orchestrates files, transcription, LM Studio translation, and subtitle rendering without running the ML models locally. Provider or model integrations should not leak credentials into output metadata.
 
 ## Build, Test, and Development Commands
 
-- `make image` — build the `linux/arm64` Docker image for M1 systems.
 - `make test` — run the standard-library unit test suite without downloading models.
 - `make check` — compile Python sources and check changed files for whitespace errors.
-- `docker compose config` — validate the Compose definition.
-- `docker compose run --rm stt /data/sample.mkv --duration-seconds 300` — transcribe a five-minute test segment.
+- `docker compose --env-file .env.nas.example config` — validate the GHCR-only NAS Compose definition.
 
 ## Coding Style & Naming Conventions
 
