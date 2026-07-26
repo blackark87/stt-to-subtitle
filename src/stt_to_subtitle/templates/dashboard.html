@@ -2,8 +2,21 @@
 {% block title %}작업 대시보드 · STT to Subtitle{% endblock %}
 {% block head %}
   <script defer src="{{ url_for('static', path='/media-picker.js') }}"></script>
+  <script defer src="{{ url_for('static', path='/folder-browser.js') }}"></script>
 {% endblock %}
 {% block content %}
+  <div
+    class="folder-loading-overlay"
+    data-folder-loading
+    aria-live="polite"
+    aria-busy="true"
+    hidden
+  >
+    <div class="folder-loading-panel">
+      <span class="loading-spinner" aria-hidden="true"></span>
+      <strong>폴더 내용을 불러오는 중...</strong>
+    </div>
+  </div>
   <h1>자막 작업</h1>
   <p class="muted">NAS가 오디오를 추출하고, Mac 전사 API와 별도 LM Studio PC를 순서대로 호출합니다.</p>
   {% if error %}<p class="alert">{{ error }}</p>{% endif %}
@@ -13,8 +26,19 @@
     <h2>새 작업</h2>
     <form method="post" action="/jobs" class="grid-form">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <input type="hidden" name="return_folder" value="{{ current_folder }}">
       <fieldset class="media-picker wide">
-        <legend>미디어 파일</legend>
+        <legend>미디어 탐색</legend>
+        <nav class="breadcrumbs" aria-label="미디어 폴더 경로">
+          {% for breadcrumb in breadcrumbs %}
+            {% if loop.last %}
+              <span aria-current="page">{{ breadcrumb.name }}</span>
+            {% else %}
+              <a data-folder-link href="/?folder={{ breadcrumb.path|urlencode }}">{{ breadcrumb.name }}</a>
+              <span class="breadcrumb-separator" aria-hidden="true">/</span>
+            {% endif %}
+          {% endfor %}
+        </nav>
         {% if files %}
           <div class="media-toolbar">
             <span><strong data-selection-count>0</strong>개 선택</span>
@@ -23,9 +47,22 @@
               <button type="button" class="secondary compact" data-clear-selection>선택 해제</button>
             </span>
           </div>
+        {% endif %}
+        {% if folders or files %}
           <div class="media-board">
+          {% for folder in folders %}
+              <a class="folder-card" data-folder-link href="/?folder={{ folder.path|urlencode }}">
+                <span class="folder-visual" aria-hidden="true">
+                  <span class="folder-mark">→</span>
+                </span>
+                <span class="folder-card-content">
+                  <strong class="folder-name">{{ folder.name }}</strong>
+                  <span class="folder-summary">폴더 열기</span>
+                </span>
+              </a>
+          {% endfor %}
           {% for file in files %}
-              <label class="media-card">
+              <label class="media-card video-card">
                 <input
                   class="media-card-checkbox"
                   name="source_rels"
@@ -42,7 +79,7 @@
                         loading="lazy"
                       >
                     {% else %}
-                      <span class="poster-placeholder" aria-hidden="true">NFO</span>
+                      <span class="poster-placeholder" aria-hidden="true">포스터 없음</span>
                     {% endif %}
                   </span>
                   <span class="media-card-content">
@@ -58,8 +95,8 @@
                     </span>
                   </span>
                 {% else %}
-                  <span class="folder-glyph" aria-hidden="true">
-                    <span class="folder-film">▶</span>
+                  <span class="video-placeholder" aria-hidden="true">
+                    <span class="video-play">▶</span>
                   </span>
                   <span class="media-card-content">
                     <strong class="media-title">{{ file.name }}</strong>
@@ -76,7 +113,7 @@
           {% endfor %}
           </div>
         {% else %}
-          <p class="empty-state">MEDIA_ROOT에 지원 파일이 없습니다.</p>
+          <p class="empty-state">이 폴더에 하위 폴더나 지원 미디어 파일이 없습니다.</p>
         {% endif %}
       </fieldset>
 

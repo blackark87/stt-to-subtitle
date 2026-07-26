@@ -25,23 +25,28 @@
 {% if job.status == "completed" and job.srt_path %}
   <section class="card result-preview">
     <h2>결과 미리보기</h2>
-    <video class="result-player" controls preload="metadata" playsinline>
-      <source src="{{ url_for('job_video', job_id=job.id) }}">
-      <track
-        kind="subtitles"
-        src="{{ url_for('job_subtitles', job_id=job.id) }}"
-        srclang="ko"
-        label="한국어"
-        default
-      >
+    <video
+      class="result-player"
+      controls
+      preload="metadata"
+      playsinline
+      data-result-player
+      data-video-src="{{ url_for('job_video', job_id=job.id) }}"
+      data-video-type="{{ video_mime_type }}"
+      data-subtitle-src="{{ url_for('job_subtitles', job_id=job.id) }}"
+    >
       이 브라우저는 HTML5 비디오 재생을 지원하지 않습니다.
     </video>
+    <p class="playback-message" data-playback-message role="status" hidden></p>
+    <noscript>
+      <p class="playback-message">결과 미리보기에는 JavaScript가 필요합니다.</p>
+    </noscript>
     <div class="actions">
       <a class="button secondary" href="{{ url_for('job_video', job_id=job.id) }}" download>원본 영상 다운로드</a>
     </div>
     <p class="muted preview-note">
       생성된 <code>.ko.srt</code>를 WebVTT로 변환해 미리보기에 표시합니다.
-      원본 컨테이너와 코덱이 브라우저에서 지원되지 않으면 재생할 수 없습니다.
+      지원하지 않는 MIME 형식은 요청하지 않으며, 코덱 오류가 발생해도 자동 재시도하지 않습니다.
     </p>
   </section>
 {% endif %}

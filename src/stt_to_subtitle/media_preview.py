@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from html import escape
+import mimetypes
 from pathlib import Path
 import re
 
@@ -13,6 +14,21 @@ _SRT_TIMING = re.compile(
     r"\s*-->\s*"
     r"(?P<end>\d+:\d{2}:\d{2})[,.](?P<end_ms>\d{3})"
 )
+MEDIA_TYPE_OVERRIDES = {
+    ".mkv": "video/x-matroska",
+    ".mp4": "video/mp4",
+    ".mov": "video/quicktime",
+    ".webm": "video/webm",
+}
+
+
+def guess_media_type(file_name: str) -> str:
+    suffix = Path(file_name).suffix.lower()
+    return (
+        MEDIA_TYPE_OVERRIDES.get(suffix)
+        or mimetypes.guess_type(file_name)[0]
+        or "application/octet-stream"
+    )
 
 
 def parse_byte_range(
