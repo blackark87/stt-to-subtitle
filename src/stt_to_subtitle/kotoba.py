@@ -4,11 +4,14 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+import importlib
 from pathlib import Path
-from typing import Any, Mapping, Protocol
+from types import MethodType
+from typing import Any, Mapping, Protocol, Sequence
 
 MODEL_ID = "kotoba-tech/kotoba-whisper-v2.2"
 MODEL_REVISION = "9d33482a0eb9b57f1ad80708e8ac5538246d8355"
+TIMESTAMP_POSTPROCESSOR = "stt-to-subtitle/kotoba-speaker-span-v1"
 
 
 @dataclass(frozen=True)
@@ -51,6 +54,190 @@ class TranscriptionOptions:
 
 class SpeechPipeline(Protocol):
     def __call__(self, audio_path: str, **kwargs: Any) -> Mapping[str, Any]: ...
+
+
+def _speaker_group_key(output: Mapping[str, Any]) -> tuple[str, float, float]:
+    speaker = str(output.get("speaker_id", "UNKNOWN"))
+    span = output.get("speaker_span")
+    if not isinstance(span, (list, tuple)) or len(span) != 2:
+        raise ValueError("Kotoba output does not contain a valid speaker span")
+    try:
+        start = float(span[0])
+        end = float(span[1])
+    except (TypeError, ValueError) as error:
+        raise ValueError("Kotoba output contains an invalid speaker span") from error
+    if start < 0 or end < start:
+        raise ValueError("Kotoba output contains an invalid speaker span")
+    return speaker, start, end
+
+
+def _decode_speaker_group(
+    speech_pipeline: Any,
+    model_outputs: Sequence[Mapping[str, Any]],
+    *,
+    speaker: str,
+    span_start: float,
+    span_end: float,
+    return_language: bool,
+    return_timestamps: bool,
+) -> tuple[str, list[dict[str, Any]]]:
+    sampling_rate = float(speech_pipeline.feature_extractor.sampling_rate)
+    if sampling_rate <= 0:
+        raise ValueError("Kotoba feature extractor has an invalid sampling rate")
+
+    prepared_outputs: list[dict[str, Any]] = []
+    for output in model_outputs:
+        prepared = dict(output)
+        stride = prepared.get("stride")
+        if isinstance(stride, (list, tuple)) and len(stride) == 3:
+            prepared["stride"] = tuple(
+                float(value) / sampling_rate for value in stride
+            )
+        prepared_outputs.append(prepared)
+
+    time_precision = (
+        float(speech_pipeline.feature_extractor.chunk_length)
+        / float(speech_pipeline.model.config.max_source_positions)
+    )
+    text, optional = speech_pipeline.tokenizer._decode_asr(
+        prepared_outputs,
+        return_language=return_language,
+        return_timestamps=return_timestamps,
+        time_precision=time_precision,
+    )
+    raw_chunks = optional.get("chunks", []) if isinstance(optional, Mapping) else []
+    corrected: list[dict[str, Any]] = []
+    for raw_chunk in raw_chunks:
+        if not isinstance(raw_chunk, Mapping):
+            continue
+        timestamp = raw_chunk.get("timestamp")
+        if not isinstance(timestamp, (list, tuple)) or len(timestamp) != 2:
+            continue
+        if timestamp[0] is None or timestamp[1] is None:
+            continue
+        relative_start = max(0.0, float(timestamp[0]))
+        relative_end = max(relative_start, float(timestamp[1]))
+        absolute_start = min(span_end, span_start + relative_start)
+        absolute_end = min(span_end, span_start + relative_end)
+        if absolute_end <= absolute_start and span_end > absolute_start:
+            absolute_end = min(span_end, absolute_start + 0.1)
+        corrected.append(
+            {
+                **dict(raw_chunk),
+                "timestamp": [
+                    round(absolute_start, 3),
+                    round(absolute_end, 3),
+                ],
+                "speaker_id": speaker,
+            }
+        )
+    if not corrected and str(text).strip() and span_end > span_start:
+        corrected.append(
+            {
+                "text": str(text).strip(),
+                "timestamp": [round(span_start, 3), round(span_end, 3)],
+                "speaker_id": speaker,
+            }
+        )
+    return str(text), corrected
+
+
+def _load_punctuator(speech_pipeline: Any) -> Any:
+    punctuator = getattr(speech_pipeline, "punctuator", None)
+    if punctuator is not None:
+        return punctuator
+    module = importlib.import_module(type(speech_pipeline).__module__)
+    factory = getattr(module, "Punctuator", None)
+    if not callable(factory):
+        raise RuntimeError("Kotoba punctuation model is unavailable")
+    punctuator = factory()
+    speech_pipeline.punctuator = punctuator
+    return punctuator
+
+
+def corrected_kotoba_postprocess(
+    speech_pipeline: Any,
+    model_outputs: Sequence[Mapping[str, Any]],
+    **postprocess_parameters: Any,
+) -> Mapping[str, Any]:
+    """Stitch each speaker turn once and preserve decoded start/end timestamps."""
+    grouped: dict[
+        tuple[str, float, float],
+        list[Mapping[str, Any]],
+    ] = {}
+    for output in model_outputs:
+        if not isinstance(output, Mapping):
+            continue
+        grouped.setdefault(_speaker_group_key(output), []).append(output)
+
+    output_chunks: list[dict[str, Any]] = []
+    speaker_texts: dict[str, list[tuple[float, str]]] = {}
+    return_language = bool(postprocess_parameters.get("return_language", False))
+    return_timestamps = bool(
+        postprocess_parameters.get("return_timestamps", True)
+    )
+    for (speaker, span_start, span_end), group in grouped.items():
+        text, chunks = _decode_speaker_group(
+            speech_pipeline,
+            group,
+            speaker=speaker,
+            span_start=span_start,
+            span_end=span_end,
+            return_language=return_language,
+            return_timestamps=return_timestamps,
+        )
+        output_chunks.extend(chunks)
+        if text.strip():
+            speaker_texts.setdefault(speaker, []).append((span_start, text))
+
+    output_chunks.sort(
+        key=lambda item: (
+            float(item["timestamp"][0]),
+            float(item["timestamp"][1]),
+            str(item["speaker_id"]),
+        )
+    )
+    speaker_ids = sorted(
+        {
+            str(chunk["speaker_id"])
+            for chunk in output_chunks
+        }
+        | set(speaker_texts)
+    )
+    result: dict[str, Any] = {
+        "chunks": output_chunks,
+        "speaker_ids": speaker_ids,
+        "timestamp_postprocessor": TIMESTAMP_POSTPROCESSOR,
+    }
+    add_punctuation = bool(
+        postprocess_parameters.get("add_punctuation", False)
+    )
+    punctuator = _load_punctuator(speech_pipeline) if add_punctuation else None
+    for speaker in speaker_ids:
+        chunks = [
+            chunk
+            for chunk in output_chunks
+            if str(chunk["speaker_id"]) == speaker
+        ]
+        result[f"chunks/{speaker}"] = chunks
+        joined = "".join(
+            text
+            for _start, text in sorted(speaker_texts.get(speaker, []))
+        )
+        result[f"text/{speaker}"] = (
+            punctuator.punctuate(joined)
+            if punctuator is not None and joined
+            else joined
+        )
+    return result
+
+
+def install_corrected_kotoba_postprocess(speech_pipeline: Any) -> None:
+    """Override the pinned remote postprocessor without editing model caches."""
+    speech_pipeline.postprocess = MethodType(
+        corrected_kotoba_postprocess,
+        speech_pipeline,
+    )
 
 
 @dataclass(frozen=True)
@@ -217,7 +404,9 @@ def load_pipeline(
     if diarization_device is not None:
         pipeline_options["device_pyannote"] = diarization_device
 
-    return pipeline(**pipeline_options)
+    speech_pipeline = pipeline(**pipeline_options)
+    install_corrected_kotoba_postprocess(speech_pipeline)
+    return speech_pipeline
 
 
 def run_pipeline(

@@ -134,6 +134,7 @@ class NASAppTests(unittest.TestCase):
                 create_app(self.settings(root, media_root))
             ) as client:
                 service = client.app.state.orchestrator
+                service.stop()
                 job = service.create_job(
                     "movie.mp4",
                     force_overwrite=True,
@@ -194,6 +195,7 @@ class NASAppTests(unittest.TestCase):
                 create_app(self.settings(root, media_root))
             ) as client:
                 service = client.app.state.orchestrator
+                service.stop()
                 job = service.create_job(
                     "movie.mp4",
                     force_overwrite=True,
@@ -273,6 +275,11 @@ class NASAppTests(unittest.TestCase):
                     },
                     follow_redirects=False,
                 )
+                captions = client.get(f"/jobs/{job.id}/subtitles.vtt")
+                styled_subtitle = client.get(
+                    f"/jobs/{job.id}/subtitle.ass"
+                )
+                refreshed_page = client.get(f"/jobs/{job.id}")
 
             self.assertIn("20", page.text)
             self.assertIn("21 생성", page.text)
@@ -284,6 +291,14 @@ class NASAppTests(unittest.TestCase):
             self.assertEqual(invalid.status_code, 400)
             self.assertIn("JSON syntax error", invalid.text)
             self.assertEqual(saved.status_code, 303)
+            self.assertIn(
+                "<c.speaker-1><b>화자 1:</b>",
+                captions.text,
+            )
+            self.assertEqual(styled_subtitle.status_code, 200)
+            self.assertIn("text/x-ssa", styled_subtitle.headers["content-type"])
+            self.assertIn("[V4+ Styles]", styled_subtitle.text)
+            self.assertIn("스타일 ASS 다운로드", refreshed_page.text)
             self.assertIn(
                 "수정된 번역",
                 (media_root / "movie.ko.srt").read_text(encoding="utf-8"),

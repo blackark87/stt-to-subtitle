@@ -14,7 +14,7 @@
   </div>
 
   {% if error %}<p class="alert" role="alert">{{ error }}</p>{% endif %}
-  {% if saved %}<p class="notice" role="status">저장했으며, 가능한 경우 SRT도 다시 생성했습니다.</p>{% endif %}
+  {% if saved %}<p class="notice" role="status">저장했으며, 가능한 경우 SRT와 ASS도 다시 생성했습니다.</p>{% endif %}
 
   <form
     method="post"
@@ -47,7 +47,7 @@
   </form>
 
   <p class="muted editor-note">
-    저장은 원자적으로 처리됩니다. 전사와 번역 JSON이 모두 유효하면 한국어 SRT를 즉시 다시 생성합니다.
+    저장은 원자적으로 처리됩니다. 전사와 번역 JSON이 모두 유효하면 한국어 SRT와 ASS를 즉시 다시 생성합니다.
     완료·중단·실패 상태의 작업만 편집할 수 있습니다.
   </p>
 {% endblock %}

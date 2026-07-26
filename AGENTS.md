@@ -6,7 +6,7 @@ Application code lives in `src/stt_to_subtitle/`. `audio.py` builds and runs FFm
 
 ## Architecture & Data Flow
 
-Maintain explicit boundaries between audio extraction, speech transcription, transcript normalization, translation, and subtitle rendering. The Mac transcription API runs natively with Whisper on MPS and Pyannote on CPU. The NAS Docker service orchestrates files, transcription, LM Studio translation, and subtitle rendering without running the ML models locally. Provider or model integrations should not leak credentials into output metadata.
+Maintain explicit boundaries between audio extraction, speech transcription, transcript normalization, translation, and subtitle rendering. The Mac transcription API runs natively with Whisper on MPS and Pyannote on CPU. Correct model-relative timestamps at the Mac transcript-normalization boundary; do not defer known model timestamp defects to translation. Subtitle rendering must preserve real cross-speaker overlap, replace overlapping lines from the same speaker, and emit both compatible SRT and styled ASS without changing translation IDs. The NAS Docker service orchestrates files, transcription, LM Studio translation, and subtitle rendering without running the ML models locally. Provider or model integrations should not leak credentials into output metadata.
 
 ## Build, Test, and Development Commands
 
@@ -33,3 +33,20 @@ Always communicate in Korean with a professional, precise expert tone.
 ## Commit & Pull Request Guidelines
 
 Use concise, imperative commit subjects, optionally prefixed with `feat:`, `fix:`, or `docs:`. Pull requests must describe the affected pipeline stage, validation results, operational constraints, and any output-format changes. Link relevant issues and include small, sanitized examples when useful.
+
+Every new pull request must update the project version in `pyproject.toml`
+exactly once and list both the version change and resulting GHCR tag in the PR
+description. Follow Semantic Versioning:
+
+- increment `MAJOR` for backward-incompatible API, configuration, storage, or
+  output-format changes that require migration;
+- increment `MINOR` for backward-compatible features;
+- increment `PATCH` for backward-compatible fixes, documentation, dependency,
+  CI, or operational changes.
+
+Select the next unused version relative to the latest `main` and existing
+release tags. Do not increment the version again for follow-up commits on the
+same PR unless the PR's compatibility scope changes. The GHCR workflow must
+publish `ghcr.io/blackark87/stt-to-subtitle:nas-X.Y.Z` from the
+`pyproject.toml` version while retaining moving and immutable traceability tags
+such as `nas-latest` and the full commit SHA.

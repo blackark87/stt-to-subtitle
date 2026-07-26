@@ -8,7 +8,9 @@ from stt_to_subtitle.kotoba import (
     ChunkProgress,
     MODEL_ID,
     MODEL_REVISION,
+    TIMESTAMP_POSTPROCESSOR,
     TranscriptionOptions,
+    corrected_kotoba_postprocess,
     load_pipeline,
     normalize_segments,
     run_pipeline,
@@ -18,6 +20,132 @@ from stt_to_subtitle.kotoba import (
 
 
 class NormalizeSegmentsTests(unittest.TestCase):
+    def test_corrected_postprocess_preserves_decoded_end_timestamp(self) -> None:
+        class FakeTokenizer:
+            def __init__(self) -> None:
+                self.received_outputs = []
+
+            def _decode_asr(self, outputs, **_kwargs):
+                self.received_outputs.append(outputs)
+                return (
+                    "発話",
+                    {
+                        "chunks": [
+                            {
+                                "text": "発話",
+                                "timestamp": [5.8, 7.1],
+                            }
+                        ]
+                    },
+                )
+
+        tokenizer = FakeTokenizer()
+        speech_pipeline = SimpleNamespace(
+            tokenizer=tokenizer,
+            feature_extractor=SimpleNamespace(
+                sampling_rate=16_000,
+                chunk_length=30,
+            ),
+            model=SimpleNamespace(
+                config=SimpleNamespace(max_source_positions=1500)
+            ),
+            punctuator=None,
+        )
+
+        result = corrected_kotoba_postprocess(
+            speech_pipeline,
+            [
+                {
+                    "speaker_id": "SPEAKER_00",
+                    "speaker_span": [0.0, 55.0],
+                    "stride": (240_000, 0, 40_000),
+                    "tokens": [1],
+                },
+                {
+                    "speaker_id": "SPEAKER_00",
+                    "speaker_span": [0.0, 55.0],
+                    "stride": (240_000, 40_000, 0),
+                    "tokens": [2],
+                },
+            ],
+            return_timestamps=True,
+            return_language=False,
+            add_punctuation=False,
+        )
+
+        self.assertEqual(
+            result["chunks"][0]["timestamp"],
+            [5.8, 7.1],
+        )
+        self.assertNotEqual(result["chunks"][0]["timestamp"][1], 55.0)
+        self.assertEqual(
+            result["timestamp_postprocessor"],
+            TIMESTAMP_POSTPROCESSOR,
+        )
+        self.assertEqual(len(tokenizer.received_outputs[0]), 2)
+        self.assertEqual(
+            tokenizer.received_outputs[0][0]["stride"],
+            (15.0, 0.0, 2.5),
+        )
+
+    def test_corrected_postprocess_keeps_cross_speaker_overlap(self) -> None:
+        class FakeTokenizer:
+            def _decode_asr(self, outputs, **_kwargs):
+                speaker = outputs[0]["speaker_id"]
+                return (
+                    speaker,
+                    {
+                        "chunks": [
+                            {
+                                "text": speaker,
+                                "timestamp": [0.2, 1.1],
+                            }
+                        ]
+                    },
+                )
+
+        speech_pipeline = SimpleNamespace(
+            tokenizer=FakeTokenizer(),
+            feature_extractor=SimpleNamespace(
+                sampling_rate=16_000,
+                chunk_length=30,
+            ),
+            model=SimpleNamespace(
+                config=SimpleNamespace(max_source_positions=1500)
+            ),
+            punctuator=None,
+        )
+
+        result = corrected_kotoba_postprocess(
+            speech_pipeline,
+            [
+                {
+                    "speaker_id": "SPEAKER_00",
+                    "speaker_span": [10.0, 20.0],
+                    "tokens": [1],
+                },
+                {
+                    "speaker_id": "SPEAKER_01",
+                    "speaker_span": [10.5, 13.0],
+                    "tokens": [2],
+                },
+            ],
+            return_timestamps=True,
+            return_language=False,
+            add_punctuation=False,
+        )
+
+        self.assertEqual(
+            [
+                (chunk["speaker_id"], chunk["timestamp"])
+                for chunk in result["chunks"]
+            ],
+            [
+                ("SPEAKER_00", [10.2, 11.1]),
+                ("SPEAKER_01", [10.7, 11.6]),
+            ],
+        )
+
     def test_sorts_segments_and_applies_source_offset(self) -> None:
         result = {
             "chunks": [

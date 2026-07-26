@@ -335,6 +335,12 @@ class TranscriptionService:
                     "id": MODEL_ID,
                     "revision": MODEL_REVISION,
                 },
+                "timing": {
+                    "postprocessor": raw_result.get(
+                        "timestamp_postprocessor",
+                        "model-default",
+                    ),
+                },
                 "runtime": {
                     "device": self.settings.device,
                     "diarization_device": self.settings.diarization_device,

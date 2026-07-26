@@ -272,7 +272,8 @@ class MediaLibrary:
 
     def _describe_media(self, path: Path) -> dict[str, object]:
         relative = path.relative_to(self.root).as_posix()
-        subtitle = path.with_name(f"{path.stem}.ko.srt")
+        srt_subtitle = path.with_name(f"{path.stem}.ko.srt")
+        ass_subtitle = path.with_name(f"{path.stem}.ko.ass")
         nfo_path = self._find_nfo(path)
         title: str | None = None
         poster_path: str | None = None
@@ -287,7 +288,7 @@ class MediaLibrary:
             "name": path.name,
             "directory": "" if relative_parent == "." else relative_parent,
             "size": path.stat().st_size,
-            "has_subtitle": subtitle.is_file(),
+            "has_subtitle": srt_subtitle.is_file() or ass_subtitle.is_file(),
             "has_nfo": nfo_path is not None,
             "title": title or path.stem,
             "poster_path": poster_path,

@@ -30,6 +30,7 @@ class NASJob:
     transcript_path: str | None
     translation_path: str | None
     srt_path: str | None
+    ass_path: str | None
     blocked_stage: str | None
     error: str | None
     chunks_created: int
@@ -52,6 +53,7 @@ class NASStore:
         "transcript_path",
         "translation_path",
         "srt_path",
+        "ass_path",
         "blocked_stage",
         "error",
         "chunks_created",
@@ -86,6 +88,7 @@ class NASStore:
                     transcript_path TEXT,
                     translation_path TEXT,
                     srt_path TEXT,
+                    ass_path TEXT,
                     blocked_stage TEXT,
                     error TEXT,
                     chunks_created INTEGER NOT NULL DEFAULT 0,
@@ -127,6 +130,7 @@ class NASStore:
                     "ALTER TABLE jobs ADD COLUMN "
                     "chunk_progress_every INTEGER NOT NULL DEFAULT 10"
                 ),
+                "ass_path": "ALTER TABLE jobs ADD COLUMN ass_path TEXT",
             }
             for column, statement in migrations.items():
                 if column not in columns:
@@ -154,6 +158,7 @@ class NASStore:
                 str(row["translation_path"]) if row["translation_path"] else None
             ),
             srt_path=str(row["srt_path"]) if row["srt_path"] else None,
+            ass_path=str(row["ass_path"]) if row["ass_path"] else None,
             blocked_stage=(
                 str(row["blocked_stage"]) if row["blocked_stage"] else None
             ),
