@@ -8,6 +8,25 @@ from stt_to_subtitle.orchestrator import NASOrchestrator
 
 
 class NASOrchestratorTests(unittest.TestCase):
+    def make_orchestrator(
+        self,
+        root: Path,
+        media_root: Path,
+    ) -> NASOrchestrator:
+        return NASOrchestrator(
+            NASSettings(
+                state_dir=root / "state",
+                media_root=media_root,
+                admin_password="admin-password",
+                session_secret="a" * 32,
+                stt_base_url="http://stt.test",
+                stt_token="stt-token",
+                lm_base_url="http://lm.test/v1",
+                lm_token="lm-token",
+                lm_model="model",
+            )
+        )
+
     def test_zero_duration_means_process_to_end(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -37,6 +56,56 @@ class NASOrchestratorTests(unittest.TestCase):
                 orchestrator.stop()
 
             self.assertIsNone(job.options["duration_seconds"])
+
+    def test_creates_one_job_for_each_selected_media_file(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            (media_root / "one.mkv").write_bytes(b"media")
+            (media_root / "two.mp4").write_bytes(b"media")
+            orchestrator = self.make_orchestrator(root, media_root)
+            try:
+                jobs = orchestrator.create_jobs(
+                    ["one.mkv", "two.mp4", "one.mkv"],
+                    force_overwrite=False,
+                    options={"duration_seconds": "0"},
+                )
+            finally:
+                orchestrator.stop()
+
+            self.assertEqual(
+                [job.source_rel for job in jobs],
+                ["one.mkv", "two.mp4"],
+            )
+            self.assertTrue(
+                all(job.options["duration_seconds"] is None for job in jobs)
+            )
+
+    def test_batch_is_prevalidated_before_creating_any_job(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            (media_root / "one.mkv").write_bytes(b"media")
+            (media_root / "two.mp4").write_bytes(b"media")
+            (media_root / "two.ko.srt").write_text(
+                "existing",
+                encoding="utf-8",
+            )
+            orchestrator = self.make_orchestrator(root, media_root)
+            try:
+                with self.assertRaises(FileExistsError):
+                    orchestrator.create_jobs(
+                        ["one.mkv", "two.mp4"],
+                        force_overwrite=False,
+                        options={},
+                    )
+                jobs = orchestrator.store.list_jobs()
+            finally:
+                orchestrator.stop()
+
+            self.assertEqual(jobs, [])
 
     def test_transcription_translation_and_rendering_keep_service_boundaries(
         self,

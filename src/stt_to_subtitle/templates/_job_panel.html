@@ -1,4 +1,7 @@
-<section class="card">
+<section
+  class="card"
+  {% if job.status in ["completed", "blocked", "failed"] %}data-poll-stop{% endif %}
+>
   <dl class="details">
     <dt>상태</dt><dd><span class="status status-{{ job.status }}">{{ job.status }}</span></dd>
     <dt>작업 ID</dt><dd><code>{{ job.id }}</code></dd>
@@ -19,6 +22,29 @@
     {% endif %}
   </div>
 </section>
+{% if job.status == "completed" and job.srt_path %}
+  <section class="card result-preview">
+    <h2>결과 미리보기</h2>
+    <video class="result-player" controls preload="metadata" playsinline>
+      <source src="{{ url_for('job_video', job_id=job.id) }}">
+      <track
+        kind="subtitles"
+        src="{{ url_for('job_subtitles', job_id=job.id) }}"
+        srclang="ko"
+        label="한국어"
+        default
+      >
+      이 브라우저는 HTML5 비디오 재생을 지원하지 않습니다.
+    </video>
+    <div class="actions">
+      <a class="button secondary" href="{{ url_for('job_video', job_id=job.id) }}" download>원본 영상 다운로드</a>
+    </div>
+    <p class="muted preview-note">
+      생성된 <code>.ko.srt</code>를 WebVTT로 변환해 미리보기에 표시합니다.
+      원본 컨테이너와 코덱이 브라우저에서 지원되지 않으면 재생할 수 없습니다.
+    </p>
+  </section>
+{% endif %}
 <section class="card">
   <h2>진행 로그</h2>
   <ol class="events">
