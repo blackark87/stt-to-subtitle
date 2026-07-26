@@ -86,9 +86,6 @@
                     <span class="metadata-label">NFO</span>
                     <strong class="media-title">{{ file.title }}</strong>
                     <span class="media-filename" title="{{ file.name }}">{{ file.name }}</span>
-                    {% if file.directory %}
-                      <span class="media-directory" title="{{ file.directory }}">{{ file.directory }}</span>
-                    {% endif %}
                     <span class="media-size">{{ file.size|filesize }}</span>
                     <span class="media-duration">재생시간 {{ file.duration_seconds|duration }}</span>
                     <span class="subtitle-state {% if file.has_subtitle %}is-done{% else %}is-pending{% endif %}">
@@ -101,9 +98,6 @@
                   </span>
                   <span class="media-card-content">
                     <strong class="media-title">{{ file.name }}</strong>
-                    {% if file.directory %}
-                      <span class="media-directory" title="{{ file.directory }}">{{ file.directory }}</span>
-                    {% endif %}
                     <span class="media-size">{{ file.size|filesize }}</span>
                     <span class="media-duration">재생시간 {{ file.duration_seconds|duration }}</span>
                     <span class="subtitle-state {% if file.has_subtitle %}is-done{% else %}is-pending{% endif %}">

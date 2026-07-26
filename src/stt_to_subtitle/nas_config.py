@@ -337,11 +337,9 @@ class MediaLibrary:
             poster = self._find_poster(path, nfo_path, poster_references)
             if poster is not None:
                 poster_path = poster.relative_to(self.root).as_posix()
-        relative_parent = path.relative_to(self.root).parent.as_posix()
         return {
             "path": relative,
             "name": path.name,
-            "directory": "" if relative_parent == "." else relative_parent,
             "size": file_stat.st_size,
             "duration_seconds": self._media_duration(path, file_stat),
             "has_subtitle": srt_subtitle.is_file() or ass_subtitle.is_file(),

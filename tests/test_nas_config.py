@@ -180,6 +180,7 @@ class MediaLibraryTests(unittest.TestCase):
             self.assertTrue(files[0]["has_subtitle"])
             self.assertFalse(files[0]["has_nfo"])
             self.assertIsNone(files[0]["poster_path"])
+            self.assertNotIn("directory", files[0])
 
     def test_ass_file_alone_marks_media_as_subtitled(self) -> None:
         with TemporaryDirectory() as directory:
