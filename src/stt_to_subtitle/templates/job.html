@@ -1,6 +1,7 @@
 {% extends "base.html" %}
 {% block title %}{{ job.source_rel }} · STT to Subtitle{% endblock %}
 {% block head %}
+  <script defer src="{{ url_for('static', path='/vr180-player.js') }}"></script>
   <script defer src="{{ url_for('static', path='/player.js') }}"></script>
 {% endblock %}
 {% block content %}

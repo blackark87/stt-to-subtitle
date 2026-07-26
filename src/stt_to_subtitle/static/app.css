@@ -221,7 +221,23 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 .option-checks { display: flex; align-items: flex-start; gap: 12px 28px; flex-wrap: wrap; }
 .submit-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
 .submit-row .muted { font-size: .88rem; }
-.result-player { display: block; width: 100%; max-height: 70vh; border-radius: 9px; background: #000; }
+.result-player-shell { display: grid; gap: 10px; }
+.player-mode-toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.player-mode-toolbar > span { margin-right: 2px; color: var(--muted); font-size: .88rem; font-weight: 700; }
+.player-mode-toolbar button[aria-pressed="true"],
+.vr180-eye-controls button[aria-pressed="true"] {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 15%, var(--card));
+  color: var(--accent);
+}
+.result-player-stage { position: relative; min-width: 0; overflow: hidden; border-radius: 9px; background: #000; }
+.result-player-stage.is-vr180 { width: 100%; max-height: 70vh; aspect-ratio: 16 / 9; }
+.result-player { display: block; width: 100%; max-height: 70vh; background: #000; }
+.result-player[hidden],
+.vr180-canvas[hidden],
+.vr180-controls[hidden],
+.vr180-subtitles[hidden],
+.vr180-hint[hidden] { display: none; }
 .result-player::cue {
   color: #fff;
   background: rgb(0 0 0 / 78%);
@@ -237,6 +253,97 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 .result-player::cue(.speaker-6) { color: #fdba74; }
 .result-player::cue(.speaker-7) { color: #93c5fd; }
 .result-player::cue(.speaker-8) { color: #fca5a5; }
+.vr180-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  outline: none;
+  background: #000;
+  cursor: grab;
+  touch-action: none;
+}
+.vr180-canvas.is-dragging { cursor: grabbing; }
+.vr180-canvas:focus-visible { box-shadow: inset 0 0 0 3px var(--accent); }
+.vr180-subtitles {
+  position: absolute;
+  z-index: 2;
+  right: 5%;
+  bottom: 7%;
+  left: 5%;
+  display: grid;
+  justify-items: center;
+  gap: .25rem;
+  pointer-events: none;
+  text-align: center;
+}
+.vr180-subtitle-line {
+  max-width: min(90%, 920px);
+  border-radius: .2rem;
+  padding: .08em .38em;
+  background: rgb(0 0 0 / 78%);
+  color: #fff;
+  font-family: "Noto Sans CJK KR", "Apple SD Gothic Neo", sans-serif;
+  font-size: clamp(1rem, 2.5vw, 2rem);
+  font-weight: 650;
+  line-height: 1.35;
+  text-shadow: 0 1px 2px #000, 0 0 4px #000;
+  white-space: pre-line;
+}
+.vr180-subtitle-line .speaker-1 { color: #67e8f9; }
+.vr180-subtitle-line .speaker-2 { color: #fde047; }
+.vr180-subtitle-line .speaker-3 { color: #f9a8d4; }
+.vr180-subtitle-line .speaker-4 { color: #86efac; }
+.vr180-subtitle-line .speaker-5 { color: #c4b5fd; }
+.vr180-subtitle-line .speaker-6 { color: #fdba74; }
+.vr180-subtitle-line .speaker-7 { color: #93c5fd; }
+.vr180-subtitle-line .speaker-8 { color: #fca5a5; }
+.vr180-hint {
+  position: absolute;
+  z-index: 2;
+  top: 10px;
+  left: 10px;
+  margin: 0;
+  border-radius: 5px;
+  padding: 5px 8px;
+  background: rgb(0 0 0 / 64%);
+  color: #fff;
+  font-size: .78rem;
+  pointer-events: none;
+}
+.vr180-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+.vr180-controls output { min-width: 7.5rem; color: var(--muted); font-variant-numeric: tabular-nums; font-size: .84rem; }
+.vr180-seek { min-width: 180px; padding: 0; flex: 1 1 280px; accent-color: var(--accent); }
+.vr180-eye-controls { display: inline-flex; gap: 4px; }
+.result-player-shell:fullscreen {
+  grid-template-rows: auto minmax(0, 1fr) auto auto;
+  width: 100vw;
+  height: 100vh;
+  padding: 14px;
+  background: #000;
+  color: #fff;
+}
+.result-player-shell:fullscreen .result-player-stage {
+  display: grid;
+  place-items: center;
+  width: 100%;
+  height: 100%;
+  max-height: none;
+  aspect-ratio: auto;
+  border-radius: 0;
+  background: #000;
+}
+.result-player-shell:fullscreen .player-mode-toolbar > span,
+.result-player-shell:fullscreen .vr180-controls output { color: #d0d5dd; }
+.result-player-shell:fullscreen button.secondary { border-color: #667085; color: #fff; }
+.result-player-shell:fullscreen .vr180-canvas { position: absolute; inset: 0; }
+.result-player-shell:fullscreen .vr180-subtitles { bottom: 8%; }
+.result-player-shell:fullscreen .vr180-hint { top: 18px; left: 18px; }
 .playback-message { border-left: 4px solid var(--danger); background: color-mix(in srgb, var(--danger) 10%, transparent); padding: 10px 12px; }
 .preview-note { margin-bottom: 0; font-size: .88rem; }
 .table-scroll { overflow-x: auto; }

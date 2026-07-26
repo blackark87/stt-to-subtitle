@@ -50,19 +50,85 @@
 {% if job.status == "completed" and job.srt_path %}
   <section class="card result-preview">
     <h2>결과 미리보기</h2>
-    <video
-      class="result-player"
-      controls
-      preload="metadata"
-      playsinline
-      data-result-player
-      data-video-src="{{ url_for('job_video', job_id=job.id) }}"
-      data-video-type="{{ video_mime_type }}"
-      data-subtitle-src="{{ url_for('job_subtitles', job_id=job.id) }}"
-    >
-      이 브라우저는 HTML5 비디오 재생을 지원하지 않습니다.
-    </video>
-    <p class="playback-message" data-playback-message role="status" hidden></p>
+    <div class="result-player-shell" data-result-player-shell>
+      <div class="player-mode-toolbar" aria-label="미리보기 방식">
+        <span>보기 방식</span>
+        <button
+          type="button"
+          class="secondary compact"
+          data-player-mode="flat"
+          aria-pressed="true"
+        >일반</button>
+        <button
+          type="button"
+          class="secondary compact"
+          data-player-mode="vr180"
+          aria-pressed="false"
+        >VR 180 SBS</button>
+      </div>
+      <div class="result-player-stage" data-result-player-stage>
+        <video
+          class="result-player"
+          controls
+          preload="metadata"
+          playsinline
+          data-result-player
+          data-video-src="{{ url_for('job_video', job_id=job.id) }}"
+          data-video-type="{{ video_mime_type }}"
+          data-subtitle-src="{{ url_for('job_subtitles', job_id=job.id) }}"
+        >
+          이 브라우저는 HTML5 비디오 재생을 지원하지 않습니다.
+        </video>
+        <canvas
+          class="vr180-canvas"
+          data-vr180-canvas
+          tabindex="0"
+          aria-label="VR 180 영상. 드래그하거나 방향키로 시점을 이동할 수 있습니다."
+          hidden
+        ></canvas>
+        <div
+          class="vr180-subtitles"
+          data-vr180-subtitles
+          aria-live="off"
+          hidden
+        ></div>
+        <p class="vr180-hint" data-vr180-hint hidden>
+          드래그·방향키: 시점 이동 · 휠: 확대/축소
+        </p>
+      </div>
+      <div class="vr180-controls" data-vr180-controls hidden>
+        <button type="button" class="compact" data-vr-play>재생</button>
+        <input
+          type="range"
+          class="vr180-seek"
+          data-vr-seek
+          min="0"
+          max="0"
+          value="0"
+          step="0.1"
+          aria-label="재생 위치"
+        >
+        <output data-vr-time>0:00 / 0:00</output>
+        <button type="button" class="secondary compact" data-vr-mute>음소거</button>
+        <span class="vr180-eye-controls" aria-label="미리보기 눈 선택">
+          <button
+            type="button"
+            class="secondary compact"
+            data-vr-eye="left"
+            aria-pressed="true"
+          >좌안</button>
+          <button
+            type="button"
+            class="secondary compact"
+            data-vr-eye="right"
+            aria-pressed="false"
+          >우안</button>
+        </span>
+        <button type="button" class="secondary compact" data-vr-reset>정면</button>
+        <button type="button" class="secondary compact" data-vr-fullscreen>전체 화면</button>
+      </div>
+      <p class="playback-message" data-playback-message role="status" hidden></p>
+    </div>
     <noscript>
       <p class="playback-message">결과 미리보기에는 JavaScript가 필요합니다.</p>
     </noscript>
@@ -77,6 +143,8 @@
       전사·번역 결과를 화자별 색상 WebVTT로 렌더링해 미리보기에 표시합니다.
       실제 동시 발화는 한 cue의 여러 줄로 표시되며, 외부 플레이어에서는
       <code>.ko.ass</code>가 색상과 글꼴을 가장 안정적으로 보존합니다.
+      VR 180 SBS 모드는 좌·우 영상을 선택해 180도 반구로 펼치며,
+      마우스·터치 또는 키보드로 시점을 조작할 수 있습니다.
       지원하지 않는 MIME 형식은 요청하지 않으며, 코덱 오류가 발생해도 자동 재시도하지 않습니다.
     </p>
   </section>
