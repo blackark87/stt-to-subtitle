@@ -108,6 +108,27 @@ class NASOrchestratorTests(unittest.TestCase):
 
             self.assertEqual(jobs, [])
 
+    def test_batch_is_rejected_when_styled_subtitle_exists(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            (media_root / "movie.mkv").write_bytes(b"media")
+            (media_root / "movie.ko.ass").write_text(
+                "existing",
+                encoding="utf-8",
+            )
+            orchestrator = self.make_orchestrator(root, media_root)
+            try:
+                with self.assertRaises(FileExistsError):
+                    orchestrator.create_job(
+                        "movie.mkv",
+                        force_overwrite=False,
+                        options={},
+                    )
+            finally:
+                orchestrator.stop()
+
     def test_transcription_translation_and_rendering_keep_service_boundaries(
         self,
     ) -> None:
@@ -204,6 +225,15 @@ class NASOrchestratorTests(unittest.TestCase):
                 Path(completed_job.translation_path).name,
                 "movie_result_ko.json",
             )
+            self.assertEqual(
+                Path(completed_job.ass_path).name,
+                "movie.ko.ass",
+            )
+            styled = source.with_name("movie.ko.ass").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("[V4+ Styles]", styled)
+            self.assertIn("화자 1:", styled)
 
     def test_editing_translation_json_regenerates_the_srt(self) -> None:
         with TemporaryDirectory() as directory:
@@ -287,4 +317,8 @@ class NASOrchestratorTests(unittest.TestCase):
             self.assertIn(
                 "수정된 번역",
                 (media_root / "movie.ko.srt").read_text(encoding="utf-8"),
+            )
+            self.assertIn(
+                "수정된 번역",
+                (media_root / "movie.ko.ass").read_text(encoding="utf-8"),
             )

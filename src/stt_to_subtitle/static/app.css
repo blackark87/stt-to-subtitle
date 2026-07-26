@@ -222,6 +222,21 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 .submit-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
 .submit-row .muted { font-size: .88rem; }
 .result-player { display: block; width: 100%; max-height: 70vh; border-radius: 9px; background: #000; }
+.result-player::cue {
+  color: #fff;
+  background: rgb(0 0 0 / 78%);
+  font-family: "Noto Sans CJK KR", "Apple SD Gothic Neo", sans-serif;
+  font-weight: 650;
+  text-shadow: 0 1px 2px #000, 0 0 4px #000;
+}
+.result-player::cue(.speaker-1) { color: #67e8f9; }
+.result-player::cue(.speaker-2) { color: #fde047; }
+.result-player::cue(.speaker-3) { color: #f9a8d4; }
+.result-player::cue(.speaker-4) { color: #86efac; }
+.result-player::cue(.speaker-5) { color: #c4b5fd; }
+.result-player::cue(.speaker-6) { color: #fdba74; }
+.result-player::cue(.speaker-7) { color: #93c5fd; }
+.result-player::cue(.speaker-8) { color: #fca5a5; }
 .playback-message { border-left: 4px solid var(--danger); background: color-mix(in srgb, var(--danger) 10%, transparent); padding: 10px 12px; }
 .preview-note { margin-bottom: 0; font-size: .88rem; }
 .table-scroll { overflow-x: auto; }

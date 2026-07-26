@@ -22,7 +22,7 @@ from .kotoba import TranscriptionOptions
 from .nas_config import MediaLibrary, NASSettings
 from .nas_store import NASJob, NASStore
 from .service_clients import ExternalServiceError, LMStudioClient, STTAPIClient
-from .subtitle import write_srt_atomic
+from .subtitle import write_styled_subtitles_atomic
 
 LOGGER = logging.getLogger(__name__)
 MAX_EDITABLE_JSON_BYTES = 20 * 1024 * 1024
@@ -120,10 +120,17 @@ class NASOrchestrator:
         normalized_options = self._normalize_options(options)
         for source_rel in unique_source_rels:
             source = self.library.resolve_file(source_rel)
-            subtitle = source.with_name(f"{source.stem}.ko.srt")
-            if subtitle.exists() and not force_overwrite:
+            existing_subtitles = [
+                path
+                for path in (
+                    source.with_name(f"{source.stem}.ko.srt"),
+                    source.with_name(f"{source.stem}.ko.ass"),
+                )
+                if path.exists()
+            ]
+            if existing_subtitles and not force_overwrite:
                 raise FileExistsError(
-                    f"{source_rel}: 기존 .ko.srt가 있습니다. "
+                    f"{source_rel}: 기존 한국어 자막 파일이 있습니다. "
                     "덮어쓰기를 명시적으로 선택하세요."
                 )
 
@@ -340,7 +347,11 @@ class NASOrchestrator:
         ):
             self._render_artifacts(
                 refreshed,
-                overwrite=refreshed.force_overwrite or bool(refreshed.srt_path),
+                overwrite=(
+                    refreshed.force_overwrite
+                    or bool(refreshed.srt_path)
+                    or bool(refreshed.ass_path)
+                ),
             )
             self.store.add_event(
                 job.id,
@@ -647,12 +658,18 @@ class NASOrchestrator:
     def _render(self, job: NASJob) -> None:
         self._render_artifacts(job, overwrite=job.force_overwrite)
         refreshed = self.store.get(job.id)
-        if refreshed is None or not refreshed.srt_path:
+        if (
+            refreshed is None
+            or not refreshed.srt_path
+            or not refreshed.ass_path
+        ):
             raise RuntimeError("rendered subtitle job could not be read")
         self.store.add_event(
             job.id,
             "info",
-            f"subtitle written: {Path(refreshed.srt_path).name}",
+            "subtitles written: "
+            f"{Path(refreshed.srt_path).name}, "
+            f"{Path(refreshed.ass_path).name}",
         )
 
     def _render_artifacts(
@@ -680,16 +697,27 @@ class NASOrchestrator:
         )
         source = self.library.resolve_file(job.source_rel)
         srt_path = source.with_name(f"{source.stem}.ko.srt")
-        write_srt_atomic(
+        ass_path = source.with_name(f"{source.stem}.ko.ass")
+        timeline = write_styled_subtitles_atomic(
             srt_path,
+            ass_path,
             segments,
             translations,
             overwrite=overwrite,
         )
+        if timeline.repaired_segment_ids:
+            self.store.add_event(
+                job.id,
+                "warning",
+                "repaired "
+                f"{len(timeline.repaired_segment_ids)} legacy or abnormal "
+                "subtitle timestamp(s)",
+            )
         self.store.update(
             job.id,
             status="completed",
             srt_path=str(srt_path),
+            ass_path=str(ass_path),
             blocked_stage=None,
             error=None,
         )

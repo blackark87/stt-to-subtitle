@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 import hmac
+import json
 import logging
 import os
 from pathlib import Path
@@ -25,6 +27,7 @@ from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
 
 from .artifacts import artifact_filename
+from .contracts import validate_transcript, validate_translation_items
 from .media_preview import (
     guess_media_type,
     iter_file_range,
@@ -33,6 +36,7 @@ from .media_preview import (
 )
 from .nas_config import NASSettings
 from .orchestrator import NASOrchestrator
+from .subtitle import render_webvtt
 from .time_display import (
     configure_kst_logging,
     format_kst_iso,
@@ -130,6 +134,30 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
                 status_code=404,
                 detail="artifact not found",
             ) from error
+
+    def styled_webvtt(job: Any) -> str | None:
+        if not job.transcript_path or not job.translation_path:
+            return None
+        transcript_path = Path(job.transcript_path)
+        translation_path = Path(job.translation_path)
+        if not transcript_path.is_file() or not translation_path.is_file():
+            return None
+        transcript_payload = json.loads(
+            transcript_path.read_text(encoding="utf-8")
+        )
+        translation_payload = json.loads(
+            translation_path.read_text(encoding="utf-8")
+        )
+        if not isinstance(transcript_payload, Mapping):
+            raise ValueError("transcript JSON document must be an object")
+        if not isinstance(translation_payload, Mapping):
+            raise ValueError("translation JSON document must be an object")
+        segments = validate_transcript(transcript_payload)
+        translations = validate_translation_items(
+            translation_payload.get("translations"),
+            [str(segment["id"]) for segment in segments],
+        )
+        return render_webvtt(segments, translations)
 
     def dashboard_context(
         request: Request,
@@ -397,18 +425,59 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
         if job is None or not job.srt_path:
             raise HTTPException(status_code=404, detail="subtitle not found")
         try:
-            source = service.library.resolve_file(job.source_rel)
-            subtitle = source.with_name(f"{source.stem}.ko.srt")
-            srt_text = subtitle.read_text(encoding="utf-8-sig")
-        except (OSError, UnicodeError, ValueError) as error:
+            webvtt = styled_webvtt(job)
+            if webvtt is None:
+                source = service.library.resolve_file(job.source_rel)
+                subtitle = source.with_name(f"{source.stem}.ko.srt")
+                webvtt = srt_to_webvtt(
+                    subtitle.read_text(encoding="utf-8-sig")
+                )
+        except (
+            KeyError,
+            OSError,
+            TypeError,
+            UnicodeError,
+            ValueError,
+            json.JSONDecodeError,
+        ) as error:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="subtitle not found",
             ) from error
         return Response(
-            srt_to_webvtt(srt_text),
+            webvtt,
             media_type="text/vtt",
             headers={"Cache-Control": "private, no-cache"},
+        )
+
+    @app.get(
+        "/jobs/{job_id}/subtitle.{subtitle_format}",
+        name="job_subtitle_file",
+    )
+    def job_subtitle_file(
+        request: Request,
+        job_id: str,
+        subtitle_format: str,
+    ) -> Any:
+        if not is_authenticated(request):
+            return login_redirect()
+        job = orchestrator(request).store.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="job not found")
+        details = {
+            "srt": (job.srt_path, "application/x-subrip"),
+            "ass": (job.ass_path, "text/x-ssa"),
+        }
+        if subtitle_format not in details:
+            raise HTTPException(status_code=404, detail="subtitle not found")
+        path_value, media_type = details[subtitle_format]
+        if not path_value or not Path(path_value).is_file():
+            raise HTTPException(status_code=404, detail="subtitle not found")
+        source_name = Path(job.source_rel).stem
+        return FileResponse(
+            path_value,
+            media_type=media_type,
+            filename=f"{source_name}.ko.{subtitle_format}",
         )
 
     @app.get("/jobs/{job_id}", response_class=HTMLResponse)

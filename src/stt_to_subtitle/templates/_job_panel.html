@@ -19,6 +19,7 @@
       </dd>
     {% endif %}
     {% if job.srt_path %}<dt>SRT</dt><dd>{{ job.srt_path }}</dd>{% endif %}
+    {% if job.ass_path %}<dt>ASS</dt><dd>{{ job.ass_path }}</dd>{% endif %}
   </dl>
   <div class="actions">
     {% set editable = job.status in ["completed", "blocked", "failed"] %}
@@ -57,9 +58,15 @@
     </noscript>
     <div class="actions">
       <a class="button secondary" href="{{ url_for('job_video', job_id=job.id) }}" download>원본 영상 다운로드</a>
+      <a class="button secondary" href="{{ url_for('job_subtitle_file', job_id=job.id, subtitle_format='srt') }}" download>SRT 다운로드</a>
+      {% if job.ass_path %}
+        <a class="button secondary" href="{{ url_for('job_subtitle_file', job_id=job.id, subtitle_format='ass') }}" download>스타일 ASS 다운로드</a>
+      {% endif %}
     </div>
     <p class="muted preview-note">
-      생성된 <code>.ko.srt</code>를 WebVTT로 변환해 미리보기에 표시합니다.
+      전사·번역 결과를 화자별 색상 WebVTT로 렌더링해 미리보기에 표시합니다.
+      실제 동시 발화는 한 cue의 여러 줄로 표시되며, 외부 플레이어에서는
+      <code>.ko.ass</code>가 색상과 글꼴을 가장 안정적으로 보존합니다.
       지원하지 않는 MIME 형식은 요청하지 않으며, 코덱 오류가 발생해도 자동 재시도하지 않습니다.
     </p>
   </section>

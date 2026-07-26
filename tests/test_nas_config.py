@@ -98,6 +98,20 @@ class MediaLibraryTests(unittest.TestCase):
             self.assertFalse(files[0]["has_nfo"])
             self.assertIsNone(files[0]["poster_path"])
 
+    def test_ass_file_alone_marks_media_as_subtitled(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "sample.mkv").write_bytes(b"media")
+            (root / "sample.ko.ass").write_text(
+                "[Script Info]\n",
+                encoding="utf-8",
+            )
+
+            files = MediaLibrary(root).browse()["files"]
+
+            self.assertEqual(len(files), 1)
+            self.assertTrue(files[0]["has_subtitle"])
+
     def test_reads_nfo_title_and_local_poster(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)

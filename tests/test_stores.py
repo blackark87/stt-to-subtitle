@@ -181,3 +181,4 @@ class NASStoreTests(unittest.TestCase):
             self.assertEqual(job.chunks_created, 0)
             self.assertEqual(job.chunks_completed, 0)
             self.assertEqual(job.chunk_progress_every, 10)
+            self.assertIsNone(job.ass_path)
