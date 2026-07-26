@@ -107,6 +107,12 @@ class NASAppTests(unittest.TestCase):
                 {job["source_rel"] for job in jobs},
                 {"one.mkv", "two.mp4"},
             )
+            self.assertTrue(
+                all(job["created_at"].endswith("+09:00") for job in jobs)
+            )
+            self.assertTrue(
+                all(job["updated_at"].endswith("+09:00") for job in jobs)
+            )
 
     def test_completed_job_streams_video_range_and_webvtt(self) -> None:
         with TemporaryDirectory() as directory:
@@ -150,6 +156,7 @@ class NASAppTests(unittest.TestCase):
                 captions = client.get(f"/jobs/{job.id}/subtitles.vtt")
 
             self.assertEqual(page.status_code, 200)
+            self.assertIn("KST", page.text)
             self.assertIn('class="result-player"', page.text)
             self.assertIn('data-video-type="video/mp4"', page.text)
             self.assertIn("data-subtitle-src=", page.text)

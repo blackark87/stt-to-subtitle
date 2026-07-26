@@ -24,6 +24,7 @@ from fastapi.responses import JSONResponse
 from .contracts import TRANSCRIPT_SCHEMA_VERSION, add_segment_ids
 from .files import write_json_atomic
 from .kotoba import (
+    ChunkProgress,
     MODEL_ID,
     MODEL_REVISION,
     SpeechPipeline,
@@ -33,6 +34,7 @@ from .kotoba import (
     run_pipeline,
 )
 from .transcription_store import TranscriptionJob, TranscriptionStore
+from .time_display import configure_kst_logging
 
 LOGGER = logging.getLogger(__name__)
 
@@ -48,6 +50,7 @@ class MacOSAPISettings:
     threads: int | None = None
     max_upload_bytes: int = 2 * 1024 * 1024 * 1024
     progress_interval: float = 30.0
+    chunk_progress_every: int = 10
 
     @classmethod
     def from_env(cls) -> MacOSAPISettings:
@@ -73,6 +76,9 @@ class MacOSAPISettings:
             progress_interval=float(
                 os.environ.get("STT_PROGRESS_INTERVAL_SECONDS", "30")
             ),
+            chunk_progress_every=int(
+                os.environ.get("STT_CHUNK_PROGRESS_EVERY", "10")
+            ),
         )
 
     def validate(self) -> None:
@@ -86,6 +92,8 @@ class MacOSAPISettings:
             raise ValueError("STT_MAX_UPLOAD_BYTES must be at least 1")
         if self.progress_interval <= 0:
             raise ValueError("STT_PROGRESS_INTERVAL_SECONDS must be positive")
+        if self.chunk_progress_every not in {10, 100}:
+            raise ValueError("STT_CHUNK_PROGRESS_EVERY must be 10 or 100")
 
 
 def _parse_options(raw_options: str, settings: MacOSAPISettings) -> dict[str, Any]:
@@ -312,6 +320,11 @@ class TranscriptionService:
                 self._get_pipeline(),
                 Path(job.audio_path),
                 options,
+                progress_callback=lambda progress: self._record_chunk_progress(
+                    job.id,
+                    progress,
+                ),
+                progress_every=self.settings.chunk_progress_every,
             )
             segments = add_segment_ids(normalize_segments(raw_result))
             payload = {
@@ -354,6 +367,26 @@ class TranscriptionService:
             heartbeat_stop.set()
             heartbeat.join()
 
+    def _record_chunk_progress(
+        self,
+        job_id: str,
+        progress: ChunkProgress,
+    ) -> None:
+        self.store.update_chunk_progress(
+            job_id,
+            created=progress.created,
+            completed=progress.completed,
+        )
+        LOGGER.info(
+            "transcription job %s chunks: created %d, completed %d, "
+            "in progress %d (reporting every %d chunks)",
+            job_id,
+            progress.created,
+            progress.completed,
+            progress.in_progress,
+            self.settings.chunk_progress_every,
+        )
+
     def _log_heartbeat(
         self,
         job_id: str,
@@ -361,10 +394,23 @@ class TranscriptionService:
         stop_event: threading.Event,
     ) -> None:
         while not stop_event.wait(self.settings.progress_interval):
+            job = self.store.get(job_id)
+            progress = (
+                ChunkProgress(
+                    created=job.chunks_created,
+                    completed=job.chunks_completed,
+                )
+                if job is not None
+                else ChunkProgress(created=0, completed=0)
+            )
             LOGGER.info(
-                "transcription job %s is still running (elapsed %.0fs)",
+                "transcription job %s is still running (elapsed %.0fs; "
+                "chunks created %d, completed %d, in progress %d)",
                 job_id,
                 time.monotonic() - started,
+                progress.created,
+                progress.completed,
+                progress.in_progress,
             )
 
 
@@ -517,9 +563,8 @@ app = create_app()
 def main() -> None:
     import uvicorn
 
-    logging.basicConfig(
-        level=os.environ.get("LOG_LEVEL", "INFO").upper(),
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    configure_kst_logging(
+        os.environ.get("LOG_LEVEL", "INFO").upper(),
     )
     uvicorn.run(
         "stt_to_subtitle.macos_api:app",

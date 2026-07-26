@@ -9,6 +9,8 @@ import sqlite3
 import time
 from typing import Any, Mapping
 
+from .time_display import format_kst_iso
+
 
 @dataclass(frozen=True)
 class TranscriptionJob:
@@ -20,17 +22,25 @@ class TranscriptionJob:
     options: dict[str, Any]
     result_path: str | None
     error: str | None
+    chunks_created: int
+    chunks_completed: int
     created_at: float
     updated_at: float
 
     def public_dict(self) -> dict[str, Any]:
+        in_progress = max(0, self.chunks_created - self.chunks_completed)
         return {
             "id": self.id,
             "status": self.status,
             "audio_sha256": self.audio_sha256,
             "error": self.error,
-            "created_at": self.created_at,
-            "updated_at": self.updated_at,
+            "chunk_progress": {
+                "created": self.chunks_created,
+                "completed": self.chunks_completed,
+                "in_progress": in_progress,
+            },
+            "created_at": format_kst_iso(self.created_at),
+            "updated_at": format_kst_iso(self.updated_at),
         }
 
 
@@ -60,11 +70,33 @@ class TranscriptionStore:
                     options_json TEXT NOT NULL,
                     result_path TEXT,
                     error TEXT,
+                    chunks_created INTEGER NOT NULL DEFAULT 0,
+                    chunks_completed INTEGER NOT NULL DEFAULT 0,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL
                 )
                 """
             )
+            columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(transcription_jobs)"
+                ).fetchall()
+            }
+            if "chunks_created" not in columns:
+                connection.execute(
+                    """
+                    ALTER TABLE transcription_jobs
+                    ADD COLUMN chunks_created INTEGER NOT NULL DEFAULT 0
+                    """
+                )
+            if "chunks_completed" not in columns:
+                connection.execute(
+                    """
+                    ALTER TABLE transcription_jobs
+                    ADD COLUMN chunks_completed INTEGER NOT NULL DEFAULT 0
+                    """
+                )
 
     @staticmethod
     def _from_row(row: sqlite3.Row | None) -> TranscriptionJob | None:
@@ -81,6 +113,8 @@ class TranscriptionStore:
                 str(row["result_path"]) if row["result_path"] is not None else None
             ),
             error=str(row["error"]) if row["error"] is not None else None,
+            chunks_created=int(row["chunks_created"]),
+            chunks_completed=int(row["chunks_completed"]),
             created_at=float(row["created_at"]),
             updated_at=float(row["updated_at"]),
         )
@@ -174,7 +208,36 @@ class TranscriptionStore:
             )
 
     def requeue(self, job_id: str) -> None:
-        self.update(job_id, status="queued", error=None)
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE transcription_jobs
+                SET status = 'queued', error = NULL,
+                    chunks_created = 0, chunks_completed = 0,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (time.time(), job_id),
+            )
+
+    def update_chunk_progress(
+        self,
+        job_id: str,
+        *,
+        created: int,
+        completed: int,
+    ) -> None:
+        if created < 0 or completed < 0 or completed > created:
+            raise ValueError("invalid transcription chunk progress")
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE transcription_jobs
+                SET chunks_created = ?, chunks_completed = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (created, completed, time.time(), job_id),
+            )
 
     def fail_interrupted_jobs(self) -> int:
         with self._connect() as connection:

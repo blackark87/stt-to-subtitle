@@ -144,8 +144,15 @@ class NASOrchestratorTests(unittest.TestCase):
                     audio_path=str(audio_path),
                     audio_sha256="abc",
                 )
-                orchestrator.stt_client.transcribe = Mock(
-                    return_value={
+                def transcribe_with_progress(*_args, **kwargs):
+                    kwargs["on_progress"](
+                        {
+                            "created": 20,
+                            "completed": 10,
+                            "in_progress": 10,
+                        }
+                    )
+                    return {
                         "schema_version": 1,
                         "job_id": "remote-job",
                         "segments": [
@@ -158,8 +165,15 @@ class NASOrchestratorTests(unittest.TestCase):
                             }
                         ],
                     }
+
+                orchestrator.stt_client.transcribe = Mock(
+                    side_effect=transcribe_with_progress
                 )
                 orchestrator._transcribe(orchestrator.store.get(job.id))
+                progress_messages = [
+                    event["message"]
+                    for event in orchestrator.store.events(job.id)
+                ]
 
                 orchestrator.lm_client.translate = Mock(
                     return_value=[
@@ -175,4 +189,8 @@ class NASOrchestratorTests(unittest.TestCase):
             self.assertIn("00:00:11,000 --> 00:00:12,000", subtitle)
             self.assertIn("안녕하세요", subtitle)
             self.assertNotIn("SPEAKER_00", subtitle)
+            self.assertIn(
+                "transcription chunks: created 20, completed 10, in progress 10",
+                progress_messages,
+            )
             self.assertEqual(orchestrator.store.get(job.id).status, "completed")
