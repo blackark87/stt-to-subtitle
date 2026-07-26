@@ -42,6 +42,20 @@ class MacOSAPIHelpersTests(unittest.TestCase):
 
             _validate_wav(path)
 
+    def test_chunk_progress_interval_accepts_only_10_or_100(self) -> None:
+        settings = MacOSAPISettings(
+            state_dir=Path("/tmp/not-used"),
+            api_token="",
+            hf_token="hf-token",
+            chunk_progress_every=25,
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "STT_CHUNK_PROGRESS_EVERY must be 10 or 100",
+        ):
+            settings.validate()
+
 
 class MacOSAPIRouteTests(unittest.TestCase):
     def test_health_is_public_and_job_status_requires_bearer_token(self) -> None:

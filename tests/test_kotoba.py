@@ -5,11 +5,13 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from stt_to_subtitle.kotoba import (
+    ChunkProgress,
     MODEL_ID,
     MODEL_REVISION,
     TranscriptionOptions,
     load_pipeline,
     normalize_segments,
+    run_pipeline,
     speaker_transcripts,
     transcribe,
 )
@@ -78,6 +80,43 @@ class TranscriptionOptionsTests(unittest.TestCase):
 
 
 class TranscribeTests(unittest.TestCase):
+    def test_reports_actual_pipeline_chunk_progress_at_configured_interval(
+        self,
+    ) -> None:
+        class FakePipeline:
+            def preprocess(self, _audio_path, **_kwargs):
+                for _index in range(23):
+                    yield {
+                        "input_features": SimpleNamespace(shape=(1, 80, 3000))
+                    }
+
+            def _forward(self, model_inputs, **_kwargs):
+                return model_inputs
+
+            def __call__(self, audio_path, **kwargs):
+                outputs = []
+                for model_inputs in self.preprocess(audio_path, **kwargs):
+                    outputs.append(self._forward(model_inputs))
+                return {"chunks": outputs}
+
+        speech_pipeline = FakePipeline()
+        progress: list[ChunkProgress] = []
+
+        run_pipeline(
+            speech_pipeline,
+            Path("/output/sample.wav"),
+            TranscriptionOptions(),
+            progress_callback=progress.append,
+            progress_every=10,
+        )
+
+        self.assertEqual(
+            [(item.created, item.completed, item.in_progress) for item in progress],
+            [(10, 10, 0), (20, 20, 0), (23, 23, 0)],
+        )
+        self.assertNotIn("preprocess", speech_pipeline.__dict__)
+        self.assertNotIn("_forward", speech_pipeline.__dict__)
+
     def test_loads_whisper_on_mps_and_pyannote_on_cpu(self) -> None:
         pipeline_factory = Mock(return_value=Mock())
         fake_torch = SimpleNamespace(

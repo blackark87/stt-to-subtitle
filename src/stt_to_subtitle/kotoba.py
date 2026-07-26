@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Protocol
@@ -52,6 +53,136 @@ class SpeechPipeline(Protocol):
     def __call__(self, audio_path: str, **kwargs: Any) -> Mapping[str, Any]: ...
 
 
+@dataclass(frozen=True)
+class ChunkProgress:
+    """Observed chunk counts inside the Kotoba preprocessing/inference pipeline."""
+
+    created: int
+    completed: int
+
+    @property
+    def in_progress(self) -> int:
+        return max(0, self.created - self.completed)
+
+    def public_dict(self) -> dict[str, int]:
+        return {
+            "created": self.created,
+            "completed": self.completed,
+            "in_progress": self.in_progress,
+        }
+
+
+class _ChunkProgressTracker:
+    def __init__(
+        self,
+        callback: Callable[[ChunkProgress], None],
+        report_every: int,
+    ) -> None:
+        self.callback = callback
+        self.report_every = report_every
+        self.created = 0
+        self.completed = 0
+        self._last_reported: tuple[int, int] | None = None
+
+    def chunk_created(self) -> None:
+        self.created += 1
+
+    def chunks_completed(self, count: int) -> None:
+        self.completed = min(self.created, self.completed + count)
+        if self.completed // self.report_every > (
+            (self.completed - count) // self.report_every
+        ):
+            self._report()
+
+    def finish(self) -> None:
+        self._report()
+
+    def _report(self) -> None:
+        current = (self.created, self.completed)
+        if current == self._last_reported:
+            return
+        self._last_reported = current
+        self.callback(ChunkProgress(*current))
+
+
+def _model_input_count(model_inputs: Any) -> int:
+    if not isinstance(model_inputs, Mapping):
+        return 1
+    input_features = model_inputs.get("input_features")
+    shape = getattr(input_features, "shape", None)
+    if shape is None or len(shape) < 1:
+        return 1
+    try:
+        return max(1, int(shape[0]))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _run_with_chunk_progress(
+    speech_pipeline: SpeechPipeline,
+    audio_path: Path,
+    options: TranscriptionOptions,
+    callback: Callable[[ChunkProgress], None],
+    report_every: int,
+) -> Mapping[str, Any]:
+    preprocess = getattr(speech_pipeline, "preprocess", None)
+    forward = getattr(speech_pipeline, "_forward", None)
+    if not callable(preprocess) or not callable(forward):
+        raise TypeError(
+            "the loaded speech pipeline does not expose chunk progress hooks"
+        )
+
+    tracker = _ChunkProgressTracker(callback, report_every)
+    instance_attributes = getattr(speech_pipeline, "__dict__", {})
+    had_preprocess_override = "preprocess" in instance_attributes
+    had_forward_override = "_forward" in instance_attributes
+    previous_preprocess_override = instance_attributes.get("preprocess")
+    previous_forward_override = instance_attributes.get("_forward")
+
+    def tracked_preprocess(*args: Any, **kwargs: Any) -> Iterator[Any]:
+        for item in preprocess(*args, **kwargs):
+            tracker.chunk_created()
+            yield item
+
+    def tracked_forward(model_inputs: Any, **kwargs: Any) -> Any:
+        chunk_count = _model_input_count(model_inputs)
+        result = forward(model_inputs, **kwargs)
+        tracker.chunks_completed(chunk_count)
+        return result
+
+    setattr(speech_pipeline, "preprocess", tracked_preprocess)
+    setattr(speech_pipeline, "_forward", tracked_forward)
+    try:
+        return speech_pipeline(
+            str(audio_path),
+            chunk_length_s=options.chunk_length_seconds,
+            add_punctuation=options.add_punctuation,
+            num_speakers=options.num_speakers,
+            min_speakers=options.min_speakers,
+            max_speakers=options.max_speakers,
+        )
+    finally:
+        try:
+            tracker.finish()
+        finally:
+            if had_preprocess_override:
+                setattr(
+                    speech_pipeline,
+                    "preprocess",
+                    previous_preprocess_override,
+                )
+            else:
+                delattr(speech_pipeline, "preprocess")
+            if had_forward_override:
+                setattr(
+                    speech_pipeline,
+                    "_forward",
+                    previous_forward_override,
+                )
+            else:
+                delattr(speech_pipeline, "_forward")
+
+
 def load_pipeline(
     token: str,
     *,
@@ -94,9 +225,22 @@ def run_pipeline(
     speech_pipeline: SpeechPipeline,
     audio_path: Path,
     options: TranscriptionOptions,
+    *,
+    progress_callback: Callable[[ChunkProgress], None] | None = None,
+    progress_every: int = 10,
 ) -> Mapping[str, Any]:
     """Run one validated transcription against an already loaded pipeline."""
     options.validate()
+    if progress_every not in {10, 100}:
+        raise ValueError("progress_every must be either 10 or 100")
+    if progress_callback is not None:
+        return _run_with_chunk_progress(
+            speech_pipeline,
+            audio_path,
+            options,
+            progress_callback,
+            progress_every,
+        )
     return speech_pipeline(
         str(audio_path),
         chunk_length_s=options.chunk_length_seconds,

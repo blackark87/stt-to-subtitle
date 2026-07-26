@@ -95,9 +95,12 @@ STT_HOST=0.0.0.0
 STT_PORT=8100
 STT_DEVICE=mps
 STT_DIARIZATION_DEVICE=cpu
+STT_CHUNK_PROGRESS_EVERY=10
 ```
 
 `HF_TOKEN`은 gated 모델 다운로드에 필수입니다. Hugging Face 설정에서 read 권한 토큰을 발급해 `hf_replace_me`를 교체하십시오. 신뢰하는 내부망에서 서비스 간 인증이 필요 없다면 `STT_API_TOKEN`은 비워 둡니다. 값을 설정하면 작업 API에 Bearer 인증이 자동으로 활성화되며 NAS에도 같은 값을 설정해야 합니다.
+
+`STT_CHUNK_PROGRESS_EVERY`는 `10` 또는 `100`만 사용할 수 있으며 기본값은 `10`입니다. Mac API는 Kotoba 파이프라인의 실제 전처리·추론 경계를 기준으로 지정한 완료 청크 간격마다 `생성`, `완료`, `진행/대기` 수를 기록합니다. 상태 API의 `chunk_progress`에도 같은 값이 포함되고, NAS가 이를 폴링해 작업 상세의 진행 로그에 남깁니다. 전사가 끝날 때는 간격에 못 미친 마지막 청크 수도 한 번 더 기록합니다. 여기서 청크는 화자 분리 후 겹침 구간을 포함한 모델 입력 단위이므로 SRT 세그먼트 수나 단순한 `영상 길이 ÷ 청크 길이`와 일치하지 않을 수 있습니다. 긴 영상에서 로그를 줄이려면 `100`으로 변경한 뒤 Mac API를 재시작하십시오.
 
 실행 폴더를 다른 위치나 다른 Mac으로 복사할 수 있습니다. 단, Python 가상환경에는 생성 당시의 절대 경로가 포함될 수 있으므로 폴더를 옮긴 뒤에는 대상 위치에서 `./setup.sh`를 다시 실행하십시오. `.env`에는 토큰이 있으므로 복사와 백업 시 노출되지 않도록 주의합니다.
 
@@ -138,7 +141,7 @@ macOS 방화벽이 Python 또는 포트 `8100`의 수신 연결 허용 여부를
 - `GET /healthz`
 - `GET /readyz`
 - `POST /v1/transcriptions` — multipart WAV, `options` JSON, `Idempotency-Key`
-- `GET /v1/transcriptions/{id}`
+- `GET /v1/transcriptions/{id}` — `chunk_progress.created/completed/in_progress` 포함
 - `GET /v1/transcriptions/{id}/result`
 
 `STT_API_TOKEN`이 비어 있으면 작업 API는 인증 없이 동작합니다. 값이 있으면 `Authorization: Bearer <STT_API_TOKEN>`이 필요합니다.
@@ -294,6 +297,8 @@ curl http://127.0.0.1:8080/healthz
 - `${STATE_PATH}:/var/lib/stt:rw` — SQLite WAL DB, 추출 WAV, 전사 JSON, 번역 JSON
 
 웹 UI에서 일본어 전사 JSON과 한국어 번역 JSON을 다운로드할 수 있습니다. 설정한 토큰과 자격 증명은 결과 메타데이터나 진행 로그에 기록하지 않습니다.
+
+작업 생성·갱신 및 진행 로그의 실제 시각은 NAS UI와 NAS/Mac API에서 모두 KST(`+09:00`)로 표시하거나 직렬화합니다. SQLite 내부에는 시간대와 무관한 epoch 값을 유지합니다. SRT 및 전사 세그먼트 타임스탬프는 영상 시작점 기준 상대시간이므로 KST 변환 대상이 아닙니다.
 
 무인증 모드는 세 장비가 격리된 신뢰 가능한 LAN에 있을 때만 사용하십시오. NAS UI, Mac API, LM Studio 포트를 인터넷이나 게스트 Wi-Fi에 직접 노출하지 말고 LAN 방화벽 또는 신뢰할 수 있는 VPN으로 제한하십시오. HTTPS reverse proxy와 웹 로그인을 사용하는 경우 `NAS_SECURE_COOKIE=true`로 설정합니다.
 

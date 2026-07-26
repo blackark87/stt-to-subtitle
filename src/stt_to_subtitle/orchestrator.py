@@ -387,12 +387,23 @@ class NASOrchestrator:
                 f"remote transcription job accepted: {remote_job_id}",
             )
 
+        def log_chunk_progress(progress: Mapping[str, int]) -> None:
+            self.store.add_event(
+                job.id,
+                "info",
+                "transcription chunks: "
+                f"created {progress['created']}, "
+                f"completed {progress['completed']}, "
+                f"in progress {progress['in_progress']}",
+            )
+
         payload = self.stt_client.transcribe(
             Path(job.audio_path),
             options=options,
             idempotency_key=f"nas-{job.id}",
             existing_job_id=job.stt_job_id,
             on_job_created=save_remote_job,
+            on_progress=log_chunk_progress,
         )
         offset = float(job.options["start_seconds"])
         if offset:

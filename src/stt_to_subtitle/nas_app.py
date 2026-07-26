@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from dataclasses import asdict
-from datetime import datetime
 import hmac
 import logging
 import os
@@ -33,13 +32,16 @@ from .media_preview import (
 )
 from .nas_config import NASSettings
 from .orchestrator import NASOrchestrator
+from .time_display import (
+    configure_kst_logging,
+    format_kst_iso,
+    format_kst_timestamp,
+)
 
 LOGGER = logging.getLogger(__name__)
 PACKAGE_DIR = Path(__file__).parent
 TEMPLATES = Jinja2Templates(directory=PACKAGE_DIR / "templates")
-TEMPLATES.env.filters["datetime"] = lambda value: datetime.fromtimestamp(
-    float(value)
-).strftime("%Y-%m-%d %H:%M:%S")
+TEMPLATES.env.filters["datetime"] = format_kst_timestamp
 TEMPLATES.env.filters["filesize"] = lambda value: (
     f"{float(value) / 1024 / 1024:.1f} MiB"
 )
@@ -466,10 +468,13 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
     def list_jobs(request: Request) -> list[dict[str, Any]]:
         if not is_authenticated(request):
             raise HTTPException(status_code=401, detail="authentication required")
-        return [
-            asdict(job)
-            for job in orchestrator(request).store.list_jobs()
-        ]
+        jobs: list[dict[str, Any]] = []
+        for job in orchestrator(request).store.list_jobs():
+            payload = asdict(job)
+            payload["created_at"] = format_kst_iso(job.created_at)
+            payload["updated_at"] = format_kst_iso(job.updated_at)
+            jobs.append(payload)
+        return jobs
 
     return app
 
@@ -480,9 +485,8 @@ app = create_app()
 def main() -> None:
     import uvicorn
 
-    logging.basicConfig(
-        level=os.environ.get("LOG_LEVEL", "INFO").upper(),
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    configure_kst_logging(
+        os.environ.get("LOG_LEVEL", "INFO").upper(),
     )
     uvicorn.run(
         "stt_to_subtitle.nas_app:app",

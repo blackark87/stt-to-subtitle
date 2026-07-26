@@ -110,9 +110,11 @@ class STTAPIClient(RetryingJSONClient):
         idempotency_key: str,
         existing_job_id: str | None = None,
         on_job_created: Callable[[str], None] | None = None,
+        on_progress: Callable[[Mapping[str, int]], None] | None = None,
     ) -> dict[str, Any]:
         job_id = existing_job_id
         may_requeue_existing = existing_job_id is not None
+        last_progress: tuple[int, int, int] | None = None
         while True:
             if job_id is None:
                 job_id = self._submit(
@@ -140,6 +142,29 @@ class STTAPIClient(RetryingJSONClient):
                 raise ExternalServiceError(
                     "transcription API returned an invalid status response"
                 ) from error
+            progress = status_payload.get("chunk_progress")
+            if on_progress is not None and isinstance(progress, Mapping):
+                try:
+                    current_progress = (
+                        int(progress["created"]),
+                        int(progress["completed"]),
+                        int(progress["in_progress"]),
+                    )
+                except (KeyError, TypeError, ValueError):
+                    current_progress = None
+                if (
+                    current_progress is not None
+                    and current_progress != last_progress
+                    and any(current_progress)
+                ):
+                    last_progress = current_progress
+                    on_progress(
+                        {
+                            "created": current_progress[0],
+                            "completed": current_progress[1],
+                            "in_progress": current_progress[2],
+                        }
+                    )
             if remote_status == "completed":
                 break
             if remote_status == "failed":

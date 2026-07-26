@@ -13,6 +13,8 @@ brew install python@3.11 ffmpeg libsndfile portaudio
 
 생성된 `.env`에서 `HF_TOKEN`을 실제 Hugging Face read 토큰으로 교체합니다. 신뢰할 수 있는 LAN에서 인증 없이 사용할 때는 `STT_API_TOKEN`을 비워 둡니다.
 
+전사 청크 진행 로그는 기본적으로 실제 완료 청크 10개마다 출력됩니다. 긴 영상에서 로그를 줄이려면 `.env`의 `STT_CHUNK_PROGRESS_EVERY=10`을 `100`으로 변경합니다. 사용할 수 있는 값은 `10`과 `100`뿐이며, 변경 후 서버를 재시작해야 합니다.
+
 ```bash
 ./run.sh
 ```
