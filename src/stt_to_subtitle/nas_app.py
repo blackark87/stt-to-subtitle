@@ -7,12 +7,11 @@ from dataclasses import asdict
 from datetime import datetime
 import hmac
 import logging
-import mimetypes
 import os
 from pathlib import Path
 import secrets
 from typing import Any, AsyncIterator
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 from fastapi import FastAPI, Form, HTTPException, Request, status
 from fastapi.responses import (
@@ -26,7 +25,12 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
 
-from .media_preview import iter_file_range, parse_byte_range, srt_to_webvtt
+from .media_preview import (
+    guess_media_type,
+    iter_file_range,
+    parse_byte_range,
+    srt_to_webvtt,
+)
 from .nas_config import NASSettings
 from .orchestrator import NASOrchestrator
 
@@ -105,15 +109,17 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
         *,
         error: str | None = None,
         notice: str | None = None,
+        folder: str = "",
     ) -> dict[str, Any]:
         service = orchestrator(request)
+        browser = service.library.browse(folder)
         return {
             "request": request,
-            "files": service.library.list_files(),
             "jobs": service.store.list_jobs(),
             "csrf_token": request.session.get("csrf_token", ""),
             "error": error,
             "notice": notice,
+            **browser,
         }
 
     @app.get("/healthz")
@@ -168,7 +174,11 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
         return login_redirect()
 
     @app.get("/", response_class=HTMLResponse)
-    def dashboard(request: Request, queued: int | None = None) -> Any:
+    def dashboard(
+        request: Request,
+        queued: int | None = None,
+        folder: str = "",
+    ) -> Any:
         if not is_authenticated(request):
             return login_redirect()
         notice = (
@@ -176,10 +186,21 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
             if queued is not None and queued > 1
             else None
         )
+        try:
+            context = dashboard_context(
+                request,
+                notice=notice,
+                folder=folder,
+            )
+            response_status = status.HTTP_200_OK
+        except ValueError as error:
+            context = dashboard_context(request, error=str(error))
+            response_status = status.HTTP_400_BAD_REQUEST
         return TEMPLATES.TemplateResponse(
             request,
             "dashboard.html",
-            dashboard_context(request, notice=notice),
+            context,
+            status_code=response_status,
         )
 
     @app.get(
@@ -212,6 +233,7 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
     def create_job(
         request: Request,
         source_rels: list[str] | None = Form(None),
+        return_folder: str = Form(""),
         csrf_token: str = Form(""),
         force_overwrite: bool = Form(False),
         audio_stream: str = Form("0"),
@@ -243,15 +265,26 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
                 options=options,
             )
         except (FileExistsError, OSError, ValueError) as error:
+            try:
+                context = dashboard_context(
+                    request,
+                    error=str(error),
+                    folder=return_folder,
+                )
+            except ValueError:
+                context = dashboard_context(request, error=str(error))
             return TEMPLATES.TemplateResponse(
                 request,
                 "dashboard.html",
-                dashboard_context(request, error=str(error)),
+                context,
                 status_code=status.HTTP_400_BAD_REQUEST,
             )
         if len(jobs) > 1:
+            query = {"queued": len(jobs)}
+            if return_folder:
+                query["folder"] = return_folder
             return RedirectResponse(
-                f"/?queued={len(jobs)}",
+                f"/?{urlencode(query)}",
                 status_code=status.HTTP_303_SEE_OTHER,
             )
         return RedirectResponse(
@@ -311,10 +344,7 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
                 f"bytes {start}-{end}/{file_size}"
             )
         base_headers["Content-Length"] = str(max(0, end - start + 1))
-        media_type = (
-            mimetypes.guess_type(source.name)[0]
-            or "application/octet-stream"
-        )
+        media_type = guess_media_type(source.name)
         if request.method == "HEAD":
             return Response(
                 status_code=response_status,
@@ -369,6 +399,7 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
                 "job": job,
                 "events": service.store.events(job_id),
                 "csrf_token": request.session.get("csrf_token", ""),
+                "video_mime_type": guess_media_type(job.source_rel),
             },
         )
 
@@ -387,6 +418,7 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
                 "job": job,
                 "events": service.store.events(job_id),
                 "csrf_token": request.session.get("csrf_token", ""),
+                "video_mime_type": guess_media_type(job.source_rel),
             },
         )
 

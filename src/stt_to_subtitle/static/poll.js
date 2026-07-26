@@ -9,6 +9,7 @@ document.addEventListener("DOMContentLoaded", () => {
         });
         if (response.ok) {
           target.innerHTML = await response.text();
+          window.initializeResultPlayers?.(target);
           if (target.querySelector("[data-poll-stop]")) {
             window.clearInterval(interval);
           }

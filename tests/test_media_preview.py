@@ -3,6 +3,7 @@ from tempfile import TemporaryDirectory
 import unittest
 
 from stt_to_subtitle.media_preview import (
+    guess_media_type,
     iter_file_range,
     parse_byte_range,
     srt_to_webvtt,
@@ -10,6 +11,10 @@ from stt_to_subtitle.media_preview import (
 
 
 class MediaPreviewTests(unittest.TestCase):
+    def test_uses_stable_video_mime_types(self) -> None:
+        self.assertEqual(guess_media_type("movie.mkv"), "video/x-matroska")
+        self.assertEqual(guess_media_type("movie.mp4"), "video/mp4")
+
     def test_parses_open_ended_suffix_and_clamped_ranges(self) -> None:
         self.assertEqual(parse_byte_range("bytes=2-5", 10), (2, 5))
         self.assertEqual(parse_byte_range("bytes=7-", 10), (7, 9))
