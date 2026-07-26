@@ -21,7 +21,10 @@ SPEAKER_COLORS = (
     "#93C5FD",
     "#FCA5A5",
 )
-ASS_FONT_NAME = "Noto Sans CJK KR"
+# Noto Sans KR is a widely available, screen-readable Korean subtitle face.
+# ASS stores only one font family; glyph fallback is supplied by the player
+# (for example, Jellyfin's configured fallback-font directory).
+ASS_FONT_NAME = "Noto Sans KR"
 MINIMUM_CUE_SECONDS = 0.1
 
 

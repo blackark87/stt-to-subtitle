@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 import hmac
@@ -91,6 +91,19 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
         redoc_url=None,
     )
     app.state.authentication_enabled = authentication_enabled
+
+    @app.middleware("http")
+    async def allow_same_origin_webxr(
+        request: Request,
+        call_next: Callable[[Request], Awaitable[Response]],
+    ) -> Response:
+        response = await call_next(request)
+        response.headers.setdefault(
+            "Permissions-Policy",
+            "xr-spatial-tracking=(self)",
+        )
+        return response
+
     app.add_middleware(
         SessionMiddleware,
         secret_key=configured_settings.session_secret

@@ -1,4 +1,15 @@
 (() => {
+  const SPEAKER_COLORS = [
+    "#67e8f9",
+    "#fde047",
+    "#f9a8d4",
+    "#86efac",
+    "#c4b5fd",
+    "#fdba74",
+    "#93c5fd",
+    "#fca5a5",
+  ];
+
   const formatTime = (value) => {
     if (!Number.isFinite(value) || value < 0) {
       return "0:00";
@@ -37,10 +48,47 @@
     video.removeAttribute("src");
     video.load();
     video.hidden = true;
-    shell.querySelectorAll("[data-player-mode]").forEach((button) => {
-      button.disabled = true;
-    });
+    shell
+      .querySelectorAll("[data-player-mode], [data-vr-headset]")
+      .forEach((button) => {
+        button.disabled = true;
+      });
     showMessage(messageElement, message);
+  };
+
+  const colorForElement = (element) => {
+    for (const className of element.classList) {
+      const match = /^speaker-(\d+)$/.exec(className);
+      if (match) {
+        const index = (Number(match[1]) - 1) % SPEAKER_COLORS.length;
+        return SPEAKER_COLORS[Math.max(0, index)];
+      }
+    }
+    return "#ffffff";
+  };
+
+  const cueLinesForXR = (cue) => {
+    if (typeof cue.getCueAsHTML !== "function") {
+      return String(cue.text || "")
+        .split(/\r?\n/)
+        .map((text) => ({ text: text.trim(), color: "#ffffff" }))
+        .filter((line) => line.text);
+    }
+    const holder = document.createElement("div");
+    holder.append(cue.getCueAsHTML());
+    const styled = Array.from(holder.querySelectorAll("[class]"))
+      .map((element) => ({
+        color: colorForElement(element),
+        text: element.textContent.trim(),
+      }))
+      .filter((line) => line.text);
+    if (styled.length) {
+      return styled;
+    }
+    return holder.textContent
+      .split(/\r?\n/)
+      .map((text) => ({ text: text.trim(), color: "#ffffff" }))
+      .filter((line) => line.text);
   };
 
   const initialize = (root = document) => {
@@ -69,7 +117,8 @@
       const volume = shell.querySelector("[data-vr-volume]");
       const resetButton = shell.querySelector("[data-vr-reset]");
       const fullscreenButton = shell.querySelector("[data-vr-fullscreen]");
-      const eyeButtons = shell.querySelectorAll("[data-vr-eye]");
+      const headsetButton = shell.querySelector("[data-vr-headset]");
+      const xrStatus = shell.querySelector("[data-vr-xr-status]");
 
       if (
         !stage ||
@@ -77,7 +126,8 @@
         !vrControls ||
         !subtitleOverlay ||
         !flatButton ||
-        !vrButton
+        !vrButton ||
+        !headsetButton
       ) {
         continue;
       }
@@ -85,7 +135,14 @@
       let mode = "flat";
       let renderer = null;
       let textTrack = null;
-      let eyeMode = "dual";
+      let xrActive = false;
+      let xrSupported = false;
+
+      const setXRStatus = (message) => {
+        if (xrStatus) {
+          xrStatus.textContent = message;
+        }
+      };
 
       const updateModeButtons = () => {
         flatButton.setAttribute(
@@ -100,38 +157,24 @@
 
       const updateSubtitles = () => {
         subtitleOverlay.replaceChildren();
-        if (mode !== "vr180" || !textTrack?.activeCues?.length) {
+        const cues = textTrack?.activeCues
+          ? Array.from(textTrack.activeCues)
+          : [];
+        renderer?.setSubtitleLines(cues.flatMap(cueLinesForXR));
+        if (mode !== "vr180" || xrActive || !cues.length) {
           subtitleOverlay.hidden = true;
           return;
         }
 
-        const cues = Array.from(textTrack.activeCues);
-        const appendCues = (container) => {
-          for (const cue of cues) {
-            const row = document.createElement("div");
-            row.className = "vr180-subtitle-line";
-            if (typeof cue.getCueAsHTML === "function") {
-              row.append(cue.getCueAsHTML());
-            } else {
-              row.textContent = cue.text;
-            }
-            container.append(row);
+        for (const cue of cues) {
+          const row = document.createElement("div");
+          row.className = "vr180-subtitle-line";
+          if (typeof cue.getCueAsHTML === "function") {
+            row.append(cue.getCueAsHTML());
+          } else {
+            row.textContent = cue.text;
           }
-        };
-        subtitleOverlay.classList.toggle(
-          "is-dual-eye",
-          eyeMode === "dual"
-        );
-        if (eyeMode === "dual") {
-          for (const eye of ["left", "right"]) {
-            const eyePanel = document.createElement("div");
-            eyePanel.className = `vr180-subtitle-eye is-${eye}`;
-            eyePanel.setAttribute("aria-hidden", eye === "right" ? "true" : "false");
-            appendCues(eyePanel);
-            subtitleOverlay.append(eyePanel);
-          }
-        } else {
-          appendCues(subtitleOverlay);
+          subtitleOverlay.append(row);
         }
         subtitleOverlay.hidden = false;
       };
@@ -191,6 +234,23 @@
         });
       };
 
+      const onXRChange = (active) => {
+        xrActive = active;
+        headsetButton.textContent = active
+          ? "VR 헤드셋 종료"
+          : "VR 헤드셋으로 보기";
+        headsetButton.setAttribute(
+          "aria-pressed",
+          active ? "true" : "false"
+        );
+        setXRStatus(
+          active
+            ? "헤드셋에 좌·우 눈 영상을 각각 출력하고 있습니다."
+            : "WebXR 헤드셋 모드 사용 가능"
+        );
+        updateSubtitles();
+      };
+
       const activateFlatMode = () => {
         mode = "flat";
         renderer?.stop();
@@ -210,35 +270,44 @@
       const handleVRFailure = (message) => {
         activateFlatMode();
         vrButton.disabled = true;
+        headsetButton.disabled = true;
         showMessage(messageElement, message);
+      };
+
+      const ensureRenderer = () => {
+        if (renderer) {
+          return renderer;
+        }
+        if (typeof window.createVR180Renderer !== "function") {
+          throw new Error("VR 180 렌더러를 불러오지 못했습니다.");
+        }
+        renderer = window.createVR180Renderer({
+          video,
+          canvas,
+          onContextLost: () => {
+            handleVRFailure(
+              "WebGL 연결이 끊겨 일반 플레이어로 전환했습니다. VR 모드는 자동으로 재시도하지 않습니다."
+            );
+          },
+          onXRChange,
+        });
+        updateSubtitles();
+        return renderer;
       };
 
       const activateVRMode = () => {
         if (video.dataset.playbackStopped === "true") {
-          return;
+          return false;
         }
-        if (!renderer) {
-          try {
-            if (typeof window.createVR180Renderer !== "function") {
-              throw new Error("VR 180 렌더러를 불러오지 못했습니다.");
-            }
-            renderer = window.createVR180Renderer({
-              video,
-              canvas,
-              onContextLost: () => {
-                handleVRFailure(
-                  "WebGL 연결이 끊겨 일반 플레이어로 전환했습니다. VR 모드는 자동으로 재시도하지 않습니다."
-                );
-              },
-            });
-          } catch (error) {
-            handleVRFailure(
-              `VR 180 모드를 시작할 수 없습니다: ${
-                error?.message || "WebGL 초기화 오류"
-              }`
-            );
-            return;
-          }
+        try {
+          ensureRenderer();
+        } catch (error) {
+          handleVRFailure(
+            `180° 미리보기를 시작할 수 없습니다: ${
+              error?.message || "WebGL 초기화 오류"
+            }`
+          );
+          return false;
         }
 
         mode = "vr180";
@@ -253,9 +322,33 @@
         setTrackMode("vr180");
         updateModeButtons();
         updatePlaybackControls();
-        renderer.setEye(eyeMode);
         renderer.start();
         canvas.focus({ preventScroll: true });
+        return true;
+      };
+
+      const refreshXRSupport = async () => {
+        xrSupported = false;
+        headsetButton.disabled = true;
+        if (!window.isSecureContext) {
+          setXRStatus("실제 VR 헤드셋 모드에는 HTTPS 접속이 필요합니다.");
+          return;
+        }
+        if (
+          !navigator.xr ||
+          typeof window.isImmersiveVRSupported !== "function"
+        ) {
+          setXRStatus("이 브라우저는 WebXR immersive-vr을 지원하지 않습니다.");
+          return;
+        }
+        setXRStatus("연결된 VR 헤드셋을 확인하고 있습니다.");
+        xrSupported = await window.isImmersiveVRSupported();
+        headsetButton.disabled = !xrSupported;
+        setXRStatus(
+          xrSupported
+            ? "WebXR 헤드셋 모드 사용 가능"
+            : "연결된 immersive-vr 헤드셋을 찾지 못했습니다."
+        );
       };
 
       const mimeType =
@@ -306,6 +399,31 @@
         video.focus({ preventScroll: true });
       });
       vrButton.addEventListener("click", activateVRMode);
+      headsetButton.addEventListener("click", async () => {
+        if (renderer?.isXRPresenting) {
+          await renderer.exitXR().catch(() => {});
+          return;
+        }
+        if (!xrSupported || !activateVRMode()) {
+          return;
+        }
+        headsetButton.disabled = true;
+        setXRStatus("VR 헤드셋 세션을 시작하고 있습니다.");
+        try {
+          await renderer.enterXR();
+        } catch (error) {
+          const cancelled = error?.name === "NotAllowedError";
+          setXRStatus(
+            cancelled
+              ? "VR 헤드셋 시작이 취소되었습니다."
+              : `VR 헤드셋을 시작할 수 없습니다: ${
+                  error?.message || "WebXR 오류"
+                }`
+          );
+        } finally {
+          headsetButton.disabled = !xrSupported;
+        }
+      });
       playButton?.addEventListener("click", togglePlayback);
       shell.addEventListener("keydown", (event) => {
         if (
@@ -386,20 +504,6 @@
           );
         });
       });
-      for (const eyeButton of eyeButtons) {
-        eyeButton.addEventListener("click", () => {
-          const eye = eyeButton.dataset.vrEye;
-          eyeMode = eye || "left";
-          renderer?.setEye(eye);
-          for (const candidate of eyeButtons) {
-            candidate.setAttribute(
-              "aria-pressed",
-              candidate === eyeButton ? "true" : "false"
-            );
-          }
-          updateSubtitles();
-        });
-      }
       for (const eventName of [
         "durationchange",
         "ended",
@@ -420,6 +524,8 @@
         }
         renderer?.requestDraw();
       });
+      navigator.xr?.addEventListener("devicechange", refreshXRSupport);
+      refreshXRSupport();
       updatePlaybackControls();
     }
   };

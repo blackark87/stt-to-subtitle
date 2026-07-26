@@ -71,7 +71,7 @@
           class="secondary compact"
           data-player-mode="vr180"
           aria-pressed="false"
-        >VR 180 SBS</button>
+        >180° 미리보기</button>
       </div>
       <div class="result-player-stage" data-result-player-stage>
         <video
@@ -130,28 +130,18 @@
             aria-label="음량"
           >
         </label>
-        <span class="vr180-eye-controls" aria-label="미리보기 눈 선택">
-          <button
-            type="button"
-            class="secondary compact"
-            data-vr-eye="dual"
-            aria-pressed="true"
-          >양안</button>
-          <button
-            type="button"
-            class="secondary compact"
-            data-vr-eye="left"
-            aria-pressed="false"
-          >좌안</button>
-          <button
-            type="button"
-            class="secondary compact"
-            data-vr-eye="right"
-            aria-pressed="false"
-          >우안</button>
-        </span>
         <button type="button" class="secondary compact" data-vr-reset>정면</button>
         <button type="button" class="secondary compact" data-vr-fullscreen>전체 화면</button>
+        <button
+          type="button"
+          class="secondary compact"
+          data-vr-headset
+          aria-pressed="false"
+          disabled
+        >VR 헤드셋 확인 중</button>
+        <span class="vr-xr-status" data-vr-xr-status role="status">
+          WebXR 지원을 확인하고 있습니다.
+        </span>
       </div>
       <p class="playback-message" data-playback-message role="status" hidden></p>
     </div>
@@ -169,8 +159,9 @@
       전사·번역 결과를 화자별 색상 WebVTT로 렌더링해 미리보기에 표시합니다.
       실제 동시 발화는 한 cue의 여러 줄로 표시되며, 외부 플레이어에서는
       <code>.ko.ass</code>가 색상과 글꼴을 가장 안정적으로 보존합니다.
-      VR 180 SBS 모드는 양안 분할 또는 좌·우 단안 영상을 180도 반구로 펼치며,
-      마우스·터치 드래그로 시점을 조작할 수 있습니다.
+      180° 미리보기는 SBS의 좌안 영상을 투영해 마우스·터치 드래그로 둘러봅니다.
+      HTTPS에서 WebXR 헤드셋을 연결하면 좌안에는 SBS 왼쪽 절반, 우안에는
+      오른쪽 절반을 각각 출력하고 헤드 트래킹을 적용합니다.
       지원하지 않는 MIME 형식은 요청하지 않으며, 코덱 오류가 발생해도 자동 재시도하지 않습니다.
     </p>
   </section>
