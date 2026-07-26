@@ -14,7 +14,7 @@ from stt_to_subtitle.subtitle import (
 
 
 class SubtitleTests(unittest.TestCase):
-    def test_renders_korean_text_with_speaker_color_and_label(self) -> None:
+    def test_renders_korean_text_with_speaker_color_without_label(self) -> None:
         rendered = render_srt(
             [
                 {
@@ -31,7 +31,7 @@ class SubtitleTests(unittest.TestCase):
         self.assertIn("01:01:01,234 --> 01:01:02,500", rendered)
         self.assertIn("안녕하세요", rendered)
         self.assertNotIn("SPEAKER_00", rendered)
-        self.assertIn("화자 1:", rendered)
+        self.assertNotIn("화자 1", rendered)
         self.assertIn('<font color="#67E8F9">', rendered)
 
     def test_splits_real_speaker_overlap_into_non_overlapping_cues(self) -> None:
@@ -67,8 +67,13 @@ class SubtitleTests(unittest.TestCase):
             [1, 2, 1],
         )
         rendered = render_srt(segments, translations)
-        self.assertIn("화자 1:", rendered)
-        self.assertIn("화자 2:", rendered)
+        self.assertNotIn("화자 1", rendered)
+        self.assertNotIn("화자 2", rendered)
+        self.assertIn('<font color="#67E8F9">괜찮아요?</font>', rendered)
+        self.assertIn(
+            '<font color="#FDE047">네, 괜찮습니다.</font>',
+            rendered,
+        )
 
     def test_replaces_overlapping_lines_from_the_same_speaker(self) -> None:
         timeline = build_subtitle_timeline(
@@ -184,8 +189,10 @@ class SubtitleTests(unittest.TestCase):
 
         self.assertIn("[V4+ Styles]", ass)
         self.assertIn("Noto Sans CJK KR", ass)
-        self.assertIn(r"{\c&H00F9E867&\b1}화자 1:", ass)
-        self.assertIn("<c.speaker-1><b>화자 1:</b>", webvtt)
+        self.assertIn(r"{\c&H00F9E867&}안녕하세요", ass)
+        self.assertIn("<c.speaker-1>안녕하세요</c>", webvtt)
+        self.assertNotIn("화자 1", ass)
+        self.assertNotIn("화자 1", webvtt)
 
     def test_refuses_existing_srt_without_force(self) -> None:
         with TemporaryDirectory() as directory:

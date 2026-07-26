@@ -28,7 +28,6 @@ MINIMUM_CUE_SECONDS = 0.1
 @dataclass(frozen=True)
 class SubtitleLine:
     speaker: str
-    label: str
     css_class: str
     color: str
     text: str
@@ -74,7 +73,7 @@ def _maximum_legacy_duration(text: str) -> float:
 
 def _speaker_presentations(
     segments: Sequence[Mapping[str, Any]],
-) -> dict[str, tuple[str, str, str]]:
+) -> dict[str, tuple[str, str]]:
     speakers = list(
         dict.fromkeys(
             str(segment.get("speaker", "UNKNOWN"))
@@ -83,7 +82,6 @@ def _speaker_presentations(
     )
     return {
         speaker: (
-            f"화자 {index + 1}",
             f"speaker-{index + 1}",
             SPEAKER_COLORS[index % len(SPEAKER_COLORS)],
         )
@@ -92,7 +90,7 @@ def _speaker_presentations(
 
 
 def _speaker_order(
-    presentations: Mapping[str, tuple[str, str, str]],
+    presentations: Mapping[str, tuple[str, str]],
 ) -> dict[str, int]:
     return {
         speaker: index
@@ -203,9 +201,8 @@ def build_subtitle_timeline(
         lines = tuple(
             SubtitleLine(
                 speaker=str(segment["speaker"]),
-                label=presentations[str(segment["speaker"])][0],
-                css_class=presentations[str(segment["speaker"])][1],
-                color=presentations[str(segment["speaker"])][2],
+                css_class=presentations[str(segment["speaker"])][0],
+                color=presentations[str(segment["speaker"])][1],
                 text=str(segment["text"]),
             )
             for segment in active
@@ -226,8 +223,7 @@ def _render_srt_timeline(timeline: SubtitleTimeline) -> str:
         for line in cue.lines:
             text = escape(line.text, quote=False).replace("\r", "")
             lines.append(
-                f'<font color="{line.color}"><b>{line.label}:</b> '
-                f"{text}</font>"
+                f'<font color="{line.color}">{text}</font>'
             )
         blocks.append(
             f"{index}\n"
@@ -288,9 +284,8 @@ def _render_ass_timeline(timeline: SubtitleTimeline) -> str:
         lines = []
         for line in cue.lines:
             lines.append(
-                rf"{{\c{_ass_color(line.color)}\b1}}"
-                f"{_escape_ass_text(line.label)}:"
-                rf"{{\b0}} {_escape_ass_text(line.text)}"
+                rf"{{\c{_ass_color(line.color)}}}"
+                f"{_escape_ass_text(line.text)}"
             )
         events.append(
             "Dialogue: 0,"
@@ -318,7 +313,7 @@ def _render_webvtt_timeline(timeline: SubtitleTimeline) -> str:
         for line in cue.lines:
             text = escape(line.text, quote=False).replace("\r", "")
             lines.append(
-                f"<c.{line.css_class}><b>{line.label}:</b> {text}</c>"
+                f"<c.{line.css_class}>{text}</c>"
             )
         cues.append(
             f"{format_webvtt_timestamp(cue.start)} --> "

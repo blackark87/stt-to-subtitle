@@ -233,7 +233,8 @@ class NASOrchestratorTests(unittest.TestCase):
                 encoding="utf-8"
             )
             self.assertIn("[V4+ Styles]", styled)
-            self.assertIn("화자 1:", styled)
+            self.assertNotIn("화자 1", styled)
+            self.assertIn("안녕하세요", styled)
 
     def test_editing_translation_json_regenerates_the_srt(self) -> None:
         with TemporaryDirectory() as directory:
