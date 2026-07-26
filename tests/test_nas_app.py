@@ -292,9 +292,10 @@ class NASAppTests(unittest.TestCase):
             self.assertIn("JSON syntax error", invalid.text)
             self.assertEqual(saved.status_code, 303)
             self.assertIn(
-                "<c.speaker-1><b>화자 1:</b>",
+                "<c.speaker-1>수정된 번역</c>",
                 captions.text,
             )
+            self.assertNotIn("화자 1", captions.text)
             self.assertEqual(styled_subtitle.status_code, 200)
             self.assertIn("text/x-ssa", styled_subtitle.headers["content-type"])
             self.assertIn("[V4+ Styles]", styled_subtitle.text)
