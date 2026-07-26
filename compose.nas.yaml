@@ -1,10 +1,7 @@
 services:
   orchestrator:
     platform: linux/amd64
-    build:
-      context: .
-      dockerfile: Dockerfile.nas
-    image: ${NAS_IMAGE:-stt-to-subtitle:nas}
+    image: ${NAS_IMAGE:-ghcr.io/blackark87/stt-to-subtitle:nas-latest}
     user: "${PUID:-1000}:${PGID:-1000}"
     init: true
     restart: unless-stopped

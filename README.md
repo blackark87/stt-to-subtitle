@@ -176,19 +176,25 @@ NAS에는 OpenAI 호환 API 루트(예: `http://192.168.1.30:1234/v1`)와 로드
 
 ## 3. NAS: 웹 오케스트레이터 설치 및 실행
 
-Synology Package Center에서 Container Manager를 설치하고 SSH를 일시적으로 활성화합니다. 이후 미디어 공유 폴더에 읽기/쓰기 가능한 NAS 계정으로 접속합니다. J3455 NAS에서는 GHCR의 `linux/amd64` 이미지를 실행하며 NAS에서 ML 모델을 실행하지 않습니다.
+Synology Package Center에서 Container Manager를 설치하고 SSH를 일시적으로 활성화합니다. J3455 NAS에서는 GHCR의 `linux/amd64` 이미지만 pull하여 실행하며, Git 저장소·Python 소스·Dockerfile·빌드 도구는 NAS에 필요하지 않습니다.
+
+이 저장소를 받은 PC에서 NAS 배포에 필요한 두 파일만 복사합니다. File Station을 사용해도 됩니다.
+
+```bash
+ssh NAS_USER@NAS_IP \
+  'mkdir -p /volume1/docker/stt-to-subtitle'
+scp compose.nas.yaml .env.nas.example \
+  NAS_USER@NAS_IP:/volume1/docker/stt-to-subtitle/
+```
+
+그다음 미디어 공유 폴더에 읽기/쓰기 가능한 NAS 계정으로 접속해 환경 파일을 준비합니다.
 
 ```bash
 ssh NAS_USER@NAS_IP
-cd /volume1/docker
-git clone https://github.com/blackark87/stt-to-subtitle.git
-cd stt-to-subtitle
-
-cp .env.nas.example .env.nas
+cd /volume1/docker/stt-to-subtitle
+mv .env.nas.example .env.nas
 chmod 600 .env.nas
 ```
-
-저장소를 받을 수 있는 `git` 명령이 NAS에 없다면 다른 PC에서 저장소를 받은 뒤 `compose.nas.yaml`과 `.env.nas.example`을 `/volume1/docker/stt-to-subtitle/`로 복사해도 됩니다.
 
 미디어 공유 폴더에 접근하는 계정의 숫자 UID/GID를 확인합니다.
 
@@ -227,7 +233,7 @@ LM_STUDIO_TOKEN=
 LM_STUDIO_MODEL=LM_STUDIO에_표시된_모델_식별자
 ```
 
-Compose는 GHCR 이미지의 기본 사용자와 관계없이 `PUID:PGID`를 컨테이너의 런타임 사용자로 적용합니다. 상태 폴더를 미리 만들어 해당 사용자가 쓸 수 있게 합니다. 저장소를 `NAS_USER`로 clone했다면 일반적으로 추가 `chown`은 필요하지 않습니다.
+Compose는 GHCR 이미지의 기본 사용자와 관계없이 `PUID:PGID`를 컨테이너의 런타임 사용자로 적용합니다. 상태 폴더를 미리 만들어 해당 사용자가 쓸 수 있게 합니다. 배포 폴더를 `NAS_USER`로 만들었다면 일반적으로 추가 `chown`은 필요하지 않습니다.
 
 ```bash
 mkdir -p ./var/nas-state
@@ -263,7 +269,7 @@ Compose 구성을 검증하고 GHCR 이미지를 받아 실행합니다.
 ```bash
 docker compose --env-file .env.nas -f compose.nas.yaml config
 docker compose --env-file .env.nas -f compose.nas.yaml pull
-docker compose --env-file .env.nas -f compose.nas.yaml up -d --no-build
+docker compose --env-file .env.nas -f compose.nas.yaml up -d
 docker compose --env-file .env.nas -f compose.nas.yaml ps
 docker compose --env-file .env.nas -f compose.nas.yaml logs -f orchestrator
 ```
@@ -287,13 +293,14 @@ curl http://127.0.0.1:8080/healthz
 
 ### NAS 업데이트 및 운영 명령
 
-`main`에 새 이미지가 게시된 뒤 다음 명령으로 설정 파일과 이미지를 업데이트합니다. Git에서 추적하지 않는 `.env.nas`는 유지됩니다.
+`main`에 새 이미지가 게시된 뒤에는 애플리케이션 소스를 받을 필요 없이 이미지만 갱신합니다.
 
 ```bash
-git pull --ff-only
 docker compose --env-file .env.nas -f compose.nas.yaml pull
-docker compose --env-file .env.nas -f compose.nas.yaml up -d --no-build
+docker compose --env-file .env.nas -f compose.nas.yaml up -d
 ```
+
+Compose 설정 자체가 변경된 경우에만 PC에서 새 `compose.nas.yaml`을 NAS 배포 폴더로 다시 복사합니다. `.env.nas`와 `${STATE_PATH}`는 그대로 유지합니다.
 
 자주 사용하는 운영 명령:
 
@@ -315,7 +322,7 @@ docker compose --env-file .env.nas -f compose.nas.yaml down
 
 ## GHCR 이미지 게시 및 NAS에서 받기
 
-[`.github/workflows/publish-ghcr.yaml`](.github/workflows/publish-ghcr.yaml)은 테스트를 통과한 NAS용 `linux/amd64` 이미지를 `ghcr.io/<owner>/<repository>`로 게시합니다. 다음 경우 실행됩니다.
+[`.github/workflows/publish-ghcr.yaml`](.github/workflows/publish-ghcr.yaml)은 `Dockerfile.nas`와 애플리케이션 소스를 GitHub Actions에서 빌드해, 테스트를 통과한 NAS용 `linux/amd64` 이미지를 `ghcr.io/blackark87/stt-to-subtitle`에 게시합니다. 이 빌드 파일들은 CI에만 필요하며 NAS로 복사하지 않습니다. 다음 경우 실행됩니다.
 
 - `main` 브랜치 push
 - `v*` 태그 push
@@ -327,17 +334,17 @@ docker compose --env-file .env.nas -f compose.nas.yaml down
 echo "$GHCR_PAT" | docker login ghcr.io -u GITHUB_USER --password-stdin
 ```
 
-NAS의 `.env.nas`에서 이미지 이름을 설정합니다.
+NAS의 `.env.nas`에는 기본 이미지가 이미 설정되어 있습니다. 다른 버전 태그를 고정할 때만 값을 변경합니다.
 
 ```dotenv
-NAS_IMAGE=ghcr.io/owner/repository:nas-latest
+NAS_IMAGE=ghcr.io/blackark87/stt-to-subtitle:nas-latest
 ```
 
-그 다음 로컬 빌드 없이 가져와 실행합니다.
+이미지를 가져와 실행합니다. `compose.nas.yaml`에는 `build:` 항목이 없으므로 NAS에서 로컬 빌드가 실행될 수 없습니다.
 
 ```bash
 docker compose --env-file .env.nas -f compose.nas.yaml pull
-docker compose --env-file .env.nas -f compose.nas.yaml up -d --no-build
+docker compose --env-file .env.nas -f compose.nas.yaml up -d
 ```
 
 GHCR 이미지 자체의 기본 UID/GID는 `1000:1000`이지만 `compose.nas.yaml`이 `.env.nas`의 `PUID`/`PGID`로 런타임 사용자를 덮어씁니다. 따라서 NAS에서 UID/GID 때문에 이미지를 다시 빌드할 필요는 없습니다.
