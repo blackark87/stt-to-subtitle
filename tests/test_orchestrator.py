@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
@@ -182,6 +183,7 @@ class NASOrchestratorTests(unittest.TestCase):
                 )
                 orchestrator._translate(orchestrator.store.get(job.id))
                 orchestrator._render(orchestrator.store.get(job.id))
+                completed_job = orchestrator.store.get(job.id)
             finally:
                 orchestrator.stop()
 
@@ -193,4 +195,96 @@ class NASOrchestratorTests(unittest.TestCase):
                 "transcription chunks: created 20, completed 10, in progress 10",
                 progress_messages,
             )
-            self.assertEqual(orchestrator.store.get(job.id).status, "completed")
+            self.assertEqual(completed_job.status, "completed")
+            self.assertEqual(
+                Path(completed_job.transcript_path).name,
+                "movie_translate.json",
+            )
+            self.assertEqual(
+                Path(completed_job.translation_path).name,
+                "movie_result_ko.json",
+            )
+
+    def test_editing_translation_json_regenerates_the_srt(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            source = media_root / "movie.mkv"
+            source.write_bytes(b"media")
+            orchestrator = self.make_orchestrator(root, media_root)
+            job = orchestrator.create_job(
+                "movie.mkv",
+                force_overwrite=False,
+                options={},
+            )
+            artifact_dir = root / "state" / "jobs" / job.id
+            artifact_dir.mkdir(parents=True)
+            transcript_path = artifact_dir / "movie_translate.json"
+            translation_path = artifact_dir / "movie_result_ko.json"
+            transcript_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "job_id": "remote-job",
+                        "segments": [
+                            {
+                                "id": "segment-000001",
+                                "start": 0,
+                                "end": 1,
+                                "speaker": "SPEAKER_00",
+                                "text": "こんにちは",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            translation_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "status": "completed",
+                        "translations": [
+                            {
+                                "id": "segment-000001",
+                                "text": "안녕하세요",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            orchestrator.store.update(
+                job.id,
+                status="completed",
+                transcript_path=str(transcript_path),
+                translation_path=str(translation_path),
+                srt_path=str(media_root / "movie.ko.srt"),
+            )
+            (media_root / "movie.ko.srt").write_text(
+                "old subtitle",
+                encoding="utf-8",
+            )
+            edited = json.dumps(
+                {
+                    "schema_version": 1,
+                    "status": "completed",
+                    "translations": [
+                        {
+                            "id": "segment-000001",
+                            "text": "수정된 번역",
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            )
+            try:
+                orchestrator.save_artifact(job.id, "translation", edited)
+            finally:
+                orchestrator.stop()
+
+            self.assertIn(
+                "수정된 번역",
+                (media_root / "movie.ko.srt").read_text(encoding="utf-8"),
+            )

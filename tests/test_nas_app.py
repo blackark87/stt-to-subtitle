@@ -1,4 +1,5 @@
 from importlib.util import find_spec
+import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
@@ -180,6 +181,113 @@ class NASAppTests(unittest.TestCase):
                 captions.text,
             )
             self.assertIn("처리 결과", captions.text)
+
+    def test_edits_source_named_json_and_shows_chunk_progress(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            source = media_root / "movie.mp4"
+            source.write_bytes(b"media")
+
+            with TestClient(
+                create_app(self.settings(root, media_root))
+            ) as client:
+                service = client.app.state.orchestrator
+                job = service.create_job(
+                    "movie.mp4",
+                    force_overwrite=True,
+                    options={},
+                )
+                artifact_dir = root / "state" / "jobs" / job.id
+                artifact_dir.mkdir(parents=True, exist_ok=True)
+                transcript = artifact_dir / "movie_translate.json"
+                translation = artifact_dir / "movie_result_ko.json"
+                transcript.write_text(
+                    json.dumps(
+                        {
+                            "schema_version": 1,
+                            "job_id": "remote-job",
+                            "segments": [
+                                {
+                                    "id": "segment-000001",
+                                    "start": 0,
+                                    "end": 1,
+                                    "speaker": "SPEAKER_00",
+                                    "text": "こんにちは",
+                                }
+                            ],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                translation.write_text(
+                    json.dumps(
+                        {
+                            "schema_version": 1,
+                            "status": "completed",
+                            "translations": [
+                                {
+                                    "id": "segment-000001",
+                                    "text": "안녕하세요",
+                                }
+                            ],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                service.store.update(
+                    job.id,
+                    status="completed",
+                    transcript_path=str(transcript),
+                    translation_path=str(translation),
+                    chunks_created=21,
+                    chunks_completed=20,
+                    chunk_progress_every=10,
+                )
+
+                page = client.get(f"/jobs/{job.id}")
+                editor = client.get(
+                    f"/jobs/{job.id}/artifacts/translation/edit"
+                )
+                invalid = client.post(
+                    f"/jobs/{job.id}/artifacts/translation/edit",
+                    data={"content": "{not-json"},
+                )
+                saved = client.post(
+                    f"/jobs/{job.id}/artifacts/translation/edit",
+                    data={
+                        "content": json.dumps(
+                            {
+                                "schema_version": 1,
+                                "status": "completed",
+                                "translations": [
+                                    {
+                                        "id": "segment-000001",
+                                        "text": "수정된 번역",
+                                    }
+                                ],
+                            },
+                            ensure_ascii=False,
+                        )
+                    },
+                    follow_redirects=False,
+                )
+
+            self.assertIn("20", page.text)
+            self.assertIn("21 생성", page.text)
+            self.assertIn("1 진행·대기", page.text)
+            self.assertIn("한국어 결과 JSON 편집", page.text)
+            self.assertEqual(editor.status_code, 200)
+            self.assertIn("movie_result_ko.json", editor.text)
+            self.assertIn("json-editor.js", editor.text)
+            self.assertEqual(invalid.status_code, 400)
+            self.assertIn("JSON syntax error", invalid.text)
+            self.assertEqual(saved.status_code, 303)
+            self.assertIn(
+                "수정된 번역",
+                (media_root / "movie.ko.srt").read_text(encoding="utf-8"),
+            )
 
 
 if __name__ == "__main__":

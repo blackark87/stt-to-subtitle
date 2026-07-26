@@ -111,8 +111,27 @@ class TranscribeTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            [(item.created, item.completed, item.in_progress) for item in progress],
-            [(10, 10, 0), (20, 20, 0), (23, 23, 0)],
+            (
+                progress[0].created,
+                progress[0].completed,
+                progress[0].in_progress,
+            ),
+            (1, 0, 1),
+        )
+        self.assertEqual(
+            (
+                progress[-1].created,
+                progress[-1].completed,
+                progress[-1].in_progress,
+                progress[-1].final,
+            ),
+            (23, 23, 0, True),
+        )
+        self.assertTrue(
+            any(
+                item.created == 10 and item.completed == 10
+                for item in progress
+            )
         )
         self.assertNotIn("preprocess", speech_pipeline.__dict__)
         self.assertNotIn("_forward", speech_pipeline.__dict__)

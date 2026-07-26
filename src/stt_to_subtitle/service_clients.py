@@ -20,6 +20,10 @@ class ExternalServiceError(RuntimeError):
     """An external stage cannot currently make progress."""
 
 
+class TranslationResponseIDError(ExternalServiceError):
+    """LM Studio returned translations for a different segment ID set."""
+
+
 def _safe_error(response: requests.Response) -> str:
     try:
         body = response.json()
@@ -110,11 +114,11 @@ class STTAPIClient(RetryingJSONClient):
         idempotency_key: str,
         existing_job_id: str | None = None,
         on_job_created: Callable[[str], None] | None = None,
-        on_progress: Callable[[Mapping[str, int]], None] | None = None,
+        on_progress: Callable[[Mapping[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         job_id = existing_job_id
         may_requeue_existing = existing_job_id is not None
-        last_progress: tuple[int, int, int] | None = None
+        last_progress: tuple[int, int, int, int, bool] | None = None
         while True:
             if job_id is None:
                 job_id = self._submit(
@@ -149,8 +153,19 @@ class STTAPIClient(RetryingJSONClient):
                         int(progress["created"]),
                         int(progress["completed"]),
                         int(progress["in_progress"]),
+                        int(progress.get("report_every", 10)),
+                        remote_status == "completed",
                     )
                 except (KeyError, TypeError, ValueError):
+                    current_progress = None
+                if current_progress is not None and (
+                    current_progress[0] < 0
+                    or current_progress[1] < 0
+                    or current_progress[1] > current_progress[0]
+                    or current_progress[2]
+                    != current_progress[0] - current_progress[1]
+                    or current_progress[3] not in {10, 100}
+                ):
                     current_progress = None
                 if (
                     current_progress is not None
@@ -163,6 +178,8 @@ class STTAPIClient(RetryingJSONClient):
                             "created": current_progress[0],
                             "completed": current_progress[1],
                             "in_progress": current_progress[2],
+                            "report_every": current_progress[3],
+                            "final": current_progress[4],
                         }
                     )
             if remote_status == "completed":
@@ -171,6 +188,7 @@ class STTAPIClient(RetryingJSONClient):
                 if may_requeue_existing:
                     may_requeue_existing = False
                     job_id = None
+                    last_progress = None
                     continue
                 raise ExternalServiceError(
                     "transcription job failed: "
@@ -305,6 +323,59 @@ def batch_segments(
     return batches
 
 
+def normalize_translation_response(
+    items: Any,
+    expected_ids: Sequence[str],
+) -> list[dict[str, str]]:
+    """Accept reordered IDs, but reject missing, duplicate, or unrelated IDs."""
+    if not isinstance(items, list):
+        raise TranslationResponseIDError(
+            "translation response must contain a translations list"
+        )
+
+    received: dict[str, str] = {}
+    duplicate_ids: set[str] = set()
+    for index, item in enumerate(items):
+        if not isinstance(item, Mapping):
+            raise TranslationResponseIDError(
+                f"translation item {index} must be an object"
+            )
+        segment_id = str(item.get("id", "")).strip()
+        text = str(item.get("text", "")).strip()
+        if not segment_id or not text:
+            raise TranslationResponseIDError(
+                f"translation item {index} has an empty id or text"
+            )
+        if segment_id in received:
+            duplicate_ids.add(segment_id)
+        received[segment_id] = text
+
+    expected = list(expected_ids)
+    if len(expected) == 1 and len(items) == 1 and not duplicate_ids:
+        return [{"id": expected[0], "text": next(iter(received.values()))}]
+
+    expected_set = set(expected)
+    received_set = set(received)
+    missing = [segment_id for segment_id in expected if segment_id not in received]
+    unexpected = sorted(received_set - expected_set)
+    if missing or unexpected or duplicate_ids:
+        details = []
+        if missing:
+            details.append(f"missing={missing[:5]}")
+        if unexpected:
+            details.append(f"unexpected={unexpected[:5]}")
+        if duplicate_ids:
+            details.append(f"duplicate={sorted(duplicate_ids)[:5]}")
+        raise TranslationResponseIDError(
+            "translation response ids do not match the request"
+            + (f" ({', '.join(details)})" if details else "")
+        )
+    return [
+        {"id": segment_id, "text": received[segment_id]}
+        for segment_id in expected
+    ]
+
+
 class LMStudioClient(RetryingJSONClient):
     def __init__(
         self,
@@ -336,10 +407,20 @@ class LMStudioClient(RetryingJSONClient):
         on_batch: Callable[[list[dict[str, str]]], None] | None = None,
     ) -> list[dict[str, str]]:
         expected_ids = [str(segment["id"]) for segment in segments]
-        known = dict(existing or {})
-        unknown_existing = set(known) - set(expected_ids)
-        if unknown_existing:
-            raise ValueError("partial translation contains unknown segment ids")
+        expected_set = set(expected_ids)
+        known = {
+            str(segment_id): str(text).strip()
+            for segment_id, text in (existing or {}).items()
+            if str(segment_id) in expected_set and str(text).strip()
+        }
+        ignored_existing = {
+            str(segment_id) for segment_id in (existing or {})
+        } - expected_set
+        if ignored_existing:
+            LOGGER.warning(
+                "ignored %d stale translation checkpoint id(s)",
+                len(ignored_existing),
+            )
 
         pending = [
             segment for segment in segments if str(segment["id"]) not in known
@@ -349,7 +430,7 @@ class LMStudioClient(RetryingJSONClient):
             max_segments=self.max_segments,
             max_characters=self.max_characters,
         ):
-            translated = self._translate_batch(batch)
+            translated = self._translate_batch_with_recovery(batch)
             for item in translated:
                 known[item["id"]] = item["text"]
             if on_batch is not None:
@@ -367,6 +448,27 @@ class LMStudioClient(RetryingJSONClient):
             if segment_id in known
         ]
         return validate_translation_items(result, expected_ids)
+
+    def _translate_batch_with_recovery(
+        self,
+        segments: Sequence[Mapping[str, Any]],
+    ) -> list[dict[str, str]]:
+        try:
+            return self._translate_batch(segments)
+        except TranslationResponseIDError:
+            if len(segments) <= 1:
+                raise
+            midpoint = len(segments) // 2
+            LOGGER.warning(
+                "LM Studio returned mismatched translation IDs; "
+                "retrying as %d and %d segment batches",
+                midpoint,
+                len(segments) - midpoint,
+            )
+            return [
+                *self._translate_batch_with_recovery(segments[:midpoint]),
+                *self._translate_batch_with_recovery(segments[midpoint:]),
+            ]
 
     def _translate_batch(
         self,
@@ -449,7 +551,4 @@ class LMStudioClient(RetryingJSONClient):
             raise ExternalServiceError(
                 "LM Studio returned invalid structured translation JSON"
             ) from error
-        try:
-            return validate_translation_items(translations, expected_ids)
-        except ValueError as error:
-            raise ExternalServiceError(str(error)) from error
+        return normalize_translation_response(translations, expected_ids)

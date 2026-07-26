@@ -27,7 +27,7 @@ class TranscriptionJob:
     created_at: float
     updated_at: float
 
-    def public_dict(self) -> dict[str, Any]:
+    def public_dict(self, *, report_every: int = 10) -> dict[str, Any]:
         in_progress = max(0, self.chunks_created - self.chunks_completed)
         return {
             "id": self.id,
@@ -38,6 +38,7 @@ class TranscriptionJob:
                 "created": self.chunks_created,
                 "completed": self.chunks_completed,
                 "in_progress": in_progress,
+                "report_every": report_every,
             },
             "created_at": format_kst_iso(self.created_at),
             "updated_at": format_kst_iso(self.updated_at),

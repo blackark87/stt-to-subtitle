@@ -35,6 +35,7 @@ class TranscriptionStoreTests(unittest.TestCase):
                     "created": 20,
                     "completed": 10,
                     "in_progress": 10,
+                    "report_every": 10,
                 },
             )
             self.assertTrue(public_job["created_at"].endswith("+09:00"))
@@ -115,3 +116,68 @@ class NASStoreTests(unittest.TestCase):
             job = store.get("job-1")
             self.assertEqual(job.status, "blocked")
             self.assertEqual(job.blocked_stage, "translation")
+
+    def test_persists_chunk_progress_for_the_job_panel(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = NASStore(Path(directory) / "jobs.sqlite3")
+            store.create(
+                job_id="job-1",
+                source_rel="movie.mkv",
+                force_overwrite=False,
+                options={},
+            )
+
+            store.update(
+                "job-1",
+                chunks_created=21,
+                chunks_completed=20,
+                chunk_progress_every=10,
+            )
+
+            job = store.get("job-1")
+            self.assertEqual(job.chunks_created, 21)
+            self.assertEqual(job.chunks_completed, 20)
+            self.assertEqual(job.chunks_in_progress, 1)
+            self.assertEqual(job.chunk_progress_every, 10)
+
+    def test_adds_progress_columns_to_an_existing_nas_database(self) -> None:
+        with TemporaryDirectory() as directory:
+            database_path = Path(directory) / "jobs.sqlite3"
+            now = time.time()
+            with sqlite3.connect(database_path) as connection:
+                connection.execute(
+                    """
+                    CREATE TABLE jobs (
+                        id TEXT PRIMARY KEY,
+                        source_rel TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        force_overwrite INTEGER NOT NULL,
+                        options_json TEXT NOT NULL,
+                        audio_path TEXT,
+                        audio_sha256 TEXT,
+                        stt_job_id TEXT,
+                        transcript_path TEXT,
+                        translation_path TEXT,
+                        srt_path TEXT,
+                        blocked_stage TEXT,
+                        error TEXT,
+                        created_at REAL NOT NULL,
+                        updated_at REAL NOT NULL
+                    )
+                    """
+                )
+                connection.execute(
+                    """
+                    INSERT INTO jobs VALUES (
+                        'job-1', 'movie.mkv', 'queued', 0, '{}',
+                        NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?
+                    )
+                    """,
+                    (now, now),
+                )
+
+            job = NASStore(database_path).get("job-1")
+
+            self.assertEqual(job.chunks_created, 0)
+            self.assertEqual(job.chunks_completed, 0)
+            self.assertEqual(job.chunk_progress_every, 10)

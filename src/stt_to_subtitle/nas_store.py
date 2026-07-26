@@ -32,8 +32,15 @@ class NASJob:
     srt_path: str | None
     blocked_stage: str | None
     error: str | None
+    chunks_created: int
+    chunks_completed: int
+    chunk_progress_every: int
     created_at: float
     updated_at: float
+
+    @property
+    def chunks_in_progress(self) -> int:
+        return max(0, self.chunks_created - self.chunks_completed)
 
 
 class NASStore:
@@ -47,6 +54,9 @@ class NASStore:
         "srt_path",
         "blocked_stage",
         "error",
+        "chunks_created",
+        "chunks_completed",
+        "chunk_progress_every",
     }
 
     def __init__(self, database_path: Path) -> None:
@@ -78,6 +88,9 @@ class NASStore:
                     srt_path TEXT,
                     blocked_stage TEXT,
                     error TEXT,
+                    chunks_created INTEGER NOT NULL DEFAULT 0,
+                    chunks_completed INTEGER NOT NULL DEFAULT 0,
+                    chunk_progress_every INTEGER NOT NULL DEFAULT 10,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL
                 );
@@ -97,6 +110,27 @@ class NASStore:
                     ON job_events(job_id, id);
                 """
             )
+            columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(jobs)").fetchall()
+            }
+            migrations = {
+                "chunks_created": (
+                    "ALTER TABLE jobs ADD COLUMN "
+                    "chunks_created INTEGER NOT NULL DEFAULT 0"
+                ),
+                "chunks_completed": (
+                    "ALTER TABLE jobs ADD COLUMN "
+                    "chunks_completed INTEGER NOT NULL DEFAULT 0"
+                ),
+                "chunk_progress_every": (
+                    "ALTER TABLE jobs ADD COLUMN "
+                    "chunk_progress_every INTEGER NOT NULL DEFAULT 10"
+                ),
+            }
+            for column, statement in migrations.items():
+                if column not in columns:
+                    connection.execute(statement)
 
     @staticmethod
     def _from_row(row: sqlite3.Row | None) -> NASJob | None:
@@ -124,6 +158,9 @@ class NASStore:
                 str(row["blocked_stage"]) if row["blocked_stage"] else None
             ),
             error=str(row["error"]) if row["error"] else None,
+            chunks_created=int(row["chunks_created"]),
+            chunks_completed=int(row["chunks_completed"]),
+            chunk_progress_every=int(row["chunk_progress_every"]),
             created_at=float(row["created_at"]),
             updated_at=float(row["updated_at"]),
         )
