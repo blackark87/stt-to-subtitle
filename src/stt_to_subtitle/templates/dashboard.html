@@ -1,25 +1,86 @@
 {% extends "base.html" %}
 {% block title %}작업 대시보드 · STT to Subtitle{% endblock %}
+{% block head %}
+  <script defer src="{{ url_for('static', path='/media-picker.js') }}"></script>
+{% endblock %}
 {% block content %}
   <h1>자막 작업</h1>
   <p class="muted">NAS가 오디오를 추출하고, Mac 전사 API와 별도 LM Studio PC를 순서대로 호출합니다.</p>
   {% if error %}<p class="alert">{{ error }}</p>{% endif %}
+  {% if notice %}<p class="notice">{{ notice }}</p>{% endif %}
 
   <section class="card">
     <h2>새 작업</h2>
     <form method="post" action="/jobs" class="grid-form">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-      <label class="wide">미디어 파일
-        <select name="source_rel" required>
+      <fieldset class="media-picker wide">
+        <legend>미디어 파일</legend>
+        {% if files %}
+          <div class="media-toolbar">
+            <span><strong data-selection-count>0</strong>개 선택</span>
+            <span class="media-toolbar-actions">
+              <button type="button" class="secondary compact" data-select-all>전체 선택</button>
+              <button type="button" class="secondary compact" data-clear-selection>선택 해제</button>
+            </span>
+          </div>
+          <div class="media-board">
           {% for file in files %}
-            <option value="{{ file.path }}">
-              {{ file.path }} · {{ file.size|filesize }}{% if file.has_subtitle %} · SRT 있음{% endif %}
-            </option>
-          {% else %}
-            <option value="" disabled>MEDIA_ROOT에 지원 파일이 없습니다</option>
+              <label class="media-card">
+                <input
+                  class="media-card-checkbox"
+                  name="source_rels"
+                  type="checkbox"
+                  value="{{ file.path }}"
+                  aria-label="{{ file.name }} 선택"
+                >
+                {% if file.has_nfo %}
+                  <span class="poster-frame">
+                    {% if file.poster_path %}
+                      <img
+                        src="{{ url_for('media_poster', poster_path=file.poster_path) }}"
+                        alt="{{ file.title }} 포스터"
+                        loading="lazy"
+                      >
+                    {% else %}
+                      <span class="poster-placeholder" aria-hidden="true">NFO</span>
+                    {% endif %}
+                  </span>
+                  <span class="media-card-content">
+                    <span class="metadata-label">NFO</span>
+                    <strong class="media-title">{{ file.title }}</strong>
+                    <span class="media-filename" title="{{ file.name }}">{{ file.name }}</span>
+                    {% if file.directory %}
+                      <span class="media-directory" title="{{ file.directory }}">{{ file.directory }}</span>
+                    {% endif %}
+                    <span class="media-size">{{ file.size|filesize }}</span>
+                    <span class="subtitle-state {% if file.has_subtitle %}is-done{% else %}is-pending{% endif %}">
+                      {% if file.has_subtitle %}자막 완료{% else %}자막 미완료{% endif %}
+                    </span>
+                  </span>
+                {% else %}
+                  <span class="folder-glyph" aria-hidden="true">
+                    <span class="folder-film">▶</span>
+                  </span>
+                  <span class="media-card-content">
+                    <strong class="media-title">{{ file.name }}</strong>
+                    {% if file.directory %}
+                      <span class="media-directory" title="{{ file.directory }}">{{ file.directory }}</span>
+                    {% endif %}
+                    <span class="media-size">{{ file.size|filesize }}</span>
+                    <span class="subtitle-state {% if file.has_subtitle %}is-done{% else %}is-pending{% endif %}">
+                      {% if file.has_subtitle %}자막 완료{% else %}자막 미완료{% endif %}
+                    </span>
+                  </span>
+                {% endif %}
+              </label>
           {% endfor %}
-        </select>
-      </label>
+          </div>
+        {% else %}
+          <p class="empty-state">MEDIA_ROOT에 지원 파일이 없습니다.</p>
+        {% endif %}
+      </fieldset>
+
+      <h3 class="form-section-title wide">처리 설정</h3>
       <label>오디오 스트림
         <input name="audio_stream" type="number" min="0" value="0" required>
       </label>
@@ -41,9 +102,14 @@
       <label>최대 화자
         <input name="max_speakers" type="number" min="1" placeholder="자동">
       </label>
-      <label class="check"><input name="add_punctuation" type="checkbox"> 일본어 구두점 모델 사용</label>
-      <label class="check"><input name="force_overwrite" type="checkbox"> 기존 <code>.ko.srt</code> 강제 덮어쓰기</label>
-      <div class="wide"><button type="submit" {% if not files %}disabled{% endif %}>작업 시작</button></div>
+      <div class="option-checks wide">
+        <label class="check"><input name="add_punctuation" type="checkbox"><span>일본어 구두점 모델 사용</span></label>
+        <label class="check"><input name="force_overwrite" type="checkbox"><span>기존 <code>.ko.srt</code> 강제 덮어쓰기</span></label>
+      </div>
+      <div class="wide submit-row">
+        <button type="submit" data-batch-submit {% if not files %}disabled{% endif %}>선택한 파일 작업 시작</button>
+        <span class="muted">여러 파일을 선택하면 같은 설정으로 일괄 등록됩니다.</span>
+      </div>
     </form>
   </section>
 

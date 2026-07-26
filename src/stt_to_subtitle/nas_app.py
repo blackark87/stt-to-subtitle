@@ -7,17 +7,26 @@ from dataclasses import asdict
 from datetime import datetime
 import hmac
 import logging
+import mimetypes
 import os
 from pathlib import Path
 import secrets
 from typing import Any, AsyncIterator
+from urllib.parse import quote
 
 from fastapi import FastAPI, Form, HTTPException, Request, status
-from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    RedirectResponse,
+    Response,
+    StreamingResponse,
+)
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
 
+from .media_preview import iter_file_range, parse_byte_range, srt_to_webvtt
 from .nas_config import NASSettings
 from .orchestrator import NASOrchestrator
 
@@ -95,6 +104,7 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
         request: Request,
         *,
         error: str | None = None,
+        notice: str | None = None,
     ) -> dict[str, Any]:
         service = orchestrator(request)
         return {
@@ -103,6 +113,7 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
             "jobs": service.store.list_jobs(),
             "csrf_token": request.session.get("csrf_token", ""),
             "error": error,
+            "notice": notice,
         }
 
     @app.get("/healthz")
@@ -157,14 +168,35 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
         return login_redirect()
 
     @app.get("/", response_class=HTMLResponse)
-    def dashboard(request: Request) -> Any:
+    def dashboard(request: Request, queued: int | None = None) -> Any:
         if not is_authenticated(request):
             return login_redirect()
+        notice = (
+            f"작업 {queued}개를 등록했습니다."
+            if queued is not None and queued > 1
+            else None
+        )
         return TEMPLATES.TemplateResponse(
             request,
             "dashboard.html",
-            dashboard_context(request),
+            dashboard_context(request, notice=notice),
         )
+
+    @app.get(
+        "/media/posters/{poster_path:path}",
+        name="media_poster",
+    )
+    def media_poster(request: Request, poster_path: str) -> Any:
+        if not is_authenticated(request):
+            return login_redirect()
+        try:
+            poster = orchestrator(request).library.resolve_poster(poster_path)
+        except ValueError as error:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="poster not found",
+            ) from error
+        return FileResponse(poster)
 
     @app.get("/jobs-fragment", response_class=HTMLResponse)
     def jobs_fragment(request: Request) -> Any:
@@ -179,7 +211,7 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
     @app.post("/jobs", response_class=HTMLResponse)
     def create_job(
         request: Request,
-        source_rel: str = Form(...),
+        source_rels: list[str] | None = Form(None),
         csrf_token: str = Form(""),
         force_overwrite: bool = Form(False),
         audio_stream: str = Form("0"),
@@ -205,8 +237,8 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
             "add_punctuation": add_punctuation,
         }
         try:
-            job = orchestrator(request).create_job(
-                source_rel,
+            jobs = orchestrator(request).create_jobs(
+                source_rels or [],
                 force_overwrite=force_overwrite,
                 options=options,
             )
@@ -217,9 +249,109 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
                 dashboard_context(request, error=str(error)),
                 status_code=status.HTTP_400_BAD_REQUEST,
             )
+        if len(jobs) > 1:
+            return RedirectResponse(
+                f"/?queued={len(jobs)}",
+                status_code=status.HTTP_303_SEE_OTHER,
+            )
         return RedirectResponse(
-            f"/jobs/{job.id}",
+            f"/jobs/{jobs[0].id}",
             status_code=status.HTTP_303_SEE_OTHER,
+        )
+
+    @app.api_route(
+        "/jobs/{job_id}/video",
+        methods=["GET", "HEAD"],
+        name="job_video",
+    )
+    def job_video(request: Request, job_id: str) -> Any:
+        if not is_authenticated(request):
+            return login_redirect()
+        service = orchestrator(request)
+        job = service.store.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="job not found")
+        try:
+            source = service.library.resolve_file(job.source_rel)
+        except ValueError as error:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="media file not found",
+            ) from error
+
+        file_size = source.stat().st_size
+        base_headers = {
+            "Accept-Ranges": "bytes",
+            "Cache-Control": "private, no-cache",
+            "Content-Disposition": (
+                "inline; filename*=UTF-8''" + quote(source.name)
+            ),
+        }
+        try:
+            byte_range = parse_byte_range(
+                request.headers.get("range"),
+                file_size,
+            )
+        except (OverflowError, ValueError):
+            return Response(
+                status_code=status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE,
+                headers={
+                    **base_headers,
+                    "Content-Range": f"bytes */{file_size}",
+                },
+            )
+
+        if byte_range is None:
+            start, end = 0, file_size - 1
+            response_status = status.HTTP_200_OK
+        else:
+            start, end = byte_range
+            response_status = status.HTTP_206_PARTIAL_CONTENT
+            base_headers["Content-Range"] = (
+                f"bytes {start}-{end}/{file_size}"
+            )
+        base_headers["Content-Length"] = str(max(0, end - start + 1))
+        media_type = (
+            mimetypes.guess_type(source.name)[0]
+            or "application/octet-stream"
+        )
+        if request.method == "HEAD":
+            return Response(
+                status_code=response_status,
+                media_type=media_type,
+                headers=base_headers,
+            )
+        return StreamingResponse(
+            iter_file_range(source, start, end),
+            status_code=response_status,
+            media_type=media_type,
+            headers=base_headers,
+        )
+
+    @app.get(
+        "/jobs/{job_id}/subtitles.vtt",
+        name="job_subtitles",
+    )
+    def job_subtitles(request: Request, job_id: str) -> Any:
+        if not is_authenticated(request):
+            return login_redirect()
+        service = orchestrator(request)
+        job = service.store.get(job_id)
+        if job is None or not job.srt_path:
+            raise HTTPException(status_code=404, detail="subtitle not found")
+        try:
+            source = service.library.resolve_file(job.source_rel)
+            subtitle = source.with_name(f"{source.stem}.ko.srt")
+            srt_text = subtitle.read_text(encoding="utf-8-sig")
+        except (OSError, UnicodeError, ValueError) as error:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="subtitle not found",
+            ) from error
+        return Response(
+            srt_to_webvtt(srt_text),
+            media_type="text/vtt",
+            headers={"Cache-Control": "private, no-cache"},
         )
 
     @app.get("/jobs/{job_id}", response_class=HTMLResponse)

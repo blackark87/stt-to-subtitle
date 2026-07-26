@@ -7,7 +7,7 @@ import json
 import logging
 from pathlib import Path
 import threading
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 from uuid import uuid4
 
 from .audio import AudioExtraction, extract_audio
@@ -96,13 +96,49 @@ class NASOrchestrator:
         force_overwrite: bool,
         options: Mapping[str, Any],
     ) -> NASJob:
-        source = self.library.resolve_file(source_rel)
-        subtitle = source.with_name(f"{source.stem}.ko.srt")
-        if subtitle.exists() and not force_overwrite:
-            raise FileExistsError(
-                "Korean SRT already exists; select force overwrite explicitly"
-            )
+        return self.create_jobs(
+            [source_rel],
+            force_overwrite=force_overwrite,
+            options=options,
+        )[0]
 
+    def create_jobs(
+        self,
+        source_rels: Sequence[str],
+        *,
+        force_overwrite: bool,
+        options: Mapping[str, Any],
+    ) -> list[NASJob]:
+        unique_source_rels = list(dict.fromkeys(source_rels))
+        if not unique_source_rels:
+            raise ValueError("작업할 미디어 파일을 하나 이상 선택하세요.")
+        if len(unique_source_rels) > self.settings.maximum_listed_files:
+            raise ValueError("한 번에 등록할 수 있는 파일 수를 초과했습니다.")
+
+        normalized_options = self._normalize_options(options)
+        for source_rel in unique_source_rels:
+            source = self.library.resolve_file(source_rel)
+            subtitle = source.with_name(f"{source.stem}.ko.srt")
+            if subtitle.exists() and not force_overwrite:
+                raise FileExistsError(
+                    f"{source_rel}: 기존 .ko.srt가 있습니다. "
+                    "덮어쓰기를 명시적으로 선택하세요."
+                )
+
+        return [
+            self.store.create(
+                job_id=uuid4().hex,
+                source_rel=source_rel,
+                force_overwrite=force_overwrite,
+                options=normalized_options,
+            )
+            for source_rel in unique_source_rels
+        ]
+
+    def _normalize_options(
+        self,
+        options: Mapping[str, Any],
+    ) -> dict[str, Any]:
         raw_duration = options.get("duration_seconds")
         parsed_duration = (
             float(raw_duration)
@@ -149,12 +185,7 @@ class NASOrchestrator:
             "max_speakers": transcription.max_speakers,
             "add_punctuation": transcription.add_punctuation,
         }
-        return self.store.create(
-            job_id=uuid4().hex,
-            source_rel=source_rel,
-            force_overwrite=force_overwrite,
-            options=normalized_options,
-        )
+        return normalized_options
 
     def retry(self, job_id: str) -> NASJob:
         job = self.store.get(job_id)
