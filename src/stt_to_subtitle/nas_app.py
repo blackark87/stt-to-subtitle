@@ -48,7 +48,7 @@ PACKAGE_DIR = Path(__file__).parent
 TEMPLATES = Jinja2Templates(directory=PACKAGE_DIR / "templates")
 TEMPLATES.env.filters["datetime"] = format_kst_timestamp
 TEMPLATES.env.filters["filesize"] = lambda value: (
-    f"{float(value) / 1024 / 1024:.1f} MiB"
+    f"{float(value) / 1024 / 1024 / 1024:.2f} GiB"
 )
 
 
