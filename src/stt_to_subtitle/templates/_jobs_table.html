@@ -7,7 +7,21 @@
           <td>{{ job.source_rel }}</td>
           <td><span class="status status-{{ job.status }}">{{ job.status }}</span></td>
           <td>{{ job.updated_at|datetime }}</td>
-          <td><a href="/jobs/{{ job.id }}">상세</a></td>
+          <td>
+            <div class="table-actions">
+              <a href="/jobs/{{ job.id }}">상세</a>
+              {% if job.status == "completed" and job.transcript_path %}
+                <form
+                  method="post"
+                  action="/jobs/{{ job.id }}/restart-translation"
+                  data-confirm-message="기존 번역 결과를 초기화하고 번역부터 다시 시작하시겠습니까? 일본어 전사 결과는 유지됩니다."
+                >
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <button type="submit" class="secondary">번역 다시 시작</button>
+                </form>
+              {% endif %}
+            </div>
+          </td>
         </tr>
       {% else %}
         <tr><td colspan="4" class="muted">아직 작업이 없습니다.</td></tr>

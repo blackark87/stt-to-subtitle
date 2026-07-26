@@ -281,7 +281,10 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
         return TEMPLATES.TemplateResponse(
             request,
             "_jobs_table.html",
-            {"jobs": orchestrator(request).store.list_jobs()},
+            {
+                "jobs": orchestrator(request).store.list_jobs(),
+                "csrf_token": request.session.get("csrf_token", ""),
+            },
         )
 
     @app.post("/jobs", response_class=HTMLResponse)
@@ -550,6 +553,24 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
         try:
             orchestrator(request).retry(job_id)
         except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        return RedirectResponse(
+            f"/jobs/{job_id}",
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+
+    @app.post("/jobs/{job_id}/restart-translation")
+    def restart_translation(
+        request: Request,
+        job_id: str,
+        csrf_token: str = Form(""),
+    ) -> Any:
+        if not is_authenticated(request):
+            return login_redirect()
+        validate_csrf(request, csrf_token)
+        try:
+            orchestrator(request).restart_translation(job_id)
+        except (OSError, UnicodeError, ValueError) as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
         return RedirectResponse(
             f"/jobs/{job_id}",

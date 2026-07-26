@@ -263,6 +263,73 @@ class NASOrchestrator:
             raise RuntimeError("retried NAS job could not be read")
         return retried
 
+    def restart_translation(self, job_id: str) -> NASJob:
+        """Reset translation only while preserving a completed transcript."""
+        job = self.store.get(job_id)
+        if job is None:
+            raise ValueError("job not found")
+        if job.status != "completed":
+            raise ValueError(
+                "translation can only be restarted for completed jobs"
+            )
+        if not job.transcript_path:
+            raise ValueError("transcript artifact is unavailable")
+
+        transcript_path = Path(job.transcript_path)
+        if not transcript_path.is_file():
+            raise ValueError("transcript artifact is unavailable")
+        try:
+            transcript_payload = json.loads(
+                transcript_path.read_text(encoding="utf-8")
+            )
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise ValueError("transcript artifact could not be read") from error
+        if not isinstance(transcript_payload, Mapping):
+            raise ValueError("transcript JSON document must be an object")
+        validate_transcript(transcript_payload)
+        transcript_job_id = str(
+            transcript_payload.get("job_id", "")
+        ).strip()
+        if not transcript_job_id:
+            raise ValueError("transcript job_id is unavailable")
+
+        translation_path = (
+            Path(job.translation_path)
+            if job.translation_path
+            else artifact_path(
+                self.settings.state_dir,
+                job.id,
+                job.source_rel,
+                "translation",
+            )
+        )
+        write_json_atomic(
+            translation_path,
+            {
+                "schema_version": TRANSLATION_SCHEMA_VERSION,
+                "status": "partial",
+                "transcript_job_id": transcript_job_id,
+                "translations": [],
+            },
+        )
+        self.store.update(
+            job.id,
+            status="transcribed",
+            translation_path=str(translation_path),
+            blocked_stage=None,
+            error=None,
+        )
+        self.store.add_event(
+            job.id,
+            "info",
+            "translation restart requested; transcript preserved and "
+            "translation checkpoint reset",
+        )
+        restarted = self.store.get(job.id)
+        if restarted is None:
+            raise RuntimeError("restarted NAS job could not be read")
+        return restarted
+
     def save_artifact(
         self,
         job_id: str,
@@ -656,7 +723,14 @@ class NASOrchestrator:
         )
 
     def _render(self, job: NASJob) -> None:
-        self._render_artifacts(job, overwrite=job.force_overwrite)
+        self._render_artifacts(
+            job,
+            overwrite=(
+                job.force_overwrite
+                or bool(job.srt_path)
+                or bool(job.ass_path)
+            ),
+        )
         refreshed = self.store.get(job.id)
         if (
             refreshed is None

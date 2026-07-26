@@ -1,4 +1,11 @@
 document.addEventListener("DOMContentLoaded", () => {
+  document.addEventListener("submit", (event) => {
+    const form = event.target.closest?.("form[data-confirm-message]");
+    if (form && !window.confirm(form.dataset.confirmMessage)) {
+      event.preventDefault();
+    }
+  });
+
   for (const target of document.querySelectorAll("[data-poll-url]")) {
     const seconds = Number(target.dataset.pollSeconds || "5");
     const interval = window.setInterval(async () => {

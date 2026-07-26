@@ -280,6 +280,15 @@ class NASAppTests(unittest.TestCase):
                     f"/jobs/{job.id}/subtitle.ass"
                 )
                 refreshed_page = client.get(f"/jobs/{job.id}")
+                completed_jobs = client.get("/jobs-fragment")
+                restart = client.post(
+                    f"/jobs/{job.id}/restart-translation",
+                    follow_redirects=False,
+                )
+                restarted_job = service.store.get(job.id)
+                reset_translation = json.loads(
+                    translation.read_text(encoding="utf-8")
+                )
 
             self.assertIn("20", page.text)
             self.assertIn("21 생성", page.text)
@@ -300,10 +309,21 @@ class NASAppTests(unittest.TestCase):
             self.assertIn("text/x-ssa", styled_subtitle.headers["content-type"])
             self.assertIn("[V4+ Styles]", styled_subtitle.text)
             self.assertIn("스타일 ASS 다운로드", refreshed_page.text)
+            self.assertIn("번역부터 다시 시작", refreshed_page.text)
+            self.assertIn("번역 다시 시작", completed_jobs.text)
+            self.assertIn(
+                f'/jobs/{job.id}/restart-translation',
+                completed_jobs.text,
+            )
             self.assertIn(
                 "수정된 번역",
                 (media_root / "movie.ko.srt").read_text(encoding="utf-8"),
             )
+            self.assertEqual(restart.status_code, 303)
+            self.assertEqual(restarted_job.status, "transcribed")
+            self.assertEqual(reset_translation["status"], "partial")
+            self.assertEqual(reset_translation["translations"], [])
+            self.assertTrue(transcript.is_file())
 
 
 if __name__ == "__main__":
