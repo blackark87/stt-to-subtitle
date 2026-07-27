@@ -18,7 +18,7 @@
     </div>
   </div>
   <h1>자막 작업</h1>
-  <p class="muted">NAS가 오디오를 추출하고, MPS/CUDA 전사 API와 별도 LM Studio PC를 순서대로 호출합니다.</p>
+  <p class="muted">NAS가 오디오를 추출하고, MPS/CUDA 전사 API와 별도 OpenAI 호환 번역 서버를 순서대로 호출합니다.</p>
   {% if not remote_servers.configured %}
     <p class="alert">
       작업을 시작하려면 먼저 <a href="/settings">전사·번역 서버를 설정</a>하세요.
@@ -156,9 +156,22 @@
     </form>
   </section>
 
-  <section class="card">
-    <h2>최근 작업</h2>
-    <div data-poll-url="/jobs-fragment" data-poll-seconds="5">
+  <section class="card recent-jobs-card">
+    <div class="section-heading">
+      <div>
+        <h2>최근 작업</h2>
+        <p class="muted">최신 생성 순으로 최대 20개를 표시합니다.</p>
+      </div>
+      <span class="polling-indicator">
+        <span aria-hidden="true"></span>
+        5초마다 갱신
+      </span>
+    </div>
+    <div
+      data-poll-url="/jobs-fragment"
+      data-poll-seconds="5"
+      aria-live="off"
+    >
       {% include "_jobs_table.html" %}
     </div>
   </section>

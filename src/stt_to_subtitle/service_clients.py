@@ -1,4 +1,4 @@
-"""HTTP clients for the independent STT and LM Studio services."""
+"""HTTP clients for the independent STT and translation services."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ class ExternalServiceError(RuntimeError):
 
 
 class TranslationResponseIDError(ExternalServiceError):
-    """LM Studio returned translations for a different segment ID set."""
+    """The translation server returned a different segment ID set."""
 
 
 def _safe_error(response: requests.Response) -> str:
@@ -376,7 +376,58 @@ def normalize_translation_response(
     ]
 
 
-class LMStudioClient(RetryingJSONClient):
+def list_openai_compatible_models(
+    base_url: str,
+    token: str,
+    *,
+    attempts: int = 1,
+) -> list[str]:
+    """Return model identifiers exposed by an OpenAI-compatible server."""
+    client = RetryingJSONClient(
+        token=token,
+        read_timeout=30.0,
+        attempts=attempts,
+    )
+    response = client.request(
+        "GET",
+        f"{base_url.rstrip('/')}/models",
+        headers=client.headers,
+    )
+    if response.status_code != 200:
+        raise ExternalServiceError(
+            "OpenAI-compatible model lookup failed: "
+            f"HTTP {response.status_code}: {_safe_error(response)}"
+        )
+    try:
+        data = response.json()["data"]
+    except (KeyError, TypeError, ValueError) as error:
+        raise ExternalServiceError(
+            "OpenAI-compatible server returned an invalid model list"
+        ) from error
+    if not isinstance(data, list):
+        raise ExternalServiceError(
+            "OpenAI-compatible server returned an invalid model list"
+        )
+
+    model_ids: list[str] = []
+    seen: set[str] = set()
+    for index, item in enumerate(data):
+        if not isinstance(item, Mapping):
+            raise ExternalServiceError(
+                f"model list item {index} must be an object"
+            )
+        model_id = str(item.get("id", "")).strip()
+        if not model_id:
+            raise ExternalServiceError(
+                f"model list item {index} has an empty id"
+            )
+        if model_id not in seen:
+            seen.add(model_id)
+            model_ids.append(model_id)
+    return sorted(model_ids, key=str.casefold)
+
+
+class OpenAICompatibleClient(RetryingJSONClient):
     def __init__(
         self,
         base_url: str,
@@ -393,9 +444,9 @@ class LMStudioClient(RetryingJSONClient):
             attempts=attempts,
         )
         if not model.strip():
-            raise ValueError("LM Studio model name is required")
+            raise ValueError("OpenAI-compatible model name is required")
         self.base_url = base_url.rstrip("/")
-        self.model = model
+        self.model = model.strip()
         self.max_segments = max_segments
         self.max_characters = max_characters
 
@@ -460,7 +511,7 @@ class LMStudioClient(RetryingJSONClient):
                 raise
             midpoint = len(segments) // 2
             LOGGER.warning(
-                "LM Studio returned mismatched translation IDs; "
+                "translation server returned mismatched translation IDs; "
                 "retrying as %d and %d segment batches",
                 midpoint,
                 len(segments) - midpoint,
@@ -540,7 +591,7 @@ class LMStudioClient(RetryingJSONClient):
         )
         if response.status_code != 200:
             raise ExternalServiceError(
-                "LM Studio translation failed: "
+                "OpenAI-compatible translation failed: "
                 f"HTTP {response.status_code}: {_safe_error(response)}"
             )
         try:
@@ -549,6 +600,12 @@ class LMStudioClient(RetryingJSONClient):
             translations = decoded["translations"]
         except (KeyError, IndexError, TypeError, ValueError) as error:
             raise ExternalServiceError(
-                "LM Studio returned invalid structured translation JSON"
+                "OpenAI-compatible server returned invalid structured "
+                "translation JSON"
             ) from error
         return normalize_translation_response(translations, expected_ids)
+
+
+# Backward-compatible import for callers that used the former product-specific
+# class name. New code should use OpenAICompatibleClient.
+LMStudioClient = OpenAICompatibleClient

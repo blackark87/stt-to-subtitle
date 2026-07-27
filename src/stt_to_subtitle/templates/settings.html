@@ -1,5 +1,8 @@
 {% extends "base.html" %}
 {% block title %}서버 설정 · STT to Subtitle{% endblock %}
+{% block head %}
+  <script defer src="{{ url_for('static', path='/server-settings.js') }}"></script>
+{% endblock %}
 {% block content %}
   <div class="page-heading">
     <div>
@@ -16,7 +19,13 @@
   {% if error %}<p class="alert">{{ error }}</p>{% endif %}
   {% if notice %}<p class="notice">{{ notice }}</p>{% endif %}
 
-  <form method="post" action="/settings" class="stack">
+  <form
+    method="post"
+    action="/settings"
+    class="stack"
+    data-server-settings
+    data-models-url="/settings/translation-models"
+  >
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
 
     <section class="card settings-card">
@@ -49,21 +58,16 @@
 
     <section class="card settings-card">
       <h2>번역 서버</h2>
-      <label>LM Studio API 주소
+      <p class="muted settings-description">
+        OpenAI 호환 API의 <code>/models</code>와
+        <code>/chat/completions</code>를 사용합니다.
+      </p>
+      <label>OpenAI 호환 API 주소
         <input
           name="lm_base_url"
           type="url"
           value="{{ remote_servers.lm_base_url }}"
           placeholder="http://192.168.1.30:1234/v1"
-          required
-        >
-      </label>
-      <label>모델 식별자
-        <input
-          name="lm_model"
-          type="text"
-          value="{{ remote_servers.lm_model }}"
-          placeholder="LM Studio에 표시된 모델 식별자"
           required
         >
       </label>
@@ -79,9 +83,35 @@
       {% if remote_servers.lm_token_configured %}
         <label class="check">
           <input name="clear_lm_token" type="checkbox" value="true">
-          <span>저장된 LM Studio 토큰 삭제</span>
+          <span>저장된 번역 API 토큰 삭제</span>
         </label>
       {% endif %}
+      <div class="model-picker">
+        <label>번역 모델
+          <select
+            name="lm_model"
+            required
+            data-model-select
+            data-saved-model="{{ remote_servers.lm_model }}"
+          >
+            {% if remote_servers.lm_model %}
+              <option value="{{ remote_servers.lm_model }}" selected>
+                {{ remote_servers.lm_model }}
+              </option>
+            {% else %}
+              <option value="" selected disabled>
+                서버에서 모델을 조회하세요
+              </option>
+            {% endif %}
+          </select>
+        </label>
+        <button type="button" class="secondary" data-model-refresh>
+          모델 조회
+        </button>
+      </div>
+      <p class="muted model-status" data-model-status role="status">
+        API 주소와 토큰을 사용해 서버의 모델 목록을 조회합니다.
+      </p>
     </section>
 
     <div class="submit-row">

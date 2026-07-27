@@ -98,7 +98,7 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _normalize_server_url(value: str, setting: str) -> str:
+def normalize_server_url(value: str, setting: str) -> str:
     normalized = value.strip().rstrip("/")
     parsed = urlsplit(normalized)
     if (
@@ -114,6 +114,14 @@ def _normalize_server_url(value: str, setting: str) -> str:
             "query parameters, or fragments"
         )
     return normalized
+
+
+def _first_configured_env(*names: str) -> str:
+    for name in names:
+        value = os.environ.get(name, "")
+        if value.strip():
+            return value
+    return ""
 
 
 @dataclass(frozen=True)
@@ -140,8 +148,8 @@ class RemoteServerSettings:
             name
             for name, value in (
                 ("STT_BASE_URL", self.stt_base_url),
-                ("LM_STUDIO_BASE_URL", self.lm_base_url),
-                ("LM_STUDIO_MODEL", self.lm_model),
+                ("OPENAI_COMPATIBLE_BASE_URL", self.lm_base_url),
+                ("OPENAI_COMPATIBLE_MODEL", self.lm_model),
             )
             if not value.strip()
         ]
@@ -150,14 +158,14 @@ class RemoteServerSettings:
                 f"required server settings are missing: {', '.join(missing)}"
             )
         return RemoteServerSettings(
-            stt_base_url=_normalize_server_url(
+            stt_base_url=normalize_server_url(
                 self.stt_base_url,
                 "STT_BASE_URL",
             ),
             stt_token=self.stt_token,
-            lm_base_url=_normalize_server_url(
+            lm_base_url=normalize_server_url(
                 self.lm_base_url,
-                "LM_STUDIO_BASE_URL",
+                "OPENAI_COMPATIBLE_BASE_URL",
             ),
             lm_token=self.lm_token,
             lm_model=self.lm_model.strip(),
@@ -194,9 +202,18 @@ class NASSettings:
             session_secret=os.environ.get("NAS_SESSION_SECRET", ""),
             stt_base_url=os.environ.get("STT_BASE_URL", "").strip(),
             stt_token=os.environ.get("STT_API_TOKEN", ""),
-            lm_base_url=os.environ.get("LM_STUDIO_BASE_URL", "").strip(),
-            lm_token=os.environ.get("LM_STUDIO_TOKEN", ""),
-            lm_model=os.environ.get("LM_STUDIO_MODEL", "").strip(),
+            lm_base_url=_first_configured_env(
+                "OPENAI_COMPATIBLE_BASE_URL",
+                "LM_STUDIO_BASE_URL",
+            ).strip(),
+            lm_token=_first_configured_env(
+                "OPENAI_COMPATIBLE_TOKEN",
+                "LM_STUDIO_TOKEN",
+            ),
+            lm_model=_first_configured_env(
+                "OPENAI_COMPATIBLE_MODEL",
+                "LM_STUDIO_MODEL",
+            ).strip(),
             secure_cookie=_env_bool("NAS_SECURE_COOKIE"),
             maximum_listed_files=int(
                 os.environ.get("NAS_MAXIMUM_LISTED_FILES", "5000")

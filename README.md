@@ -1,8 +1,8 @@
 # STT to Subtitle
 
-NAS의 영상 파일을 선택해 일본어를 전사하고, 별도 PC의 LM Studio에서
-한국어로 번역한 뒤 영상 옆에 화자 구분 SRT·ASS를 생성하는 로컬 웹
-서비스입니다.
+NAS의 영상 파일을 선택해 일본어를 전사하고, 별도 PC의 OpenAI 호환
+번역 서버에서 한국어로 번역한 뒤 영상 옆에 화자 구분 SRT·ASS를
+생성하는 로컬 웹 서비스입니다.
 
 ## 구성
 
@@ -15,13 +15,15 @@ Synology NAS · linux/amd64 Docker
    │                         │
    │ 16 kHz mono PCM WAV     │ 일본어 세그먼트 JSON
    ▼                         ▼
-네이티브 전사 PC             별도 LM Studio PC
+네이티브 전사 PC             별도 번역 서버 PC
 FastAPI + Uvicorn           OpenAI 호환 API
 Whisper: MPS 또는 CUDA      번역 모델
 Pyannote: CPU 또는 CUDA
 ```
 
-전사 모델과 번역 모델은 완전히 분리된 서비스입니다. 따라서 작업 A를 LM Studio가 번역하는 동안 전사 PC는 작업 B를 처리할 수 있습니다. NAS의 각 단계 동시 실행 수는 기본적으로 오디오 1개, 전사 1개, 번역 1개입니다.
+전사 모델과 번역 모델은 완전히 분리된 서비스입니다. 따라서 작업 A를
+번역 서버가 처리하는 동안 전사 PC는 작업 B를 처리할 수 있습니다. NAS의
+각 단계 동시 실행 수는 기본적으로 오디오 1개, 전사 1개, 번역 1개입니다.
 
 Xcode 애플리케이션을 만들 필요는 없습니다. Mac, Linux 또는 Windows에서
 일반 Python FastAPI/Uvicorn 서버를 네이티브로 실행합니다. Mac 패키지
@@ -37,15 +39,15 @@ Docker Desktop, Podman Machine, Colima 등 Mac의 Linux VM에서 실행하는 �
 | 장비 | 역할 | 기본 포트 |
 | --- | --- | ---: |
 | Mac 또는 NVIDIA GPU PC | MPS 또는 CUDA 전사 API | `8100` |
-| LM Studio PC | 번역 API | `1234` |
+| OpenAI 호환 번역 서버 PC | 번역 API | 제공자 설정에 따름 |
 | Synology NAS | 파일 선택 및 작업 웹 UI | `8080` |
 
 처음 설치할 때는 다음 순서가 가장 단순합니다.
 
-1. LM Studio PC에서 번역 모델과 LAN API 서버를 실행합니다.
+1. 별도 PC에서 번역 모델과 OpenAI 호환 LAN API 서버를 실행합니다.
 2. Mac 또는 NVIDIA GPU PC에서 네이티브 MPS/CUDA 전사 API를 실행합니다.
 3. NAS에서 이 저장소의 Compose 파일과 환경 파일을 준비하고 GHCR 이미지를 실행합니다.
-4. NAS에서 전사 PC와 LM Studio의 API에 접속할 수 있는지 확인합니다.
+4. NAS에서 전사 PC와 번역 서버의 API에 접속할 수 있는지 확인합니다.
 5. 브라우저로 NAS 웹 UI를 열어 짧은 파일로 전체 흐름을 검증합니다.
 
 ## 처리 흐름
@@ -59,7 +61,10 @@ queued → extracting → audio_ready
        → rendering → completed
 ```
 
-Mac 또는 LM Studio PC가 응답하지 않거나 원격 단계가 실패하면 작업은 `blocked`가 됩니다. 자동으로 계속 재시도하지 않으며, 원인을 해결한 뒤 웹 UI에서 **수동 재시도**해야 합니다. 저장된 WAV, 전사 JSON, 번역 체크포인트 중 정상인 마지막 결과부터 재개합니다.
+전사 PC 또는 번역 서버가 응답하지 않거나 원격 단계가 실패하면 작업은
+`blocked`가 됩니다. 자동으로 계속 재시도하지 않으며, 원인을 해결한 뒤
+웹 UI에서 **수동 재시도**해야 합니다. 저장된 WAV, 전사 JSON, 번역
+체크포인트 중 정상인 마지막 결과부터 재개합니다.
 
 최종 결과는 원본 영상과 같은 디렉터리의 `<원본이름>.ko.srt`와
 `<원본이름>.ko.ass`입니다. 자막 본문에는 `화자 1` 같은 식별자를 붙이지
@@ -330,17 +335,28 @@ NAS의 전사 API 주소에는 Mac 대신 이 CUDA PC의 내부 IP와 포트 `81
 설정하면 됩니다. `.env.cuda`, `var/cuda-cache/`, `var/cuda-stt/`,
 `.venv-cuda/`는 Git에서 제외됩니다.
 
-## 2. 별도 PC의 LM Studio
+## 2. OpenAI 호환 번역 서버
 
-LM Studio는 전사 API와 다른 PC에서도 실행할 수 있는 독립 번역 서비스입니다.
+LM Studio처럼 OpenAI 호환 API를 제공하는 서버를 전사 API와 독립적으로
+실행합니다. 서버는 최소한 `GET /v1/models`와
+`POST /v1/chat/completions`를 지원해야 합니다.
 
 1. 일본어→한국어 번역에 사용할 모델을 로드합니다.
 2. LAN에서 접근 가능한 API 서버를 활성화합니다.
-3. NAS에서 접근할 수 있도록 호스트 방화벽의 LM Studio 포트를 내부망으로 제한합니다.
+3. NAS에서 접근할 수 있도록 호스트 방화벽의 번역 API 포트를 내부망으로 제한합니다.
 
-NAS에는 OpenAI 호환 API 루트(예: `http://192.168.1.30:1234/v1`)와 로드한 모델 식별자를 설정합니다. LM Studio 인증을 사용하지 않으면 `LM_STUDIO_TOKEN`은 비워 둡니다. 번역 요청은 `/chat/completions`의 JSON Schema structured output을 사용하며 세그먼트 ID가 정확히 보존되지 않으면 실패 처리합니다.
+NAS에는 OpenAI 호환 API 루트(예: `http://192.168.1.30:1234/v1`)와
+선택적 API 토큰을 설정합니다. 웹 설정 화면이 `/models`를 조회하므로
+모델 식별자를 직접 입력할 필요 없이 목록에서 선택할 수 있습니다. 번역
+요청은 `/chat/completions`의 JSON Schema structured output을 사용하며
+세그먼트 ID가 정확히 보존되지 않으면 실패 처리합니다.
 
-번역은 기본 30개 세그먼트 또는 6,000자 단위로 나뉩니다. 각 배치 후 `<원본명>_result_ko.json` 체크포인트를 저장하므로 중간 실패 후 완료한 배치는 다시 요청하지 않습니다. 재시도할 때 현재 전사에 없는 오래된 체크포인트 ID는 자동으로 제외합니다. LM Studio가 올바른 ID를 다른 순서로 반환하면 요청 순서로 정렬하고, 누락되거나 다른 ID를 반환한 배치는 더 작은 배치로 나눠 다시 요청합니다.
+번역은 기본 30개 세그먼트 또는 6,000자 단위로 나뉩니다. 각 배치 후
+`<원본명>_result_ko.json` 체크포인트를 저장하므로 중간 실패 후 완료한
+배치는 다시 요청하지 않습니다. 재시도할 때 현재 전사에 없는 오래된
+체크포인트 ID는 자동으로 제외합니다. 서버가 올바른 ID를 다른 순서로
+반환하면 요청 순서로 정렬하고, 누락되거나 다른 ID를 반환한 배치는 더
+작은 배치로 나눠 다시 요청합니다.
 
 ## 3. NAS: 웹 오케스트레이터 설치 및 실행
 
@@ -379,8 +395,9 @@ id NAS_USER
 
 전사·번역 서버 주소, 토큰과 번역 모델은 컨테이너를 실행한 뒤 웹의
 **서버 설정** 화면에서 입력합니다. `.env.nas`의 `STT_*`와
-`LM_STUDIO_*` 값은 최초 실행 시 사용할 선택적 기본값이므로 비워 둘 수
-있습니다.
+`OPENAI_COMPATIBLE_*` 값은 최초 실행 시 사용할 선택적 기본값이므로
+비워 둘 수 있습니다. 기존 `LM_STUDIO_*` 환경변수도 호환을 위해 계속
+인식합니다.
 
 예:
 
@@ -399,9 +416,9 @@ NAS_SECURE_COOKIE=false
 STT_BASE_URL=
 STT_API_TOKEN=
 
-LM_STUDIO_BASE_URL=
-LM_STUDIO_TOKEN=
-LM_STUDIO_MODEL=
+OPENAI_COMPATIBLE_BASE_URL=
+OPENAI_COMPATIBLE_TOKEN=
+OPENAI_COMPATIBLE_MODEL=
 ```
 
 Compose는 GHCR 이미지의 기본 사용자와 관계없이 `PUID:PGID`를 컨테이너의 런타임 사용자로 적용합니다. 상태 폴더를 미리 만들어 해당 사용자가 쓸 수 있게 합니다. 배포 폴더를 `NAS_USER`로 만들었다면 일반적으로 추가 `chown`은 필요하지 않습니다.
@@ -412,13 +429,21 @@ test -w ./var/nas-state && echo "state directory is writable"
 test -w /volume1/video && echo "media directory is writable"
 ```
 
-내부망에서 무인증으로 사용할 때는 `NAS_ADMIN_PASSWORD`, `NAS_SESSION_SECRET`, `STT_API_TOKEN`, `LM_STUDIO_TOKEN`을 모두 비워 둡니다. `NAS_ADMIN_PASSWORD`를 설정하면 웹 로그인이 활성화되며, 이 경우 `NAS_SESSION_SECRET`도 32자 이상으로 설정해야 합니다. 세션 키 생성 예:
+내부망에서 무인증으로 사용할 때는 `NAS_ADMIN_PASSWORD`,
+`NAS_SESSION_SECRET`, `STT_API_TOKEN`, `OPENAI_COMPATIBLE_TOKEN`을
+모두 비워 둡니다. `NAS_ADMIN_PASSWORD`를 설정하면 웹 로그인이
+활성화되며, 이 경우 `NAS_SESSION_SECRET`도 32자 이상으로 설정해야
+합니다. 세션 키 생성 예:
 
 ```bash
 python3 -c 'import secrets; print(secrets.token_urlsafe(48))'
 ```
 
-GHCR 패키지가 private이면 다음과 같이 `read:packages` 권한이 있는 GitHub classic PAT로 NAS의 Docker에 한 번 로그인합니다. 패키지를 public으로 설정했다면 이 단계는 필요하지 않습니다. 이 로그인은 이미지 다운로드용이며, 위에서 비워 둔 NAS·STT·LM Studio의 내부 서비스 인증과는 별개입니다.
+GHCR 패키지가 private이면 다음과 같이 `read:packages` 권한이 있는
+GitHub classic PAT로 NAS의 Docker에 한 번 로그인합니다. 패키지를
+public으로 설정했다면 이 단계는 필요하지 않습니다. 이 로그인은 이미지
+다운로드용이며, 위에서 비워 둔 NAS·STT·번역 서버의 내부 서비스 인증과는
+별개입니다.
 
 ```bash
 echo "$GHCR_PAT" | docker login ghcr.io -u GITHUB_USER --password-stdin
@@ -430,7 +455,8 @@ echo "$GHCR_PAT" | docker login ghcr.io -u GITHUB_USER --password-stdin
 **서버 설정**을 엽니다. 다음 값을 입력하고 저장합니다.
 
 - 전사 API 주소와 선택적 API 토큰
-- LM Studio API 주소, 모델 식별자와 선택적 API 토큰
+- OpenAI 호환 API 주소와 선택적 API 토큰
+- `/models` 조회 결과에서 사용할 번역 모델
 
 설정은 `${STATE_PATH}`의 SQLite DB에 저장되므로 컨테이너를 다시 만들거나
 재시작해도 유지됩니다. 수정한 값은 저장 직후 다음 전사·번역 요청부터
@@ -451,9 +477,9 @@ curl http://192.168.1.20:8100/readyz
 curl http://192.168.1.30:1234/v1/models
 ```
 
-첫 번째 주소는 웹에서 저장한 전사 API 주소, 두 번째 주소는 LM Studio API
-주소에 맞춰 변경합니다. LM Studio의 `/models` 결과에 나온 모델 식별자를
-웹 설정의 모델 식별자에 사용합니다.
+첫 번째 주소는 웹에서 저장한 전사 API 주소, 두 번째 주소는 OpenAI 호환
+번역 API 주소에 맞춰 변경합니다. 웹 설정 화면에서도 같은 `/models`
+응답을 자동 조회하여 선택 목록으로 표시합니다.
 
 Compose 구성을 검증하고 GHCR 이미지를 받아 실행합니다.
 
@@ -498,14 +524,18 @@ WebXR immersive 모드는 보안 컨텍스트가 필요하므로 `http://NAS_IP:
 
 완료된 작업의 **번역부터 다시 시작** 버튼은 일본어 전사 JSON과 추출
 오디오를 유지한 채 기존 번역 체크포인트만 빈 상태로 초기화합니다. 이후
-LM Studio 번역과 SRT·ASS 렌더링만 다시 실행하므로 시간이 오래 걸리는
+번역 서버 호출과 SRT·ASS 렌더링만 다시 실행하므로 시간이 오래 걸리는
 전사를 반복하지 않습니다. 새 번역이 완료될 때 기존 SRT·ASS를 같은
-경로에 교체하며, LM Studio가 꺼져 있으면 번역 단계에서 `blocked`가 되어
+경로에 교체하며, 번역 서버가 꺼져 있으면 번역 단계에서 `blocked`가 되어
 서비스를 실행한 뒤 수동 재시도로 이어갈 수 있습니다.
 
 작업 생성·갱신 및 진행 로그의 실제 시각은 NAS UI와 전사 API에서 모두 KST(`+09:00`)로 표시하거나 직렬화합니다. SQLite 내부에는 시간대와 무관한 epoch 값을 유지합니다. SRT 및 전사 세그먼트 타임스탬프는 영상 시작점 기준 상대시간이므로 KST 변환 대상이 아닙니다.
 
-무인증 모드는 세 장비가 격리된 신뢰 가능한 LAN에 있을 때만 사용하십시오. NAS UI, 전사 API, LM Studio 포트를 인터넷이나 게스트 Wi-Fi에 직접 노출하지 말고 LAN 방화벽 또는 신뢰할 수 있는 VPN으로 제한하십시오. HTTPS reverse proxy와 웹 로그인을 사용하는 경우 `NAS_SECURE_COOKIE=true`로 설정합니다.
+무인증 모드는 세 장비가 격리된 신뢰 가능한 LAN에 있을 때만 사용하십시오.
+NAS UI, 전사 API, 번역 API 포트를 인터넷이나 게스트 Wi-Fi에 직접
+노출하지 말고 LAN 방화벽 또는 신뢰할 수 있는 VPN으로 제한하십시오.
+HTTPS reverse proxy와 웹 로그인을 사용하는 경우
+`NAS_SECURE_COOKIE=true`로 설정합니다.
 
 ### NAS 업데이트 및 운영 명령
 

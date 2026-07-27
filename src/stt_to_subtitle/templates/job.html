@@ -5,8 +5,16 @@
   <script defer src="{{ url_for('static', path='/player.js') }}"></script>
 {% endblock %}
 {% block content %}
-  <p><a href="/">← 대시보드</a></p>
-  <h1>{{ job.source_rel }}</h1>
+  <div class="page-heading job-page-heading">
+    <div>
+      <p class="editor-kicker">작업 상세</p>
+      <h1>{{ job.source_rel|filename }}</h1>
+      {% if job.source_rel|parent_path %}
+        <p class="job-source-path">{{ job.source_rel|parent_path }}</p>
+      {% endif %}
+    </div>
+    <a href="/" class="button secondary">← 최근 작업으로</a>
+  </div>
   <div
     {% if job.status not in ["completed", "blocked", "failed"] %}
       data-poll-url="/jobs/{{ job.id }}/panel"

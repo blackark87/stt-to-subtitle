@@ -1089,6 +1089,7 @@ FodyWeavers.xsd
 !go.mod
 
 !README.md
+!MEMORY.md
 !LICENSE
 
 # !Makefile

@@ -296,6 +296,41 @@ class MediaLibraryTests(unittest.TestCase):
 
 
 class NASSettingsTests(unittest.TestCase):
+    def test_reads_openai_compatible_environment_settings(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "OPENAI_COMPATIBLE_BASE_URL": "http://translation.test/v1",
+                "OPENAI_COMPATIBLE_TOKEN": "token",
+                "OPENAI_COMPATIBLE_MODEL": "model",
+            },
+            clear=True,
+        ):
+            settings = NASSettings.from_env()
+
+        self.assertEqual(
+            settings.lm_base_url,
+            "http://translation.test/v1",
+        )
+        self.assertEqual(settings.lm_token, "token")
+        self.assertEqual(settings.lm_model, "model")
+
+    def test_keeps_legacy_lm_studio_environment_fallback(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "LM_STUDIO_BASE_URL": "http://legacy.test/v1",
+                "LM_STUDIO_TOKEN": "legacy-token",
+                "LM_STUDIO_MODEL": "legacy-model",
+            },
+            clear=True,
+        ):
+            settings = NASSettings.from_env()
+
+        self.assertEqual(settings.lm_base_url, "http://legacy.test/v1")
+        self.assertEqual(settings.lm_token, "legacy-token")
+        self.assertEqual(settings.lm_model, "legacy-model")
+
     def test_allows_server_configuration_after_startup(self) -> None:
         settings = NASSettings(
             state_dir=Path("/state"),

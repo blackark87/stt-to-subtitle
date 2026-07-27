@@ -1,21 +1,51 @@
 <section
-  class="card"
+  class="card job-overview-card"
   {% if job.status in ["completed", "blocked", "failed"] %}data-poll-stop{% endif %}
 >
+  <div class="job-overview-heading">
+    <div>
+      <p class="editor-kicker">현재 작업 상태</p>
+      <h2>
+        <span
+          class="status status-{{ job.status }}"
+          title="내부 상태: {{ job.status }}"
+        >{{ job.status|job_status }}</span>
+      </h2>
+    </div>
+    <p class="job-overview-updated">
+      최근 갱신
+      <time datetime="{{ job.updated_at|datetime_iso }}">
+        {{ job.updated_at|datetime }}
+      </time>
+    </p>
+  </div>
   <dl class="details">
-    <dt>상태</dt><dd><span class="status status-{{ job.status }}">{{ job.status }}</span></dd>
     <dt>작업 ID</dt><dd><code>{{ job.id }}</code></dd>
-    <dt>생성</dt><dd>{{ job.created_at|datetime }}</dd>
-    <dt>갱신</dt><dd>{{ job.updated_at|datetime }}</dd>
-    {% if job.blocked_stage %}<dt>중단 단계</dt><dd>{{ job.blocked_stage }}</dd>{% endif %}
+    <dt>생성 시각</dt>
+    <dd>
+      <time datetime="{{ job.created_at|datetime_iso }}">
+        {{ job.created_at|datetime }}
+      </time>
+    </dd>
+    {% if job.blocked_stage %}
+      <dt>확인 단계</dt>
+      <dd>{{ job.blocked_stage|job_stage }}</dd>
+    {% endif %}
     {% if job.error %}<dt>오류</dt><dd class="error-text">{{ job.error }}</dd>{% endif %}
     {% if job.chunks_created %}
       <dt>전사 청크</dt>
-      <dd class="chunk-progress">
-        <strong>{{ job.chunks_completed }}</strong> 완료
-        <span>/ {{ job.chunks_created }} 생성</span>
-        <span>/ {{ job.chunks_in_progress }} 진행·대기</span>
-        <span class="muted">({{ job.chunk_progress_every }}개 단위 로그)</span>
+      <dd class="chunk-progress-detail">
+        <progress
+          value="{{ job.chunks_completed }}"
+          max="{{ job.chunks_created }}"
+          aria-label="전사 청크 진행률"
+        ></progress>
+        <span class="chunk-progress">
+          <strong>{{ job.chunks_completed }}</strong> 완료
+          <span>/ {{ job.chunks_created }} 생성</span>
+          <span>/ {{ job.chunks_in_progress }} 진행·대기</span>
+          <span class="muted">({{ job.chunk_progress_every }}개 단위 로그)</span>
+        </span>
       </dd>
     {% endif %}
     {% if job.srt_path %}<dt>SRT</dt><dd>{{ job.srt_path }}</dd>{% endif %}
@@ -166,13 +196,35 @@
     </p>
   </section>
 {% endif %}
-<section class="card">
-  <h2>진행 로그 (KST)</h2>
-  <ol class="events">
-    {% for event in events %}
-      <li class="event-{{ event.level }}"><time>{{ event.created_at|datetime }}</time> {{ event.message }}</li>
+<section class="card job-history-card">
+  <div class="section-heading">
+    <div>
+      <h2>작업 히스토리</h2>
+      <p class="muted">최신 기록부터 표시합니다. 시각은 KST 기준입니다.</p>
+    </div>
+    <span class="history-count">{{ events|length }}개 기록</span>
+  </div>
+  <ol class="job-timeline">
+    {% for event in events|reverse %}
+      <li class="timeline-item event-{{ event.level }}">
+        <span class="timeline-marker" aria-hidden="true"></span>
+        <div class="timeline-content">
+          <div class="timeline-meta">
+            <span class="event-level event-level-{{ event.level }}">
+              {{ event.level|event_level }}
+            </span>
+            {% if loop.first %}
+              <span class="latest-event">최신</span>
+            {% endif %}
+            <time datetime="{{ event.created_at|datetime_iso }}">
+              {{ event.created_at|datetime }}
+            </time>
+          </div>
+          <p>{{ event.message }}</p>
+        </div>
+      </li>
     {% else %}
-      <li class="muted">로그가 없습니다.</li>
+      <li class="timeline-empty">아직 기록된 작업 이벤트가 없습니다.</li>
     {% endfor %}
   </ol>
 </section>
