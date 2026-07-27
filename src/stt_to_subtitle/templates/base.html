@@ -11,12 +11,17 @@
   <body>
     <header class="topbar">
       <a href="/" class="brand">STT to Subtitle</a>
-      {% if request.app.state.authentication_enabled and request.session.get("authenticated") %}
-        <form method="post" action="/logout">
-          <input type="hidden" name="csrf_token" value="{{ request.session.get('csrf_token') }}">
-          <button type="submit" class="secondary">로그아웃</button>
-        </form>
-      {% endif %}
+      <div class="topbar-actions">
+        {% if not request.app.state.authentication_enabled or request.session.get("authenticated") %}
+          <a href="/settings" class="button secondary">서버 설정</a>
+        {% endif %}
+        {% if request.app.state.authentication_enabled and request.session.get("authenticated") %}
+          <form method="post" action="/logout">
+            <input type="hidden" name="csrf_token" value="{{ request.session.get('csrf_token') }}">
+            <button type="submit" class="secondary">로그아웃</button>
+          </form>
+        {% endif %}
+      </div>
     </header>
     <main class="container">
       {% block content %}{% endblock %}

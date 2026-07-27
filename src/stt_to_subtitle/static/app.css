@@ -21,6 +21,8 @@ body { margin: 0; background: var(--bg); color: var(--text); }
 a { color: var(--accent); }
 .topbar { min-height: 64px; padding: 12px max(20px, calc((100vw - 1120px) / 2)); background: var(--card); border-bottom: 1px solid var(--line); display: flex; align-items: center; justify-content: space-between; }
 .brand { color: var(--text); font-weight: 750; text-decoration: none; }
+.topbar-actions { display: flex; align-items: center; gap: 9px; }
+.topbar-actions form { margin: 0; }
 .container { max-width: 1120px; margin: 0 auto; padding: 28px 20px 60px; }
 .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 20px; margin: 20px 0; }
 .narrow { max-width: 420px; margin: 12vh auto 0; }
@@ -221,6 +223,9 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 .option-checks { display: flex; align-items: flex-start; gap: 12px 28px; flex-wrap: wrap; }
 .submit-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
 .submit-row .muted { font-size: .88rem; }
+.page-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 18px; }
+.page-heading h1 { margin: 0; }
+.settings-card { display: grid; gap: 14px; margin: 0; }
 .result-player-shell { display: grid; gap: 10px; }
 .result-player-shell:focus-visible {
   outline: 3px solid color-mix(in srgb, var(--accent) 45%, transparent);

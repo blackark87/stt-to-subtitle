@@ -4,7 +4,7 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import Mock
 
-from stt_to_subtitle.nas_config import NASSettings
+from stt_to_subtitle.nas_config import NASSettings, RemoteServerSettings
 from stt_to_subtitle.orchestrator import NASOrchestrator
 
 
@@ -59,6 +59,78 @@ class NASOrchestratorTests(unittest.TestCase):
             self.assertIsNone(job.options["duration_seconds"])
             self.assertEqual(job.options["chunk_length_seconds"], 60)
             self.assertTrue(job.options["noise_filter"])
+
+    def test_updates_and_reloads_remote_servers_without_restart(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            original = self.make_orchestrator(root, media_root)
+            try:
+                original_stt_client = original.stt_client
+                saved = original.update_remote_servers(
+                    RemoteServerSettings(
+                        stt_base_url="http://new-stt.test/",
+                        stt_token="new-stt-token",
+                        lm_base_url="http://new-lm.test/v1/",
+                        lm_token="new-lm-token",
+                        lm_model="new-model",
+                    )
+                )
+
+                self.assertIsNot(original.stt_client, original_stt_client)
+                self.assertEqual(
+                    original.stt_client.base_url,
+                    "http://new-stt.test",
+                )
+                self.assertEqual(
+                    original.lm_client.base_url,
+                    "http://new-lm.test/v1",
+                )
+                self.assertEqual(original.lm_client.model, "new-model")
+                self.assertEqual(saved.lm_model, "new-model")
+            finally:
+                original.stop()
+
+            reloaded = self.make_orchestrator(root, media_root)
+            try:
+                self.assertEqual(
+                    reloaded.stt_client.base_url,
+                    "http://new-stt.test",
+                )
+                self.assertEqual(reloaded.stt_client.token, "new-stt-token")
+                self.assertEqual(reloaded.lm_client.model, "new-model")
+            finally:
+                reloaded.stop()
+
+    def test_requires_web_server_settings_before_creating_job(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            (media_root / "movie.mkv").write_bytes(b"media")
+            orchestrator = NASOrchestrator(
+                NASSettings(
+                    state_dir=root / "state",
+                    media_root=media_root,
+                    admin_password="",
+                    session_secret="",
+                    stt_base_url="",
+                    stt_token="",
+                    lm_base_url="",
+                    lm_token="",
+                    lm_model="",
+                )
+            )
+            try:
+                with self.assertRaisesRegex(ValueError, "서버 설정"):
+                    orchestrator.create_job(
+                        "movie.mkv",
+                        force_overwrite=False,
+                        options={},
+                    )
+            finally:
+                orchestrator.stop()
 
     def test_creates_one_job_for_each_selected_media_file(self) -> None:
         with TemporaryDirectory() as directory:

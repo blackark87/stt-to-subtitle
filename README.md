@@ -376,8 +376,11 @@ id NAS_USER
 - `MEDIA_PATH` — NAS의 실제 미디어 공유 폴더 절대 경로
 - `STATE_PATH` — 작업 DB와 중간 결과를 보관할 NAS 경로
 - `NAS_IMAGE` — `ghcr.io/blackark87/stt-to-subtitle:nas-latest`
-- `STT_BASE_URL` — M1 Max 전사 API
-- `LM_STUDIO_BASE_URL`, `LM_STUDIO_MODEL` — 별도 번역 PC
+
+전사·번역 서버 주소, 토큰과 번역 모델은 컨테이너를 실행한 뒤 웹의
+**서버 설정** 화면에서 입력합니다. `.env.nas`의 `STT_*`와
+`LM_STUDIO_*` 값은 최초 실행 시 사용할 선택적 기본값이므로 비워 둘 수
+있습니다.
 
 예:
 
@@ -393,12 +396,12 @@ NAS_ADMIN_PASSWORD=
 NAS_SESSION_SECRET=
 NAS_SECURE_COOKIE=false
 
-STT_BASE_URL=http://192.168.1.20:8100
+STT_BASE_URL=
 STT_API_TOKEN=
 
-LM_STUDIO_BASE_URL=http://192.168.1.30:1234/v1
+LM_STUDIO_BASE_URL=
 LM_STUDIO_TOKEN=
-LM_STUDIO_MODEL=LM_STUDIO에_표시된_모델_식별자
+LM_STUDIO_MODEL=
 ```
 
 Compose는 GHCR 이미지의 기본 사용자와 관계없이 `PUID:PGID`를 컨테이너의 런타임 사용자로 적용합니다. 상태 폴더를 미리 만들어 해당 사용자가 쓸 수 있게 합니다. 배포 폴더를 `NAS_USER`로 만들었다면 일반적으로 추가 `chown`은 필요하지 않습니다.
@@ -421,7 +424,25 @@ GHCR 패키지가 private이면 다음과 같이 `read:packages` 권한이 있�
 echo "$GHCR_PAT" | docker login ghcr.io -u GITHUB_USER --password-stdin
 ```
 
-### NAS에서 연결 및 설정 확인
+### 웹에서 전사·번역 서버 설정
+
+컨테이너를 실행한 뒤 `http://NAS_IP:8080/settings` 또는 상단의
+**서버 설정**을 엽니다. 다음 값을 입력하고 저장합니다.
+
+- 전사 API 주소와 선택적 API 토큰
+- LM Studio API 주소, 모델 식별자와 선택적 API 토큰
+
+설정은 `${STATE_PATH}`의 SQLite DB에 저장되므로 컨테이너를 다시 만들거나
+재시작해도 유지됩니다. 수정한 값은 저장 직후 다음 전사·번역 요청부터
+적용되며 Docker 재시작은 필요하지 않습니다. 이미 실행 중인 원격 요청은
+기존 설정으로 마친 뒤 다음 요청부터 새 설정을 사용합니다. 토큰 입력을
+비우면 기존 토큰을 유지하며, 저장된 토큰을 제거하려면 화면의 토큰 삭제
+체크박스를 사용합니다.
+
+`NAS_ADMIN_PASSWORD`를 사용하지 않는 구성에서는 서버 설정 화면도 인증
+없이 열리므로 반드시 신뢰할 수 있는 LAN이나 VPN 안에서만 노출하십시오.
+
+### NAS에서 연결 확인
 
 NAS에서 두 원격 API에 접속할 수 있는지 먼저 확인합니다.
 
@@ -430,7 +451,9 @@ curl http://192.168.1.20:8100/readyz
 curl http://192.168.1.30:1234/v1/models
 ```
 
-첫 번째 주소는 `.env.nas`의 `STT_BASE_URL`, 두 번째 주소는 `LM_STUDIO_BASE_URL`에 맞춰 변경합니다. LM Studio의 `/models` 결과에 나온 모델 식별자를 `LM_STUDIO_MODEL`에 사용합니다.
+첫 번째 주소는 웹에서 저장한 전사 API 주소, 두 번째 주소는 LM Studio API
+주소에 맞춰 변경합니다. LM Studio의 `/models` 결과에 나온 모델 식별자를
+웹 설정의 모델 식별자에 사용합니다.
 
 Compose 구성을 검증하고 GHCR 이미지를 받아 실행합니다.
 

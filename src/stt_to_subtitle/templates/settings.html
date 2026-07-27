@@ -1,0 +1,94 @@
+{% extends "base.html" %}
+{% block title %}서버 설정 · STT to Subtitle{% endblock %}
+{% block content %}
+  <div class="page-heading">
+    <div>
+      <p class="editor-kicker">NAS 런타임 설정</p>
+      <h1>서버 설정</h1>
+    </div>
+    <a href="/" class="button secondary">작업으로 돌아가기</a>
+  </div>
+
+  <p class="muted">
+    저장한 값은 다음 전사·번역 요청부터 즉시 적용됩니다. Docker를
+    재시작할 필요가 없습니다.
+  </p>
+  {% if error %}<p class="alert">{{ error }}</p>{% endif %}
+  {% if notice %}<p class="notice">{{ notice }}</p>{% endif %}
+
+  <form method="post" action="/settings" class="stack">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+
+    <section class="card settings-card">
+      <h2>전사 서버</h2>
+      <label>전사 API 주소
+        <input
+          name="stt_base_url"
+          type="url"
+          value="{{ remote_servers.stt_base_url }}"
+          placeholder="http://192.168.1.20:8100"
+          required
+        >
+      </label>
+      <label>API 토큰
+        <input
+          name="stt_token"
+          type="password"
+          value=""
+          placeholder="{% if remote_servers.stt_token_configured %}저장된 토큰 유지{% else %}인증을 사용하지 않으면 비워두기{% endif %}"
+          autocomplete="new-password"
+        >
+      </label>
+      {% if remote_servers.stt_token_configured %}
+        <label class="check">
+          <input name="clear_stt_token" type="checkbox" value="true">
+          <span>저장된 전사 API 토큰 삭제</span>
+        </label>
+      {% endif %}
+    </section>
+
+    <section class="card settings-card">
+      <h2>번역 서버</h2>
+      <label>LM Studio API 주소
+        <input
+          name="lm_base_url"
+          type="url"
+          value="{{ remote_servers.lm_base_url }}"
+          placeholder="http://192.168.1.30:1234/v1"
+          required
+        >
+      </label>
+      <label>모델 식별자
+        <input
+          name="lm_model"
+          type="text"
+          value="{{ remote_servers.lm_model }}"
+          placeholder="LM Studio에 표시된 모델 식별자"
+          required
+        >
+      </label>
+      <label>API 토큰
+        <input
+          name="lm_token"
+          type="password"
+          value=""
+          placeholder="{% if remote_servers.lm_token_configured %}저장된 토큰 유지{% else %}인증을 사용하지 않으면 비워두기{% endif %}"
+          autocomplete="new-password"
+        >
+      </label>
+      {% if remote_servers.lm_token_configured %}
+        <label class="check">
+          <input name="clear_lm_token" type="checkbox" value="true">
+          <span>저장된 LM Studio 토큰 삭제</span>
+        </label>
+      {% endif %}
+    </section>
+
+    <div class="submit-row">
+      <button type="submit">서버 설정 저장</button>
+      <span class="muted">
+        토큰 입력을 비우면 기존 토큰을 유지합니다.
+      </span>
+    </div>
+  </form>
+{% endblock %}
