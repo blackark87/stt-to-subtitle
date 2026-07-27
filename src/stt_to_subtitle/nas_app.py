@@ -34,7 +34,7 @@ from .media_preview import (
     parse_byte_range,
     srt_to_webvtt,
 )
-from .nas_config import NASSettings
+from .nas_config import NASSettings, RemoteServerSettings
 from .orchestrator import NASOrchestrator
 from .subtitle import render_webvtt
 from .time_display import (
@@ -204,6 +204,7 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
             "csrf_token": request.session.get("csrf_token", ""),
             "error": error,
             "notice": notice,
+            "remote_servers": service.remote_servers_view(),
             **browser,
         }
 
@@ -214,6 +215,7 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
             "status": "ok",
             "media_root_available": service.library.root.is_dir(),
             "authentication_enabled": authentication_enabled,
+            "remote_servers_configured": service.remote_servers_configured,
         }
 
     @app.get("/login", response_class=HTMLResponse)
@@ -286,6 +288,95 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
             "dashboard.html",
             context,
             status_code=response_status,
+        )
+
+    def settings_context(
+        request: Request,
+        *,
+        error: str | None = None,
+        notice: str | None = None,
+        values: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        service = orchestrator(request)
+        server_values = service.remote_servers_view()
+        if values is not None:
+            server_values.update(values)
+        return {
+            "request": request,
+            "csrf_token": request.session.get("csrf_token", ""),
+            "error": error,
+            "notice": notice,
+            "remote_servers": server_values,
+        }
+
+    @app.get("/settings", response_class=HTMLResponse)
+    def server_settings_page(
+        request: Request,
+        saved: bool = False,
+    ) -> Any:
+        if not is_authenticated(request):
+            return login_redirect()
+        return TEMPLATES.TemplateResponse(
+            request,
+            "settings.html",
+            settings_context(
+                request,
+                notice="서버 설정을 저장했습니다." if saved else None,
+            ),
+        )
+
+    @app.post("/settings", response_class=HTMLResponse)
+    def save_server_settings(
+        request: Request,
+        csrf_token: str = Form(""),
+        stt_base_url: str = Form(...),
+        stt_token: str = Form(""),
+        clear_stt_token: bool = Form(False),
+        lm_base_url: str = Form(...),
+        lm_token: str = Form(""),
+        clear_lm_token: bool = Form(False),
+        lm_model: str = Form(...),
+    ) -> Any:
+        if not is_authenticated(request):
+            return login_redirect()
+        validate_csrf(request, csrf_token)
+        service = orchestrator(request)
+        current = service.remote_servers
+        updated = RemoteServerSettings(
+            stt_base_url=stt_base_url,
+            stt_token=(
+                ""
+                if clear_stt_token
+                else stt_token if stt_token else current.stt_token
+            ),
+            lm_base_url=lm_base_url,
+            lm_token=(
+                ""
+                if clear_lm_token
+                else lm_token if lm_token else current.lm_token
+            ),
+            lm_model=lm_model,
+        )
+        try:
+            service.update_remote_servers(updated)
+        except ValueError as error:
+            return TEMPLATES.TemplateResponse(
+                request,
+                "settings.html",
+                settings_context(
+                    request,
+                    error=str(error),
+                    values={
+                        "stt_base_url": stt_base_url,
+                        "lm_base_url": lm_base_url,
+                        "lm_model": lm_model,
+                    },
+                ),
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+        return RedirectResponse(
+            "/settings?saved=true",
+            status_code=status.HTTP_303_SEE_OTHER,
         )
 
     @app.get(

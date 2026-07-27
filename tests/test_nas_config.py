@@ -8,6 +8,7 @@ from unittest.mock import patch
 from stt_to_subtitle.nas_config import (
     MediaLibrary,
     NASSettings,
+    RemoteServerSettings,
     probe_media_duration,
 )
 
@@ -295,6 +296,21 @@ class MediaLibraryTests(unittest.TestCase):
 
 
 class NASSettingsTests(unittest.TestCase):
+    def test_allows_server_configuration_after_startup(self) -> None:
+        settings = NASSettings(
+            state_dir=Path("/state"),
+            media_root=Path("/media"),
+            admin_password="",
+            session_secret="",
+            stt_base_url="",
+            stt_token="",
+            lm_base_url="",
+            lm_token="",
+            lm_model="",
+        )
+
+        settings.validate()
+
     def test_allows_blank_credentials_on_trusted_network(self) -> None:
         settings = NASSettings(
             state_dir=Path("/state"),
@@ -325,3 +341,30 @@ class NASSettingsTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "NAS_SESSION_SECRET"):
             settings.validate()
+
+    def test_normalizes_remote_server_urls(self) -> None:
+        settings = RemoteServerSettings(
+            stt_base_url=" http://stt.test/ ",
+            stt_token="stt-token",
+            lm_base_url="http://lm.test/v1/",
+            lm_token="lm-token",
+            lm_model=" model ",
+        )
+
+        normalized = settings.normalized()
+
+        self.assertEqual(normalized.stt_base_url, "http://stt.test")
+        self.assertEqual(normalized.lm_base_url, "http://lm.test/v1")
+        self.assertEqual(normalized.lm_model, "model")
+
+    def test_rejects_invalid_remote_server_url(self) -> None:
+        settings = RemoteServerSettings(
+            stt_base_url="file:///tmp/stt",
+            stt_token="",
+            lm_base_url="http://lm.test/v1",
+            lm_token="",
+            lm_model="model",
+        )
+
+        with self.assertRaisesRegex(ValueError, "STT_BASE_URL"):
+            settings.normalized()

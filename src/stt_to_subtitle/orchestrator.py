@@ -19,7 +19,12 @@ from .contracts import (
 )
 from .files import sha256_file, write_json_atomic
 from .kotoba import DEFAULT_CHUNK_LENGTH_SECONDS, TranscriptionOptions
-from .nas_config import MediaLibrary, NASSettings, probe_media_duration
+from .nas_config import (
+    MediaLibrary,
+    NASSettings,
+    RemoteServerSettings,
+    probe_media_duration,
+)
 from .nas_store import NASJob, NASStore
 from .service_clients import ExternalServiceError, LMStudioClient, STTAPIClient
 from .subtitle import write_styled_subtitles_atomic
@@ -41,18 +46,22 @@ class NASOrchestrator:
             duration_probe=probe_media_duration,
         )
         self.store = NASStore(settings.state_dir / "jobs.sqlite3")
-        self.stt_client = STTAPIClient(
-            settings.stt_base_url,
-            settings.stt_token,
-            poll_interval=settings.stt_poll_interval,
+        saved_servers = self.store.get_remote_server_settings()
+        initial_servers = (
+            RemoteServerSettings(**saved_servers)
+            if saved_servers is not None
+            else settings.remote_servers()
         )
-        self.lm_client = LMStudioClient(
-            settings.lm_base_url,
-            settings.lm_token,
-            settings.lm_model,
-            max_segments=settings.translation_batch_segments,
-            max_characters=settings.translation_batch_characters,
-        )
+        self._remote_runtime: tuple[
+            STTAPIClient | None,
+            LMStudioClient | None,
+            RemoteServerSettings,
+        ] = (None, None, initial_servers)
+        if initial_servers.is_complete:
+            try:
+                self._set_remote_servers(initial_servers, persist=False)
+            except ValueError as error:
+                LOGGER.warning("remote server settings are invalid: %s", error)
         self._stop_event = threading.Event()
         self._scheduler = threading.Thread(
             target=self._scheduler_loop,
@@ -71,6 +80,69 @@ class NASOrchestrator:
             max_workers=1,
             thread_name_prefix="nas-translation",
         )
+
+    @property
+    def stt_client(self) -> STTAPIClient | None:
+        return self._remote_runtime[0]
+
+    @property
+    def lm_client(self) -> LMStudioClient | None:
+        return self._remote_runtime[1]
+
+    @property
+    def remote_servers(self) -> RemoteServerSettings:
+        return self._remote_runtime[2]
+
+    @property
+    def remote_servers_configured(self) -> bool:
+        return self.stt_client is not None and self.lm_client is not None
+
+    def remote_servers_view(self) -> dict[str, Any]:
+        servers = self.remote_servers
+        return {
+            "stt_base_url": servers.stt_base_url,
+            "stt_token_configured": bool(servers.stt_token),
+            "lm_base_url": servers.lm_base_url,
+            "lm_token_configured": bool(servers.lm_token),
+            "lm_model": servers.lm_model,
+            "configured": self.remote_servers_configured,
+        }
+
+    def update_remote_servers(
+        self,
+        settings: RemoteServerSettings,
+    ) -> RemoteServerSettings:
+        return self._set_remote_servers(settings, persist=True)
+
+    def _set_remote_servers(
+        self,
+        settings: RemoteServerSettings,
+        *,
+        persist: bool,
+    ) -> RemoteServerSettings:
+        normalized = settings.normalized()
+        stt_client = STTAPIClient(
+            normalized.stt_base_url,
+            normalized.stt_token,
+            poll_interval=self.settings.stt_poll_interval,
+        )
+        lm_client = LMStudioClient(
+            normalized.lm_base_url,
+            normalized.lm_token,
+            normalized.lm_model,
+            max_segments=self.settings.translation_batch_segments,
+            max_characters=self.settings.translation_batch_characters,
+        )
+        if persist:
+            self.store.save_remote_server_settings(
+                stt_base_url=normalized.stt_base_url,
+                stt_token=normalized.stt_token,
+                lm_base_url=normalized.lm_base_url,
+                lm_token=normalized.lm_token,
+                lm_model=normalized.lm_model,
+            )
+        self._remote_runtime = (stt_client, lm_client, normalized)
+        return normalized
 
     def start(self) -> None:
         interrupted = self.store.recover_interrupted()
@@ -112,6 +184,10 @@ class NASOrchestrator:
         force_overwrite: bool,
         options: Mapping[str, Any],
     ) -> list[NASJob]:
+        if not self.remote_servers_configured:
+            raise ValueError(
+                "먼저 서버 설정에서 전사 서버와 번역 서버를 저장하세요."
+            )
         unique_source_rels = list(dict.fromkeys(source_rels))
         if not unique_source_rels:
             raise ValueError("작업할 미디어 파일을 하나 이상 선택하세요.")
@@ -561,6 +637,9 @@ class NASOrchestrator:
         )
 
     def _transcribe(self, job: NASJob) -> None:
+        stt_client = self.stt_client
+        if stt_client is None:
+            raise ExternalServiceError("transcription server is not configured")
         if not job.audio_path or not Path(job.audio_path).is_file():
             raise RuntimeError("extracted WAV is unavailable")
         options = {
@@ -611,7 +690,7 @@ class NASOrchestrator:
                     f"in progress {in_progress}",
                 )
 
-        payload = self.stt_client.transcribe(
+        payload = stt_client.transcribe(
             Path(job.audio_path),
             options=options,
             idempotency_key=f"nas-{job.id}",
@@ -658,6 +737,11 @@ class NASOrchestrator:
                 )
 
     def _translate(self, job: NASJob) -> None:
+        remote_runtime = self._remote_runtime
+        lm_client = remote_runtime[1]
+        servers = remote_runtime[2]
+        if lm_client is None:
+            raise ExternalServiceError("translation server is not configured")
         if not job.transcript_path:
             raise RuntimeError("transcript artifact is unavailable")
         transcript_payload = json.loads(
@@ -719,7 +803,7 @@ class NASOrchestrator:
                 f"translation checkpoint saved ({len(items)}/{len(segments)})",
             )
 
-        translations = self.lm_client.translate(
+        translations = lm_client.translate(
             segments,
             existing=existing,
             on_batch=save_batch,
@@ -730,7 +814,7 @@ class NASOrchestrator:
                 "schema_version": TRANSLATION_SCHEMA_VERSION,
                 "status": "completed",
                 "transcript_job_id": transcript_payload["job_id"],
-                "model": self.settings.lm_model,
+                "model": servers.lm_model,
                 "translations": translations,
             },
         )

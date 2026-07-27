@@ -101,6 +101,30 @@ class TranscriptionStoreTests(unittest.TestCase):
 
 
 class NASStoreTests(unittest.TestCase):
+    def test_persists_remote_server_settings(self) -> None:
+        with TemporaryDirectory() as directory:
+            database_path = Path(directory) / "jobs.sqlite3"
+            store = NASStore(database_path)
+
+            store.save_remote_server_settings(
+                stt_base_url="http://stt.test",
+                stt_token="stt-token",
+                lm_base_url="http://lm.test/v1",
+                lm_token="lm-token",
+                lm_model="model",
+            )
+
+            self.assertEqual(
+                NASStore(database_path).get_remote_server_settings(),
+                {
+                    "stt_base_url": "http://stt.test",
+                    "stt_token": "stt-token",
+                    "lm_base_url": "http://lm.test/v1",
+                    "lm_token": "lm-token",
+                    "lm_model": "model",
+                },
+            )
+
     def test_recovers_running_stage_as_manually_retryable(self) -> None:
         with TemporaryDirectory() as directory:
             store = NASStore(Path(directory) / "jobs.sqlite3")

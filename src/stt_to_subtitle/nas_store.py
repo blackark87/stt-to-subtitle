@@ -107,6 +107,16 @@ class NASStore:
                     FOREIGN KEY (job_id) REFERENCES jobs(id)
                 );
 
+                CREATE TABLE IF NOT EXISTS remote_server_settings (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    stt_base_url TEXT NOT NULL,
+                    stt_token TEXT NOT NULL,
+                    lm_base_url TEXT NOT NULL,
+                    lm_token TEXT NOT NULL,
+                    lm_model TEXT NOT NULL,
+                    updated_at REAL NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS jobs_status_idx
                     ON jobs(status, created_at);
                 CREATE INDEX IF NOT EXISTS job_events_job_idx
@@ -135,6 +145,59 @@ class NASStore:
             for column, statement in migrations.items():
                 if column not in columns:
                     connection.execute(statement)
+
+    def get_remote_server_settings(self) -> dict[str, str] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT stt_base_url, stt_token, lm_base_url, lm_token, lm_model
+                FROM remote_server_settings
+                WHERE id = 1
+                """
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "stt_base_url": str(row["stt_base_url"]),
+            "stt_token": str(row["stt_token"]),
+            "lm_base_url": str(row["lm_base_url"]),
+            "lm_token": str(row["lm_token"]),
+            "lm_model": str(row["lm_model"]),
+        }
+
+    def save_remote_server_settings(
+        self,
+        *,
+        stt_base_url: str,
+        stt_token: str,
+        lm_base_url: str,
+        lm_token: str,
+        lm_model: str,
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO remote_server_settings (
+                    id, stt_base_url, stt_token,
+                    lm_base_url, lm_token, lm_model, updated_at
+                ) VALUES (1, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    stt_base_url = excluded.stt_base_url,
+                    stt_token = excluded.stt_token,
+                    lm_base_url = excluded.lm_base_url,
+                    lm_token = excluded.lm_token,
+                    lm_model = excluded.lm_model,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    stt_base_url,
+                    stt_token,
+                    lm_base_url,
+                    lm_token,
+                    lm_model,
+                    time.time(),
+                ),
+            )
 
     @staticmethod
     def _from_row(row: sqlite3.Row | None) -> NASJob | None:

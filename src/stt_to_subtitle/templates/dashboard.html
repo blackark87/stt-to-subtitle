@@ -19,6 +19,11 @@
   </div>
   <h1>자막 작업</h1>
   <p class="muted">NAS가 오디오를 추출하고, MPS/CUDA 전사 API와 별도 LM Studio PC를 순서대로 호출합니다.</p>
+  {% if not remote_servers.configured %}
+    <p class="alert">
+      작업을 시작하려면 먼저 <a href="/settings">전사·번역 서버를 설정</a>하세요.
+    </p>
+  {% endif %}
   {% if error %}<p class="alert">{{ error }}</p>{% endif %}
   {% if notice %}<p class="notice">{{ notice }}</p>{% endif %}
 
@@ -145,7 +150,7 @@
         <label class="check"><input name="force_overwrite" type="checkbox"><span>기존 <code>.ko.srt/.ko.ass</code> 강제 덮어쓰기</span></label>
       </div>
       <div class="wide submit-row">
-        <button type="submit" data-batch-submit {% if not files %}disabled{% endif %}>선택한 파일 작업 시작</button>
+        <button type="submit" data-batch-submit {% if not files or not remote_servers.configured %}disabled{% endif %}>선택한 파일 작업 시작</button>
         <span class="muted">여러 파일을 선택하면 같은 설정으로 일괄 등록됩니다.</span>
       </div>
     </form>

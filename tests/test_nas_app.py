@@ -95,6 +95,101 @@ class NASAppTests(unittest.TestCase):
             self.assertEqual(poster.status_code, 200)
             self.assertEqual(poster.content, b"poster-bytes")
 
+    def test_updates_remote_servers_from_settings_page(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+
+            with TestClient(
+                create_app(self.settings(root, media_root))
+            ) as client:
+                page = client.get("/settings")
+                response = client.post(
+                    "/settings",
+                    data={
+                        "stt_base_url": "http://new-stt.test:8100/",
+                        "stt_token": "new-stt-token",
+                        "lm_base_url": "http://new-lm.test:1234/v1/",
+                        "lm_token": "new-lm-token",
+                        "lm_model": "new-model",
+                    },
+                    follow_redirects=False,
+                )
+                service = client.app.state.orchestrator
+                saved_page = client.get("/settings?saved=true")
+
+            self.assertEqual(page.status_code, 200)
+            self.assertIn("서버 설정", page.text)
+            self.assertIn("Docker를", page.text)
+            self.assertNotIn("stt-token", page.text)
+            self.assertEqual(response.status_code, 303)
+            self.assertEqual(
+                response.headers["location"],
+                "/settings?saved=true",
+            )
+            self.assertEqual(
+                service.stt_client.base_url,
+                "http://new-stt.test:8100",
+            )
+            self.assertEqual(service.stt_client.token, "new-stt-token")
+            self.assertEqual(service.lm_client.model, "new-model")
+            self.assertIn("서버 설정을 저장했습니다.", saved_page.text)
+            self.assertNotIn("new-stt-token", saved_page.text)
+            self.assertNotIn("new-lm-token", saved_page.text)
+
+            with TestClient(
+                create_app(self.settings(root, media_root))
+            ) as client:
+                reloaded = client.app.state.orchestrator
+                reloaded_page = client.get("/settings")
+
+            self.assertEqual(
+                reloaded.stt_client.base_url,
+                "http://new-stt.test:8100",
+            )
+            self.assertEqual(reloaded.lm_client.model, "new-model")
+            self.assertIn("http://new-stt.test:8100", reloaded_page.text)
+
+    def test_first_run_is_configured_entirely_from_web_page(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            (media_root / "movie.mp4").write_bytes(b"media")
+            settings = NASSettings(
+                state_dir=root / "state",
+                media_root=media_root,
+                admin_password="",
+                session_secret="",
+                stt_base_url="",
+                stt_token="",
+                lm_base_url="",
+                lm_token="",
+                lm_model="",
+            )
+
+            with TestClient(create_app(settings)) as client:
+                before = client.get("/")
+                saved = client.post(
+                    "/settings",
+                    data={
+                        "stt_base_url": "http://stt.test:8100",
+                        "lm_base_url": "http://lm.test:1234/v1",
+                        "lm_model": "model",
+                    },
+                    follow_redirects=False,
+                )
+                after = client.get("/")
+                health = client.get("/healthz").json()
+
+            self.assertIn("전사·번역 서버를 설정", before.text)
+            self.assertIn("data-batch-submit disabled", before.text)
+            self.assertEqual(saved.status_code, 303)
+            self.assertNotIn("전사·번역 서버를 설정", after.text)
+            self.assertNotIn("data-batch-submit disabled", after.text)
+            self.assertTrue(health["remote_servers_configured"])
+
     def test_batch_submission_queues_all_selected_files(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)

@@ -8,6 +8,7 @@ import math
 import os
 from pathlib import Path
 import subprocess
+from urllib.parse import urlsplit
 from xml.etree import ElementTree
 
 MEDIA_EXTENSIONS = {
@@ -97,6 +98,72 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _normalize_server_url(value: str, setting: str) -> str:
+    normalized = value.strip().rstrip("/")
+    parsed = urlsplit(normalized)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError(
+            f"{setting} must be an http(s) URL without credentials, "
+            "query parameters, or fragments"
+        )
+    return normalized
+
+
+@dataclass(frozen=True)
+class RemoteServerSettings:
+    stt_base_url: str
+    stt_token: str
+    lm_base_url: str
+    lm_token: str
+    lm_model: str
+
+    @property
+    def is_complete(self) -> bool:
+        return all(
+            value.strip()
+            for value in (
+                self.stt_base_url,
+                self.lm_base_url,
+                self.lm_model,
+            )
+        )
+
+    def normalized(self) -> RemoteServerSettings:
+        missing = [
+            name
+            for name, value in (
+                ("STT_BASE_URL", self.stt_base_url),
+                ("LM_STUDIO_BASE_URL", self.lm_base_url),
+                ("LM_STUDIO_MODEL", self.lm_model),
+            )
+            if not value.strip()
+        ]
+        if missing:
+            raise ValueError(
+                f"required server settings are missing: {', '.join(missing)}"
+            )
+        return RemoteServerSettings(
+            stt_base_url=_normalize_server_url(
+                self.stt_base_url,
+                "STT_BASE_URL",
+            ),
+            stt_token=self.stt_token,
+            lm_base_url=_normalize_server_url(
+                self.lm_base_url,
+                "LM_STUDIO_BASE_URL",
+            ),
+            lm_token=self.lm_token,
+            lm_model=self.lm_model.strip(),
+        )
+
+
 @dataclass(frozen=True)
 class NASSettings:
     state_dir: Path
@@ -146,14 +213,6 @@ class NASSettings:
         )
 
     def validate(self) -> None:
-        required = {
-            "STT_BASE_URL": self.stt_base_url,
-            "LM_STUDIO_BASE_URL": self.lm_base_url,
-            "LM_STUDIO_MODEL": self.lm_model,
-        }
-        missing = [name for name, value in required.items() if not value.strip()]
-        if missing:
-            raise ValueError(f"required settings are missing: {', '.join(missing)}")
         if self.admin_password.strip() and not self.session_secret.strip():
             raise ValueError(
                 "NAS_SESSION_SECRET is required when NAS_ADMIN_PASSWORD is set"
@@ -169,6 +228,15 @@ class NASSettings:
             or self.translation_batch_characters < 1
         ):
             raise ValueError("translation batch limits must be positive")
+
+    def remote_servers(self) -> RemoteServerSettings:
+        return RemoteServerSettings(
+            stt_base_url=self.stt_base_url,
+            stt_token=self.stt_token,
+            lm_base_url=self.lm_base_url,
+            lm_token=self.lm_token,
+            lm_model=self.lm_model,
+        )
 
 
 class MediaLibrary:
