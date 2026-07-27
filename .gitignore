@@ -61,6 +61,7 @@ tmp/
 .env.*
 !.env.nas.example
 !.env.macos.example
+!.env.cuda.example
 var/
 local.properties
 .settings/
@@ -1328,9 +1329,11 @@ tags
 !/requirements.txt
 !/requirements-nas.txt
 !/requirements-macos.txt
+!/requirements-cuda.txt
 !/requirements-test.txt
 !/.env.nas.example
 !/.env.macos.example
+!/.env.cuda.example
 !/.github/
 !/.github/**
 !/scripts/

@@ -1,4 +1,4 @@
-"""macOS-native FastAPI service for MPS transcription."""
+"""Native FastAPI transcription service for MPS, CUDA, or CPU."""
 
 from __future__ import annotations
 
@@ -34,6 +34,7 @@ from .kotoba import (
     load_pipeline,
     normalize_segments,
     run_pipeline,
+    validate_device,
 )
 from .transcription_store import TranscriptionJob, TranscriptionStore
 from .time_display import configure_kst_logging
@@ -93,6 +94,11 @@ class MacOSAPISettings:
     def validate(self) -> None:
         if not self.hf_token.strip():
             raise ValueError("HF_TOKEN is required")
+        validate_device(self.device, setting="STT_DEVICE")
+        validate_device(
+            self.diarization_device,
+            setting="STT_DIARIZATION_DEVICE",
+        )
         if self.batch_size < 1:
             raise ValueError("STT_BATCH_SIZE must be at least 1")
         if self.threads is not None and self.threads < 1:
@@ -107,6 +113,30 @@ class MacOSAPISettings:
             raise ValueError(
                 "STT_NOISE_FILTER_TRIGGER_LEVEL must be positive"
             )
+
+
+def _device_unavailable_reason(torch: Any, device: str) -> str | None:
+    if device == "cpu":
+        return None
+    if device == "mps":
+        backends = getattr(torch, "backends", None)
+        mps = getattr(backends, "mps", None)
+        if mps is None or not mps.is_available():
+            return "PyTorch MPS is not available"
+        return None
+
+    cuda = getattr(torch, "cuda", None)
+    if cuda is None or not cuda.is_available():
+        return "PyTorch CUDA is not available"
+    if ":" not in device:
+        return None
+    index = int(device.split(":", maxsplit=1)[1])
+    if index >= cuda.device_count():
+        return (
+            f"CUDA device {device} is not available; "
+            f"found {cuda.device_count()} CUDA device(s)"
+        )
+    return None
 
 
 def _parse_options(raw_options: str, settings: MacOSAPISettings) -> dict[str, Any]:
@@ -236,9 +266,20 @@ class TranscriptionService:
             detail["status"] = "not_ready"
             detail["reason"] = "PyTorch is not installed"
             return False, detail
-        if self.settings.device == "mps" and not torch.backends.mps.is_available():
+        reason = _device_unavailable_reason(torch, self.settings.device)
+        if reason is not None:
             detail["status"] = "not_ready"
-            detail["reason"] = "PyTorch MPS is not available"
+            detail["reason"] = reason
+            return False, detail
+        reason = _device_unavailable_reason(
+            torch,
+            self.settings.diarization_device,
+        )
+        if reason is not None:
+            detail["status"] = "not_ready"
+            detail["reason"] = (
+                f"{reason} for STT_DIARIZATION_DEVICE"
+            )
             return False, detail
         detail["status"] = "ready"
         return True, detail
@@ -490,7 +531,7 @@ def create_app(
             service.stop()
 
     app = FastAPI(
-        title="stt-to-subtitle macOS transcription API",
+        title="stt-to-subtitle native transcription API",
         version="1.0.0",
         lifespan=lifespan,
     )

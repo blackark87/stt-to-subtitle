@@ -15,15 +15,18 @@ Synology NAS · linux/amd64 Docker
    │                         │
    │ 16 kHz mono PCM WAV     │ 일본어 세그먼트 JSON
    ▼                         ▼
-M1 Max MacBook Pro          별도 LM Studio PC
+네이티브 전사 PC             별도 LM Studio PC
 FastAPI + Uvicorn           OpenAI 호환 API
-Whisper: MPS                번역 모델
-Pyannote: CPU
+Whisper: MPS 또는 CUDA      번역 모델
+Pyannote: CPU 또는 CUDA
 ```
 
-전사 모델과 번역 모델은 완전히 분리된 서비스입니다. 따라서 작업 A를 LM Studio가 번역하는 동안 Mac은 작업 B를 전사할 수 있습니다. NAS의 각 단계 동시 실행 수는 기본적으로 오디오 1개, 전사 1개, 번역 1개입니다.
+전사 모델과 번역 모델은 완전히 분리된 서비스입니다. 따라서 작업 A를 LM Studio가 번역하는 동안 전사 PC는 작업 B를 처리할 수 있습니다. NAS의 각 단계 동시 실행 수는 기본적으로 오디오 1개, 전사 1개, 번역 1개입니다.
 
-Xcode 애플리케이션을 만들 필요는 없습니다. Mac에서는 일반 Python FastAPI/Uvicorn 서버를 네이티브로 실행합니다. 패키지 빌드에 Apple Command Line Tools가 필요할 수 있지만 GUI 앱 개발은 필요하지 않습니다.
+Xcode 애플리케이션을 만들 필요는 없습니다. Mac, Linux 또는 Windows에서
+일반 Python FastAPI/Uvicorn 서버를 네이티브로 실행합니다. Mac 패키지
+빌드에는 Apple Command Line Tools가 필요할 수 있지만 GUI 앱 개발은
+필요하지 않습니다.
 
 Docker Desktop, Podman Machine, Colima 등 Mac의 Linux VM에서 실행하는 컨테이너는 PyTorch에 Metal/MPS 장치를 전달하지 않습니다. Apple Silicon용 컨테이너 이미지나 Docker 호환 도구가 존재하는 것과 MPS 장치 전달은 별개의 문제입니다. MPS 전사는 반드시 macOS 호스트 프로세스로 실행하십시오.
 
@@ -33,16 +36,16 @@ Docker Desktop, Podman Machine, Colima 등 Mac의 Linux VM에서 실행하는 �
 
 | 장비 | 역할 | 기본 포트 |
 | --- | --- | ---: |
-| M1 Max MacBook Pro | MPS 전사 API | `8100` |
+| Mac 또는 NVIDIA GPU PC | MPS 또는 CUDA 전사 API | `8100` |
 | LM Studio PC | 번역 API | `1234` |
 | Synology NAS | 파일 선택 및 작업 웹 UI | `8080` |
 
 처음 설치할 때는 다음 순서가 가장 단순합니다.
 
 1. LM Studio PC에서 번역 모델과 LAN API 서버를 실행합니다.
-2. MacBook에서 이 저장소를 받은 뒤 네이티브 MPS 전사 API를 실행합니다.
+2. Mac 또는 NVIDIA GPU PC에서 네이티브 MPS/CUDA 전사 API를 실행합니다.
 3. NAS에서 이 저장소의 Compose 파일과 환경 파일을 준비하고 GHCR 이미지를 실행합니다.
-4. NAS에서 MacBook과 LM Studio의 API에 접속할 수 있는지 확인합니다.
+4. NAS에서 전사 PC와 LM Studio의 API에 접속할 수 있는지 확인합니다.
 5. 브라우저로 NAS 웹 UI를 열어 짧은 파일로 전체 흐름을 검증합니다.
 
 ## 처리 흐름
@@ -114,7 +117,7 @@ fallback으로 제공해야 합니다.
 클라이언트 또는 burn-in 서버의 한글 글꼴 문제입니다. ASS만 네모라면
 위 fallback 경로 또는 ASS 웹 렌더러 쪽 설정을 먼저 확인합니다.
 
-## 1. MacBook: MPS 전사 API 설치 및 실행
+## 1-A. MacBook: MPS 전사 API 설치 및 실행
 
 ### 준비
 
@@ -157,9 +160,9 @@ STT_NOISE_FILTER_TRIGGER_LEVEL=7.0
 
 `HF_TOKEN`은 gated 모델 다운로드에 필수입니다. Hugging Face 설정에서 read 권한 토큰을 발급해 `hf_replace_me`를 교체하십시오. 신뢰하는 내부망에서 서비스 간 인증이 필요 없다면 `STT_API_TOKEN`은 비워 둡니다. 값을 설정하면 작업 API에 Bearer 인증이 자동으로 활성화되며 NAS에도 같은 값을 설정해야 합니다.
 
-`STT_CHUNK_PROGRESS_EVERY`는 `10` 또는 `100`만 사용할 수 있으며 기본값은 `10`입니다. Mac API는 Kotoba 파이프라인의 실제 전처리·추론 경계를 기준으로 청크가 생성되거나 완료될 때마다 현재 상태를 갱신합니다. NAS 작업 상세에는 `완료 / 생성 / 진행·대기` 카운터가 계속 표시되고, 진행 로그 행은 작업 시작, 지정한 완료 청크 간격, 작업 종료 시점에만 추가됩니다. 상태 API의 `chunk_progress`에는 같은 값과 `report_every`가 포함됩니다. 여기서 청크는 화자 분리 후 겹침 구간을 포함한 모델 입력 단위이므로 SRT 세그먼트 수나 단순한 `영상 길이 ÷ 청크 길이`와 일치하지 않을 수 있습니다. 긴 영상에서 로그를 줄이려면 `100`으로 변경한 뒤 Mac API를 재시작하십시오.
+`STT_CHUNK_PROGRESS_EVERY`는 `10` 또는 `100`만 사용할 수 있으며 기본값은 `10`입니다. 전사 API는 Kotoba 파이프라인의 실제 전처리·추론 경계를 기준으로 청크가 생성되거나 완료될 때마다 현재 상태를 갱신합니다. NAS 작업 상세에는 `완료 / 생성 / 진행·대기` 카운터가 계속 표시되고, 진행 로그 행은 작업 시작, 지정한 완료 청크 간격, 작업 종료 시점에만 추가됩니다. 상태 API의 `chunk_progress`에는 같은 값과 `report_every`가 포함됩니다. 여기서 청크는 화자 분리 후 겹침 구간을 포함한 모델 입력 단위이므로 SRT 세그먼트 수나 단순한 `영상 길이 ÷ 청크 길이`와 일치하지 않을 수 있습니다. 긴 영상에서 로그를 줄이려면 `100`으로 변경한 뒤 전사 API를 재시작하십시오.
 
-사용자가 Kotoba 내부 처리를 조정할 필요는 없습니다. Mac API는 먼저
+사용자가 Kotoba 내부 처리를 조정할 필요는 없습니다. 전사 API는 먼저
 Pyannote로 화자와 실제 발화 구간을 찾고, 각 화자 구간을 Kotoba Whisper로
 전사한 뒤 로컬 후처리기가 Whisper의 상대 시작·종료 시각을 영상 기준
 절대 시각으로 변환합니다. 고정된 Kotoba 원격 코드가 화자 구간 끝을 각
@@ -169,7 +172,7 @@ Pyannote로 화자와 실제 발화 구간을 찾고, 각 화자 구간을 Kotob
 웹 UI의 **청크(초)**는 자막 표시 시간이 아니라 Whisper 추론 입력 창의
 크기이며 프로젝트 기본값은 `60`초입니다. 고정된 Kotoba 원격 코드가
 30초보다 긴 청크를 Whisper 특징 추출기의 기본 길이로 잘라 버리지 않도록,
-Mac API가 긴 입력에서는 truncation을 끄고 attention mask를 전달합니다.
+전사 API가 긴 입력에서는 truncation을 끄고 attention mask를 전달합니다.
 따라서 60초 입력 전체가 Whisper 장문 전사 경로로 전달됩니다. 이 값은 SRT
 한 줄의 표시 시간을 의미하지 않으며, 더 늘리면 메모리 사용량과 한 번의
 추론 지연이 커질 수 있습니다.
@@ -246,9 +249,90 @@ cd /path/to/stt-to-subtitle-python
 
 `--update`는 내보내기 도구가 만든 `.stt-macos-runtime` 표식이 있는 폴더에서만 동작하므로 다른 디렉터리를 실수로 덮어쓰지 않습니다.
 
+## 1-B. Linux/Windows: CUDA 전사 API 설치 및 실행
+
+CUDA 버전은 MPS 버전과 같은 API 및 전사 정규화 코드를 사용하며 실행
+장치만 다릅니다. NVIDIA 드라이버, Git, 64비트 Python 3.11이 필요합니다.
+`requirements-cuda.txt`는 고정된 PyTorch 2.4.1 CUDA 12.1 휠을 사용하므로
+`nvidia-smi`가 정상 동작하고 CUDA 12.1 런타임과 호환되는 드라이버가
+설치되어 있어야 합니다. 별도의 CUDA Toolkit 설치는 필수가 아닙니다.
+
+먼저 Hugging Face에서 MPS 설치 절과 같은 Pyannote 모델 이용 조건을
+승인합니다. Linux에서는 다음과 같이 설치합니다.
+
+```bash
+git clone https://github.com/blackark87/stt-to-subtitle.git
+cd stt-to-subtitle
+python3.11 -m venv .venv-cuda
+.venv-cuda/bin/python -m pip install --upgrade pip
+.venv-cuda/bin/python -m pip install -r requirements-cuda.txt
+cp .env.cuda.example .env.cuda
+```
+
+Windows PowerShell에서는 다음 명령을 사용합니다.
+
+```powershell
+git clone https://github.com/blackark87/stt-to-subtitle.git
+Set-Location stt-to-subtitle
+py -3.11 -m venv .venv-cuda
+.\.venv-cuda\Scripts\python.exe -m pip install --upgrade pip
+.\.venv-cuda\Scripts\python.exe -m pip install -r requirements-cuda.txt
+Copy-Item .env.cuda.example .env.cuda
+```
+
+`.env.cuda`의 `HF_TOKEN`을 실제 read 토큰으로 바꿉니다. 기본값은 Whisper와
+Pyannote를 모두 첫 번째 GPU에서 실행합니다.
+
+```dotenv
+STT_DEVICE=cuda
+STT_DIARIZATION_DEVICE=cuda
+```
+
+GPU를 명시하려면 `cuda:0`, `cuda:1` 형식을 사용합니다. VRAM이 부족하면
+`STT_DIARIZATION_DEVICE=cpu`로 바꿔 Whisper만 CUDA에서 실행할 수 있습니다.
+지원 장치는 `cpu`, `mps`, `cuda`, `cuda:<index>`이며, 요청한 가속기를
+사용할 수 없을 때 CPU로 자동 전환하지 않습니다.
+
+설치된 CUDA PyTorch를 확인합니다.
+
+```bash
+.venv-cuda/bin/python -c \
+  "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+```
+
+Windows에서는 실행 파일 경로만 다음과 같이 바꿉니다.
+
+```powershell
+.\.venv-cuda\Scripts\python.exe -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+```
+
+Linux에서 서버를 실행합니다.
+
+```bash
+./scripts/run-cuda-stt.sh
+```
+
+Windows PowerShell에서 서버를 실행합니다. 로컬 정책이 서명되지 않은
+스크립트를 차단하는 경우 현재 프로세스에만 `Bypass`를 적용할 수 있습니다.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\run-cuda-stt.ps1
+```
+
+두 플랫폼 모두 다음 상태 API로 확인합니다. CUDA를 찾지 못하거나 지정한
+GPU 인덱스가 범위를 벗어나면 `/readyz`는 이유와 함께 503을 반환합니다.
+
+```bash
+curl http://127.0.0.1:8100/readyz
+```
+
+NAS의 전사 API 주소에는 Mac 대신 이 CUDA PC의 내부 IP와 포트 `8100`을
+설정하면 됩니다. `.env.cuda`, `var/cuda-cache/`, `var/cuda-stt/`,
+`.venv-cuda/`는 Git에서 제외됩니다.
+
 ## 2. 별도 PC의 LM Studio
 
-LM Studio는 Mac 전사 API와 다른 PC에서 실행하는 독립 번역 서비스입니다.
+LM Studio는 전사 API와 다른 PC에서도 실행할 수 있는 독립 번역 서비스입니다.
 
 1. 일본어→한국어 번역에 사용할 모델을 로드합니다.
 2. LAN에서 접근 가능한 API 서버를 활성화합니다.
@@ -392,13 +476,13 @@ WebXR immersive 모드는 보안 컨텍스트가 필요하므로 `http://NAS_IP:
 완료된 작업의 **번역부터 다시 시작** 버튼은 일본어 전사 JSON과 추출
 오디오를 유지한 채 기존 번역 체크포인트만 빈 상태로 초기화합니다. 이후
 LM Studio 번역과 SRT·ASS 렌더링만 다시 실행하므로 시간이 오래 걸리는
-Mac 전사를 반복하지 않습니다. 새 번역이 완료될 때 기존 SRT·ASS를 같은
+전사를 반복하지 않습니다. 새 번역이 완료될 때 기존 SRT·ASS를 같은
 경로에 교체하며, LM Studio가 꺼져 있으면 번역 단계에서 `blocked`가 되어
 서비스를 실행한 뒤 수동 재시도로 이어갈 수 있습니다.
 
-작업 생성·갱신 및 진행 로그의 실제 시각은 NAS UI와 NAS/Mac API에서 모두 KST(`+09:00`)로 표시하거나 직렬화합니다. SQLite 내부에는 시간대와 무관한 epoch 값을 유지합니다. SRT 및 전사 세그먼트 타임스탬프는 영상 시작점 기준 상대시간이므로 KST 변환 대상이 아닙니다.
+작업 생성·갱신 및 진행 로그의 실제 시각은 NAS UI와 전사 API에서 모두 KST(`+09:00`)로 표시하거나 직렬화합니다. SQLite 내부에는 시간대와 무관한 epoch 값을 유지합니다. SRT 및 전사 세그먼트 타임스탬프는 영상 시작점 기준 상대시간이므로 KST 변환 대상이 아닙니다.
 
-무인증 모드는 세 장비가 격리된 신뢰 가능한 LAN에 있을 때만 사용하십시오. NAS UI, Mac API, LM Studio 포트를 인터넷이나 게스트 Wi-Fi에 직접 노출하지 말고 LAN 방화벽 또는 신뢰할 수 있는 VPN으로 제한하십시오. HTTPS reverse proxy와 웹 로그인을 사용하는 경우 `NAS_SECURE_COOKIE=true`로 설정합니다.
+무인증 모드는 세 장비가 격리된 신뢰 가능한 LAN에 있을 때만 사용하십시오. NAS UI, 전사 API, LM Studio 포트를 인터넷이나 게스트 Wi-Fi에 직접 노출하지 말고 LAN 방화벽 또는 신뢰할 수 있는 VPN으로 제한하십시오. HTTPS reverse proxy와 웹 로그인을 사용하는 경우 `NAS_SECURE_COOKIE=true`로 설정합니다.
 
 ### NAS 업데이트 및 운영 명령
 
