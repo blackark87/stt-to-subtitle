@@ -4,10 +4,12 @@ from unittest.mock import Mock, patch
 
 from stt_to_subtitle.service_clients import (
     LMStudioClient,
+    OpenAICompatibleClient,
     RetryingJSONClient,
     STTAPIClient,
     TranslationResponseIDError,
     batch_segments,
+    list_openai_compatible_models,
     normalize_translation_response,
 )
 
@@ -49,6 +51,56 @@ class AuthenticationHeaderTests(unittest.TestCase):
         client = RetryingJSONClient(token="")
 
         self.assertEqual(client.headers, {"Accept": "application/json"})
+
+
+class OpenAICompatibleModelTests(unittest.TestCase):
+    def test_lists_unique_model_ids_in_stable_order(self) -> None:
+        response = Mock(status_code=200)
+        response.json.return_value = {
+            "object": "list",
+            "data": [
+                {"id": "zeta"},
+                {"id": "Alpha"},
+                {"id": "zeta"},
+            ],
+        }
+
+        with patch.object(
+            RetryingJSONClient,
+            "request",
+            return_value=response,
+        ) as request:
+            models = list_openai_compatible_models(
+                "http://translation.test/v1/",
+                "secret",
+            )
+
+        self.assertEqual(models, ["Alpha", "zeta"])
+        request.assert_called_once_with(
+            "GET",
+            "http://translation.test/v1/models",
+            headers={
+                "Accept": "application/json",
+                "Authorization": "Bearer secret",
+            },
+        )
+
+    def test_rejects_an_invalid_model_list(self) -> None:
+        response = Mock(status_code=200)
+        response.json.return_value = {"data": [{"id": ""}]}
+
+        with patch.object(
+            RetryingJSONClient,
+            "request",
+            return_value=response,
+        ), self.assertRaisesRegex(RuntimeError, "empty id"):
+            list_openai_compatible_models(
+                "http://translation.test/v1",
+                "",
+            )
+
+    def test_legacy_client_name_is_a_backward_compatible_alias(self) -> None:
+        self.assertIs(LMStudioClient, OpenAICompatibleClient)
 
 
 class STTAPIClientProgressTests(unittest.TestCase):

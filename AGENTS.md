@@ -6,7 +6,7 @@ Application code lives in `src/stt_to_subtitle/`. `audio.py` builds and runs FFm
 
 ## Architecture & Data Flow
 
-Maintain explicit boundaries between audio extraction, speech transcription, transcript normalization, translation, and subtitle rendering. The Mac transcription API runs natively with Whisper on MPS and Pyannote on CPU. Correct model-relative timestamps at the Mac transcript-normalization boundary; do not defer known model timestamp defects to translation. Subtitle rendering must preserve real cross-speaker overlap, replace overlapping lines from the same speaker, and emit both compatible SRT and styled ASS without changing translation IDs. The NAS Docker service orchestrates files, transcription, LM Studio translation, and subtitle rendering without running the ML models locally. Provider or model integrations should not leak credentials into output metadata.
+Maintain explicit boundaries between audio extraction, speech transcription, transcript normalization, translation, and subtitle rendering. The Mac transcription API runs natively with Whisper on MPS and Pyannote on CPU. Correct model-relative timestamps at the Mac transcript-normalization boundary; do not defer known model timestamp defects to translation. Subtitle rendering must preserve real cross-speaker overlap, replace overlapping lines from the same speaker, and emit both compatible SRT and styled ASS without changing translation IDs. The NAS Docker service orchestrates files, transcription, OpenAI-compatible translation, and subtitle rendering without running the ML models locally. Provider or model integrations should not leak credentials into output metadata.
 
 ## Build, Test, and Development Commands
 
@@ -29,6 +29,15 @@ Pass `HF_TOKEN` only at runtime and never store it in source, images, logs, or c
 ## Agent Communication
 
 Always communicate in Korean with a professional, precise expert tone.
+
+## Agent Execution Environment
+
+Agents work in a CLI-only environment for this repository. The Browser skill
+and an interactive browser backend are unavailable, so do not invoke Browser
+automation or claim browser-based visual validation. Validate web UI changes
+with template and route tests, JavaScript syntax checks, static inspection, and
+other CLI-accessible checks. Revisit this restriction only when the user
+explicitly provides a browser-enabled environment.
 
 ## Commit & Pull Request Guidelines
 

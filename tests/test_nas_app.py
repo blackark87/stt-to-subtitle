@@ -151,6 +151,111 @@ class NASAppTests(unittest.TestCase):
             self.assertEqual(reloaded.lm_client.model, "new-model")
             self.assertIn("http://new-stt.test:8100", reloaded_page.text)
 
+    def test_queries_openai_compatible_models_for_settings_list(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+
+            with patch(
+                "stt_to_subtitle.nas_app.list_openai_compatible_models",
+                return_value=["model-a", "model-b"],
+            ) as list_models, TestClient(
+                create_app(self.settings(root, media_root))
+            ) as client:
+                page = client.get("/settings")
+                response = client.post(
+                    "/settings/translation-models",
+                    data={
+                        "lm_base_url": "http://translation.test:1234/v1/",
+                        "lm_token": "lookup-token",
+                    },
+                )
+
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(
+                response.json(),
+                {"models": ["model-a", "model-b"]},
+            )
+            list_models.assert_called_once_with(
+                "http://translation.test:1234/v1",
+                "lookup-token",
+            )
+            self.assertIn("OpenAI 호환 API 주소", page.text)
+            self.assertIn('name="lm_model"', page.text)
+            self.assertIn("모델 조회", page.text)
+            self.assertIn("server-settings.js", page.text)
+
+    def test_recent_jobs_and_history_use_readable_responsive_layout(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+
+            with TestClient(
+                create_app(self.settings(root, media_root))
+            ) as client:
+                service = client.app.state.orchestrator
+                service.stop()
+                blocked = service.store.create(
+                    job_id="blocked-job",
+                    source_rel="show/movie.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                service.store.add_event(
+                    blocked.id,
+                    "info",
+                    "older history entry",
+                )
+                service.store.update(
+                    blocked.id,
+                    status="blocked",
+                    blocked_stage="translation",
+                    error="translation server unavailable",
+                )
+                service.store.add_event(
+                    blocked.id,
+                    "warning",
+                    "newest history entry",
+                )
+                active = service.store.create(
+                    job_id="active-job",
+                    source_rel="another.mp4",
+                    force_overwrite=False,
+                    options={},
+                )
+                service.store.update(
+                    active.id,
+                    status="transcription_running",
+                    chunks_created=12,
+                    chunks_completed=7,
+                )
+
+                dashboard = client.get("/")
+                detail = client.get(f"/jobs/{blocked.id}")
+
+            self.assertEqual(dashboard.status_code, 200)
+            self.assertIn('class="recent-job-list"', dashboard.text)
+            self.assertNotIn("<table", dashboard.text)
+            self.assertIn("진행·대기", dashboard.text)
+            self.assertIn("전사 중", dashboard.text)
+            self.assertIn("확인 필요", dashboard.text)
+            self.assertIn("전사 청크", dashboard.text)
+            self.assertIn('max="12"', dashboard.text)
+            self.assertIn("movie.mkv", dashboard.text)
+            self.assertIn("show", dashboard.text)
+
+            self.assertEqual(detail.status_code, 200)
+            self.assertIn("작업 히스토리", detail.text)
+            self.assertIn("번역", detail.text)
+            self.assertIn('class="latest-event"', detail.text)
+            self.assertIn("주의", detail.text)
+            self.assertLess(
+                detail.text.index("newest history entry"),
+                detail.text.index("older history entry"),
+            )
+
     def test_first_run_is_configured_entirely_from_web_page(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)

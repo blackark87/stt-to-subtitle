@@ -34,8 +34,16 @@ from .media_preview import (
     parse_byte_range,
     srt_to_webvtt,
 )
-from .nas_config import NASSettings, RemoteServerSettings
+from .nas_config import (
+    NASSettings,
+    RemoteServerSettings,
+    normalize_server_url,
+)
 from .orchestrator import NASOrchestrator
+from .service_clients import (
+    ExternalServiceError,
+    list_openai_compatible_models,
+)
 from .subtitle import render_webvtt
 from .time_display import (
     configure_kst_logging,
@@ -45,10 +53,52 @@ from .time_display import (
 
 LOGGER = logging.getLogger(__name__)
 PACKAGE_DIR = Path(__file__).parent
+RECENT_JOB_LIMIT = 20
+JOB_STATUS_LABELS = {
+    "queued": "대기 중",
+    "extracting": "오디오 추출 중",
+    "audio_ready": "오디오 준비 완료",
+    "transcription_running": "전사 중",
+    "transcribed": "전사 완료",
+    "translation_running": "번역 중",
+    "translated": "번역 완료",
+    "rendering": "자막 생성 중",
+    "completed": "완료",
+    "blocked": "확인 필요",
+    "failed": "실패",
+}
+JOB_STAGE_LABELS = {
+    "audio extraction": "오디오 추출",
+    "transcription": "전사",
+    "translation": "번역",
+    "render": "자막 생성",
+}
+EVENT_LEVEL_LABELS = {
+    "info": "정보",
+    "warning": "주의",
+    "error": "오류",
+}
 TEMPLATES = Jinja2Templates(directory=PACKAGE_DIR / "templates")
 TEMPLATES.env.filters["datetime"] = format_kst_timestamp
+TEMPLATES.env.filters["datetime_iso"] = format_kst_iso
 TEMPLATES.env.filters["filesize"] = lambda value: (
     f"{float(value) / 1024 / 1024 / 1024:.2f} GiB"
+)
+TEMPLATES.env.filters["job_status"] = lambda value: JOB_STATUS_LABELS.get(
+    str(value),
+    str(value),
+)
+TEMPLATES.env.filters["job_stage"] = lambda value: JOB_STAGE_LABELS.get(
+    str(value),
+    str(value),
+)
+TEMPLATES.env.filters["event_level"] = lambda value: EVENT_LEVEL_LABELS.get(
+    str(value),
+    str(value),
+)
+TEMPLATES.env.filters["filename"] = lambda value: Path(str(value)).name
+TEMPLATES.env.filters["parent_path"] = lambda value: (
+    "" if str(Path(str(value)).parent) == "." else str(Path(str(value)).parent)
 )
 
 
@@ -200,7 +250,7 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
         browser = service.library.browse(folder)
         return {
             "request": request,
-            "jobs": service.store.list_jobs(),
+            "jobs": service.store.list_jobs(limit=RECENT_JOB_LIMIT),
             "csrf_token": request.session.get("csrf_token", ""),
             "error": error,
             "notice": notice,
@@ -325,6 +375,39 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
             ),
         )
 
+    @app.post("/settings/translation-models")
+    def translation_models(
+        request: Request,
+        csrf_token: str = Form(""),
+        lm_base_url: str = Form(...),
+        lm_token: str = Form(""),
+        clear_lm_token: bool = Form(False),
+    ) -> dict[str, list[str]]:
+        if not is_authenticated(request):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="로그인이 필요합니다.",
+            )
+        validate_csrf(request, csrf_token)
+        current = orchestrator(request).remote_servers
+        token = (
+            ""
+            if clear_lm_token
+            else lm_token if lm_token else current.lm_token
+        )
+        try:
+            base_url = normalize_server_url(
+                lm_base_url,
+                "OPENAI_COMPATIBLE_BASE_URL",
+            )
+            models = list_openai_compatible_models(base_url, token)
+        except (ValueError, ExternalServiceError) as error:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=str(error),
+            ) from error
+        return {"models": models}
+
     @app.post("/settings", response_class=HTMLResponse)
     def save_server_settings(
         request: Request,
@@ -403,7 +486,9 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
             request,
             "_jobs_table.html",
             {
-                "jobs": orchestrator(request).store.list_jobs(),
+                "jobs": orchestrator(request).store.list_jobs(
+                    limit=RECENT_JOB_LIMIT
+                ),
                 "csrf_token": request.session.get("csrf_token", ""),
             },
         )

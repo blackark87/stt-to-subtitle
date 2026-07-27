@@ -26,7 +26,11 @@ from .nas_config import (
     probe_media_duration,
 )
 from .nas_store import NASJob, NASStore
-from .service_clients import ExternalServiceError, LMStudioClient, STTAPIClient
+from .service_clients import (
+    ExternalServiceError,
+    OpenAICompatibleClient,
+    STTAPIClient,
+)
 from .subtitle import write_styled_subtitles_atomic
 
 LOGGER = logging.getLogger(__name__)
@@ -54,7 +58,7 @@ class NASOrchestrator:
         )
         self._remote_runtime: tuple[
             STTAPIClient | None,
-            LMStudioClient | None,
+            OpenAICompatibleClient | None,
             RemoteServerSettings,
         ] = (None, None, initial_servers)
         if initial_servers.is_complete:
@@ -86,7 +90,7 @@ class NASOrchestrator:
         return self._remote_runtime[0]
 
     @property
-    def lm_client(self) -> LMStudioClient | None:
+    def lm_client(self) -> OpenAICompatibleClient | None:
         return self._remote_runtime[1]
 
     @property
@@ -126,7 +130,7 @@ class NASOrchestrator:
             normalized.stt_token,
             poll_interval=self.settings.stt_poll_interval,
         )
-        lm_client = LMStudioClient(
+        lm_client = OpenAICompatibleClient(
             normalized.lm_base_url,
             normalized.lm_token,
             normalized.lm_model,
