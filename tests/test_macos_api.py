@@ -1,12 +1,15 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 import unittest
+from unittest.mock import Mock
 import wave
 
 from fastapi.testclient import TestClient
 
 from stt_to_subtitle.macos_api import (
     MacOSAPISettings,
+    _device_unavailable_reason,
     _parse_options,
     _validate_wav,
     create_app,
@@ -85,6 +88,55 @@ class MacOSAPIHelpersTests(unittest.TestCase):
             "STT_NOISE_FILTER_TRIGGER_LEVEL must be positive",
         ):
             settings.validate()
+
+    def test_accepts_cuda_devices_with_optional_indexes(self) -> None:
+        settings = MacOSAPISettings(
+            state_dir=Path("/tmp/not-used"),
+            api_token="",
+            hf_token="hf-token",
+            device="cuda:0",
+            diarization_device="cuda:1",
+        )
+
+        settings.validate()
+
+    def test_rejects_unsupported_device(self) -> None:
+        settings = MacOSAPISettings(
+            state_dir=Path("/tmp/not-used"),
+            api_token="",
+            hf_token="hf-token",
+            device="auto",
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "STT_DEVICE must be cpu, mps, cuda",
+        ):
+            settings.validate()
+
+    def test_reports_unavailable_cuda_runtime(self) -> None:
+        torch = SimpleNamespace(
+            cuda=SimpleNamespace(is_available=Mock(return_value=False)),
+        )
+
+        reason = _device_unavailable_reason(torch, "cuda")
+
+        self.assertEqual(reason, "PyTorch CUDA is not available")
+
+    def test_reports_out_of_range_cuda_device_index(self) -> None:
+        torch = SimpleNamespace(
+            cuda=SimpleNamespace(
+                is_available=Mock(return_value=True),
+                device_count=Mock(return_value=1),
+            ),
+        )
+
+        reason = _device_unavailable_reason(torch, "cuda:1")
+
+        self.assertEqual(
+            reason,
+            "CUDA device cuda:1 is not available; found 1 CUDA device(s)",
+        )
 
 
 class MacOSAPIRouteTests(unittest.TestCase):

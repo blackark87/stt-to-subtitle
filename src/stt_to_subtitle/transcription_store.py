@@ -1,4 +1,4 @@
-"""SQLite persistence for the macOS transcription service."""
+"""SQLite persistence for the native transcription service."""
 
 from __future__ import annotations
 

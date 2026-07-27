@@ -7,11 +7,13 @@ from dataclasses import dataclass
 import importlib
 import logging
 from pathlib import Path
+import re
 from types import MethodType
 from typing import Any, Mapping, Protocol, Sequence
 
 MODEL_ID = "kotoba-tech/kotoba-whisper-v2.2"
 MODEL_REVISION = "9d33482a0eb9b57f1ad80708e8ac5538246d8355"
+DEVICE_PATTERN = re.compile(r"^(?:cpu|mps|cuda(?::\d+)?)$")
 TIMESTAMP_POSTPROCESSOR = "stt-to-subtitle/kotoba-speaker-span-v1"
 DEFAULT_CHUNK_LENGTH_SECONDS = 60
 DEFAULT_NOISE_FILTER_TRIGGER_LEVEL = 7.0
@@ -62,6 +64,14 @@ class TranscriptionOptions:
 
 class SpeechPipeline(Protocol):
     def __call__(self, audio_path: str, **kwargs: Any) -> Mapping[str, Any]: ...
+
+
+def validate_device(device: str, *, setting: str = "device") -> None:
+    """Validate a PyTorch device accepted by the native STT service."""
+    if not DEVICE_PATTERN.fullmatch(device):
+        raise ValueError(
+            f"{setting} must be cpu, mps, cuda, or cuda:<non-negative index>"
+        )
 
 
 def corrected_kotoba_chunk_iter(
@@ -618,6 +628,9 @@ def load_pipeline(
         raise ValueError("batch_size must be at least 1")
     if threads is not None and threads < 1:
         raise ValueError("threads must be at least 1")
+    validate_device(device)
+    if diarization_device is not None:
+        validate_device(diarization_device, setting="diarization_device")
 
     import torch
     from transformers import pipeline
@@ -625,7 +638,8 @@ def load_pipeline(
     if threads is not None:
         torch.set_num_threads(threads)
 
-    torch_dtype = torch.float16 if device == "mps" else torch.float32
+    uses_accelerator = device == "mps" or device.startswith("cuda")
+    torch_dtype = torch.float16 if uses_accelerator else torch.float32
     pipeline_options: dict[str, Any] = {
         "model": MODEL_ID,
         "revision": MODEL_REVISION,
