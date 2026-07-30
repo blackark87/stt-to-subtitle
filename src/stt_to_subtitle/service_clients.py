@@ -12,6 +12,7 @@ from typing import Any
 import requests
 
 from .contracts import validate_transcript, validate_translation_items
+from .translation_prompt import KOREAN_JAV_SYSTEM_PROMPT
 
 LOGGER = logging.getLogger(__name__)
 
@@ -551,12 +552,7 @@ class OpenAICompatibleClient(RetryingJSONClient):
             "messages": [
                 {
                     "role": "system",
-                    "content": (
-                        "Translate Japanese subtitle segments into natural Korean. "
-                        "Preserve every id exactly and in the same order. "
-                        "Return only the requested structured JSON. Do not add "
-                        "speaker names, timestamps, commentary, or omitted lines."
-                    ),
+                    "content": KOREAN_JAV_SYSTEM_PROMPT,
                 },
                 {
                     "role": "user",

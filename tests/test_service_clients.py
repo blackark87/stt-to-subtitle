@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 import unittest
 from unittest.mock import Mock, patch
 
@@ -12,6 +13,7 @@ from stt_to_subtitle.service_clients import (
     list_openai_compatible_models,
     normalize_translation_response,
 )
+from stt_to_subtitle.translation_prompt import KOREAN_JAV_SYSTEM_PROMPT
 
 
 class BatchSegmentsTests(unittest.TestCase):
@@ -242,3 +244,56 @@ class TranslationResponseTests(unittest.TestCase):
             [item["id"] for item in result],
             ["segment-1", "segment-2", "segment-3"],
         )
+
+    def test_sends_the_static_korean_jav_system_prompt(self) -> None:
+        client = OpenAICompatibleClient(
+            "http://translation.test/v1",
+            "",
+            "model",
+        )
+        response = Mock(status_code=200)
+        response.json.return_value = {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "translations": [
+                                    {"id": "segment-1", "text": "번역"}
+                                ]
+                            },
+                            ensure_ascii=False,
+                        )
+                    }
+                }
+            ]
+        }
+        client.request = Mock(return_value=response)
+
+        result = client._translate_batch(
+            [{"id": "segment-1", "text": "翻訳"}]
+        )
+
+        self.assertEqual(result, [{"id": "segment-1", "text": "번역"}])
+        request_payload = client.request.call_args.kwargs["json"]
+        self.assertEqual(
+            request_payload["messages"][0],
+            {
+                "role": "system",
+                "content": KOREAN_JAV_SYSTEM_PROMPT,
+            },
+        )
+        self.assertIn("Japanese spoken subtitle segments", KOREAN_JAV_SYSTEM_PROMPT)
+        self.assertIn('"translations"', KOREAN_JAV_SYSTEM_PROMPT)
+        self.assertIn("Preserve every id exactly", KOREAN_JAV_SYSTEM_PROMPT)
+        self.assertIn("生ハメ→노콘", KOREAN_JAV_SYSTEM_PROMPT)
+        for metadata_marker in (
+            "<<<actress",
+            "<<<title",
+            "<<<description",
+            "<<<maker",
+            "<<<label",
+            "<<<director",
+            "<<<JZ_DONE>>>",
+        ):
+            self.assertNotIn(metadata_marker, KOREAN_JAV_SYSTEM_PROMPT)
