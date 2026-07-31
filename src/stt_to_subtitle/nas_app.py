@@ -57,11 +57,13 @@ RECENT_JOB_LIMIT = 20
 JOB_STATUS_LABELS = {
     "queued": "대기 중",
     "extracting": "오디오 추출 중",
-    "audio_ready": "오디오 준비 완료",
+    "audio_ready": "전사 대기",
+    "audio_completed": "오디오 추출 완료",
     "transcription_running": "전사 중",
-    "transcribed": "전사 완료",
+    "transcribed": "번역 대기",
     "translation_running": "번역 중",
-    "translated": "번역 완료",
+    "translation_paused": "번역 중단됨",
+    "translated": "자막 생성 대기",
     "rendering": "자막 생성 중",
     "completed": "완료",
     "blocked": "확인 필요",
@@ -245,12 +247,49 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
         error: str | None = None,
         notice: str | None = None,
         folder: str = "",
+        completed_page: int = 1,
     ) -> dict[str, Any]:
         service = orchestrator(request)
         browser = service.library.browse(folder)
+        latest_jobs = service.store.latest_jobs_by_source()
+        completed_subtitles = service.store.latest_completed_subtitle_jobs()
+        for media in browser["files"]:
+            source_rel = str(media["path"])
+            latest = latest_jobs.get(source_rel)
+            linked_job = None
+            if latest is not None and latest.status in {"blocked", "failed"}:
+                media["subtitle_state"] = "attention"
+                linked_job = latest
+            elif latest is not None and latest.status not in {
+                "audio_completed",
+                "completed",
+            }:
+                media["subtitle_state"] = "running"
+                linked_job = latest
+            elif media["has_subtitle"]:
+                media["subtitle_state"] = "completed"
+                linked_job = completed_subtitles.get(source_rel)
+            else:
+                media["subtitle_state"] = "pending"
+            media["job_id"] = linked_job.id if linked_job else None
+            media["selectable"] = media["subtitle_state"] == "pending"
+
+        completed_page = max(1, completed_page)
+        completed_count = service.store.count_successful_jobs()
+        completed_offset = (completed_page - 1) * RECENT_JOB_LIMIT
         return {
             "request": request,
-            "jobs": service.store.list_jobs(limit=RECENT_JOB_LIMIT),
+            "open_jobs": service.store.list_open_jobs(),
+            "completed_jobs": service.store.list_successful_jobs(
+                limit=RECENT_JOB_LIMIT,
+                offset=completed_offset,
+            ),
+            "completed_page": completed_page,
+            "completed_has_previous": completed_page > 1,
+            "completed_has_next": (
+                completed_offset + RECENT_JOB_LIMIT < completed_count
+            ),
+            "completed_count": completed_count,
             "csrf_token": request.session.get("csrf_token", ""),
             "error": error,
             "notice": notice,
@@ -315,12 +354,13 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
         request: Request,
         queued: int | None = None,
         folder: str = "",
+        completed_page: int = 1,
     ) -> Any:
         if not is_authenticated(request):
             return login_redirect()
         notice = (
             f"작업 {queued}개를 등록했습니다."
-            if queued is not None and queued > 1
+            if queued is not None and queued > 0
             else None
         )
         try:
@@ -328,6 +368,7 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
                 request,
                 notice=notice,
                 folder=folder,
+                completed_page=completed_page,
             )
             response_status = status.HTTP_200_OK
         except ValueError as error:
@@ -419,6 +460,7 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
         lm_token: str = Form(""),
         clear_lm_token: bool = Form(False),
         lm_model: str = Form(...),
+        translation_workers: int = Form(1),
     ) -> Any:
         if not is_authenticated(request):
             return login_redirect()
@@ -439,6 +481,7 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
                 else lm_token if lm_token else current.lm_token
             ),
             lm_model=lm_model,
+            translation_workers=translation_workers,
         )
         try:
             service.update_remote_servers(updated)
@@ -453,6 +496,7 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
                         "stt_base_url": stt_base_url,
                         "lm_base_url": lm_base_url,
                         "lm_model": lm_model,
+                        "translation_workers": translation_workers,
                     },
                 ),
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -479,16 +523,33 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
         return FileResponse(poster)
 
     @app.get("/jobs-fragment", response_class=HTMLResponse)
-    def jobs_fragment(request: Request) -> Any:
+    def jobs_fragment(
+        request: Request,
+        completed_page: int = 1,
+        folder: str = "",
+    ) -> Any:
         if not is_authenticated(request):
             raise HTTPException(status_code=401, detail="authentication required")
+        service = orchestrator(request)
+        completed_page = max(1, completed_page)
+        completed_count = service.store.count_successful_jobs()
+        completed_offset = (completed_page - 1) * RECENT_JOB_LIMIT
         return TEMPLATES.TemplateResponse(
             request,
             "_jobs_table.html",
             {
-                "jobs": orchestrator(request).store.list_jobs(
-                    limit=RECENT_JOB_LIMIT
+                "open_jobs": service.store.list_open_jobs(),
+                "completed_jobs": service.store.list_successful_jobs(
+                    limit=RECENT_JOB_LIMIT,
+                    offset=completed_offset,
                 ),
+                "completed_page": completed_page,
+                "completed_has_previous": completed_page > 1,
+                "completed_has_next": (
+                    completed_offset + RECENT_JOB_LIMIT < completed_count
+                ),
+                "completed_count": completed_count,
+                "current_folder": folder,
                 "csrf_token": request.session.get("csrf_token", ""),
             },
         )
@@ -509,6 +570,7 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
         max_speakers: str = Form(""),
         add_punctuation: bool = Form(False),
         noise_filter: list[bool] | None = Form(None),
+        operation: str = Form("full"),
     ) -> Any:
         if not is_authenticated(request):
             return login_redirect()
@@ -529,6 +591,7 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
                 source_rels or [],
                 force_overwrite=force_overwrite,
                 options=options,
+                operation=operation,
             )
         except (FileExistsError, OSError, ValueError) as error:
             try:
@@ -545,16 +608,11 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
                 context,
                 status_code=status.HTTP_400_BAD_REQUEST,
             )
-        if len(jobs) > 1:
-            query = {"queued": len(jobs)}
-            if return_folder:
-                query["folder"] = return_folder
-            return RedirectResponse(
-                f"/?{urlencode(query)}",
-                status_code=status.HTTP_303_SEE_OTHER,
-            )
+        query = {"queued": len(jobs)}
+        if return_folder:
+            query["folder"] = return_folder
         return RedirectResponse(
-            f"/jobs/{jobs[0].id}",
+            f"/?{urlencode(query)}",
             status_code=status.HTTP_303_SEE_OTHER,
         )
 
@@ -704,7 +762,13 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
             "job.html",
             {
                 "job": job,
-                "events": service.store.events(job_id),
+                "events": [
+                    event
+                    for event in service.store.events(job_id)
+                    if not event["message"].startswith(
+                        ("transcription chunks:", "translation checkpoint saved")
+                    )
+                ],
                 "csrf_token": request.session.get("csrf_token", ""),
                 "video_mime_type": guess_media_type(job.source_rel),
                 "artifact_names": {
@@ -733,7 +797,13 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
             "_job_panel.html",
             {
                 "job": job,
-                "events": service.store.events(job_id),
+                "events": [
+                    event
+                    for event in service.store.events(job_id)
+                    if not event["message"].startswith(
+                        ("transcription chunks:", "translation checkpoint saved")
+                    )
+                ],
                 "csrf_token": request.session.get("csrf_token", ""),
                 "video_mime_type": guess_media_type(job.source_rel),
                 "artifact_names": {
@@ -782,6 +852,61 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail=str(error)) from error
         return RedirectResponse(
             f"/jobs/{job_id}",
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+
+    @app.post("/jobs/{job_id}/pause-translation")
+    def pause_translation(
+        request: Request,
+        job_id: str,
+        csrf_token: str = Form(""),
+    ) -> Any:
+        if not is_authenticated(request):
+            return login_redirect()
+        validate_csrf(request, csrf_token)
+        try:
+            orchestrator(request).pause_translation(job_id)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        return RedirectResponse(
+            f"/jobs/{job_id}",
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+
+    @app.post("/jobs/{job_id}/resume-translation")
+    def resume_translation(
+        request: Request,
+        job_id: str,
+        csrf_token: str = Form(""),
+    ) -> Any:
+        if not is_authenticated(request):
+            return login_redirect()
+        validate_csrf(request, csrf_token)
+        try:
+            orchestrator(request).resume_translation(job_id)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        return RedirectResponse(
+            f"/jobs/{job_id}",
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+
+    @app.post("/jobs/{job_id}/reprocess")
+    def reprocess_job(
+        request: Request,
+        job_id: str,
+        csrf_token: str = Form(""),
+        operation: str = Form(...),
+    ) -> Any:
+        if not is_authenticated(request):
+            return login_redirect()
+        validate_csrf(request, csrf_token)
+        try:
+            created = orchestrator(request).reprocess(job_id, operation)
+        except (FileExistsError, OSError, ValueError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        return RedirectResponse(
+            f"/jobs/{created.id}",
             status_code=status.HTTP_303_SEE_OTHER,
         )
 

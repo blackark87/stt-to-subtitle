@@ -1,6 +1,6 @@
 <section
   class="card job-overview-card"
-  {% if job.status in ["completed", "blocked", "failed"] %}data-poll-stop{% endif %}
+  {% if job.status in ["audio_completed", "completed", "translation_paused", "blocked", "failed"] %}data-poll-stop{% endif %}
 >
   <div class="job-overview-heading">
     <div>
@@ -32,22 +32,6 @@
       <dd>{{ job.blocked_stage|job_stage }}</dd>
     {% endif %}
     {% if job.error %}<dt>오류</dt><dd class="error-text">{{ job.error }}</dd>{% endif %}
-    {% if job.chunks_created %}
-      <dt>전사 청크</dt>
-      <dd class="chunk-progress-detail">
-        <progress
-          value="{{ job.chunks_completed }}"
-          max="{{ job.chunks_created }}"
-          aria-label="전사 청크 진행률"
-        ></progress>
-        <span class="chunk-progress">
-          <strong>{{ job.chunks_completed }}</strong> 완료
-          <span>/ {{ job.chunks_created }} 생성</span>
-          <span>/ {{ job.chunks_in_progress }} 진행·대기</span>
-          <span class="muted">({{ job.chunk_progress_every }}개 단위 로그)</span>
-        </span>
-      </dd>
-    {% endif %}
     {% if job.srt_path %}<dt>SRT</dt><dd>{{ job.srt_path }}</dd>{% endif %}
     {% if job.ass_path %}<dt>ASS</dt><dd>{{ job.ass_path }}</dd>{% endif %}
   </dl>
@@ -69,6 +53,19 @@
         <button type="submit" class="secondary" title="일본어 전사는 다시 실행하지 않습니다">번역부터 다시 시작</button>
       </form>
     {% endif %}
+    {% if job.status in ["transcribed", "translation_running"] and not job.translation_pause_requested %}
+      <form method="post" action="/jobs/{{ job.id }}/pause-translation">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button type="submit" class="secondary">번역 중단</button>
+      </form>
+    {% elif job.status == "translation_running" and job.translation_pause_requested %}
+      <span class="muted">현재 번역 청크를 저장한 뒤 중단합니다.</span>
+    {% elif job.status == "translation_paused" %}
+      <form method="post" action="/jobs/{{ job.id }}/resume-translation">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button type="submit">번역 이어 하기</button>
+      </form>
+    {% endif %}
     {% if job.status in ["blocked", "failed"] %}
       <form method="post" action="/jobs/{{ job.id }}/retry">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
@@ -76,6 +73,28 @@
       </form>
     {% endif %}
   </div>
+  {% if job.status in ["audio_completed", "completed"] %}
+    <div class="reprocess-actions">
+      <div>
+        <strong>새 작업으로 다시 처리</strong>
+        <span class="muted">현재 결과와 히스토리는 보존됩니다.</span>
+      </div>
+      <div class="actions">
+        <form method="post" action="/jobs/{{ job.id }}/reprocess">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button type="submit" name="operation" value="extract" class="secondary">오디오만 추출</button>
+        </form>
+        <form method="post" action="/jobs/{{ job.id }}/reprocess">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button type="submit" name="operation" value="translate" class="secondary">번역·자막 생성</button>
+        </form>
+        <form method="post" action="/jobs/{{ job.id }}/reprocess">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button type="submit" name="operation" value="full">오디오 추출 후 번역·자막 생성</button>
+        </form>
+      </div>
+    </div>
+  {% endif %}
 </section>
 {% if job.status == "completed" and job.srt_path %}
   <section class="card result-preview">
@@ -204,6 +223,32 @@
     </div>
     <span class="history-count">{{ events|length }}개 기록</span>
   </div>
+  {% if job.chunks_created or job.translation_chunks_total %}
+    <div class="history-progress-grid">
+      {% if job.chunks_created %}
+        <div class="history-progress-item">
+          <strong>전사 청크</strong>
+          <progress value="{{ job.chunks_completed }}" max="{{ job.chunks_created }}" aria-label="전사 청크 진행률"></progress>
+          <span class="chunk-progress">
+            <strong>{{ job.chunks_completed }}</strong> 완료
+            <span>/ {{ job.chunks_created }} 생성</span>
+            <span>/ {{ job.chunks_in_progress }} 진행·대기</span>
+          </span>
+        </div>
+      {% endif %}
+      {% if job.translation_chunks_total %}
+        <div class="history-progress-item">
+          <strong>번역 청크</strong>
+          <progress value="{{ job.translation_chunks_completed }}" max="{{ job.translation_chunks_total }}" aria-label="번역 청크 진행률"></progress>
+          <span class="chunk-progress">
+            <strong>{{ job.translation_chunks_completed }}</strong> 완료
+            <span>/ {{ job.translation_chunks_total }} 전체</span>
+            <span>/ {{ job.translation_chunks_in_progress }} 진행·대기</span>
+          </span>
+        </div>
+      {% endif %}
+    </div>
+  {% endif %}
   <ol class="job-timeline">
     {% for event in events|reverse %}
       <li class="timeline-item event-{{ event.level }}">

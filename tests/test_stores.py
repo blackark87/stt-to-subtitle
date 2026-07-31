@@ -122,6 +122,7 @@ class NASStoreTests(unittest.TestCase):
                     "lm_base_url": "http://lm.test/v1",
                     "lm_token": "lm-token",
                     "lm_model": "model",
+                    "translation_workers": 1,
                 },
             )
 
@@ -205,4 +206,8 @@ class NASStoreTests(unittest.TestCase):
             self.assertEqual(job.chunks_created, 0)
             self.assertEqual(job.chunks_completed, 0)
             self.assertEqual(job.chunk_progress_every, 10)
+            self.assertEqual(job.operation, "full")
+            self.assertEqual(job.translation_chunks_total, 0)
+            self.assertEqual(job.translation_chunks_completed, 0)
+            self.assertFalse(job.translation_pause_requested)
             self.assertIsNone(job.ass_path)

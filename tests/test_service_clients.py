@@ -8,6 +8,7 @@ from stt_to_subtitle.service_clients import (
     OpenAICompatibleClient,
     RetryingJSONClient,
     STTAPIClient,
+    TranslationPaused,
     TranslationResponseIDError,
     batch_segments,
     list_openai_compatible_models,
@@ -166,6 +167,43 @@ class STTAPIClientProgressTests(unittest.TestCase):
 
 
 class TranslationResponseTests(unittest.TestCase):
+    def test_reports_logical_batch_progress_and_pauses_after_checkpoint(
+        self,
+    ) -> None:
+        client = OpenAICompatibleClient(
+            "http://translation.test/v1",
+            "",
+            "model",
+            max_segments=1,
+        )
+        client._translate_batch_with_recovery = Mock(
+            side_effect=lambda batch: [
+                {"id": str(batch[0]["id"]), "text": "번역"}
+            ]
+        )
+        progress: list[tuple[int, int]] = []
+        checkpoints: list[list[dict[str, str]]] = []
+
+        with self.assertRaises(TranslationPaused):
+            client.translate(
+                [
+                    {"id": "segment-1", "text": "一"},
+                    {"id": "segment-2", "text": "二"},
+                ],
+                on_batch=checkpoints.append,
+                on_progress=lambda completed, total: progress.append(
+                    (completed, total)
+                ),
+                should_pause=lambda: True,
+            )
+
+        self.assertEqual(progress, [(0, 2), (1, 2)])
+        self.assertEqual(
+            checkpoints,
+            [[{"id": "segment-1", "text": "번역"}]],
+        )
+        self.assertEqual(client._translate_batch_with_recovery.call_count, 1)
+
     def test_reorders_an_exact_translation_id_set(self) -> None:
         normalized = normalize_translation_response(
             [

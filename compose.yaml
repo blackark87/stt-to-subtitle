@@ -1,7 +1,7 @@
 services:
   orchestrator:
     platform: linux/amd64
-    image: ${NAS_IMAGE:-ghcr.io/blackark87/stt-to-subtitle:nas-latest}
+    image: ${NAS_IMAGE:-ghcr.io/blackark87/stt-to-subtitle:latest}
     user: "${PUID:-1000}:${PGID:-1000}"
     init: true
     restart: unless-stopped

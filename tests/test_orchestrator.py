@@ -2,10 +2,11 @@ import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from stt_to_subtitle.nas_config import NASSettings, RemoteServerSettings
 from stt_to_subtitle.orchestrator import NASOrchestrator
+from stt_to_subtitle.service_clients import TranslationPaused
 
 
 class NASOrchestratorTests(unittest.TestCase):
@@ -103,6 +104,58 @@ class NASOrchestratorTests(unittest.TestCase):
             finally:
                 reloaded.stop()
 
+    def test_translation_worker_limit_controls_file_dispatch(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            for index in range(3):
+                (media_root / f"movie-{index}.mkv").write_bytes(b"media")
+            orchestrator = self.make_orchestrator(root, media_root)
+            try:
+                orchestrator.update_remote_servers(
+                    RemoteServerSettings(
+                        stt_base_url="http://stt.test",
+                        stt_token="",
+                        lm_base_url="http://lm.test/v1",
+                        lm_token="",
+                        lm_model="model",
+                        translation_workers=2,
+                    )
+                )
+                jobs = orchestrator.create_jobs(
+                    [f"movie-{index}.mkv" for index in range(3)],
+                    force_overwrite=False,
+                    options={},
+                )
+                for job in jobs:
+                    orchestrator.store.update(job.id, status="transcribed")
+                orchestrator._translation_executor.submit = Mock()
+
+                dispatched = orchestrator._dispatch_translations()
+                running = orchestrator.store.ids_with_status(
+                    "translation_running"
+                )
+                waiting = orchestrator.store.ids_with_status("transcribed")
+                orchestrator.update_remote_servers(
+                    RemoteServerSettings(
+                        stt_base_url="http://stt.test",
+                        stt_token="",
+                        lm_base_url="http://lm.test/v1",
+                        lm_token="",
+                        lm_model="model",
+                        translation_workers=1,
+                    )
+                )
+                after_decrease = orchestrator._dispatch_translations()
+            finally:
+                orchestrator.stop()
+
+            self.assertEqual(dispatched, 2)
+            self.assertEqual(len(running), 2)
+            self.assertEqual(len(waiting), 1)
+            self.assertEqual(after_decrease, 0)
+
     def test_requires_web_server_settings_before_creating_job(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -131,6 +184,209 @@ class NASOrchestratorTests(unittest.TestCase):
                     )
             finally:
                 orchestrator.stop()
+
+    def test_audio_only_job_does_not_require_remote_servers(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            (media_root / "movie.mkv").write_bytes(b"media")
+            orchestrator = NASOrchestrator(
+                NASSettings(
+                    state_dir=root / "state",
+                    media_root=media_root,
+                    admin_password="",
+                    session_secret="",
+                    stt_base_url="",
+                    stt_token="",
+                    lm_base_url="",
+                    lm_token="",
+                    lm_model="",
+                )
+            )
+            try:
+                job = orchestrator.create_job(
+                    "movie.mkv",
+                    force_overwrite=False,
+                    options={},
+                    operation="extract",
+                )
+
+                def fake_extract(_source, target, _options):
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(b"wave")
+
+                with patch(
+                    "stt_to_subtitle.orchestrator.extract_audio",
+                    side_effect=fake_extract,
+                ):
+                    orchestrator._extract(job)
+                completed = orchestrator.store.get(job.id)
+            finally:
+                orchestrator.stop()
+
+            self.assertEqual(completed.status, "audio_completed")
+            self.assertEqual(completed.operation, "extract")
+            self.assertTrue(Path(completed.audio_path).is_file())
+
+    def test_translation_reuses_latest_extracted_audio_or_falls_back(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            (media_root / "movie.mkv").write_bytes(b"media")
+            orchestrator = self.make_orchestrator(root, media_root)
+            try:
+                extracted = orchestrator.create_job(
+                    "movie.mkv",
+                    force_overwrite=False,
+                    options={"start_seconds": "12"},
+                    operation="extract",
+                )
+                audio_path = root / "state" / "jobs" / extracted.id / "audio.wav"
+                audio_path.parent.mkdir(parents=True)
+                audio_path.write_bytes(b"wave")
+                orchestrator.store.update(
+                    extracted.id,
+                    status="audio_completed",
+                    audio_path=str(audio_path),
+                    audio_sha256="digest",
+                )
+
+                reused = orchestrator.create_job(
+                    "movie.mkv",
+                    force_overwrite=True,
+                    options={"chunk_length_seconds": "30"},
+                    operation="translate",
+                )
+                audio_path.unlink()
+                orchestrator.store.update(extracted.id, status="audio_completed")
+                fallback = orchestrator.create_job(
+                    "movie.mkv",
+                    force_overwrite=True,
+                    options={"chunk_length_seconds": "20"},
+                    operation="translate",
+                )
+            finally:
+                orchestrator.stop()
+
+            self.assertEqual(reused.id, extracted.id)
+            self.assertEqual(reused.status, "audio_ready")
+            self.assertEqual(reused.options["start_seconds"], 12.0)
+            self.assertEqual(reused.options["chunk_length_seconds"], 30)
+            self.assertEqual(fallback.id, extracted.id)
+            self.assertEqual(fallback.status, "queued")
+            self.assertIsNone(fallback.audio_path)
+            self.assertEqual(fallback.options["chunk_length_seconds"], 20)
+
+    def test_pauses_waiting_translation_and_resumes_checkpoint(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            (media_root / "movie.mkv").write_bytes(b"media")
+            orchestrator = self.make_orchestrator(root, media_root)
+            try:
+                job = orchestrator.create_job(
+                    "movie.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                orchestrator.store.update(
+                    job.id,
+                    status="transcribed",
+                    translation_chunks_total=4,
+                    translation_chunks_completed=2,
+                )
+                paused = orchestrator.pause_translation(job.id)
+                resumed = orchestrator.resume_translation(job.id)
+            finally:
+                orchestrator.stop()
+
+            self.assertEqual(paused.status, "translation_paused")
+            self.assertTrue(paused.translation_pause_requested)
+            self.assertEqual(resumed.status, "transcribed")
+            self.assertFalse(resumed.translation_pause_requested)
+            self.assertEqual(resumed.translation_chunks_completed, 2)
+
+    def test_running_translation_pauses_after_persisted_logical_chunk(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            (media_root / "movie.mkv").write_bytes(b"media")
+            orchestrator = self.make_orchestrator(root, media_root)
+            try:
+                job = orchestrator.create_job(
+                    "movie.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                artifact_dir = root / "state" / "jobs" / job.id
+                artifact_dir.mkdir(parents=True)
+                transcript_path = artifact_dir / "transcript.json"
+                transcript_path.write_text(
+                    json.dumps(
+                        {
+                            "schema_version": 1,
+                            "job_id": "remote-job",
+                            "segments": [
+                                {
+                                    "id": "segment-000001",
+                                    "start": 0,
+                                    "end": 1,
+                                    "speaker": "SPEAKER_00",
+                                    "text": "こんにちは",
+                                }
+                            ],
+                        },
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+                orchestrator.store.update(
+                    job.id,
+                    status="translation_running",
+                    transcript_path=str(transcript_path),
+                    translation_pause_requested=1,
+                )
+                translation_client = Mock()
+
+                def pause_after_checkpoint(_segments, **kwargs):
+                    items = [{"id": "segment-000001", "text": "안녕하세요"}]
+                    kwargs["on_progress"](0, 2)
+                    kwargs["on_batch"](items)
+                    kwargs["on_progress"](1, 2)
+                    raise TranslationPaused()
+
+                translation_client.translate = Mock(
+                    side_effect=pause_after_checkpoint
+                )
+                orchestrator._make_translation_client = Mock(
+                    return_value=translation_client
+                )
+
+                orchestrator._run_stage(
+                    job.id,
+                    "translation",
+                    orchestrator._translate,
+                )
+                paused = orchestrator.store.get(job.id)
+                checkpoint = json.loads(
+                    Path(paused.translation_path).read_text(encoding="utf-8")
+                )
+            finally:
+                orchestrator.stop()
+
+            self.assertEqual(paused.status, "translation_paused")
+            self.assertEqual(paused.translation_chunks_completed, 1)
+            self.assertEqual(paused.translation_chunks_total, 2)
+            self.assertEqual(
+                checkpoint["translations"],
+                [{"id": "segment-000001", "text": "안녕하세요"}],
+            )
 
     def test_creates_one_job_for_each_selected_media_file(self) -> None:
         with TemporaryDirectory() as directory:
@@ -277,10 +533,14 @@ class NASOrchestratorTests(unittest.TestCase):
                     for event in orchestrator.store.events(job.id)
                 ]
 
-                orchestrator.lm_client.translate = Mock(
+                translation_client = Mock()
+                translation_client.translate = Mock(
                     return_value=[
                         {"id": "segment-000001", "text": "안녕하세요"}
                     ]
+                )
+                orchestrator._make_translation_client = Mock(
+                    return_value=translation_client
                 )
                 orchestrator._translate(orchestrator.store.get(job.id))
                 orchestrator._render(orchestrator.store.get(job.id))
@@ -292,7 +552,7 @@ class NASOrchestratorTests(unittest.TestCase):
             self.assertIn("00:00:11,000 --> 00:00:12,000", subtitle)
             self.assertIn("안녕하세요", subtitle)
             self.assertNotIn("SPEAKER_00", subtitle)
-            self.assertIn(
+            self.assertNotIn(
                 "transcription chunks: created 20, completed 10, in progress 10",
                 progress_messages,
             )
@@ -479,13 +739,17 @@ class NASOrchestratorTests(unittest.TestCase):
                 ass_path=str(ass_path),
             )
             original_transcript = transcript_path.read_bytes()
-            orchestrator.lm_client.translate = Mock(
+            translation_client = Mock()
+            translation_client.translate = Mock(
                 return_value=[
                     {
                         "id": "segment-000001",
                         "text": "새 번역",
                     }
                 ]
+            )
+            orchestrator._make_translation_client = Mock(
+                return_value=translation_client
             )
 
             try:
@@ -515,7 +779,7 @@ class NASOrchestratorTests(unittest.TestCase):
             self.assertIn("새 번역", ass_path.read_text(encoding="utf-8"))
             self.assertNotIn("old srt", srt_path.read_text(encoding="utf-8"))
             self.assertEqual(
-                orchestrator.lm_client.translate.call_args.kwargs["existing"],
+                translation_client.translate.call_args.kwargs["existing"],
                 {},
             )
             self.assertTrue(
