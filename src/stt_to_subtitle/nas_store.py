@@ -16,6 +16,8 @@ RUNNING_STATUSES = {
     "rendering",
 }
 
+SUCCESS_STATUSES = {"audio_completed", "completed"}
+
 
 @dataclass(frozen=True)
 class NASJob:
@@ -23,6 +25,7 @@ class NASJob:
     source_rel: str
     status: str
     force_overwrite: bool
+    operation: str
     options: dict[str, Any]
     audio_path: str | None
     audio_sha256: str | None
@@ -36,6 +39,9 @@ class NASJob:
     chunks_created: int
     chunks_completed: int
     chunk_progress_every: int
+    translation_chunks_total: int
+    translation_chunks_completed: int
+    translation_pause_requested: bool
     created_at: float
     updated_at: float
 
@@ -43,10 +49,20 @@ class NASJob:
     def chunks_in_progress(self) -> int:
         return max(0, self.chunks_created - self.chunks_completed)
 
+    @property
+    def translation_chunks_in_progress(self) -> int:
+        return max(
+            0,
+            self.translation_chunks_total - self.translation_chunks_completed,
+        )
+
 
 class NASStore:
     _UPDATABLE_FIELDS = {
         "status",
+        "force_overwrite",
+        "operation",
+        "options_json",
         "audio_path",
         "audio_sha256",
         "stt_job_id",
@@ -59,6 +75,9 @@ class NASStore:
         "chunks_created",
         "chunks_completed",
         "chunk_progress_every",
+        "translation_chunks_total",
+        "translation_chunks_completed",
+        "translation_pause_requested",
     }
 
     def __init__(self, database_path: Path) -> None:
@@ -81,6 +100,7 @@ class NASStore:
                     source_rel TEXT NOT NULL,
                     status TEXT NOT NULL,
                     force_overwrite INTEGER NOT NULL,
+                    operation TEXT NOT NULL DEFAULT 'full',
                     options_json TEXT NOT NULL,
                     audio_path TEXT,
                     audio_sha256 TEXT,
@@ -94,6 +114,9 @@ class NASStore:
                     chunks_created INTEGER NOT NULL DEFAULT 0,
                     chunks_completed INTEGER NOT NULL DEFAULT 0,
                     chunk_progress_every INTEGER NOT NULL DEFAULT 10,
+                    translation_chunks_total INTEGER NOT NULL DEFAULT 0,
+                    translation_chunks_completed INTEGER NOT NULL DEFAULT 0,
+                    translation_pause_requested INTEGER NOT NULL DEFAULT 0,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL
                 );
@@ -114,6 +137,7 @@ class NASStore:
                     lm_base_url TEXT NOT NULL,
                     lm_token TEXT NOT NULL,
                     lm_model TEXT NOT NULL,
+                    translation_workers INTEGER NOT NULL DEFAULT 1,
                     updated_at REAL NOT NULL
                 );
 
@@ -141,16 +165,44 @@ class NASStore:
                     "chunk_progress_every INTEGER NOT NULL DEFAULT 10"
                 ),
                 "ass_path": "ALTER TABLE jobs ADD COLUMN ass_path TEXT",
+                "operation": (
+                    "ALTER TABLE jobs ADD COLUMN "
+                    "operation TEXT NOT NULL DEFAULT 'full'"
+                ),
+                "translation_chunks_total": (
+                    "ALTER TABLE jobs ADD COLUMN translation_chunks_total "
+                    "INTEGER NOT NULL DEFAULT 0"
+                ),
+                "translation_chunks_completed": (
+                    "ALTER TABLE jobs ADD COLUMN translation_chunks_completed "
+                    "INTEGER NOT NULL DEFAULT 0"
+                ),
+                "translation_pause_requested": (
+                    "ALTER TABLE jobs ADD COLUMN translation_pause_requested "
+                    "INTEGER NOT NULL DEFAULT 0"
+                ),
             }
             for column, statement in migrations.items():
                 if column not in columns:
                     connection.execute(statement)
+            server_columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(remote_server_settings)"
+                ).fetchall()
+            }
+            if "translation_workers" not in server_columns:
+                connection.execute(
+                    "ALTER TABLE remote_server_settings ADD COLUMN "
+                    "translation_workers INTEGER NOT NULL DEFAULT 1"
+                )
 
-    def get_remote_server_settings(self) -> dict[str, str] | None:
+    def get_remote_server_settings(self) -> dict[str, Any] | None:
         with self._connect() as connection:
             row = connection.execute(
                 """
-                SELECT stt_base_url, stt_token, lm_base_url, lm_token, lm_model
+                SELECT stt_base_url, stt_token, lm_base_url, lm_token, lm_model,
+                       translation_workers
                 FROM remote_server_settings
                 WHERE id = 1
                 """
@@ -163,6 +215,7 @@ class NASStore:
             "lm_base_url": str(row["lm_base_url"]),
             "lm_token": str(row["lm_token"]),
             "lm_model": str(row["lm_model"]),
+            "translation_workers": int(row["translation_workers"]),
         }
 
     def save_remote_server_settings(
@@ -173,20 +226,23 @@ class NASStore:
         lm_base_url: str,
         lm_token: str,
         lm_model: str,
+        translation_workers: int = 1,
     ) -> None:
         with self._connect() as connection:
             connection.execute(
                 """
                 INSERT INTO remote_server_settings (
                     id, stt_base_url, stt_token,
-                    lm_base_url, lm_token, lm_model, updated_at
-                ) VALUES (1, ?, ?, ?, ?, ?, ?)
+                    lm_base_url, lm_token, lm_model,
+                    translation_workers, updated_at
+                ) VALUES (1, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     stt_base_url = excluded.stt_base_url,
                     stt_token = excluded.stt_token,
                     lm_base_url = excluded.lm_base_url,
                     lm_token = excluded.lm_token,
                     lm_model = excluded.lm_model,
+                    translation_workers = excluded.translation_workers,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -195,6 +251,7 @@ class NASStore:
                     lm_base_url,
                     lm_token,
                     lm_model,
+                    translation_workers,
                     time.time(),
                 ),
             )
@@ -208,6 +265,7 @@ class NASStore:
             source_rel=str(row["source_rel"]),
             status=str(row["status"]),
             force_overwrite=bool(row["force_overwrite"]),
+            operation=str(row["operation"]),
             options=json.loads(str(row["options_json"])),
             audio_path=str(row["audio_path"]) if row["audio_path"] else None,
             audio_sha256=(
@@ -229,6 +287,13 @@ class NASStore:
             chunks_created=int(row["chunks_created"]),
             chunks_completed=int(row["chunks_completed"]),
             chunk_progress_every=int(row["chunk_progress_every"]),
+            translation_chunks_total=int(row["translation_chunks_total"]),
+            translation_chunks_completed=int(
+                row["translation_chunks_completed"]
+            ),
+            translation_pause_requested=bool(
+                row["translation_pause_requested"]
+            ),
             created_at=float(row["created_at"]),
             updated_at=float(row["updated_at"]),
         )
@@ -240,20 +305,23 @@ class NASStore:
         source_rel: str,
         force_overwrite: bool,
         options: Mapping[str, Any],
+        operation: str = "full",
     ) -> NASJob:
         now = time.time()
         with self._connect() as connection:
             connection.execute(
                 """
                 INSERT INTO jobs (
-                    id, source_rel, status, force_overwrite, options_json,
+                    id, source_rel, status, force_overwrite, operation,
+                    options_json,
                     created_at, updated_at
-                ) VALUES (?, ?, 'queued', ?, ?, ?, ?)
+                ) VALUES (?, ?, 'queued', ?, ?, ?, ?, ?)
                 """,
                 (
                     job_id,
                     source_rel,
                     int(force_overwrite),
+                    operation,
                     json.dumps(dict(options), sort_keys=True),
                     now,
                     now,
@@ -273,13 +341,87 @@ class NASStore:
             ).fetchone()
         return self._from_row(row)
 
-    def list_jobs(self, limit: int = 100) -> list[NASJob]:
+    def list_jobs(self, limit: int | None = 100) -> list[NASJob]:
+        with self._connect() as connection:
+            if limit is None:
+                rows = connection.execute(
+                    "SELECT * FROM jobs ORDER BY created_at DESC"
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+        return [job for row in rows if (job := self._from_row(row)) is not None]
+
+    def list_open_jobs(self) -> list[NASJob]:
+        placeholders = ", ".join("?" for _ in SUCCESS_STATUSES)
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?",
-                (limit,),
+                f"""
+                SELECT * FROM jobs
+                WHERE status NOT IN ({placeholders})
+                ORDER BY created_at DESC
+                """,
+                tuple(sorted(SUCCESS_STATUSES)),
             ).fetchall()
         return [job for row in rows if (job := self._from_row(row)) is not None]
+
+    def list_successful_jobs(self, *, limit: int, offset: int) -> list[NASJob]:
+        placeholders = ", ".join("?" for _ in SUCCESS_STATUSES)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT * FROM jobs
+                WHERE status IN ({placeholders})
+                ORDER BY created_at DESC
+                LIMIT ? OFFSET ?
+                """,
+                (*sorted(SUCCESS_STATUSES), limit, offset),
+            ).fetchall()
+        return [job for row in rows if (job := self._from_row(row)) is not None]
+
+    def count_successful_jobs(self) -> int:
+        placeholders = ", ".join("?" for _ in SUCCESS_STATUSES)
+        with self._connect() as connection:
+            row = connection.execute(
+                f"SELECT COUNT(*) AS count FROM jobs "
+                f"WHERE status IN ({placeholders})",
+                tuple(sorted(SUCCESS_STATUSES)),
+            ).fetchone()
+        return int(row["count"]) if row is not None else 0
+
+    def latest_jobs_by_source(self) -> dict[str, NASJob]:
+        latest: dict[str, NASJob] = {}
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM jobs ORDER BY updated_at DESC, created_at DESC"
+            ).fetchall()
+        for row in rows:
+            job = self._from_row(row)
+            if job is not None:
+                latest.setdefault(job.source_rel, job)
+        return latest
+
+    def latest_completed_subtitle_jobs(self) -> dict[str, NASJob]:
+        latest: dict[str, NASJob] = {}
+        for job in self.list_jobs(limit=None):
+            if job.status == "completed" and (job.srt_path or job.ass_path):
+                latest.setdefault(job.source_rel, job)
+        return latest
+
+    def latest_audio_job(self, source_rel: str) -> NASJob | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM jobs
+                WHERE source_rel = ? AND status = 'audio_completed'
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (source_rel,),
+            ).fetchone()
+        return self._from_row(row)
 
     def ids_with_status(self, status: str) -> list[str]:
         with self._connect() as connection:

@@ -403,3 +403,16 @@ class NASSettingsTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "STT_BASE_URL"):
             settings.normalized()
+
+    def test_translation_worker_count_must_be_between_one_and_eight(self) -> None:
+        for workers in (0, 9):
+            settings = RemoteServerSettings(
+                stt_base_url="http://stt.test",
+                stt_token="",
+                lm_base_url="http://lm.test/v1",
+                lm_token="",
+                lm_model="model",
+                translation_workers=workers,
+            )
+            with self.assertRaisesRegex(ValueError, "between 1 and 8"):
+                settings.normalized()

@@ -25,6 +25,10 @@ class TranslationResponseIDError(ExternalServiceError):
     """The translation server returned a different segment ID set."""
 
 
+class TranslationPaused(RuntimeError):
+    """Translation stopped cleanly after a persisted logical batch."""
+
+
 def _safe_error(response: requests.Response) -> str:
     try:
         body = response.json()
@@ -457,6 +461,8 @@ class OpenAICompatibleClient(RetryingJSONClient):
         *,
         existing: Mapping[str, str] | None = None,
         on_batch: Callable[[list[dict[str, str]]], None] | None = None,
+        on_progress: Callable[[int, int], None] | None = None,
+        should_pause: Callable[[], bool] | None = None,
     ) -> list[dict[str, str]]:
         expected_ids = [str(segment["id"]) for segment in segments]
         expected_set = set(expected_ids)
@@ -477,11 +483,14 @@ class OpenAICompatibleClient(RetryingJSONClient):
         pending = [
             segment for segment in segments if str(segment["id"]) not in known
         ]
-        for batch in batch_segments(
+        batches = batch_segments(
             pending,
             max_segments=self.max_segments,
             max_characters=self.max_characters,
-        ):
+        )
+        if on_progress is not None:
+            on_progress(0, len(batches))
+        for completed_batches, batch in enumerate(batches, start=1):
             translated = self._translate_batch_with_recovery(batch)
             for item in translated:
                 known[item["id"]] = item["text"]
@@ -493,6 +502,10 @@ class OpenAICompatibleClient(RetryingJSONClient):
                         if segment_id in known
                     ]
                 )
+            if on_progress is not None:
+                on_progress(completed_batches, len(batches))
+            if should_pause is not None and should_pause():
+                raise TranslationPaused("translation paused after checkpoint")
 
         result = [
             {"id": segment_id, "text": known[segment_id]}

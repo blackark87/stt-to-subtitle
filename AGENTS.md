@@ -56,6 +56,6 @@ description. Follow Semantic Versioning:
 Select the next unused version relative to the latest `main` and existing
 release tags. Do not increment the version again for follow-up commits on the
 same PR unless the PR's compatibility scope changes. The GHCR workflow must
-publish `ghcr.io/blackark87/stt-to-subtitle:nas-X.Y.Z` from the
+publish `ghcr.io/blackark87/stt-to-subtitle:X.Y.Z` from the
 `pyproject.toml` version while retaining moving and immutable traceability tags
-such as `nas-latest` and the full commit SHA.
+such as `latest` and the full commit SHA.

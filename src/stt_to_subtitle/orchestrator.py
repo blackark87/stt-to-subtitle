@@ -30,6 +30,7 @@ from .service_clients import (
     ExternalServiceError,
     OpenAICompatibleClient,
     STTAPIClient,
+    TranslationPaused,
 )
 from .subtitle import write_styled_subtitles_atomic
 
@@ -81,7 +82,7 @@ class NASOrchestrator:
             thread_name_prefix="nas-stt",
         )
         self._translation_executor = ThreadPoolExecutor(
-            max_workers=1,
+            max_workers=8,
             thread_name_prefix="nas-translation",
         )
 
@@ -109,6 +110,7 @@ class NASOrchestrator:
             "lm_base_url": servers.lm_base_url,
             "lm_token_configured": bool(servers.lm_token),
             "lm_model": servers.lm_model,
+            "translation_workers": servers.translation_workers,
             "configured": self.remote_servers_configured,
         }
 
@@ -144,6 +146,7 @@ class NASOrchestrator:
                 lm_base_url=normalized.lm_base_url,
                 lm_token=normalized.lm_token,
                 lm_model=normalized.lm_model,
+                translation_workers=normalized.translation_workers,
             )
         self._remote_runtime = (stt_client, lm_client, normalized)
         return normalized
@@ -174,11 +177,13 @@ class NASOrchestrator:
         *,
         force_overwrite: bool,
         options: Mapping[str, Any],
+        operation: str = "full",
     ) -> NASJob:
         return self.create_jobs(
             [source_rel],
             force_overwrite=force_overwrite,
             options=options,
+            operation=operation,
         )[0]
 
     def create_jobs(
@@ -187,8 +192,11 @@ class NASOrchestrator:
         *,
         force_overwrite: bool,
         options: Mapping[str, Any],
+        operation: str = "full",
     ) -> list[NASJob]:
-        if not self.remote_servers_configured:
+        if operation not in {"extract", "translate", "full"}:
+            raise ValueError("unsupported job operation")
+        if operation != "extract" and not self.remote_servers_configured:
             raise ValueError(
                 "먼저 서버 설정에서 전사 서버와 번역 서버를 저장하세요."
             )
@@ -209,21 +217,79 @@ class NASOrchestrator:
                 )
                 if path.exists()
             ]
-            if existing_subtitles and not force_overwrite:
+            if (
+                operation != "extract"
+                and existing_subtitles
+                and not force_overwrite
+            ):
                 raise FileExistsError(
                     f"{source_rel}: 기존 한국어 자막 파일이 있습니다. "
                     "덮어쓰기를 명시적으로 선택하세요."
                 )
 
-        return [
-            self.store.create(
-                job_id=uuid4().hex,
-                source_rel=source_rel,
-                force_overwrite=force_overwrite,
-                options=normalized_options,
+        jobs: list[NASJob] = []
+        for source_rel in unique_source_rels:
+            reusable = (
+                self.store.latest_audio_job(source_rel)
+                if operation == "translate"
+                else None
             )
-            for source_rel in unique_source_rels
-        ]
+            if reusable is not None:
+                reusable_options = dict(reusable.options)
+                for key in (
+                    "chunk_length_seconds",
+                    "num_speakers",
+                    "min_speakers",
+                    "max_speakers",
+                    "add_punctuation",
+                    "noise_filter",
+                ):
+                    reusable_options[key] = normalized_options[key]
+                audio_available = bool(
+                    reusable.audio_path
+                    and Path(reusable.audio_path).is_file()
+                )
+                self.store.update(
+                    reusable.id,
+                    status="audio_ready" if audio_available else "queued",
+                    force_overwrite=int(force_overwrite),
+                    operation="translate",
+                    options_json=json.dumps(reusable_options, sort_keys=True),
+                    audio_path=reusable.audio_path if audio_available else None,
+                    audio_sha256=(
+                        reusable.audio_sha256 if audio_available else None
+                    ),
+                    blocked_stage=None,
+                    error=None,
+                    chunks_created=0,
+                    chunks_completed=0,
+                    translation_chunks_total=0,
+                    translation_chunks_completed=0,
+                    translation_pause_requested=0,
+                )
+                self.store.add_event(
+                    reusable.id,
+                    "info",
+                    "subtitle generation requested; reusing extracted audio"
+                    if audio_available
+                    else "subtitle generation requested; audio will be "
+                    "extracted again",
+                )
+                resumed = self.store.get(reusable.id)
+                if resumed is None:
+                    raise RuntimeError("resumed NAS job could not be read")
+                jobs.append(resumed)
+                continue
+            jobs.append(
+                self.store.create(
+                    job_id=uuid4().hex,
+                    source_rel=source_rel,
+                    force_overwrite=force_overwrite,
+                    options=normalized_options,
+                    operation=operation,
+                )
+            )
+        return jobs
 
     def _normalize_options(
         self,
@@ -406,6 +472,9 @@ class NASOrchestrator:
             translation_path=str(translation_path),
             blocked_stage=None,
             error=None,
+            translation_chunks_total=0,
+            translation_chunks_completed=0,
+            translation_pause_requested=0,
         )
         self.store.add_event(
             job.id,
@@ -417,6 +486,95 @@ class NASOrchestrator:
         if restarted is None:
             raise RuntimeError("restarted NAS job could not be read")
         return restarted
+
+    def reprocess(self, job_id: str, operation: str) -> NASJob:
+        original = self.store.get(job_id)
+        if original is None:
+            raise ValueError("job not found")
+        if original.status not in {"audio_completed", "completed"}:
+            raise ValueError("only successful jobs can be reprocessed")
+        if operation not in {"extract", "translate", "full"}:
+            raise ValueError("unsupported job operation")
+        if operation != "extract" and not self.remote_servers_configured:
+            raise ValueError(
+                "먼저 서버 설정에서 전사 서버와 번역 서버를 저장하세요."
+            )
+        if operation != "translate":
+            return self.create_job(
+                original.source_rel,
+                force_overwrite=True,
+                options=original.options,
+                operation=operation,
+            )
+
+        created = self.store.create(
+            job_id=uuid4().hex,
+            source_rel=original.source_rel,
+            force_overwrite=True,
+            options=original.options,
+            operation="translate",
+        )
+        audio_available = bool(
+            original.audio_path and Path(original.audio_path).is_file()
+        )
+        self.store.update(
+            created.id,
+            status="audio_ready" if audio_available else "queued",
+            audio_path=original.audio_path if audio_available else None,
+            audio_sha256=original.audio_sha256 if audio_available else None,
+        )
+        self.store.add_event(
+            created.id,
+            "info",
+            "reprocessing requested from existing audio"
+            if audio_available
+            else "reprocessing requested; audio will be extracted again",
+        )
+        refreshed = self.store.get(created.id)
+        if refreshed is None:
+            raise RuntimeError("reprocessing NAS job could not be read")
+        return refreshed
+
+    def pause_translation(self, job_id: str) -> NASJob:
+        job = self.store.get(job_id)
+        if job is None:
+            raise ValueError("job not found")
+        if job.status == "translation_paused":
+            return job
+        if job.status == "transcribed":
+            self.store.update(
+                job.id,
+                status="translation_paused",
+                translation_pause_requested=1,
+            )
+        elif job.status == "translation_running":
+            self.store.update(job.id, translation_pause_requested=1)
+        else:
+            raise ValueError("translation is not waiting or running")
+        self.store.add_event(job.id, "info", "translation pause requested")
+        paused = self.store.get(job.id)
+        if paused is None:
+            raise RuntimeError("paused NAS job could not be read")
+        return paused
+
+    def resume_translation(self, job_id: str) -> NASJob:
+        job = self.store.get(job_id)
+        if job is None:
+            raise ValueError("job not found")
+        if job.status != "translation_paused":
+            raise ValueError("only paused translations can be resumed")
+        self.store.update(
+            job.id,
+            status="transcribed",
+            translation_pause_requested=0,
+            blocked_stage=None,
+            error=None,
+        )
+        self.store.add_event(job.id, "info", "translation resume requested")
+        resumed = self.store.get(job.id)
+        if resumed is None:
+            raise RuntimeError("resumed NAS job could not be read")
+        return resumed
 
     def save_artifact(
         self,
@@ -548,15 +706,27 @@ class NASOrchestrator:
                     self._stt_executor,
                     self._transcribe,
                 )
-            if not self.store.ids_with_status("translation_running"):
-                self._dispatch_one(
-                    "transcribed",
-                    "translation_running",
-                    "translation",
-                    self._translation_executor,
-                    self._translate,
-                )
+            self._dispatch_translations()
             self._stop_event.wait(1.0)
+
+    def _dispatch_translations(self) -> int:
+        slots = max(
+            0,
+            self.remote_servers.translation_workers
+            - len(self.store.ids_with_status("translation_running")),
+        )
+        dispatched = 0
+        for _ in range(slots):
+            if not self._dispatch_one(
+                "transcribed",
+                "translation_running",
+                "translation",
+                self._translation_executor,
+                self._translate,
+            ):
+                break
+            dispatched += 1
+        return dispatched
 
     def _dispatch_one(
         self,
@@ -606,6 +776,15 @@ class NASOrchestrator:
             )
             self.store.add_event(job_id, "warning", f"{stage} blocked: {message}")
             LOGGER.warning("job %s %s blocked: %s", job_id, stage, message)
+        except TranslationPaused:
+            self.store.update(
+                job_id,
+                status="translation_paused",
+                blocked_stage=None,
+                error=None,
+                translation_pause_requested=1,
+            )
+            self.store.add_event(job_id, "info", "translation paused")
         except BaseException as error:
             message = self._sanitize_error(str(error) or error.__class__.__name__)
             self.store.update(
@@ -628,9 +807,12 @@ class NASOrchestrator:
         )
         extract_audio(source, audio_path, options)
         digest = sha256_file(audio_path)
+        next_status = (
+            "audio_completed" if job.operation == "extract" else "audio_ready"
+        )
         self.store.update(
             job.id,
-            status="audio_ready",
+            status=next_status,
             audio_path=str(audio_path),
             audio_sha256=digest,
         )
@@ -664,35 +846,15 @@ class NASOrchestrator:
             )
 
         def update_chunk_progress(progress: Mapping[str, Any]) -> None:
-            current = self.store.get(job.id)
-            previous_created = current.chunks_created if current else 0
-            previous_completed = current.chunks_completed if current else 0
             created = int(progress["created"])
             completed = int(progress["completed"])
-            in_progress = max(0, created - completed)
             report_every = int(progress.get("report_every", 10))
-            final = bool(progress.get("final", False))
             self.store.update(
                 job.id,
                 chunks_created=created,
                 chunks_completed=completed,
                 chunk_progress_every=report_every,
             )
-            should_log = (
-                (previous_created == 0 and created > 0)
-                or completed // report_every
-                > previous_completed // report_every
-                or final
-            )
-            if should_log:
-                self.store.add_event(
-                    job.id,
-                    "info",
-                    "transcription chunks: "
-                    f"created {created}, "
-                    f"completed {completed}, "
-                    f"in progress {in_progress}",
-                )
 
         payload = stt_client.transcribe(
             Path(job.audio_path),
@@ -740,12 +902,24 @@ class NASOrchestrator:
                     f"{removed_count} non-speech diarization span(s)",
                 )
 
+    def _make_translation_client(
+        self,
+        servers: RemoteServerSettings,
+    ) -> OpenAICompatibleClient:
+        return OpenAICompatibleClient(
+            servers.lm_base_url,
+            servers.lm_token,
+            servers.lm_model,
+            max_segments=self.settings.translation_batch_segments,
+            max_characters=self.settings.translation_batch_characters,
+        )
+
     def _translate(self, job: NASJob) -> None:
         remote_runtime = self._remote_runtime
-        lm_client = remote_runtime[1]
         servers = remote_runtime[2]
-        if lm_client is None:
+        if remote_runtime[1] is None:
             raise ExternalServiceError("translation server is not configured")
+        lm_client = self._make_translation_client(servers)
         if not job.transcript_path:
             raise RuntimeError("transcript artifact is unavailable")
         transcript_payload = json.loads(
@@ -801,16 +975,25 @@ class NASOrchestrator:
                     "translations": items,
                 },
             )
-            self.store.add_event(
+        progress_base = job.translation_chunks_completed
+
+        def update_translation_progress(completed: int, total: int) -> None:
+            self.store.update(
                 job.id,
-                "info",
-                f"translation checkpoint saved ({len(items)}/{len(segments)})",
+                translation_chunks_total=progress_base + total,
+                translation_chunks_completed=progress_base + completed,
             )
+
+        def should_pause() -> bool:
+            current = self.store.get(job.id)
+            return bool(current and current.translation_pause_requested)
 
         translations = lm_client.translate(
             segments,
             existing=existing,
             on_batch=save_batch,
+            on_progress=update_translation_progress,
+            should_pause=should_pause,
         )
         write_json_atomic(
             translation_path,
@@ -822,7 +1005,15 @@ class NASOrchestrator:
                 "translations": translations,
             },
         )
-        self.store.update(job.id, status="translated")
+        refreshed = self.store.get(job.id)
+        self.store.update(
+            job.id,
+            status="translated",
+            translation_pause_requested=0,
+            translation_chunks_completed=(
+                refreshed.translation_chunks_total if refreshed else 0
+            ),
+        )
         self.store.add_event(
             job.id,
             "info",

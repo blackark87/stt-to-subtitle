@@ -77,13 +77,13 @@ class NASAppTests(unittest.TestCase):
             self.assertIn("0.00 GiB", root_response.text)
             self.assertIn("재생시간 1:43:00", root_response.text)
             self.assertNotIn('class="media-directory"', response.text)
-            self.assertIn("자막 미완료", root_response.text)
+            self.assertIn("대기", root_response.text)
             self.assertNotIn("folder-glyph", root_response.text)
             self.assertEqual(response.status_code, 200)
-            self.assertIn('name="source_rels"', response.text)
+            self.assertNotIn('name="source_rels"', response.text)
             self.assertIn('name="return_folder" value="show"', response.text)
             self.assertIn("첫 번째 에피소드", response.text)
-            self.assertIn("자막 완료", response.text)
+            self.assertIn("생성 완료", response.text)
             self.assertIn("일본어 구두점 모델 사용", response.text)
             self.assertIn("소음 오인식 필터 사용", response.text)
             self.assertIn('name="chunk_length_seconds"', response.text)
@@ -113,6 +113,7 @@ class NASAppTests(unittest.TestCase):
                         "lm_base_url": "http://new-lm.test:1234/v1/",
                         "lm_token": "new-lm-token",
                         "lm_model": "new-model",
+                        "translation_workers": "3",
                     },
                     follow_redirects=False,
                 )
@@ -134,6 +135,7 @@ class NASAppTests(unittest.TestCase):
             )
             self.assertEqual(service.stt_client.token, "new-stt-token")
             self.assertEqual(service.lm_client.model, "new-model")
+            self.assertEqual(service.remote_servers.translation_workers, 3)
             self.assertIn("서버 설정을 저장했습니다.", saved_page.text)
             self.assertNotIn("new-stt-token", saved_page.text)
             self.assertNotIn("new-lm-token", saved_page.text)
@@ -143,6 +145,8 @@ class NASAppTests(unittest.TestCase):
             ) as client:
                 reloaded = client.app.state.orchestrator
                 reloaded_page = client.get("/settings")
+                self.assertEqual(reloaded.remote_servers.translation_workers, 3)
+                self.assertIn('value="3"', reloaded_page.text)
 
             self.assertEqual(
                 reloaded.stt_client.base_url,
@@ -289,10 +293,10 @@ class NASAppTests(unittest.TestCase):
                 health = client.get("/healthz").json()
 
             self.assertIn("전사·번역 서버를 설정", before.text)
-            self.assertIn("data-batch-submit disabled", before.text)
+            self.assertIn('data-server-configured="false"', before.text)
             self.assertEqual(saved.status_code, 303)
             self.assertNotIn("전사·번역 서버를 설정", after.text)
-            self.assertNotIn("data-batch-submit disabled", after.text)
+            self.assertIn('data-server-configured="true"', after.text)
             self.assertTrue(health["remote_servers_configured"])
 
     def test_batch_submission_queues_all_selected_files(self) -> None:
@@ -306,6 +310,7 @@ class NASAppTests(unittest.TestCase):
             with TestClient(
                 create_app(self.settings(root, media_root))
             ) as client:
+                client.app.state.orchestrator.stop()
                 response = client.post(
                     "/jobs",
                     data={
@@ -592,6 +597,123 @@ class NASAppTests(unittest.TestCase):
             self.assertEqual(reset_translation["status"], "partial")
             self.assertEqual(reset_translation["translations"], [])
             self.assertTrue(transcript.is_file())
+
+    def test_media_cards_show_job_state_and_link_to_latest_detail(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            for name in ("pending.mp4", "running.mp4", "done.mp4", "bad.mp4"):
+                (media_root / name).write_bytes(b"media")
+            done_subtitle = media_root / "done.ko.srt"
+            done_subtitle.write_text("subtitle", encoding="utf-8")
+
+            with TestClient(create_app(self.settings(root, media_root))) as client:
+                service = client.app.state.orchestrator
+                service.stop()
+                running = service.store.create(
+                    job_id="running-job",
+                    source_rel="running.mp4",
+                    force_overwrite=False,
+                    options={},
+                )
+                service.store.update(running.id, status="translation_running")
+                done = service.store.create(
+                    job_id="done-job",
+                    source_rel="done.mp4",
+                    force_overwrite=True,
+                    options={},
+                )
+                service.store.update(
+                    done.id,
+                    status="completed",
+                    srt_path=str(done_subtitle),
+                )
+                failed = service.store.create(
+                    job_id="failed-job",
+                    source_rel="bad.mp4",
+                    force_overwrite=False,
+                    options={},
+                )
+                service.store.update(failed.id, status="failed", error="bad")
+
+                page = client.get("/")
+
+            self.assertIn("대기", page.text)
+            self.assertIn("생성 중", page.text)
+            self.assertIn("생성 완료", page.text)
+            self.assertIn("확인 필요", page.text)
+            self.assertIn('href="/jobs/running-job"', page.text)
+            self.assertIn('href="/jobs/done-job"', page.text)
+            self.assertIn('href="/jobs/failed-job"', page.text)
+            self.assertIn('value="pending.mp4"', page.text)
+            self.assertNotIn('value="done.mp4"', page.text)
+
+    def test_open_jobs_are_unlimited_and_completed_jobs_are_paginated(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            with TestClient(create_app(self.settings(root, media_root))) as client:
+                service = client.app.state.orchestrator
+                service.stop()
+                for index in range(25):
+                    active = service.store.create(
+                        job_id=f"active-{index:02d}",
+                        source_rel=f"active-{index:02d}.mp4",
+                        force_overwrite=False,
+                        options={},
+                    )
+                    service.store.update(active.id, status="transcription_running")
+                    completed = service.store.create(
+                        job_id=f"completed-{index:02d}",
+                        source_rel=f"completed-{index:02d}.mp4",
+                        force_overwrite=False,
+                        options={},
+                    )
+                    service.store.update(completed.id, status="completed")
+
+                first = client.get("/jobs-fragment?completed_page=1")
+                second = client.get("/jobs-fragment?completed_page=2")
+
+            self.assertEqual(first.text.count('class="recent-job-item'), 45)
+            self.assertIn("active-00.mp4", first.text)
+            self.assertIn("active-24.mp4", first.text)
+            self.assertIn("completed-24.mp4", first.text)
+            self.assertNotIn("completed-00.mp4", first.text)
+            self.assertIn("completed-00.mp4", second.text)
+            self.assertIn("completed_page=2", first.text)
+
+    def test_audio_only_submission_stays_on_dashboard_without_servers(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            (media_root / "movie.mp4").write_bytes(b"media")
+            settings = NASSettings(
+                state_dir=root / "state",
+                media_root=media_root,
+                admin_password="",
+                session_secret="",
+                stt_base_url="",
+                stt_token="",
+                lm_base_url="",
+                lm_token="",
+                lm_model="",
+            )
+            with TestClient(create_app(settings)) as client:
+                service = client.app.state.orchestrator
+                service.stop()
+                response = client.post(
+                    "/jobs",
+                    data={"source_rels": "movie.mp4", "operation": "extract"},
+                    follow_redirects=False,
+                )
+                jobs = service.store.list_jobs()
+
+            self.assertEqual(response.status_code, 303)
+            self.assertEqual(response.headers["location"], "/?queued=1")
+            self.assertEqual(jobs[0].operation, "extract")
 
 
 if __name__ == "__main__":

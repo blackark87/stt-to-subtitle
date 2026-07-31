@@ -8,7 +8,9 @@
     picker.querySelectorAll(".media-card-checkbox")
   );
   const count = picker.querySelector("[data-selection-count]");
-  const submit = document.querySelector("[data-batch-submit]");
+  const submits = Array.from(
+    document.querySelectorAll("[data-batch-submit]")
+  );
 
   const update = () => {
     const selected = checkboxes.filter((checkbox) => checkbox.checked).length;
@@ -21,8 +23,11 @@
     if (count) {
       count.textContent = String(selected);
     }
-    if (submit) {
-      submit.disabled = selected === 0;
+    for (const submit of submits) {
+      const missingServers =
+        submit.hasAttribute("data-requires-servers") &&
+        submit.dataset.serverConfigured !== "true";
+      submit.disabled = selected === 0 || missingServers;
     }
   };
 

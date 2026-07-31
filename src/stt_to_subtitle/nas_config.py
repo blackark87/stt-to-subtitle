@@ -131,6 +131,7 @@ class RemoteServerSettings:
     lm_base_url: str
     lm_token: str
     lm_model: str
+    translation_workers: int = 1
 
     @property
     def is_complete(self) -> bool:
@@ -157,6 +158,8 @@ class RemoteServerSettings:
             raise ValueError(
                 f"required server settings are missing: {', '.join(missing)}"
             )
+        if not 1 <= self.translation_workers <= 8:
+            raise ValueError("TRANSLATION_WORKERS must be between 1 and 8")
         return RemoteServerSettings(
             stt_base_url=normalize_server_url(
                 self.stt_base_url,
@@ -169,6 +172,7 @@ class RemoteServerSettings:
             ),
             lm_token=self.lm_token,
             lm_model=self.lm_model.strip(),
+            translation_workers=self.translation_workers,
         )
 
 
@@ -253,6 +257,7 @@ class NASSettings:
             lm_base_url=self.lm_base_url,
             lm_token=self.lm_token,
             lm_model=self.lm_model,
+            translation_workers=1,
         )
 
 

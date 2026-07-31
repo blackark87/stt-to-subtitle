@@ -1,118 +1,92 @@
-{% set summary = namespace(active=0, completed=0, attention=0) %}
-{% for job in jobs %}
-  {% if job.status == "completed" %}
-    {% set summary.completed = summary.completed + 1 %}
-  {% elif job.status in ["blocked", "failed"] %}
-    {% set summary.attention = summary.attention + 1 %}
-  {% else %}
-    {% set summary.active = summary.active + 1 %}
-  {% endif %}
+{% macro job_item(job, completed=false) %}
+  <article class="recent-job-item recent-job-{{ job.status }}{% if completed %} is-completed{% endif %}">
+    <div class="recent-job-main">
+      <div class="recent-job-heading">
+        <div class="recent-job-title-group">
+          <a class="recent-job-title" href="/jobs/{{ job.id }}" title="{{ job.source_rel }}">{{ job.source_rel|filename }}</a>
+          {% if job.source_rel|parent_path %}<span class="recent-job-path">{{ job.source_rel|parent_path }}</span>{% endif %}
+        </div>
+        <span class="status status-{{ job.status }}" title="내부 상태: {{ job.status }}">{{ job.status|job_status }}</span>
+      </div>
+      <div class="recent-job-meta">
+        <span>최근 갱신 <time datetime="{{ job.updated_at|datetime_iso }}">{{ job.updated_at|datetime }}</time></span>
+        <code title="작업 ID: {{ job.id }}">#{{ job.id[:8] }}</code>
+        {% if job.blocked_stage %}<span class="recent-job-stage">{{ job.blocked_stage|job_stage }} 단계</span>{% endif %}
+      </div>
+      {% if job.chunks_created %}
+        <div class="recent-job-progress">
+          <span>전사</span>
+          <progress value="{{ job.chunks_completed }}" max="{{ job.chunks_created }}" aria-label="전사 청크 진행률"></progress>
+          <strong>{{ job.chunks_completed }}/{{ job.chunks_created }}</strong>
+        </div>
+      {% endif %}
+      {% if job.translation_chunks_total %}
+        <div class="recent-job-progress">
+          <span>번역</span>
+          <progress value="{{ job.translation_chunks_completed }}" max="{{ job.translation_chunks_total }}" aria-label="번역 청크 진행률"></progress>
+          <strong>{{ job.translation_chunks_completed }}/{{ job.translation_chunks_total }}</strong>
+        </div>
+      {% endif %}
+      {% if job.error %}<p class="recent-job-error" title="{{ job.error }}">{{ job.error }}</p>{% endif %}
+    </div>
+    <div class="recent-job-actions">
+      <a class="button secondary compact" href="/jobs/{{ job.id }}">상세 보기</a>
+      {% if job.status in ["transcribed", "translation_running"] and not job.translation_pause_requested %}
+        <form method="post" action="/jobs/{{ job.id }}/pause-translation">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button type="submit" class="secondary compact">번역 중단</button>
+        </form>
+      {% elif job.status == "translation_paused" %}
+        <form method="post" action="/jobs/{{ job.id }}/resume-translation">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button type="submit" class="compact">번역 이어 하기</button>
+        </form>
+      {% endif %}
+      {% if job.status == "completed" and job.transcript_path %}
+        <form method="post" action="/jobs/{{ job.id }}/restart-translation" data-confirm-message="기존 번역 결과를 초기화하고 번역부터 다시 시작하시겠습니까? 일본어 전사 결과는 유지됩니다.">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button type="submit" class="secondary compact">번역 다시 시작</button>
+        </form>
+      {% endif %}
+    </div>
+  </article>
+{% endmacro %}
+
+{% set summary = namespace(active=0, attention=0) %}
+{% for job in open_jobs %}
+  {% if job.status in ["blocked", "failed"] %}{% set summary.attention = summary.attention + 1 %}{% else %}{% set summary.active = summary.active + 1 %}{% endif %}
 {% endfor %}
 
-{% if jobs %}
-  <div class="recent-jobs-summary" aria-label="최근 작업 요약">
-    <span class="summary-chip summary-active">
-      <span aria-hidden="true"></span>
-      진행·대기 <strong>{{ summary.active }}</strong>
-    </span>
-    <span class="summary-chip summary-completed">
-      <span aria-hidden="true"></span>
-      완료 <strong>{{ summary.completed }}</strong>
-    </span>
-    <span class="summary-chip summary-attention">
-      <span aria-hidden="true"></span>
-      확인 필요 <strong>{{ summary.attention }}</strong>
-    </span>
+<div class="recent-jobs-summary" aria-label="작업 요약">
+  <span class="summary-chip summary-active"><span aria-hidden="true"></span>진행·대기 <strong>{{ summary.active }}</strong></span>
+  <span class="summary-chip summary-attention"><span aria-hidden="true"></span>확인 필요 <strong>{{ summary.attention }}</strong></span>
+  <span class="summary-chip summary-completed"><span aria-hidden="true"></span>완료 <strong>{{ completed_count }}</strong></span>
+</div>
+
+<section class="job-list-section">
+  <h3>진행 중인 작업</h3>
+  {% if open_jobs %}
+    <div class="recent-job-list">{% for job in open_jobs %}{{ job_item(job) }}{% endfor %}</div>
+  {% else %}
+    <div class="recent-jobs-empty"><strong>진행 중인 작업이 없습니다.</strong><span>새 작업을 등록하거나 완료 목록을 확인하세요.</span></div>
+  {% endif %}
+</section>
+
+<section class="job-list-section completed-job-section">
+  <div class="section-heading compact-heading">
+    <div><h3>완료된 작업</h3><p class="muted">최신순, 페이지당 20개</p></div>
+    <span class="history-count">{{ completed_count }}개</span>
   </div>
-
-  <div class="recent-job-list">
-    {% for job in jobs %}
-      <article class="recent-job-item recent-job-{{ job.status }}">
-        <div class="recent-job-main">
-          <div class="recent-job-heading">
-            <div class="recent-job-title-group">
-              <a
-                class="recent-job-title"
-                href="/jobs/{{ job.id }}"
-                title="{{ job.source_rel }}"
-              >{{ job.source_rel|filename }}</a>
-              {% if job.source_rel|parent_path %}
-                <span class="recent-job-path">
-                  {{ job.source_rel|parent_path }}
-                </span>
-              {% endif %}
-            </div>
-            <span
-              class="status status-{{ job.status }}"
-              title="내부 상태: {{ job.status }}"
-            >{{ job.status|job_status }}</span>
-          </div>
-
-          <div class="recent-job-meta">
-            <span>
-              최근 갱신
-              <time datetime="{{ job.updated_at|datetime_iso }}">
-                {{ job.updated_at|datetime }}
-              </time>
-            </span>
-            <code title="작업 ID: {{ job.id }}">#{{ job.id[:8] }}</code>
-            {% if job.blocked_stage %}
-              <span class="recent-job-stage">
-                {{ job.blocked_stage|job_stage }} 단계
-              </span>
-            {% endif %}
-          </div>
-
-          {% if job.chunks_created %}
-            <div class="recent-job-progress">
-              <progress
-                value="{{ job.chunks_completed }}"
-                max="{{ job.chunks_created }}"
-                aria-label="전사 청크 진행률"
-              ></progress>
-              <span>
-                전사 청크
-                <strong>{{ job.chunks_completed }}</strong>/{{ job.chunks_created }}
-              </span>
-            </div>
-          {% endif %}
-
-          {% if job.error %}
-            <p class="recent-job-error" title="{{ job.error }}">
-              {{ job.error }}
-            </p>
-          {% endif %}
-        </div>
-
-        <div class="recent-job-actions">
-          <a
-            class="button secondary compact"
-            href="/jobs/{{ job.id }}"
-            aria-label="{{ job.source_rel|filename }} 작업 상세 보기"
-          >상세 보기</a>
-          {% if job.status == "completed" and job.transcript_path %}
-            <form
-              method="post"
-              action="/jobs/{{ job.id }}/restart-translation"
-              data-confirm-message="기존 번역 결과를 초기화하고 번역부터 다시 시작하시겠습니까? 일본어 전사 결과는 유지됩니다."
-            >
-              <input
-                type="hidden"
-                name="csrf_token"
-                value="{{ csrf_token }}"
-              >
-              <button type="submit" class="secondary compact">
-                번역 다시 시작
-              </button>
-            </form>
-          {% endif %}
-        </div>
-      </article>
-    {% endfor %}
-  </div>
-{% else %}
-  <div class="recent-jobs-empty">
-    <strong>아직 작업이 없습니다.</strong>
-    <span>미디어를 선택해 첫 자막 작업을 시작하세요.</span>
-  </div>
-{% endif %}
+  {% if completed_jobs %}
+    <div class="recent-job-list completed-job-list">{% for job in completed_jobs %}{{ job_item(job, true) }}{% endfor %}</div>
+    {% if completed_has_previous or completed_has_next %}
+      <nav class="pagination" aria-label="완료 작업 페이지">
+        {% if completed_has_previous %}<a class="button secondary compact" href="/?folder={{ current_folder|urlencode }}&amp;completed_page={{ completed_page - 1 }}">← 이전</a>{% endif %}
+        <span>{{ completed_page }}페이지</span>
+        {% if completed_has_next %}<a class="button secondary compact" href="/?folder={{ current_folder|urlencode }}&amp;completed_page={{ completed_page + 1 }}">다음 →</a>{% endif %}
+      </nav>
+    {% endif %}
+  {% else %}
+    <div class="recent-jobs-empty"><strong>완료된 작업이 없습니다.</strong></div>
+  {% endif %}
+</section>
