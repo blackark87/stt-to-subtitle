@@ -1,6 +1,6 @@
 # STT to Subtitle
 
-NAS의 영상 파일을 선택해 일본어를 전사하고, 별도 PC의 OpenAI 호환
+Docker 호스트에 마운트된 영상 파일을 선택해 일본어를 전사하고, 별도 PC의 OpenAI 호환
 번역 서버에서 한국어로 번역한 뒤 영상 옆에 화자 구분 SRT·ASS를
 생성하는 로컬 웹 서비스입니다.
 
@@ -10,7 +10,7 @@ NAS의 영상 파일을 선택해 일본어를 전사하고, 별도 PC의 OpenAI
 브라우저
    │
    ▼
-Synology NAS · linux/amd64 Docker
+linux/amd64 Docker 호스트
   파일 목록 / FFmpeg / 작업 상태 / SRT·ASS 저장
    │                         │
    │ 16 kHz mono PCM WAV     │ 일본어 세그먼트 JSON
@@ -22,7 +22,7 @@ Pyannote: CPU 또는 CUDA
 ```
 
 전사 모델과 번역 모델은 완전히 분리된 서비스입니다. 따라서 작업 A를
-번역 서버가 처리하는 동안 전사 PC는 작업 B를 처리할 수 있습니다. NAS의
+번역 서버가 처리하는 동안 전사 PC는 작업 B를 처리할 수 있습니다. 웹 오케스트레이터의
 오디오와 전사는 한 파일씩 처리하고, 번역은 웹 설정의 워커 수만큼 서로
 다른 파일을 병렬 처리합니다. 번역 워커 기본값은 1입니다.
 
@@ -41,19 +41,19 @@ Docker Desktop, Podman Machine, Colima 등 Mac의 Linux VM에서 실행하는 �
 | --- | --- | ---: |
 | Mac 또는 NVIDIA GPU PC | MPS 또는 CUDA 전사 API | `8100` |
 | OpenAI 호환 번역 서버 PC | 번역 API | 제공자 설정에 따름 |
-| Synology NAS | 파일 선택 및 작업 웹 UI | `8080` |
+| linux/amd64 Docker 호스트 | 파일 선택 및 작업 웹 UI | `8080` |
 
 처음 설치할 때는 다음 순서가 가장 단순합니다.
 
 1. 별도 PC에서 번역 모델과 OpenAI 호환 LAN API 서버를 실행합니다.
 2. Mac 또는 NVIDIA GPU PC에서 네이티브 MPS/CUDA 전사 API를 실행합니다.
-3. NAS에서 이 저장소의 Compose 파일과 환경 파일을 준비하고 GHCR 이미지를 실행합니다.
-4. NAS에서 전사 PC와 번역 서버의 API에 접속할 수 있는지 확인합니다.
-5. 브라우저로 NAS 웹 UI를 열어 짧은 파일로 전체 흐름을 검증합니다.
+3. Docker 호스트에서 이 저장소의 Compose 파일과 환경 파일을 준비하고 GHCR 이미지를 실행합니다.
+4. 웹 오케스트레이터 컨테이너에서 전사 PC와 번역 서버의 API에 접속할 수 있는지 확인합니다.
+5. 브라우저로 웹 UI를 열어 짧은 파일로 전체 흐름을 검증합니다.
 
 ## 처리 흐름
 
-NAS 작업 상태는 다음 순서로 진행됩니다.
+작업 상태는 다음 순서로 진행됩니다.
 
 ```text
 queued → extracting → audio_ready
@@ -87,8 +87,8 @@ fallback으로 제공해야 합니다.
 
 1. [Google Fonts의 Noto Sans KR](https://fonts.google.com/noto/specimen/Noto+Sans+KR)
    등에서 TTF, OTF 또는 WOFF2 파일을 받아
-   NAS의 예를 들어
-   `/volume1/docker/jellyfin/fallback_fonts` 폴더에 둡니다. 폴더 전체
+   Docker 호스트의 예를 들어
+   `/srv/jellyfin/fallback_fonts` 폴더에 둡니다. 폴더 전체
    크기는 Jellyfin 제한인 20 MB 이하여야 하며, 웹 재생 위주라면 WOFF2가
    가장 작습니다.
 2. Jellyfin을 컨테이너로 실행한다면 기존 Jellyfin Compose의
@@ -100,11 +100,11 @@ fallback으로 제공해야 합니다.
      jellyfin:
        volumes:
          - type: bind
-           source: /volume1/docker/jellyfin/fallback_fonts
+           source: /srv/jellyfin/fallback_fonts
            target: /usr/local/share/fonts/custom
            read_only: true
          - type: bind
-           source: /volume1/docker/jellyfin/fallback_fonts
+           source: /srv/jellyfin/fallback_fonts
            target: /fallback_fonts
            read_only: true
    ```
@@ -164,9 +164,9 @@ STT_CHUNK_PROGRESS_EVERY=10
 STT_NOISE_FILTER_TRIGGER_LEVEL=7.0
 ```
 
-`HF_TOKEN`은 gated 모델 다운로드에 필수입니다. Hugging Face 설정에서 read 권한 토큰을 발급해 `hf_replace_me`를 교체하십시오. 신뢰하는 내부망에서 서비스 간 인증이 필요 없다면 `STT_API_TOKEN`은 비워 둡니다. 값을 설정하면 작업 API에 Bearer 인증이 자동으로 활성화되며 NAS에도 같은 값을 설정해야 합니다.
+`HF_TOKEN`은 gated 모델 다운로드에 필수입니다. Hugging Face 설정에서 read 권한 토큰을 발급해 `hf_replace_me`를 교체하십시오. 신뢰하는 내부망에서 서비스 간 인증이 필요 없다면 `STT_API_TOKEN`은 비워 둡니다. 값을 설정하면 작업 API에 Bearer 인증이 자동으로 활성화되며 웹 오케스트레이터에도 같은 값을 설정해야 합니다.
 
-`STT_CHUNK_PROGRESS_EVERY`는 `10` 또는 `100`만 사용할 수 있으며 기본값은 `10`입니다. 전사 API는 Kotoba 파이프라인의 실제 전처리·추론 경계를 기준으로 청크가 생성되거나 완료될 때마다 현재 상태를 갱신합니다. NAS 작업 상세에는 `완료 / 생성 / 진행·대기` 카운터가 하나의 진행 행으로 계속 표시되며 같은 내용의 이벤트 행을 반복해서 만들지 않습니다. 상태 API의 `chunk_progress`에는 같은 값과 `report_every`가 포함됩니다. 여기서 청크는 화자 분리 후 겹침 구간을 포함한 모델 입력 단위이므로 SRT 세그먼트 수나 단순한 `영상 길이 ÷ 청크 길이`와 일치하지 않을 수 있습니다. 긴 영상에서 원격 전사 API 로그를 줄이려면 `100`으로 변경한 뒤 전사 API를 재시작하십시오.
+`STT_CHUNK_PROGRESS_EVERY`는 `10` 또는 `100`만 사용할 수 있으며 기본값은 `10`입니다. 전사 API는 Kotoba 파이프라인의 실제 전처리·추론 경계를 기준으로 청크가 생성되거나 완료될 때마다 현재 상태를 갱신합니다. 웹 작업 상세에는 `완료 / 생성 / 진행·대기` 카운터가 하나의 진행 행으로 계속 표시되며 같은 내용의 이벤트 행을 반복해서 만들지 않습니다. 상태 API의 `chunk_progress`에는 같은 값과 `report_every`가 포함됩니다. 여기서 청크는 화자 분리 후 겹침 구간을 포함한 모델 입력 단위이므로 SRT 세그먼트 수나 단순한 `영상 길이 ÷ 청크 길이`와 일치하지 않을 수 있습니다. 긴 영상에서 원격 전사 API 로그를 줄이려면 `100`으로 변경한 뒤 전사 API를 재시작하십시오.
 
 사용자가 Kotoba 내부 처리를 조정할 필요는 없습니다. 전사 API는 먼저
 Pyannote로 화자와 실제 발화 구간을 찾고, 각 화자 구간을 Kotoba Whisper로
@@ -186,7 +186,7 @@ Pyannote로 화자와 실제 발화 구간을 찾고, 각 화자 구간을 Kotob
 **소음 오인식 필터 사용**은 기본으로 켜져 있습니다. Pyannote가 찾은 각
 발화 후보를 Whisper에 전달하기 전에 Torchaudio 음성 감지기로 한 번 더
 검사해 음성이 없는 것으로 판단된 구간을 제외합니다. 제거된 개수와
-시각 범위는 Mac 로그와 전사 결과의 `noise_filter`에 기록되고, NAS 작업
+시각 범위는 Mac 로그와 전사 결과의 `noise_filter`에 기록되고, 웹 작업
 로그에도 제거 개수가 표시됩니다. 조용한 실제 발화가 빠지는 경우에는
 작업 체크를 끄거나 Mac 실행 폴더의
 `STT_NOISE_FILTER_TRIGGER_LEVEL=7.0`을 낮춘 뒤 서버를 재시작하십시오.
@@ -216,7 +216,7 @@ MacBook의 내부 IP는 Wi-Fi가 `en0`인 일반적인 구성에서 다음 명�
 ipconfig getifaddr en0
 ```
 
-NAS 또는 같은 LAN의 다른 장비에서도 다음 요청이 성공해야 합니다.
+같은 LAN의 Docker 호스트나 다른 장비에서도 다음 요청이 성공해야 합니다.
 
 ```bash
 curl http://MACBOOK_IP:8100/readyz
@@ -341,6 +341,9 @@ WhisperX 요청만 격리된 `.venv-whisperx` 작업 프로세스로 처리합�
 다음 환경을 추가합니다. CUDA 12.8 휠과 호환되는 NVIDIA 드라이버 및 FFmpeg가
 호스트에 준비되어 있어야 합니다.
 
+HTTP 전사 API와 포트 `8100`은 하나만 실행합니다. 두 가상환경은 의존성을
+분리하기 위한 것이며 별도의 WhisperX HTTP 서버를 실행하지 않습니다.
+
 ```bash
 python3.11 -m venv .venv-whisperx
 .venv-whisperx/bin/python -m pip install --upgrade pip
@@ -381,7 +384,7 @@ WhisperX는 자체 VAD를 항상 사용하므로 `backend=whisperx`에서
 완료 후 프로세스가 종료되어 VRAM을 반환하며, 다음 Kotoba 요청에서 Kotoba를
 다시 지연 로드합니다.
 
-NAS의 전사 API 주소에는 Mac 대신 이 CUDA PC의 내부 IP와 포트 `8100`을
+웹 오케스트레이터의 전사 API 주소에는 Mac 대신 이 CUDA PC의 내부 IP와 포트 `8100`을
 설정하면 됩니다. `.env.cuda`, `var/cuda-cache/`, `var/cuda-stt/`,
 `.venv-cuda/`는 Git에서 제외됩니다.
 
@@ -393,9 +396,9 @@ LM Studio처럼 OpenAI 호환 API를 제공하는 서버를 전사 API와 독립
 
 1. 일본어→한국어 번역에 사용할 모델을 로드합니다.
 2. LAN에서 접근 가능한 API 서버를 활성화합니다.
-3. NAS에서 접근할 수 있도록 호스트 방화벽의 번역 API 포트를 내부망으로 제한합니다.
+3. 웹 오케스트레이터 컨테이너에서 접근할 수 있도록 호스트 방화벽의 번역 API 포트를 내부망으로 제한합니다.
 
-NAS에는 OpenAI 호환 API 루트(예: `http://192.168.1.30:1234/v1`)와
+웹 설정에는 OpenAI 호환 API 루트(예: `http://192.168.1.30:1234/v1`)와
 선택적 API 토큰을 설정합니다. 웹 설정 화면이 `/models`를 조회하므로
 모델 식별자를 직접 입력할 필요 없이 목록에서 선택할 수 있습니다. 번역
 요청은 `/chat/completions`의 JSON Schema structured output을 사용하며
@@ -408,24 +411,24 @@ NAS에는 OpenAI 호환 API 루트(예: `http://192.168.1.30:1234/v1`)와
 반환하면 요청 순서로 정렬하고, 누락되거나 다른 ID를 반환한 배치는 더
 작은 배치로 나눠 다시 요청합니다.
 
-## 3. NAS: 웹 오케스트레이터 설치 및 실행
+## 3. Docker 웹 오케스트레이터 설치 및 실행
 
-Synology Package Center에서 Container Manager를 설치하고 SSH를 일시적으로 활성화합니다. J3455 NAS에서는 GHCR의 `linux/amd64` 이미지만 pull하여 실행하며, Git 저장소·Python 소스·Dockerfile·빌드 도구는 NAS에 필요하지 않습니다.
+Docker Engine과 Compose 플러그인을 사용할 수 있는 `linux/amd64` 호스트를 준비합니다. GHCR 이미지만 pull하여 실행하므로 Git 저장소·Python 소스·Dockerfile·빌드 도구는 실행 호스트에 필요하지 않습니다.
 
-이 저장소를 받은 PC에서 NAS 배포에 필요한 두 파일만 복사합니다. File Station을 사용해도 됩니다.
+이 저장소를 받은 PC에서 배포에 필요한 두 파일만 Docker 호스트로 복사합니다.
 
 ```bash
-ssh NAS_USER@NAS_IP \
-  'mkdir -p /volume1/docker/stt-to-subtitle'
+ssh DOCKER_USER@DOCKER_HOST_IP \
+  'mkdir -p /srv/stt-to-subtitle'
 scp compose.yaml .env.nas.example \
-  NAS_USER@NAS_IP:/volume1/docker/stt-to-subtitle/
+  DOCKER_USER@DOCKER_HOST_IP:/srv/stt-to-subtitle/
 ```
 
-그다음 미디어 공유 폴더에 읽기/쓰기 가능한 NAS 계정으로 접속해 환경 파일을 준비합니다.
+그다음 미디어 폴더에 읽기/쓰기 가능한 계정으로 접속해 환경 파일을 준비합니다.
 
 ```bash
-ssh NAS_USER@NAS_IP
-cd /volume1/docker/stt-to-subtitle
+ssh DOCKER_USER@DOCKER_HOST_IP
+cd /srv/stt-to-subtitle
 mv .env.nas.example .env.nas
 chmod 600 .env.nas
 ```
@@ -433,14 +436,14 @@ chmod 600 .env.nas
 미디어 공유 폴더에 접근하는 계정의 숫자 UID/GID를 확인합니다.
 
 ```bash
-id NAS_USER
+id DOCKER_USER
 ```
 
 `.env.nas`에서 최소한 다음 값을 실제 환경에 맞게 교체합니다.
 
-- `PUID`, `PGID` — 미디어 공유 폴더에 읽기/쓰기 가능한 NAS 사용자
-- `MEDIA_PATH` — NAS의 실제 미디어 공유 폴더 절대 경로
-- `STATE_PATH` — 작업 DB와 중간 결과를 보관할 NAS 경로
+- `PUID`, `PGID` — 미디어 폴더에 읽기/쓰기 가능한 호스트 사용자
+- `MEDIA_PATH` — Docker 호스트의 실제 미디어 폴더 절대 경로
+- `STATE_PATH` — 작업 DB와 중간 결과를 보관할 호스트 경로
 - `NAS_IMAGE` — `ghcr.io/blackark87/stt-to-subtitle:latest`
 
 전사·번역 서버 주소, 토큰과 번역 모델은 컨테이너를 실행한 뒤 웹의
@@ -454,7 +457,7 @@ id NAS_USER
 ```dotenv
 PUID=1026
 PGID=100
-MEDIA_PATH=/volume1/video
+MEDIA_PATH=/srv/media
 STATE_PATH=./var/nas-state
 NAS_WEB_PORT=8080
 NAS_IMAGE=ghcr.io/blackark87/stt-to-subtitle:latest
@@ -471,12 +474,12 @@ OPENAI_COMPATIBLE_TOKEN=
 OPENAI_COMPATIBLE_MODEL=
 ```
 
-Compose는 GHCR 이미지의 기본 사용자와 관계없이 `PUID:PGID`를 컨테이너의 런타임 사용자로 적용합니다. 상태 폴더를 미리 만들어 해당 사용자가 쓸 수 있게 합니다. 배포 폴더를 `NAS_USER`로 만들었다면 일반적으로 추가 `chown`은 필요하지 않습니다.
+Compose는 GHCR 이미지의 기본 사용자와 관계없이 `PUID:PGID`를 컨테이너의 런타임 사용자로 적용합니다. 상태 폴더를 미리 만들어 해당 사용자가 쓸 수 있게 합니다. 배포 폴더를 `DOCKER_USER`로 만들었다면 일반적으로 추가 `chown`은 필요하지 않습니다.
 
 ```bash
 mkdir -p ./var/nas-state
 test -w ./var/nas-state && echo "state directory is writable"
-test -w /volume1/video && echo "media directory is writable"
+test -w /srv/media && echo "media directory is writable"
 ```
 
 내부망에서 무인증으로 사용할 때는 `NAS_ADMIN_PASSWORD`,
@@ -490,9 +493,9 @@ python3 -c 'import secrets; print(secrets.token_urlsafe(48))'
 ```
 
 GHCR 패키지가 private이면 다음과 같이 `read:packages` 권한이 있는
-GitHub classic PAT로 NAS의 Docker에 한 번 로그인합니다. 패키지를
+GitHub classic PAT로 Docker 호스트에 한 번 로그인합니다. 패키지를
 public으로 설정했다면 이 단계는 필요하지 않습니다. 이 로그인은 이미지
-다운로드용이며, 위에서 비워 둔 NAS·STT·번역 서버의 내부 서비스 인증과는
+다운로드용이며, 위에서 비워 둔 웹·STT·번역 서버의 내부 서비스 인증과는
 별개입니다.
 
 ```bash
@@ -501,7 +504,7 @@ echo "$GHCR_PAT" | docker login ghcr.io -u GITHUB_USER --password-stdin
 
 ### 웹에서 전사·번역 서버 설정
 
-컨테이너를 실행한 뒤 `http://NAS_IP:8080/settings` 또는 상단의
+컨테이너를 실행한 뒤 `http://DOCKER_HOST_IP:8080/settings` 또는 상단의
 **서버 설정**을 엽니다. 다음 값을 입력하고 저장합니다.
 
 - 전사 API 주소와 선택적 API 토큰
@@ -519,9 +522,9 @@ echo "$GHCR_PAT" | docker login ghcr.io -u GITHUB_USER --password-stdin
 `NAS_ADMIN_PASSWORD`를 사용하지 않는 구성에서는 서버 설정 화면도 인증
 없이 열리므로 반드시 신뢰할 수 있는 LAN이나 VPN 안에서만 노출하십시오.
 
-### NAS에서 연결 확인
+### Docker 호스트에서 연결 확인
 
-NAS에서 두 원격 API에 접속할 수 있는지 먼저 확인합니다.
+Docker 호스트에서 두 원격 API에 접속할 수 있는지 먼저 확인합니다.
 
 ```bash
 curl http://192.168.1.20:8100/readyz
@@ -542,13 +545,13 @@ docker compose --env-file .env.nas ps
 docker compose --env-file .env.nas logs -f orchestrator
 ```
 
-로그 확인은 `Ctrl-C`로 빠져나와도 컨테이너를 중지하지 않습니다. 상태 API가 정상인지 NAS에서 확인합니다.
+로그 확인은 `Ctrl-C`로 빠져나와도 컨테이너를 중지하지 않습니다. 상태 API가 정상인지 Docker 호스트에서 확인합니다.
 
 ```bash
 curl http://127.0.0.1:8080/healthz
 ```
 
-브라우저에서 `http://NAS_IP:8080`을 엽니다. 관리자 비밀번호를 비워 두었다면 로그인 화면 없이 바로 대시보드가 열립니다. `MEDIA_ROOT`의 실제 디렉터리는 폴더 카드로 표시되고, 폴더를 열어 계층적으로 영상을 탐색합니다. 상위 화면에서 하위 폴더를 재귀 스캔하지 않으며, 폴더를 클릭하면 로딩 dim 화면을 먼저 표시한 뒤 일반 페이지 요청으로 들어간 폴더의 직속 항목만 조회합니다. `@eaDir`, `#recycle`, Synology 임시·스냅샷 폴더와 `.DS_Store`, `Thumbs.db` 같은 메타데이터 항목 및 `*-trailer.mp4` 파일은 탐색에서 제외됩니다.
+브라우저에서 `http://DOCKER_HOST_IP:8080`을 엽니다. 관리자 비밀번호를 비워 두었다면 로그인 화면 없이 바로 대시보드가 열립니다. `MEDIA_ROOT`의 실제 디렉터리는 폴더 카드로 표시되고, 폴더를 열어 계층적으로 영상을 탐색합니다. 상위 화면에서 하위 폴더를 재귀 스캔하지 않으며, 폴더를 클릭하면 로딩 dim 화면을 먼저 표시한 뒤 일반 페이지 요청으로 들어간 폴더의 직속 항목만 조회합니다. `@eaDir`, `#recycle`, `.snapshot`, `.DS_Store`, `Thumbs.db` 같은 저장소 메타데이터 항목 및 `*-trailer.mp4` 파일은 탐색에서 제외됩니다.
 
 영상은 폴더와 구분되는 미디어 카드로 표시됩니다. 카드에는 디렉터리 경로를 표시하지 않고 파일 크기를 GiB 단위로 표시합니다. 각 카드의 재생시간은 현재 폴더의 표시 대상만 FFprobe로 확인하며, 파일 크기와 수정 시각이 바뀌지 않은 동안 메모리에 캐시됩니다. 재생시간을 읽을 수 없는 파일은 `재생시간 알 수 없음`으로 표시됩니다. 영상 옆에 같은 이름의 `.nfo` 또는 `movie.nfo`가 있으면 `<title>`과 로컬 포스터를 함께 표시합니다. NFO가 가리키는 `<thumb aspect="poster">`/`<poster>` 이미지가 없으면 `영상이름-poster`, `영상이름`, `poster`, `folder`, `cover` 순으로 `.jpg`, `.jpeg`, `.png`, `.webp` 파일을 찾습니다. NFO가 없는 영상은 비디오 아이콘, 파일명, 파일 크기, 재생시간과 자막 상태를 표시합니다. 상태는 `대기`, `생성 중`, `생성 완료`, `확인 필요`로 구분되며 진행·완료·확인 필요 카드는 연결된 작업 상세로 이동합니다.
 
@@ -560,7 +563,7 @@ curl http://127.0.0.1:8080/healthz
 
 실제 VR 헤드셋이 연결된 WebXR 브라우저에서는 **VR 헤드셋으로 보기**가 활성화됩니다. 이 버튼은 `immersive-vr` 세션을 열어 헤드셋이 제공하는 각 `XRView`의 투영 행렬과 헤드 자세를 사용하고, 좌안에는 SBS 왼쪽 절반, 우안에는 오른쪽 절반을 각각 렌더링합니다. 자막은 DOM 오버레이가 아니라 WebGL 텍스처로 만들어 양쪽 눈에 함께 합성합니다. 헤드셋 컨트롤러의 기본 선택 동작은 재생과 일시정지를 전환합니다.
 
-WebXR immersive 모드는 보안 컨텍스트가 필요하므로 `http://NAS_IP:8080`으로 접속하면 헤드셋 버튼이 비활성화됩니다. Synology DSM 등의 HTTPS reverse proxy를 통해 NAS 컨테이너의 HTTP 포트로 전달하고, 헤드셋이 신뢰하는 인증서가 적용된 `https://호스트명`으로 접속해야 합니다. HTTPS여도 브라우저나 연결된 장치가 `immersive-vr`을 지원하지 않으면 데스크톱 180° 미리보기만 사용할 수 있습니다. 구현은 브라우저 기본 WebGL/WebXR만 사용하므로 Node.js, 외부 CDN, 영상 재인코딩은 필요하지 않습니다.
+WebXR immersive 모드는 보안 컨텍스트가 필요하므로 `http://DOCKER_HOST_IP:8080`으로 접속하면 헤드셋 버튼이 비활성화됩니다. HTTPS reverse proxy를 통해 컨테이너의 HTTP 포트로 전달하고, 헤드셋이 신뢰하는 인증서가 적용된 `https://호스트명`으로 접속해야 합니다. HTTPS여도 브라우저나 연결된 장치가 `immersive-vr`을 지원하지 않으면 데스크톱 180° 미리보기만 사용할 수 있습니다. 구현은 브라우저 기본 WebGL/WebXR만 사용하므로 Node.js, 외부 CDN, 영상 재인코딩은 필요하지 않습니다.
 
 플레이어 또는 VR 캔버스에 포커스가 있으면 `Space`는 재생/일시정지, `←`/`→`는 10초 뒤/앞 이동, `↑`/`↓`는 음량 조절로 동작합니다. 별도 음량 슬라이더와 음소거 버튼도 같은 HTML5 비디오의 오디오 상태를 제어합니다. WebGL을 사용할 수 없거나 렌더링 연결이 끊기면 일반 플레이어로 돌아가며 자동으로 VR 모드를 재시도하지 않습니다.
 
@@ -582,15 +585,15 @@ WebXR immersive 모드는 보안 컨텍스트가 필요하므로 `http://NAS_IP:
 경로에 교체하며, 번역 서버가 꺼져 있으면 번역 단계에서 `blocked`가 되어
 서비스를 실행한 뒤 수동 재시도로 이어갈 수 있습니다.
 
-작업 생성·갱신 및 진행 로그의 실제 시각은 NAS UI와 전사 API에서 모두 KST(`+09:00`)로 표시하거나 직렬화합니다. SQLite 내부에는 시간대와 무관한 epoch 값을 유지합니다. SRT 및 전사 세그먼트 타임스탬프는 영상 시작점 기준 상대시간이므로 KST 변환 대상이 아닙니다.
+작업 생성·갱신 및 진행 로그의 실제 시각은 웹 UI와 전사 API에서 모두 KST(`+09:00`)로 표시하거나 직렬화합니다. SQLite 내부에는 시간대와 무관한 epoch 값을 유지합니다. SRT 및 전사 세그먼트 타임스탬프는 영상 시작점 기준 상대시간이므로 KST 변환 대상이 아닙니다.
 
 무인증 모드는 세 장비가 격리된 신뢰 가능한 LAN에 있을 때만 사용하십시오.
-NAS UI, 전사 API, 번역 API 포트를 인터넷이나 게스트 Wi-Fi에 직접
+웹 UI, 전사 API, 번역 API 포트를 인터넷이나 게스트 Wi-Fi에 직접
 노출하지 말고 LAN 방화벽 또는 신뢰할 수 있는 VPN으로 제한하십시오.
 HTTPS reverse proxy와 웹 로그인을 사용하는 경우
 `NAS_SECURE_COOKIE=true`로 설정합니다.
 
-### NAS 업데이트 및 운영 명령
+### Docker 업데이트 및 운영 명령
 
 `main`에 새 이미지가 게시된 뒤에는 애플리케이션 소스를 받을 필요 없이 이미지만 갱신합니다.
 
@@ -599,7 +602,7 @@ docker compose --env-file .env.nas pull
 docker compose --env-file .env.nas up -d
 ```
 
-Compose 설정 자체가 변경된 경우에만 PC에서 새 `compose.yaml`을 NAS 배포 폴더로 다시 복사합니다. `.env.nas`와 `${STATE_PATH}`는 그대로 유지합니다.
+Compose 설정 자체가 변경된 경우에만 PC에서 새 `compose.yaml`을 Docker 호스트의 배포 폴더로 다시 복사합니다. `.env.nas`와 `${STATE_PATH}`는 그대로 유지합니다.
 
 자주 사용하는 운영 명령:
 
@@ -619,9 +622,9 @@ docker compose --env-file .env.nas down
 
 `down`을 실행해도 `${STATE_PATH}`와 미디어 파일은 삭제되지 않습니다. 작업 DB와 중간 결과를 초기화하려고 상태 폴더를 직접 삭제할 때는 컨테이너를 먼저 중지하고 대상 경로를 다시 확인하십시오.
 
-## GHCR 이미지 게시 및 NAS에서 받기
+## GHCR 이미지 게시 및 Docker에서 받기
 
-[`.github/workflows/publish-ghcr.yaml`](.github/workflows/publish-ghcr.yaml)은 `Dockerfile`과 애플리케이션 소스를 GitHub Actions에서 빌드해, 테스트를 통과한 NAS용 `linux/amd64` 이미지를 `ghcr.io/blackark87/stt-to-subtitle`에 게시합니다. 이 빌드 파일들은 CI에만 필요하며 NAS로 복사하지 않습니다. 다음 경우 실행됩니다.
+[`.github/workflows/publish-ghcr.yaml`](.github/workflows/publish-ghcr.yaml)은 `Dockerfile`과 애플리케이션 소스를 GitHub Actions에서 빌드해, 테스트를 통과한 `linux/amd64` 이미지를 `ghcr.io/blackark87/stt-to-subtitle`에 게시합니다. 이 빌드 파일들은 CI에만 필요하며 Docker 호스트로 복사하지 않습니다. 다음 경우 실행됩니다.
 
 - `main` 브랜치 push
 - `v*` 태그 push
@@ -633,27 +636,27 @@ docker compose --env-file .env.nas down
 호환성을 깨는 변경은 `MAJOR`, 하위 호환 기능은 `MINOR`, 하위 호환
 수정·문서·CI·운영 변경은 `PATCH`를 올립니다. 별도 registry secret은
 필요하지 않고 워크플로의 `GITHUB_TOKEN`과 `packages: write` 권한을
-사용합니다. 패키지가 private이면 NAS에서 `read:packages` 권한이 있는
+사용합니다. 패키지가 private이면 Docker 호스트에서 `read:packages` 권한이 있는
 PAT로 먼저 로그인해야 합니다.
 
 ```bash
 echo "$GHCR_PAT" | docker login ghcr.io -u GITHUB_USER --password-stdin
 ```
 
-NAS의 `.env.nas`에는 기본 이미지가 이미 설정되어 있습니다. 다른 버전 태그를 고정할 때만 값을 변경합니다.
+`.env.nas`에는 기본 이미지가 이미 설정되어 있습니다. 다른 버전 태그를 고정할 때만 값을 변경합니다.
 
 ```dotenv
 NAS_IMAGE=ghcr.io/blackark87/stt-to-subtitle:latest
 ```
 
-이미지를 가져와 실행합니다. `compose.yaml`에는 `build:` 항목이 없으므로 NAS에서 로컬 빌드가 실행될 수 없습니다.
+이미지를 가져와 실행합니다. `compose.yaml`에는 `build:` 항목이 없으므로 Docker 호스트에서 로컬 빌드가 실행될 수 없습니다.
 
 ```bash
 docker compose --env-file .env.nas pull
 docker compose --env-file .env.nas up -d
 ```
 
-GHCR 이미지 자체의 기본 UID/GID는 `1000:1000`이지만 `compose.yaml`이 `.env.nas`의 `PUID`/`PGID`로 런타임 사용자를 덮어씁니다. 따라서 NAS에서 UID/GID 때문에 이미지를 다시 빌드할 필요는 없습니다.
+GHCR 이미지 자체의 기본 UID/GID는 `1000:1000`이지만 `compose.yaml`이 `.env.nas`의 `PUID`/`PGID`로 런타임 사용자를 덮어씁니다. 따라서 Docker 호스트에서 UID/GID 때문에 이미지를 다시 빌드할 필요는 없습니다.
 
 ## 개발 검증
 
