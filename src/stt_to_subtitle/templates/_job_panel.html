@@ -1,3 +1,4 @@
+{% import "_icons.html" as icons %}
 <section
   class="card job-overview-card"
   {% if job.status in ["audio_completed", "completed", "translation_paused", "blocked", "failed"] %}data-poll-stop{% endif %}
@@ -41,10 +42,10 @@
   <div class="actions">
     {% set editable = job.status in ["completed", "blocked", "failed"] %}
     {% if job.transcript_path and editable %}
-      <a class="button secondary" href="/jobs/{{ job.id }}/artifacts/transcript/edit" title="{{ artifact_names.transcript }}">일본어 전사 JSON 편집</a>
+      <a class="button secondary" href="/jobs/{{ job.id }}/artifacts/transcript/edit" title="{{ artifact_names.transcript }}">{{ icons.pencil(16) }}일본어 전사 JSON 편집</a>
     {% endif %}
     {% if job.translation_path and editable %}
-      <a class="button secondary" href="/jobs/{{ job.id }}/artifacts/translation/edit" title="{{ artifact_names.translation }}">한국어 결과 JSON 편집</a>
+      <a class="button secondary" href="/jobs/{{ job.id }}/artifacts/translation/edit" title="{{ artifact_names.translation }}">{{ icons.pencil(16) }}한국어 결과 JSON 편집</a>
     {% endif %}
     {% if job.status == "completed" and job.transcript_path %}
       <form
@@ -58,7 +59,7 @@
             <option value="{{ category.id }}"{% if job.options.translation_prompt and job.options.translation_prompt.category_id == category.id %} selected{% endif %}>{{ category.name }}</option>
           {% endfor %}
         </select>
-        <button type="submit" class="secondary" title="일본어 전사는 다시 실행하지 않습니다">번역부터 다시 시작</button>
+        <button type="submit" class="secondary" title="일본어 전사는 다시 실행하지 않습니다">{{ icons.refresh(16) }}번역부터 다시 시작</button>
       </form>
     {% endif %}
     {% if job.job_stop_requested %}
@@ -66,7 +67,7 @@
     {% elif job.status in ["transcribed", "translation_running"] and not job.translation_pause_requested %}
       <form method="post" action="/jobs/{{ job.id }}/pause-translation">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-        <button type="submit" class="secondary">번역 중단</button>
+        <button type="submit" class="secondary">{{ icons.pause(16) }}번역 중단</button>
       </form>
     {% elif job.translation_pause_requested and job.status != "translation_paused" %}
       <span class="muted">
@@ -75,13 +76,13 @@
     {% elif job.status == "translation_paused" %}
       <form method="post" action="/jobs/{{ job.id }}/resume-translation">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-        <button type="submit">번역 이어 하기</button>
+        <button type="submit">{{ icons.play(16) }}번역 이어 하기</button>
       </form>
     {% endif %}
     {% if job.status in ["blocked", "failed"] %}
       <form method="post" action="/jobs/{{ job.id }}/retry">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-        <button type="submit">수동 재시도</button>
+        <button type="submit">{{ icons.refresh(16) }}수동 재시도</button>
       </form>
     {% endif %}
     {% if job.remote_transcription_missing %}
@@ -91,7 +92,7 @@
         data-confirm-message="원격 전사 서버에서 사라진 작업 기록을 삭제하시겠습니까? 원본 영상과 생성·중간 파일은 삭제하지 않습니다."
       >
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-        <button type="submit" class="danger">작업 삭제</button>
+        <button type="submit" class="danger">{{ icons.trash(16) }}작업 삭제</button>
       </form>
     {% endif %}
   </div>
@@ -222,10 +223,10 @@
       <p class="playback-message">결과 미리보기에는 JavaScript가 필요합니다.</p>
     </noscript>
     <div class="actions">
-      <a class="button secondary" href="{{ url_for('job_video', job_id=job.id) }}" download>원본 영상 다운로드</a>
-      <a class="button secondary" href="{{ url_for('job_subtitle_file', job_id=job.id, subtitle_format='srt') }}" download>SRT 다운로드</a>
+      <a class="button secondary" href="{{ url_for('job_video', job_id=job.id) }}" download>{{ icons.download(16) }}원본 영상 다운로드</a>
+      <a class="button secondary" href="{{ url_for('job_subtitle_file', job_id=job.id, subtitle_format='srt') }}" download>{{ icons.download(16) }}SRT 다운로드</a>
       {% if job.ass_path %}
-        <a class="button secondary" href="{{ url_for('job_subtitle_file', job_id=job.id, subtitle_format='ass') }}" download>스타일 ASS 다운로드</a>
+        <a class="button secondary" href="{{ url_for('job_subtitle_file', job_id=job.id, subtitle_format='ass') }}" download>{{ icons.download(16) }}스타일 ASS 다운로드</a>
       {% endif %}
     </div>
     <p class="muted preview-note">

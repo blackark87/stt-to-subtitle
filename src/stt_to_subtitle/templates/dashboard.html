@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% import "_icons.html" as icons %}
 {% block title %}작업 대시보드 · STT to Subtitle{% endblock %}
 {% block head %}
   <script defer src="{{ url_for('static', path='/media-picker.js') }}"></script>
@@ -26,6 +27,29 @@
   {% endif %}
   {% if error %}<p class="alert">{{ error }}</p>{% endif %}
   {% if notice %}<p class="notice">{{ notice }}</p>{% endif %}
+
+  <div class="stat-strip">
+    <div class="stat-tile stat-running">
+      <span class="stat-icon">{{ icons.activity(18) }}</span>
+      <span class="stat-value">{{ job_stats.running }}</span>
+      <span class="stat-label">진행 중</span>
+    </div>
+    <div class="stat-tile stat-attention">
+      <span class="stat-icon">{{ icons.alert_triangle(18) }}</span>
+      <span class="stat-value">{{ job_stats.attention }}</span>
+      <span class="stat-label">확인 필요</span>
+    </div>
+    <div class="stat-tile stat-waiting">
+      <span class="stat-icon">{{ icons.clock(18) }}</span>
+      <span class="stat-value">{{ job_stats.waiting }}</span>
+      <span class="stat-label">대기</span>
+    </div>
+    <div class="stat-tile stat-completed">
+      <span class="stat-icon">{{ icons.check(18) }}</span>
+      <span class="stat-value">{{ job_stats.completed }}</span>
+      <span class="stat-label">완료</span>
+    </div>
+  </div>
 
   <section class="card">
     <h2>새 작업</h2>
@@ -69,8 +93,8 @@
                 <span>하위 전체 선택</span>
               </label>
               <a data-folder-link href="/?folder={{ folder.path|urlencode }}">
-                <span class="folder-visual" aria-hidden="true">
-                  <span class="folder-mark">→</span>
+                <span class="folder-visual folder-icon" aria-hidden="true">
+                  {{ icons.folder(40) }}
                 </span>
                 <span class="folder-card-content">
                   <strong class="folder-name">{{ folder.name }}</strong>
@@ -118,7 +142,7 @@
                   </span>
                 {% else %}
                   <span class="video-placeholder" aria-hidden="true">
-                    <span class="video-play">▶</span>
+                    <span class="video-play">{{ icons.play(20) }}</span>
                   </span>
                   <span class="media-card-content">
                     <strong class="media-title">{{ file.name }}</strong>
@@ -153,36 +177,44 @@
         </select>
         <span class="field-help">오디오만 추출할 때는 선택하지 않아도 됩니다. 작업 등록 시 현재 프롬프트가 복사되어 이후 설정 변경의 영향을 받지 않습니다.</span>
       </label>
-      <label>오디오 스트림
-        <input name="audio_stream" type="number" min="0" value="0" required>
-      </label>
-      <label>시작(초)
-        <input name="start_seconds" type="number" min="0" step="0.1" value="0" required>
-      </label>
-      <label>길이(초)
-        <input name="duration_seconds" type="number" min="0" step="0.1" placeholder="비우거나 0 = 끝까지">
-      </label>
-      <label>청크(초)
-        <input name="chunk_length_seconds" type="number" min="1" value="60" required>
-      </label>
-      <label>화자 수
-        <input name="num_speakers" type="number" min="1" placeholder="자동">
-      </label>
-      <label>최소 화자
-        <input name="min_speakers" type="number" min="1" placeholder="자동">
-      </label>
-      <label>최대 화자
-        <input name="max_speakers" type="number" min="1" placeholder="자동">
-      </label>
-      <div class="option-checks wide">
-        <label class="check"><input name="add_punctuation" type="checkbox"><span>일본어 구두점 모델 사용</span></label>
-        <label class="check">
-          <input name="noise_filter" type="hidden" value="false">
-          <input name="noise_filter" type="checkbox" value="true" checked>
-          <span>소음 오인식 필터 사용</span>
-        </label>
-        <label class="check"><input name="force_overwrite" type="checkbox"><span>기존 <code>.ko.srt/.ko.ass</code> 강제 덮어쓰기</span></label>
-      </div>
+      <details class="advanced-options wide">
+        <summary>
+          <strong>고급 옵션</strong>
+          <span class="muted">오디오 구간 · 화자 수 · 필터 (기본값 그대로 진행 가능)</span>
+        </summary>
+        <div class="advanced-options-grid grid-form">
+          <label>오디오 스트림
+            <input name="audio_stream" type="number" min="0" value="0" required>
+          </label>
+          <label>시작(초)
+            <input name="start_seconds" type="number" min="0" step="0.1" value="0" required>
+          </label>
+          <label>길이(초)
+            <input name="duration_seconds" type="number" min="0" step="0.1" placeholder="비우거나 0 = 끝까지">
+          </label>
+          <label>청크(초)
+            <input name="chunk_length_seconds" type="number" min="1" value="60" required>
+          </label>
+          <label>화자 수
+            <input name="num_speakers" type="number" min="1" placeholder="자동">
+          </label>
+          <label>최소 화자
+            <input name="min_speakers" type="number" min="1" placeholder="자동">
+          </label>
+          <label>최대 화자
+            <input name="max_speakers" type="number" min="1" placeholder="자동">
+          </label>
+          <div class="option-checks wide">
+            <label class="check"><input name="add_punctuation" type="checkbox"><span>일본어 구두점 모델 사용</span></label>
+            <label class="check">
+              <input name="noise_filter" type="hidden" value="false">
+              <input name="noise_filter" type="checkbox" value="true" checked>
+              <span>소음 오인식 필터 사용</span>
+            </label>
+            <label class="check"><input name="force_overwrite" type="checkbox"><span>기존 <code>.ko.srt/.ko.ass</code> 강제 덮어쓰기</span></label>
+          </div>
+        </div>
+      </details>
       <div class="wide submit-row">
         <button type="submit" name="operation" value="extract" class="secondary" data-batch-submit disabled>오디오만 추출</button>
         <button type="submit" name="operation" value="translate" data-batch-submit data-requires-servers data-server-configured="{{ 'true' if remote_servers.configured else 'false' }}" disabled>번역·자막 생성</button>
