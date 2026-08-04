@@ -240,6 +240,98 @@ class NASOrchestratorTests(unittest.TestCase):
             self.assertIsNone(completed.translation_path)
             self.assertFalse(completed.can_pause_translation)
 
+    def test_transcription_reuses_persisted_legacy_audio_job_in_place(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            (media_root / "movie.mkv").write_bytes(b"media")
+            initial = self.make_orchestrator(root, media_root)
+            try:
+                legacy = initial.create_job(
+                    "movie.mkv",
+                    force_overwrite=False,
+                    options={"start_seconds": "12"},
+                    operation="extract",
+                )
+                audio_path = (
+                    root / "state" / "jobs" / legacy.id / "audio.16k.wav"
+                )
+                audio_path.parent.mkdir(parents=True)
+                audio_path.write_bytes(b"wave")
+                initial.store.update(
+                    legacy.id,
+                    status="audio_completed",
+                    audio_path=str(audio_path),
+                    audio_sha256="digest",
+                )
+            finally:
+                initial.stop()
+
+            reloaded = self.make_orchestrator(root, media_root)
+            try:
+                resumed = reloaded.create_job(
+                    "movie.mkv",
+                    force_overwrite=False,
+                    options={
+                        "start_seconds": "99",
+                        "chunk_length_seconds": "30",
+                    },
+                    operation="transcribe",
+                )
+                jobs = reloaded.store.list_jobs(limit=None)
+            finally:
+                reloaded.stop()
+
+            self.assertEqual(resumed.id, legacy.id)
+            self.assertEqual(resumed.operation, "transcribe")
+            self.assertEqual(resumed.status, "audio_ready")
+            self.assertEqual(resumed.audio_path, str(audio_path))
+            self.assertEqual(resumed.audio_sha256, "digest")
+            self.assertEqual(resumed.options["start_seconds"], 12.0)
+            self.assertEqual(resumed.options["chunk_length_seconds"], 30)
+            self.assertEqual([job.id for job in jobs], [legacy.id])
+
+    def test_transcription_reextracts_missing_legacy_audio_with_same_job_id(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            (media_root / "movie.mkv").write_bytes(b"media")
+            orchestrator = self.make_orchestrator(root, media_root)
+            try:
+                legacy = orchestrator.create_job(
+                    "movie.mkv",
+                    force_overwrite=False,
+                    options={},
+                    operation="extract",
+                )
+                orchestrator.store.update(
+                    legacy.id,
+                    status="audio_completed",
+                    audio_path=str(root / "missing.wav"),
+                    audio_sha256="stale-digest",
+                )
+
+                resumed = orchestrator.reprocess(
+                    legacy.id,
+                    "transcribe",
+                )
+                jobs = orchestrator.store.list_jobs(limit=None)
+            finally:
+                orchestrator.stop()
+
+            self.assertEqual(resumed.id, legacy.id)
+            self.assertEqual(resumed.status, "queued")
+            self.assertEqual(resumed.operation, "transcribe")
+            self.assertIsNone(resumed.audio_path)
+            self.assertIsNone(resumed.audio_sha256)
+            self.assertEqual([job.id for job in jobs], [legacy.id])
+
     def test_translation_reuses_validated_transcript_without_stt(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)

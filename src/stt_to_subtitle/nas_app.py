@@ -1078,7 +1078,7 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
             return login_redirect()
         validate_csrf(request, csrf_token)
         try:
-            orchestrator(request).delete_missing_remote_transcription(job_id)
+            orchestrator(request).delete_job_record(job_id)
         except ValueError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
         return RedirectResponse(
