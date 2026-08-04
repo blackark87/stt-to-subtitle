@@ -2,7 +2,7 @@
 {% macro job_item(job) %}
   {% set is_running = job.status in ['extracting', 'transcription_running', 'translation_running', 'rendering'] %}
   {% set is_attention = job.status in ['blocked', 'failed'] %}
-  {% set is_completed = job.status in ['audio_completed', 'completed'] %}
+  {% set is_completed = job.status in ['audio_completed', 'transcription_completed', 'completed'] %}
   {% set status_group = 'running' if is_running else ('attention' if is_attention else ('completed' if is_completed else 'waiting')) %}
   <article class="recent-job-item recent-job-{{ job.status }}{% if is_completed %} is-completed{% endif %}">
     <div class="recent-job-status-icon recent-job-status-{{ status_group }}" aria-hidden="true">
@@ -23,7 +23,8 @@
       <div class="recent-job-meta">
         <span>최근 갱신 <time datetime="{{ job.updated_at|datetime_iso }}">{{ job.updated_at|datetime }}</time></span>
         <code title="작업 ID: {{ job.id }}">#{{ job.id[:8] }}</code>
-        {% if job.operation != "extract" %}<span>프롬프트 {{ job.prompt_category_name }}</span>{% endif %}
+        <span>작업 범위 {{ job.operation|job_operation }}</span>
+        {% if job.operation in ["translate", "full"] %}<span>프롬프트 {{ job.prompt_category_name }}</span>{% endif %}
         {% if job.blocked_stage %}<span class="recent-job-stage">{{ job.blocked_stage|job_stage }} 단계</span>{% endif %}
       </div>
       {% if job.chunks_created %}
@@ -49,7 +50,7 @@
     </div>
     <div class="recent-job-actions">
       <a class="button secondary compact" href="/jobs/{{ job.id }}">상세 보기</a>
-      {% if job.status in ["transcribed", "translation_running"] and not job.translation_pause_requested and not job.job_stop_requested %}
+      {% if job.can_pause_translation and job.status in ["transcribed", "translation_running"] %}
         <form method="post" action="/jobs/{{ job.id }}/pause-translation">
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
           <input type="hidden" name="return_folder" value="{{ current_folder }}">

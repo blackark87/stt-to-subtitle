@@ -29,7 +29,8 @@
         submit.hasAttribute("data-requires-servers") &&
         submit.dataset.serverConfigured !== "true";
       const missingPrompt =
-        submit.value !== "extract" && !promptCategory?.value;
+        ["translate", "full"].includes(submit.value) &&
+        !promptCategory?.value;
       submit.disabled = selected === 0 || missingServers || missingPrompt;
     }
   };

@@ -17,7 +17,7 @@
     <a href="/" class="button secondary">{{ icons.chevron_left(16) }}최근 작업으로</a>
   </div>
   <div
-    {% if job.status not in ["audio_completed", "completed", "translation_paused", "blocked", "failed"] %}
+    {% if job.status not in ["audio_completed", "transcription_completed", "completed", "translation_paused", "blocked", "failed"] %}
       data-poll-url="/jobs/{{ job.id }}/panel"
       data-poll-seconds="5"
     {% endif %}

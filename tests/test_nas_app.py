@@ -202,6 +202,11 @@ class NASAppTests(unittest.TestCase):
             self.assertEqual(page.status_code, 200)
             self.assertIn("번역 프롬프트 카테고리", page.text)
             self.assertNotIn("NAS", page.text)
+            self.assertNotRegex(
+                page.text,
+                r'<details class="card settings-card prompt-category-card'
+                r'[^\"]*"\s+open',
+            )
             self.assertEqual(created.status_code, 303)
             self.assertEqual(updated.status_code, 303)
             self.assertEqual(archived.status_code, 303)
@@ -976,36 +981,54 @@ class NASAppTests(unittest.TestCase):
             self.assertIn("completed-14.mp4", second.text)
             self.assertIn("jobs_page=2", first.text)
 
-    def test_audio_only_submission_stays_on_dashboard_without_servers(self) -> None:
+    def test_dashboard_exposes_three_pipeline_buttons_and_queues_transcription(
+        self,
+    ) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
             media_root = root / "media"
             media_root.mkdir()
             (media_root / "movie.mp4").write_bytes(b"media")
-            settings = NASSettings(
-                state_dir=root / "state",
-                media_root=media_root,
-                admin_password="",
-                session_secret="",
-                stt_base_url="",
-                stt_token="",
-                lm_base_url="",
-                lm_token="",
-                lm_model="",
-            )
-            with TestClient(create_app(settings)) as client:
+            with TestClient(
+                create_app(self.settings(root, media_root))
+            ) as client:
                 service = client.app.state.orchestrator
                 service.stop()
+                dashboard = client.get("/")
                 response = client.post(
                     "/jobs",
-                    data={"source_rels": "movie.mp4", "operation": "extract"},
+                    data={
+                        "source_rels": "movie.mp4",
+                        "operation": "transcribe",
+                    },
                     follow_redirects=False,
                 )
                 jobs = service.store.list_jobs()
 
+            self.assertIn('name="operation" value="transcribe"', dashboard.text)
+            self.assertIn('name="operation" value="translate"', dashboard.text)
+            self.assertIn('name="operation" value="full"', dashboard.text)
+            self.assertIn(">전사</button>", dashboard.text)
+            self.assertIn(">번역</button>", dashboard.text)
+            self.assertIn(">전체</button>", dashboard.text)
+            self.assertNotIn("오디오만 추출", dashboard.text)
+            advanced_position = dashboard.text.index(
+                '<details class="advanced-options wide">'
+            )
+            advanced_end = dashboard.text.index(
+                "</details>",
+                advanced_position,
+            )
+            prompt_position = dashboard.text.index("data-prompt-category")
+            button_position = dashboard.text.index(
+                'name="operation" value="transcribe"'
+            )
+            self.assertLess(advanced_end, prompt_position)
+            self.assertLess(prompt_position, button_position)
             self.assertEqual(response.status_code, 303)
             self.assertEqual(response.headers["location"], "/?queued=1")
-            self.assertEqual(jobs[0].operation, "extract")
+            self.assertEqual(jobs[0].operation, "transcribe")
+            self.assertNotIn("translation_prompt", jobs[0].options)
 
 
 if __name__ == "__main__":

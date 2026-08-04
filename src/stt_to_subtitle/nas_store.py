@@ -24,7 +24,11 @@ RUNNING_STATUSES = {
     "rendering",
 }
 
-SUCCESS_STATUSES = {"audio_completed", "completed"}
+SUCCESS_STATUSES = {
+    "audio_completed",
+    "transcription_completed",
+    "completed",
+}
 STOPPABLE_STATUSES = {
     "queued",
     "extracting",
@@ -115,7 +119,7 @@ class NASJob:
     @property
     def can_pause_translation(self) -> bool:
         return (
-            self.operation != "extract"
+            self.operation in {"translate", "full"}
             and self.status in TRANSLATION_PAUSABLE_STATUSES
             and not self.translation_pause_requested
             and not self.job_stop_requested
@@ -699,6 +703,19 @@ class NASStore:
                 SELECT * FROM jobs
                 WHERE source_rel = ? AND status = 'audio_completed'
                 ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (source_rel,),
+            ).fetchone()
+        return self._from_row(row)
+
+    def latest_transcript_job(self, source_rel: str) -> NASJob | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM jobs
+                WHERE source_rel = ? AND transcript_path IS NOT NULL
+                ORDER BY updated_at DESC, created_at DESC
                 LIMIT 1
                 """,
                 (source_rel,),

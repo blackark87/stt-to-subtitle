@@ -1,7 +1,7 @@
 {% import "_icons.html" as icons %}
 <section
   class="card job-overview-card"
-  {% if job.status in ["audio_completed", "completed", "translation_paused", "blocked", "failed"] %}data-poll-stop{% endif %}
+  {% if job.status in ["audio_completed", "transcription_completed", "completed", "translation_paused", "blocked", "failed"] %}data-poll-stop{% endif %}
 >
   <div class="job-overview-heading">
     <div>
@@ -28,7 +28,8 @@
         {{ job.created_at|datetime }}
       </time>
     </dd>
-    {% if job.operation != "extract" %}
+    <dt>작업 범위</dt><dd>{{ job.operation|job_operation }}</dd>
+    {% if job.operation in ["translate", "full"] %}
       <dt>번역 프롬프트</dt><dd>{{ job.prompt_category_name }}</dd>
     {% endif %}
     {% if job.blocked_stage %}
@@ -40,7 +41,7 @@
     {% if job.ass_path %}<dt>ASS</dt><dd>{{ job.ass_path }}</dd>{% endif %}
   </dl>
   <div class="actions">
-    {% set editable = job.status in ["completed", "blocked", "failed"] %}
+    {% set editable = job.status in ["transcription_completed", "completed", "blocked", "failed"] %}
     {% if job.transcript_path and editable %}
       <a class="button secondary" href="/jobs/{{ job.id }}/artifacts/transcript/edit" title="{{ artifact_names.transcript }}">{{ icons.pencil(16) }}일본어 전사 JSON 편집</a>
     {% endif %}
@@ -64,7 +65,7 @@
     {% endif %}
     {% if job.job_stop_requested %}
       <span class="muted">전체 작업 중단 요청됨 · 현재 단계를 안전하게 마치는 중입니다.</span>
-    {% elif job.status in ["transcribed", "translation_running"] and not job.translation_pause_requested %}
+    {% elif job.can_pause_translation and job.status in ["transcribed", "translation_running"] %}
       <form method="post" action="/jobs/{{ job.id }}/pause-translation">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <button type="submit" class="secondary">{{ icons.pause(16) }}번역 중단</button>
@@ -96,7 +97,7 @@
       </form>
     {% endif %}
   </div>
-  {% if job.status in ["audio_completed", "completed"] %}
+  {% if job.status in ["audio_completed", "transcription_completed", "completed"] %}
     <div class="reprocess-actions">
       <div>
         <strong>새 작업으로 다시 처리</strong>
@@ -113,9 +114,9 @@
               {% endfor %}
             </select>
           </label>
-          <button type="submit" name="operation" value="extract" class="secondary">오디오만 추출</button>
-          <button type="submit" name="operation" value="translate" class="secondary">번역·자막 생성</button>
-          <button type="submit" name="operation" value="full">오디오 추출 후 번역·자막 생성</button>
+          <button type="submit" name="operation" value="transcribe" class="secondary">전사</button>
+          <button type="submit" name="operation" value="translate" class="secondary">번역</button>
+          <button type="submit" name="operation" value="full">전체</button>
         </form>
       </div>
     </div>
