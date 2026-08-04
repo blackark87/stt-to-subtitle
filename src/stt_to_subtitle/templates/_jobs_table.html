@@ -75,11 +75,11 @@
           <button type="submit" class="secondary compact">{{ icons.refresh(14) }}번역 다시 시작</button>
         </form>
       {% endif %}
-      {% if job.remote_transcription_missing %}
-        <form method="post" action="/jobs/{{ job.id }}/delete" data-confirm-message="원격 전사 서버에서 사라진 작업 기록을 삭제하시겠습니까? 원본 영상과 생성·중간 파일은 삭제하지 않습니다.">
+      {% if job.can_delete_record %}
+        <form method="post" action="/jobs/{{ job.id }}/delete" data-confirm-message="{% if job.status == 'audio_completed' %}완료된 오디오 추출 기록을 삭제하시겠습니까? 원본 영상과 생성된 WAV는 삭제하지 않습니다.{% else %}원격 전사 서버에서 사라진 작업 기록을 삭제하시겠습니까? 원본 영상과 생성·중간 파일은 삭제하지 않습니다.{% endif %}">
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
           <input type="hidden" name="return_folder" value="{{ current_folder }}">
-          <button type="submit" class="danger compact">{{ icons.trash(14) }}작업 삭제</button>
+          <button type="submit" class="danger compact">{{ icons.trash(14) }}{% if job.status == 'audio_completed' %}기록 삭제{% else %}작업 삭제{% endif %}</button>
         </form>
       {% endif %}
     </div>

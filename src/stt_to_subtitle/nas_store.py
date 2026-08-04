@@ -126,6 +126,13 @@ class NASJob:
         )
 
     @property
+    def can_delete_record(self) -> bool:
+        return (
+            self.status == "audio_completed"
+            or self.remote_transcription_missing
+        )
+
+    @property
     def prompt_category_name(self) -> str:
         snapshot = self.options.get("translation_prompt")
         if isinstance(snapshot, Mapping):

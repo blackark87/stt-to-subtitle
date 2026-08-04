@@ -345,9 +345,77 @@ class NASOrchestrator:
             if operation == "translate"
             else {}
         )
+        reusable_audio_jobs: dict[str, NASJob] = {}
+        if operation == "transcribe":
+            latest_jobs = self.store.latest_jobs_by_source()
+            for source_rel in unique_source_rels:
+                reusable_audio = self.store.latest_audio_job(source_rel)
+                latest = latest_jobs.get(source_rel)
+                if (
+                    reusable_audio is not None
+                    and latest is not None
+                    and latest.id == reusable_audio.id
+                ):
+                    reusable_audio_jobs[source_rel] = reusable_audio
 
         jobs: list[NASJob] = []
         for source_rel in unique_source_rels:
+            reusable_audio = reusable_audio_jobs.get(source_rel)
+            if reusable_audio is not None:
+                audio_available = bool(
+                    reusable_audio.audio_path
+                    and Path(reusable_audio.audio_path).is_file()
+                )
+                resumed_options = dict(normalized_options)
+                if audio_available:
+                    for key in (
+                        "audio_stream",
+                        "start_seconds",
+                        "duration_seconds",
+                    ):
+                        if key in reusable_audio.options:
+                            resumed_options[key] = reusable_audio.options[key]
+                self.store.update(
+                    reusable_audio.id,
+                    status="audio_ready" if audio_available else "queued",
+                    force_overwrite=int(force_overwrite),
+                    operation="transcribe",
+                    options_json=json.dumps(resumed_options, sort_keys=True),
+                    audio_path=(
+                        reusable_audio.audio_path if audio_available else None
+                    ),
+                    audio_sha256=(
+                        reusable_audio.audio_sha256 if audio_available else None
+                    ),
+                    stt_job_id=None,
+                    transcript_path=None,
+                    translation_path=None,
+                    srt_path=None,
+                    ass_path=None,
+                    blocked_stage=None,
+                    error=None,
+                    chunks_created=0,
+                    chunks_completed=0,
+                    translation_chunks_total=0,
+                    translation_chunks_completed=0,
+                    translation_pause_requested=0,
+                    job_stop_requested=0,
+                )
+                self.store.add_event(
+                    reusable_audio.id,
+                    "info",
+                    "transcription requested; reusing extracted audio"
+                    if audio_available
+                    else "transcription requested; audio will be extracted "
+                    "again",
+                )
+                resumed = self.store.get(reusable_audio.id)
+                if resumed is None:
+                    raise RuntimeError(
+                        "resumed transcription job could not be read"
+                    )
+                jobs.append(resumed)
+                continue
             reusable_transcript = reusable_transcripts.get(source_rel)
             if reusable_transcript is not None:
                 reusable, transcript_payload = reusable_transcript
@@ -553,17 +621,26 @@ class NASOrchestrator:
             raise RuntimeError("retried job could not be read")
         return retried
 
-    def delete_missing_remote_transcription(self, job_id: str) -> None:
+    def delete_job_record(self, job_id: str) -> None:
         job = self.store.get(job_id)
         if job is None:
             raise ValueError("job not found")
-        if not job.remote_transcription_missing:
+        if not job.can_delete_record:
+            raise ValueError(
+                "only completed audio extraction records or jobs missing "
+                "from the remote transcription server can be deleted"
+            )
+        if not self.store.delete(job.id):
+            raise RuntimeError("job could not be deleted")
+
+    def delete_missing_remote_transcription(self, job_id: str) -> None:
+        job = self.store.get(job_id)
+        if job is None or not job.remote_transcription_missing:
             raise ValueError(
                 "only jobs missing from the remote transcription server "
                 "can be deleted"
             )
-        if not self.store.delete(job.id):
-            raise RuntimeError("job could not be deleted")
+        self.delete_job_record(job_id)
 
     def restart_translation(
         self,

@@ -776,7 +776,7 @@ class NASAppTests(unittest.TestCase):
             self.assertIn('value="pending.mp4"', page.text)
             self.assertNotIn('value="done.mp4"', page.text)
 
-    def test_deletes_only_jobs_missing_from_remote_transcription_server(
+    def test_deletes_legacy_audio_and_missing_remote_job_records(
         self,
     ) -> None:
         missing_error = (
@@ -789,6 +789,8 @@ class NASAppTests(unittest.TestCase):
             media_root.mkdir()
             source = media_root / "movie.mp4"
             source.write_bytes(b"media")
+            audio_source = media_root / "audio.mp4"
+            audio_source.write_bytes(b"media")
 
             with TestClient(create_app(self.settings(root, media_root))) as client:
                 service = client.app.state.orchestrator
@@ -817,12 +819,30 @@ class NASAppTests(unittest.TestCase):
                     blocked_stage="transcription",
                     error="transcription server is unavailable",
                 )
+                audio = service.store.create(
+                    job_id="audio-job",
+                    source_rel=audio_source.name,
+                    force_overwrite=False,
+                    options={},
+                    operation="extract",
+                )
+                audio_artifact = (
+                    root / "state" / "jobs" / audio.id / "audio.wav"
+                )
+                audio_artifact.parent.mkdir(parents=True)
+                audio_artifact.write_bytes(b"audio")
+                service.store.update(
+                    audio.id,
+                    status="audio_completed",
+                    audio_path=str(audio_artifact),
+                )
                 artifact = root / "state" / "jobs" / missing.id / "audio.wav"
                 artifact.parent.mkdir(parents=True)
                 artifact.write_bytes(b"audio")
 
                 dashboard = client.get("/jobs-fragment")
                 detail = client.get(f"/jobs/{missing.id}")
+                audio_detail = client.get(f"/jobs/{audio.id}")
                 rejected = client.post(
                     f"/jobs/{other.id}/delete",
                     follow_redirects=False,
@@ -831,9 +851,14 @@ class NASAppTests(unittest.TestCase):
                     f"/jobs/{missing.id}/delete",
                     follow_redirects=False,
                 )
+                audio_deleted = client.post(
+                    f"/jobs/{audio.id}/delete",
+                    follow_redirects=False,
+                )
 
                 self.assertIsNotNone(service.store.get(other.id))
                 self.assertIsNone(service.store.get(missing.id))
+                self.assertIsNone(service.store.get(audio.id))
 
             self.assertIn(
                 f'action="/jobs/{missing.id}/delete"',
@@ -847,11 +872,19 @@ class NASAppTests(unittest.TestCase):
                 f'action="/jobs/{missing.id}/delete"',
                 detail.text,
             )
+            self.assertIn(
+                f'action="/jobs/{audio.id}/delete"',
+                dashboard.text,
+            )
+            self.assertIn("기록 삭제", audio_detail.text)
             self.assertEqual(rejected.status_code, 400)
             self.assertEqual(deleted.status_code, 303)
+            self.assertEqual(audio_deleted.status_code, 303)
             self.assertEqual(deleted.headers["location"], "/")
             self.assertTrue(source.is_file())
             self.assertTrue(artifact.is_file())
+            self.assertTrue(audio_source.is_file())
+            self.assertTrue(audio_artifact.is_file())
 
     def test_dashboard_actions_return_immediately_and_bulk_stop_jobs(
         self,
