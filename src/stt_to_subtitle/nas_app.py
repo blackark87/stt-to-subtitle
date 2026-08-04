@@ -61,6 +61,7 @@ JOB_STATUS_LABELS = {
     "audio_completed": "오디오 추출 완료",
     "transcription_running": "전사 중",
     "transcribed": "번역 대기",
+    "transcription_completed": "전사 완료",
     "translation_running": "번역 중",
     "translation_paused": "번역 중단됨",
     "translated": "자막 생성 대기",
@@ -68,6 +69,12 @@ JOB_STATUS_LABELS = {
     "completed": "완료",
     "blocked": "확인 필요",
     "failed": "실패",
+}
+JOB_OPERATION_LABELS = {
+    "extract": "오디오 추출 (기존 작업)",
+    "transcribe": "전사",
+    "translate": "번역",
+    "full": "전체",
 }
 JOB_STAGE_LABELS = {
     "audio extraction": "오디오 추출",
@@ -89,6 +96,9 @@ TEMPLATES.env.filters["filesize"] = lambda value: (
 TEMPLATES.env.filters["job_status"] = lambda value: JOB_STATUS_LABELS.get(
     str(value),
     str(value),
+)
+TEMPLATES.env.filters["job_operation"] = lambda value: (
+    JOB_OPERATION_LABELS.get(str(value), str(value))
 )
 TEMPLATES.env.filters["job_stage"] = lambda value: JOB_STAGE_LABELS.get(
     str(value),
@@ -279,6 +289,7 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
                 linked_job = latest
             elif latest is not None and latest.status not in {
                 "audio_completed",
+                "transcription_completed",
                 "completed",
             }:
                 media["subtitle_state"] = "running"
@@ -761,7 +772,10 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
         }
         try:
             service = orchestrator(request)
-            if operation != "extract" and not prompt_category_id.strip():
+            if (
+                operation in {"translate", "full"}
+                and not prompt_category_id.strip()
+            ):
                 raise ValueError("번역 프롬프트 카테고리를 선택하세요.")
             selected_sources, skipped = service.expand_job_sources(
                 source_rels or [],
@@ -775,7 +789,9 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
                 options=options,
                 operation=operation,
                 prompt_category_id=(
-                    prompt_category_id if operation != "extract" else None
+                    prompt_category_id
+                    if operation in {"translate", "full"}
+                    else None
                 ),
             )
         except (FileExistsError, OSError, ValueError) as error:
@@ -1157,13 +1173,18 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
             return login_redirect()
         validate_csrf(request, csrf_token)
         try:
-            if operation != "extract" and not prompt_category_id.strip():
+            if (
+                operation in {"translate", "full"}
+                and not prompt_category_id.strip()
+            ):
                 raise ValueError("번역 프롬프트 카테고리를 선택하세요.")
             created = orchestrator(request).reprocess(
                 job_id,
                 operation,
                 prompt_category_id=(
-                    prompt_category_id if operation != "extract" else None
+                    prompt_category_id
+                    if operation in {"translate", "full"}
+                    else None
                 ),
             )
         except (FileExistsError, OSError, ValueError) as error:

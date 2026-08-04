@@ -185,31 +185,21 @@ class NASOrchestratorTests(unittest.TestCase):
             finally:
                 orchestrator.stop()
 
-    def test_audio_only_job_does_not_require_remote_servers(self) -> None:
+    def test_transcribe_job_stops_after_audio_extraction_and_transcription(
+        self,
+    ) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
             media_root = root / "media"
             media_root.mkdir()
             (media_root / "movie.mkv").write_bytes(b"media")
-            orchestrator = NASOrchestrator(
-                NASSettings(
-                    state_dir=root / "state",
-                    media_root=media_root,
-                    admin_password="",
-                    session_secret="",
-                    stt_base_url="",
-                    stt_token="",
-                    lm_base_url="",
-                    lm_token="",
-                    lm_model="",
-                )
-            )
+            orchestrator = self.make_orchestrator(root, media_root)
             try:
                 job = orchestrator.create_job(
                     "movie.mkv",
                     force_overwrite=False,
                     options={},
-                    operation="extract",
+                    operation="transcribe",
                 )
 
                 def fake_extract(_source, target, _options):
@@ -221,36 +211,77 @@ class NASOrchestratorTests(unittest.TestCase):
                     side_effect=fake_extract,
                 ):
                     orchestrator._extract(job)
+                extracted = orchestrator.store.get(job.id)
+                orchestrator.stt_client.transcribe = Mock(
+                    return_value={
+                        "schema_version": 1,
+                        "job_id": "remote-job",
+                        "segments": [
+                            {
+                                "id": "segment-000001",
+                                "start": 0,
+                                "end": 1,
+                                "speaker": "SPEAKER_00",
+                                "text": "こんにちは",
+                            }
+                        ],
+                    }
+                )
+                orchestrator._transcribe(extracted)
                 completed = orchestrator.store.get(job.id)
             finally:
                 orchestrator.stop()
 
-            self.assertEqual(completed.status, "audio_completed")
-            self.assertEqual(completed.operation, "extract")
+            self.assertEqual(extracted.status, "audio_ready")
+            self.assertEqual(completed.status, "transcription_completed")
+            self.assertEqual(completed.operation, "transcribe")
             self.assertTrue(Path(completed.audio_path).is_file())
+            self.assertTrue(Path(completed.transcript_path).is_file())
+            self.assertIsNone(completed.translation_path)
+            self.assertFalse(completed.can_pause_translation)
 
-    def test_translation_reuses_latest_extracted_audio_or_falls_back(self) -> None:
+    def test_translation_reuses_validated_transcript_without_stt(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
             media_root = root / "media"
             media_root.mkdir()
             (media_root / "movie.mkv").write_bytes(b"media")
+            (media_root / "missing.mkv").write_bytes(b"media")
             orchestrator = self.make_orchestrator(root, media_root)
             try:
-                extracted = orchestrator.create_job(
+                transcribed = orchestrator.create_job(
                     "movie.mkv",
                     force_overwrite=False,
                     options={"start_seconds": "12"},
-                    operation="extract",
+                    operation="transcribe",
                 )
-                audio_path = root / "state" / "jobs" / extracted.id / "audio.wav"
-                audio_path.parent.mkdir(parents=True)
-                audio_path.write_bytes(b"wave")
+                transcript_path = (
+                    root / "state" / "jobs" / transcribed.id / "transcript.json"
+                )
+                transcript_path.parent.mkdir(parents=True)
+                transcript_path.write_text(
+                    json.dumps(
+                        {
+                            "schema_version": 1,
+                            "job_id": "remote-job",
+                            "segments": [
+                                {
+                                    "id": "segment-000001",
+                                    "start": 0,
+                                    "end": 1,
+                                    "speaker": "SPEAKER_00",
+                                    "text": "こんにちは",
+                                }
+                            ],
+                        },
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
                 orchestrator.store.update(
-                    extracted.id,
-                    status="audio_completed",
-                    audio_path=str(audio_path),
-                    audio_sha256="digest",
+                    transcribed.id,
+                    status="transcription_completed",
+                    transcript_path=str(transcript_path),
                 )
 
                 reused = orchestrator.create_job(
@@ -258,26 +289,36 @@ class NASOrchestratorTests(unittest.TestCase):
                     force_overwrite=True,
                     options={"chunk_length_seconds": "30"},
                     operation="translate",
+                    prompt_category_id="variety",
                 )
-                audio_path.unlink()
-                orchestrator.store.update(extracted.id, status="audio_completed")
-                fallback = orchestrator.create_job(
-                    "movie.mkv",
-                    force_overwrite=True,
-                    options={"chunk_length_seconds": "20"},
-                    operation="translate",
-                )
+                with self.assertRaisesRegex(ValueError, "먼저 전사를"):
+                    orchestrator.create_job(
+                        "missing.mkv",
+                        force_overwrite=True,
+                        options={},
+                        operation="translate",
+                        prompt_category_id="jav",
+                    )
+                original = orchestrator.store.get(transcribed.id)
             finally:
                 orchestrator.stop()
 
-            self.assertEqual(reused.id, extracted.id)
-            self.assertEqual(reused.status, "audio_ready")
+            self.assertNotEqual(reused.id, transcribed.id)
+            self.assertEqual(reused.status, "transcribed")
+            self.assertEqual(reused.operation, "translate")
             self.assertEqual(reused.options["start_seconds"], 12.0)
-            self.assertEqual(reused.options["chunk_length_seconds"], 30)
-            self.assertEqual(fallback.id, extracted.id)
-            self.assertEqual(fallback.status, "queued")
-            self.assertIsNone(fallback.audio_path)
-            self.assertEqual(fallback.options["chunk_length_seconds"], 20)
+            self.assertEqual(
+                reused.options["translation_prompt"]["category_id"],
+                "variety",
+            )
+            self.assertNotEqual(reused.transcript_path, str(transcript_path))
+            self.assertEqual(
+                json.loads(
+                    Path(reused.transcript_path).read_text(encoding="utf-8")
+                ),
+                json.loads(transcript_path.read_text(encoding="utf-8")),
+            )
+            self.assertEqual(original.status, "transcription_completed")
 
     def test_pauses_waiting_translation_and_resumes_checkpoint(self) -> None:
         with TemporaryDirectory() as directory:

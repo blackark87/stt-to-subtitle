@@ -167,6 +167,43 @@ class NASStoreTests(unittest.TestCase):
                 ["job-0"],
             )
 
+    def test_treats_transcription_as_success_and_finds_latest_transcript(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            store = NASStore(Path(directory) / "jobs.sqlite3")
+            older = store.create(
+                job_id="older",
+                source_rel="movie.mkv",
+                force_overwrite=False,
+                options={},
+                operation="transcribe",
+            )
+            store.update(
+                older.id,
+                status="transcription_completed",
+                transcript_path="/artifacts/older.json",
+            )
+            newer = store.create(
+                job_id="newer",
+                source_rel="movie.mkv",
+                force_overwrite=False,
+                options={},
+                operation="full",
+            )
+            store.update(
+                newer.id,
+                status="completed",
+                transcript_path="/artifacts/newer.json",
+            )
+
+            self.assertEqual(store.list_open_jobs(), [])
+            self.assertEqual(store.count_successful_jobs(), 2)
+            self.assertEqual(
+                store.latest_transcript_job("movie.mkv").id,
+                "newer",
+            )
+
     def test_does_not_dispatch_a_stopped_or_translation_paused_job(self) -> None:
         with TemporaryDirectory() as directory:
             store = NASStore(Path(directory) / "jobs.sqlite3")

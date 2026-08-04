@@ -504,7 +504,9 @@ th, td { border-bottom: 1px solid var(--line); padding: 10px 8px; text-align: le
 .status-translation_running,
 .status-translated,
 .status-rendering { background: color-mix(in srgb, var(--accent) 18%, var(--card)); color: var(--accent); }
-.status-completed, .status-audio_completed { background: color-mix(in srgb, var(--success) 16%, var(--card)); color: var(--success); }
+.status-completed,
+.status-audio_completed,
+.status-transcription_completed { background: color-mix(in srgb, var(--success) 16%, var(--card)); color: var(--success); }
 .status-translation_paused { background: color-mix(in srgb, var(--warning-strong) 18%, var(--card)); color: var(--warning); }
 .status-blocked, .status-failed { background: color-mix(in srgb, var(--danger) 14%, var(--card)); color: var(--danger); }
 .polling-indicator,
@@ -565,6 +567,7 @@ th, td { border-bottom: 1px solid var(--line); padding: 10px 8px; text-align: le
 .recent-job-rendering { border-left-color: var(--accent); }
 .recent-job-audio_ready,
 .recent-job-audio_completed,
+.recent-job-transcription_completed,
 .recent-job-transcribed,
 .recent-job-translated,
 .recent-job-completed { border-left-color: var(--success); }

@@ -56,6 +56,8 @@ RUNNING_STATUSES = {
 USER_STOP_MESSAGE = "사용자 요청으로 전체 작업이 중단되었습니다."
 TRANSLATION_PROMPT_OPTION = "translation_prompt"
 TRANSLATION_REVIEW_ROUNDS = 2
+SUPPORTED_OPERATIONS = {"extract", "transcribe", "translate", "full"}
+TRANSLATION_OPERATIONS = {"translate", "full"}
 
 
 class NASOrchestrator:
@@ -267,7 +269,11 @@ class NASOrchestrator:
                     source.with_name(f"{source.stem}.ko.ass"),
                 )
             )
-            if operation != "extract" and has_subtitle and not force_overwrite:
+            if (
+                operation in TRANSLATION_OPERATIONS
+                and has_subtitle
+                and not force_overwrite
+            ):
                 skipped += 1
                 continue
             selected.append(source_rel)
@@ -286,7 +292,7 @@ class NASOrchestrator:
         operation: str = "full",
         prompt_category_id: str | None = None,
     ) -> list[NASJob]:
-        if operation not in {"extract", "translate", "full"}:
+        if operation not in SUPPORTED_OPERATIONS:
             raise ValueError("unsupported job operation")
         if operation != "extract" and not self.remote_servers_configured:
             raise ValueError(
@@ -299,7 +305,7 @@ class NASOrchestrator:
             raise ValueError("한 번에 등록할 수 있는 파일 수를 초과했습니다.")
 
         normalized_options = self._normalize_options(options)
-        if operation != "extract":
+        if operation in TRANSLATION_OPERATIONS:
             if prompt_category_id:
                 normalized_options[TRANSLATION_PROMPT_OPTION] = (
                     self._prompt_snapshot(prompt_category_id)
@@ -322,7 +328,7 @@ class NASOrchestrator:
                 if path.exists()
             ]
             if (
-                operation != "extract"
+                operation in TRANSLATION_OPERATIONS
                 and existing_subtitles
                 and not force_overwrite
             ):
@@ -331,60 +337,54 @@ class NASOrchestrator:
                     "덮어쓰기를 명시적으로 선택하세요."
                 )
 
+        reusable_transcripts = (
+            {
+                source_rel: self._reusable_transcript(source_rel)
+                for source_rel in unique_source_rels
+            }
+            if operation == "translate"
+            else {}
+        )
+
         jobs: list[NASJob] = []
         for source_rel in unique_source_rels:
-            reusable = (
-                self.store.latest_audio_job(source_rel)
-                if operation == "translate"
-                else None
-            )
-            if reusable is not None:
+            reusable_transcript = reusable_transcripts.get(source_rel)
+            if reusable_transcript is not None:
+                reusable, transcript_payload = reusable_transcript
                 reusable_options = dict(reusable.options)
-                for key in (
-                    "chunk_length_seconds",
-                    "num_speakers",
-                    "min_speakers",
-                    "max_speakers",
-                    "add_punctuation",
-                    "noise_filter",
-                    TRANSLATION_PROMPT_OPTION,
-                ):
-                    if key in normalized_options:
-                        reusable_options[key] = normalized_options[key]
-                audio_available = bool(
-                    reusable.audio_path
-                    and Path(reusable.audio_path).is_file()
+                reusable_options[TRANSLATION_PROMPT_OPTION] = (
+                    normalized_options[TRANSLATION_PROMPT_OPTION]
                 )
-                self.store.update(
-                    reusable.id,
-                    status="audio_ready" if audio_available else "queued",
-                    force_overwrite=int(force_overwrite),
+                created = self.store.create(
+                    job_id=uuid4().hex,
+                    source_rel=source_rel,
+                    force_overwrite=force_overwrite,
+                    options=reusable_options,
                     operation="translate",
-                    options_json=json.dumps(reusable_options, sort_keys=True),
-                    audio_path=reusable.audio_path if audio_available else None,
-                    audio_sha256=(
-                        reusable.audio_sha256 if audio_available else None
-                    ),
-                    blocked_stage=None,
-                    error=None,
-                    chunks_created=0,
-                    chunks_completed=0,
-                    translation_chunks_total=0,
-                    translation_chunks_completed=0,
-                    translation_pause_requested=0,
+                )
+                transcript_path = artifact_path(
+                    self.settings.state_dir,
+                    created.id,
+                    source_rel,
+                    "transcript",
+                )
+                write_json_atomic(transcript_path, transcript_payload)
+                self.store.update(
+                    created.id,
+                    status="transcribed",
+                    audio_path=reusable.audio_path,
+                    audio_sha256=reusable.audio_sha256,
+                    transcript_path=str(transcript_path),
                 )
                 self.store.add_event(
-                    reusable.id,
+                    created.id,
                     "info",
-                    "subtitle generation requested; reusing extracted audio"
-                    if audio_available
-                    else "subtitle generation requested; audio will be "
-                    "extracted again",
+                    "translation requested; reusing validated transcript",
                 )
-                resumed = self.store.get(reusable.id)
-                if resumed is None:
-                    raise RuntimeError("resumed job could not be read")
-                jobs.append(resumed)
+                refreshed = self.store.get(created.id)
+                if refreshed is None:
+                    raise RuntimeError("translation job could not be read")
+                jobs.append(refreshed)
                 continue
             jobs.append(
                 self.store.create(
@@ -396,6 +396,29 @@ class NASOrchestrator:
                 )
             )
         return jobs
+
+    def _reusable_transcript(
+        self,
+        source_rel: str,
+    ) -> tuple[NASJob, dict[str, Any]]:
+        reusable = self.store.latest_transcript_job(source_rel)
+        message = (
+            f"{source_rel}: 번역에 사용할 유효한 전사 결과가 없습니다. "
+            "먼저 전사를 실행하세요."
+        )
+        if reusable is None or not reusable.transcript_path:
+            raise ValueError(message)
+        transcript_path = Path(reusable.transcript_path)
+        if not transcript_path.is_file():
+            raise ValueError(message)
+        try:
+            payload = json.loads(transcript_path.read_text(encoding="utf-8"))
+            if not isinstance(payload, Mapping):
+                raise ValueError("transcript JSON document must be an object")
+            validate_transcript(payload)
+        except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
+            raise ValueError(message) from error
+        return reusable, dict(payload)
 
     def _normalize_options(
         self,
@@ -471,12 +494,17 @@ class NASOrchestrator:
                     Path(job.transcript_path).read_text(encoding="utf-8")
                 )
                 transcript_segments = validate_transcript(payload)
-                target_status = "transcribed"
+                target_status = (
+                    "transcription_completed"
+                    if job.operation == "transcribe"
+                    else "transcribed"
+                )
             except (OSError, ValueError, json.JSONDecodeError):
                 transcript_segments = None
 
         if (
-            transcript_segments is not None
+            job.operation != "transcribe"
+            and transcript_segments is not None
             and job.translation_path
             and Path(job.translation_path).is_file()
         ):
@@ -633,69 +661,32 @@ class NASOrchestrator:
         original = self.store.get(job_id)
         if original is None:
             raise ValueError("job not found")
-        if original.status not in {"audio_completed", "completed"}:
+        if original.status not in SUCCESS_STATUSES:
             raise ValueError("only successful jobs can be reprocessed")
-        if operation not in {"extract", "translate", "full"}:
+        if operation not in SUPPORTED_OPERATIONS:
             raise ValueError("unsupported job operation")
         if operation != "extract" and not self.remote_servers_configured:
             raise ValueError(
                 "먼저 서버 설정에서 전사 서버와 번역 서버를 저장하세요."
             )
-        if operation != "translate":
-            return self.create_job(
-                original.source_rel,
-                force_overwrite=True,
-                options=original.options,
-                operation=operation,
-                prompt_category_id=(
-                    prompt_category_id if operation != "extract" else None
-                ),
-            )
-
-        reprocess_options = dict(original.options)
-        if prompt_category_id:
-            reprocess_options[TRANSLATION_PROMPT_OPTION] = (
-                self._prompt_snapshot(prompt_category_id)
-            )
-        elif not isinstance(
-            reprocess_options.get(TRANSLATION_PROMPT_OPTION),
-            Mapping,
-        ):
-            reprocess_options[TRANSLATION_PROMPT_OPTION] = (
-                self._legacy_prompt_snapshot()
-            )
-        created = self.store.create(
-            job_id=uuid4().hex,
-            source_rel=original.source_rel,
+        return self.create_job(
+            original.source_rel,
             force_overwrite=True,
-            options=reprocess_options,
-            operation="translate",
+            options=original.options,
+            operation=operation,
+            prompt_category_id=(
+                prompt_category_id
+                if operation in TRANSLATION_OPERATIONS
+                else None
+            ),
         )
-        audio_available = bool(
-            original.audio_path and Path(original.audio_path).is_file()
-        )
-        self.store.update(
-            created.id,
-            status="audio_ready" if audio_available else "queued",
-            audio_path=original.audio_path if audio_available else None,
-            audio_sha256=original.audio_sha256 if audio_available else None,
-        )
-        self.store.add_event(
-            created.id,
-            "info",
-            "reprocessing requested from existing audio"
-            if audio_available
-            else "reprocessing requested; audio will be extracted again",
-        )
-        refreshed = self.store.get(created.id)
-        if refreshed is None:
-            raise RuntimeError("reprocessing job could not be read")
-        return refreshed
 
     def pause_translation(self, job_id: str) -> NASJob:
         job = self.store.get(job_id)
         if job is None:
             raise ValueError("job not found")
+        if job.operation not in TRANSLATION_OPERATIONS:
+            raise ValueError("this job does not include translation")
         if job.status == "translation_paused":
             return job
         if job.status == "transcribed":
@@ -803,7 +794,12 @@ class NASOrchestrator:
         job = self.store.get(job_id)
         if job is None:
             raise ValueError("job not found")
-        if job.status not in {"completed", "blocked", "failed"}:
+        if job.status not in {
+            "transcription_completed",
+            "completed",
+            "blocked",
+            "failed",
+        }:
             raise ValueError(
                 "완료되거나 중단된 작업의 JSON만 편집할 수 있습니다."
             )
@@ -1124,11 +1120,19 @@ class NASOrchestrator:
         write_json_atomic(transcript_path, payload)
         current = self.store.get(job.id)
         translation_paused = bool(
-            current and current.translation_pause_requested
+            job.operation in TRANSLATION_OPERATIONS
+            and current
+            and current.translation_pause_requested
         )
+        if job.operation == "transcribe":
+            next_status = "transcription_completed"
+        elif translation_paused:
+            next_status = "translation_paused"
+        else:
+            next_status = "transcribed"
         self.store.update(
             job.id,
-            status="translation_paused" if translation_paused else "transcribed",
+            status=next_status,
             transcript_path=str(transcript_path),
         )
         self.store.add_event(

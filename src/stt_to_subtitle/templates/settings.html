@@ -143,7 +143,7 @@
     </div>
 
     {% for category in prompt_categories %}
-      <details class="card settings-card prompt-category-card{% if category.archived %} is-archived{% endif %}"{% if not category.archived %} open{% endif %}>
+      <details class="card settings-card prompt-category-card{% if category.archived %} is-archived{% endif %}">
         <summary>
           <strong>{{ category.name }}</strong>
           {% if category.archived %}<span class="status">보관됨</span>{% endif %}
