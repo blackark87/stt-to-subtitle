@@ -1,5 +1,17 @@
+{% import "_icons.html" as icons %}
 {% macro job_item(job) %}
-  <article class="recent-job-item recent-job-{{ job.status }}{% if job.status in ['audio_completed', 'completed'] %} is-completed{% endif %}">
+  {% set is_running = job.status in ['extracting', 'transcription_running', 'translation_running', 'rendering'] %}
+  {% set is_attention = job.status in ['blocked', 'failed'] %}
+  {% set is_completed = job.status in ['audio_completed', 'completed'] %}
+  {% set status_group = 'running' if is_running else ('attention' if is_attention else ('completed' if is_completed else 'waiting')) %}
+  <article class="recent-job-item recent-job-{{ job.status }}{% if is_completed %} is-completed{% endif %}">
+    <div class="recent-job-status-icon recent-job-status-{{ status_group }}" aria-hidden="true">
+      {% if status_group == 'running' %}{{ icons.activity(18) }}
+      {% elif status_group == 'attention' %}{{ icons.alert_triangle(18) }}
+      {% elif status_group == 'completed' %}{{ icons.check(18) }}
+      {% else %}{{ icons.clock(18) }}
+      {% endif %}
+    </div>
     <div class="recent-job-main">
       <div class="recent-job-heading">
         <div class="recent-job-title-group">
@@ -41,13 +53,13 @@
         <form method="post" action="/jobs/{{ job.id }}/pause-translation">
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
           <input type="hidden" name="return_folder" value="{{ current_folder }}">
-          <button type="submit" class="secondary compact">번역 중단</button>
+          <button type="submit" class="secondary compact">{{ icons.pause(14) }}번역 중단</button>
         </form>
       {% elif job.status == "translation_paused" %}
         <form method="post" action="/jobs/{{ job.id }}/resume-translation">
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
           <input type="hidden" name="return_folder" value="{{ current_folder }}">
-          <button type="submit" class="compact">번역 이어 하기</button>
+          <button type="submit" class="compact">{{ icons.play(14) }}번역 이어 하기</button>
         </form>
       {% endif %}
       {% if job.status == "completed" and job.transcript_path %}
@@ -59,14 +71,14 @@
               <option value="{{ category.id }}"{% if job.options.translation_prompt and job.options.translation_prompt.category_id == category.id %} selected{% endif %}>{{ category.name }}</option>
             {% endfor %}
           </select>
-          <button type="submit" class="secondary compact">번역 다시 시작</button>
+          <button type="submit" class="secondary compact">{{ icons.refresh(14) }}번역 다시 시작</button>
         </form>
       {% endif %}
       {% if job.remote_transcription_missing %}
         <form method="post" action="/jobs/{{ job.id }}/delete" data-confirm-message="원격 전사 서버에서 사라진 작업 기록을 삭제하시겠습니까? 원본 영상과 생성·중간 파일은 삭제하지 않습니다.">
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
           <input type="hidden" name="return_folder" value="{{ current_folder }}">
-          <button type="submit" class="danger compact">작업 삭제</button>
+          <button type="submit" class="danger compact">{{ icons.trash(14) }}작업 삭제</button>
         </form>
       {% endif %}
     </div>
@@ -83,12 +95,12 @@
       <form method="post" action="/jobs/pause-all-translations" data-confirm-message="대기·실행 중인 모든 번역을 중단하시겠습니까? 오디오 추출과 전사는 계속 진행됩니다.">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <input type="hidden" name="return_folder" value="{{ current_folder }}">
-        <button type="submit" class="secondary compact"{% if not pausable_translation_count %} disabled{% endif %}>전체 번역 중단 ({{ pausable_translation_count }})</button>
+        <button type="submit" class="secondary compact"{% if not pausable_translation_count %} disabled{% endif %}>{{ icons.pause(14) }}전체 번역 중단 ({{ pausable_translation_count }})</button>
       </form>
       <form method="post" action="/jobs/stop-all" data-confirm-message="진행·대기 중인 모든 작업을 중단하시겠습니까? 완료된 작업과 결과 파일은 유지됩니다.">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <input type="hidden" name="return_folder" value="{{ current_folder }}">
-        <button type="submit" class="danger compact"{% if not stoppable_job_count %} disabled{% endif %}>전체 작업 중단 ({{ stoppable_job_count }})</button>
+        <button type="submit" class="danger compact"{% if not stoppable_job_count %} disabled{% endif %}>{{ icons.alert_triangle(14) }}전체 작업 중단 ({{ stoppable_job_count }})</button>
       </form>
     </div>
   </div>
@@ -96,9 +108,9 @@
     <div class="recent-job-list">{% for job in recent_jobs %}{{ job_item(job) }}{% endfor %}</div>
     {% if jobs_has_previous or jobs_has_next %}
       <nav class="pagination" aria-label="전체 작업 페이지">
-        {% if jobs_has_previous %}<a class="button secondary compact" href="/?folder={{ current_folder|urlencode }}&amp;jobs_page={{ jobs_page - 1 }}">← 이전</a>{% endif %}
+        {% if jobs_has_previous %}<a class="button secondary compact" href="/?folder={{ current_folder|urlencode }}&amp;jobs_page={{ jobs_page - 1 }}">{{ icons.chevron_left(14) }}이전</a>{% endif %}
         <span>{{ jobs_page }}페이지 · 총 {{ job_count }}개</span>
-        {% if jobs_has_next %}<a class="button secondary compact" href="/?folder={{ current_folder|urlencode }}&amp;jobs_page={{ jobs_page + 1 }}">다음 →</a>{% endif %}
+        {% if jobs_has_next %}<a class="button secondary compact" href="/?folder={{ current_folder|urlencode }}&amp;jobs_page={{ jobs_page + 1 }}">다음{{ icons.chevron_right(14) }}</a>{% endif %}
       </nav>
     {% endif %}
   {% else %}

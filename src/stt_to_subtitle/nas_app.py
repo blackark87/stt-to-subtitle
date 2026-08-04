@@ -295,6 +295,14 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
         job_count = service.store.count_jobs()
         jobs_offset = (jobs_page - 1) * RECENT_JOB_LIMIT
         open_jobs = service.store.list_open_jobs()
+        running_count = sum(
+            job.status
+            in {"extracting", "transcription_running", "translation_running", "rendering"}
+            for job in open_jobs
+        )
+        attention_count = sum(job.status in {"blocked", "failed"} for job in open_jobs)
+        waiting_count = len(open_jobs) - running_count - attention_count
+        completed_count = service.store.count_successful_jobs()
         return {
             "request": request,
             "recent_jobs": service.store.list_jobs(
@@ -305,6 +313,12 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
             "pausable_translation_count": sum(
                 job.can_pause_translation for job in open_jobs
             ),
+            "job_stats": {
+                "running": running_count,
+                "attention": attention_count,
+                "waiting": waiting_count,
+                "completed": completed_count,
+            },
             "jobs_page": jobs_page,
             "jobs_has_previous": jobs_page > 1,
             "jobs_has_next": jobs_offset + RECENT_JOB_LIMIT < job_count,

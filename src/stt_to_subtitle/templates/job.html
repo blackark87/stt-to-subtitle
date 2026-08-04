@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% import "_icons.html" as icons %}
 {% block title %}{{ job.source_rel }} · STT to Subtitle{% endblock %}
 {% block head %}
   <script defer src="{{ url_for('static', path='/vr180-player.js') }}"></script>
@@ -13,7 +14,7 @@
         <p class="job-source-path">{{ job.source_rel|parent_path }}</p>
       {% endif %}
     </div>
-    <a href="/" class="button secondary">← 최근 작업으로</a>
+    <a href="/" class="button secondary">{{ icons.chevron_left(16) }}최근 작업으로</a>
   </div>
   <div
     {% if job.status not in ["audio_completed", "completed", "translation_paused", "blocked", "failed"] %}

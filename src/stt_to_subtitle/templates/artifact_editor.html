@@ -1,10 +1,11 @@
 {% extends "base.html" %}
+{% import "_icons.html" as icons %}
 {% block title %}{{ filename }} 편집 · STT to Subtitle{% endblock %}
 {% block head %}
   <script defer src="{{ url_for('static', path='/json-editor.js') }}"></script>
 {% endblock %}
 {% block content %}
-  <p><a href="/jobs/{{ job.id }}">← 작업 상세</a></p>
+  <p><a href="/jobs/{{ job.id }}">{{ icons.chevron_left(14) }}작업 상세</a></p>
   <div class="editor-heading">
     <div>
       <p class="editor-kicker">{{ label }}</p>
@@ -28,7 +29,7 @@
         <strong>JSON 편집</strong>
         <span class="muted">저장 전에 형식과 세그먼트 ID를 검증합니다.</span>
       </div>
-      <button type="button" class="secondary compact" data-format-json>JSON 정렬</button>
+      <button type="button" class="secondary compact" data-format-json>{{ icons.braces(14) }}JSON 정렬</button>
     </div>
     <textarea
       name="content"

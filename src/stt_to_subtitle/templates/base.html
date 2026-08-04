@@ -9,16 +9,20 @@
     {% block head %}{% endblock %}
   </head>
   <body>
+    {% import "_icons.html" as icons %}
     <header class="topbar">
-      <a href="/" class="brand">STT to Subtitle</a>
+      <a href="/" class="brand">
+        <span class="brand-mark" aria-hidden="true">{{ icons.captions(16) }}</span>
+        STT to Subtitle
+      </a>
       <div class="topbar-actions">
         {% if not request.app.state.authentication_enabled or request.session.get("authenticated") %}
-          <a href="/settings" class="button secondary">서버 설정</a>
+          <a href="/settings" class="button secondary">{{ icons.settings(16) }}서버 설정</a>
         {% endif %}
         {% if request.app.state.authentication_enabled and request.session.get("authenticated") %}
           <form method="post" action="/logout">
             <input type="hidden" name="csrf_token" value="{{ request.session.get('csrf_token') }}">
-            <button type="submit" class="secondary">로그아웃</button>
+            <button type="submit" class="secondary">{{ icons.log_out(16) }}로그아웃</button>
           </form>
         {% endif %}
       </div>
