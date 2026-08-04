@@ -22,11 +22,11 @@ class ReleaseConfigurationTests(unittest.TestCase):
         self.assertIn("stt-to-subtitle:latest", compose)
         self.assertIn("stt-to-subtitle:latest", example)
 
-    def test_project_version_is_0_12_0(self) -> None:
+    def test_project_version_is_0_12_1(self) -> None:
         project = tomllib.loads(
             (ROOT / "pyproject.toml").read_text(encoding="utf-8")
         )
-        self.assertEqual(project["project"]["version"], "0.12.0")
+        self.assertEqual(project["project"]["version"], "0.12.1")
 
 
 if __name__ == "__main__":
