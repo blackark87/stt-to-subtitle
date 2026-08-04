@@ -4,8 +4,10 @@ import unittest
 from unittest.mock import Mock, patch
 
 from stt_to_subtitle.service_clients import (
+    ExternalServiceError,
     LMStudioClient,
     OpenAICompatibleClient,
+    OperationStopped,
     RetryingJSONClient,
     STTAPIClient,
     TranslationPaused,
@@ -107,6 +109,26 @@ class OpenAICompatibleModelTests(unittest.TestCase):
 
 
 class STTAPIClientProgressTests(unittest.TestCase):
+    def test_stops_polling_when_requested(self) -> None:
+        running = Mock(status_code=200)
+        running.json.return_value = {"status": "running"}
+        client = STTAPIClient("http://stt.test", "", poll_interval=0.01)
+        client.request = Mock(return_value=running)
+        should_stop = Mock(side_effect=[False, True])
+
+        with patch(
+            "stt_to_subtitle.service_clients.time.sleep"
+        ), self.assertRaises(OperationStopped):
+            client.transcribe(
+                Path("/not-read.wav"),
+                options={},
+                idempotency_key="key",
+                existing_job_id="remote-job",
+                should_stop=should_stop,
+            )
+
+        client.request.assert_called_once()
+
     def test_forwards_changed_chunk_progress_while_polling(self) -> None:
         running = Mock(status_code=200)
         running.json.return_value = {
@@ -167,6 +189,102 @@ class STTAPIClientProgressTests(unittest.TestCase):
 
 
 class TranslationResponseTests(unittest.TestCase):
+    def test_adds_five_previous_and_three_following_context_segments(
+        self,
+    ) -> None:
+        client = OpenAICompatibleClient(
+            "http://translation.test/v1",
+            "",
+            "model",
+            max_segments=2,
+        )
+        calls: list[tuple[list[str], list[str]]] = []
+
+        def translate_batch(batch, context, _prompt):
+            calls.append(
+                (
+                    [str(item["id"]) for item in batch],
+                    [str(item["id"]) for item in context],
+                )
+            )
+            return [
+                {"id": str(item["id"]), "text": f"번역-{item['id']}"}
+                for item in batch
+            ]
+
+        client._translate_batch_with_recovery = Mock(
+            side_effect=translate_batch
+        )
+        segments = [
+            {"id": f"segment-{index}", "text": str(index)}
+            for index in range(1, 9)
+        ]
+
+        client.translate(segments)
+
+        self.assertEqual(calls[0][0], ["segment-1", "segment-2"])
+        self.assertEqual(
+            calls[0][1],
+            ["segment-3", "segment-4", "segment-5"],
+        )
+        self.assertEqual(calls[2][0], ["segment-5", "segment-6"])
+        self.assertEqual(
+            calls[2][1],
+            [
+                "segment-1",
+                "segment-2",
+                "segment-3",
+                "segment-4",
+                "segment-7",
+                "segment-8",
+            ],
+        )
+
+    def test_reviews_twice_and_stops_when_the_result_is_unchanged(self) -> None:
+        client = OpenAICompatibleClient(
+            "http://translation.test/v1",
+            "",
+            "model",
+        )
+        draft = [{"id": "segment-1", "text": "초벌"}]
+        reviewed = [{"id": "segment-1", "text": "교정"}]
+        client._translate_batch_with_recovery = Mock(return_value=draft)
+        client._review_batch_with_recovery = Mock(
+            side_effect=[reviewed, reviewed]
+        )
+
+        result = client.translate(
+            [{"id": "segment-1", "text": "原文"}],
+            review_prompt="review",
+            review_rounds=2,
+        )
+
+        self.assertEqual(result, reviewed)
+        self.assertEqual(client._review_batch_with_recovery.call_count, 2)
+
+    def test_uses_the_initial_translation_when_review_fails(self) -> None:
+        client = OpenAICompatibleClient(
+            "http://translation.test/v1",
+            "",
+            "model",
+        )
+        draft = [{"id": "segment-1", "text": "초벌"}]
+        warnings: list[str] = []
+        client._translate_batch_with_recovery = Mock(return_value=draft)
+        client._review_batch_with_recovery = Mock(
+            side_effect=ExternalServiceError("review unavailable")
+        )
+
+        result = client.translate(
+            [{"id": "segment-1", "text": "原文"}],
+            review_prompt="review",
+            review_rounds=2,
+            on_review_warning=warnings.append,
+        )
+
+        self.assertEqual(result, draft)
+        self.assertEqual(warnings, ["review unavailable"])
+
     def test_reports_logical_batch_progress_and_pauses_after_checkpoint(
         self,
     ) -> None:
@@ -177,7 +295,7 @@ class TranslationResponseTests(unittest.TestCase):
             max_segments=1,
         )
         client._translate_batch_with_recovery = Mock(
-            side_effect=lambda batch: [
+            side_effect=lambda batch, *_args: [
                 {"id": str(batch[0]["id"]), "text": "번역"}
             ]
         )
@@ -259,7 +377,7 @@ class TranslationResponseTests(unittest.TestCase):
     def test_splits_a_mismatched_batch_for_recovery(self) -> None:
         client = LMStudioClient("http://lm.test/v1", "", "model")
 
-        def translate_batch(segments):
+        def translate_batch(segments, *_args):
             if len(segments) > 1:
                 raise TranslationResponseIDError("mismatch")
             return [
@@ -323,7 +441,7 @@ class TranslationResponseTests(unittest.TestCase):
         )
         self.assertIn("Japanese spoken subtitle segments", KOREAN_JAV_SYSTEM_PROMPT)
         self.assertIn('"translations"', KOREAN_JAV_SYSTEM_PROMPT)
-        self.assertIn("Preserve every id exactly", KOREAN_JAV_SYSTEM_PROMPT)
+        self.assertIn("Preserve every target id exactly", KOREAN_JAV_SYSTEM_PROMPT)
         self.assertIn("生ハメ→노콘", KOREAN_JAV_SYSTEM_PROMPT)
         for metadata_marker in (
             "<<<actress",

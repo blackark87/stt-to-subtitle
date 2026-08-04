@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 import math
 import os
@@ -413,6 +413,56 @@ class MediaLibrary:
             "folders": folders,
             "files": files,
         }
+
+    def list_media_recursive(
+        self,
+        relative_directories: Sequence[str],
+    ) -> list[str]:
+        """Return supported media below selected folders without following links."""
+        selected: set[str] = set()
+        pending: list[Path] = []
+        for relative in dict.fromkeys(relative_directories):
+            raw_relative = Path(relative)
+            candidate = self.root
+            for part in raw_relative.parts:
+                candidate /= part
+                if candidate.is_symlink():
+                    raise ValueError("symbolic-link folders cannot be selected")
+            pending.append(self.resolve_directory(relative))
+        visited: set[Path] = set()
+        while pending:
+            directory = pending.pop()
+            if directory in visited:
+                continue
+            visited.add(directory)
+            try:
+                children = sorted(
+                    directory.iterdir(),
+                    key=lambda path: path.name.casefold(),
+                    reverse=True,
+                )
+            except OSError as error:
+                raise ValueError("media folder cannot be read") from error
+            for child in children:
+                if child.is_symlink():
+                    continue
+                if child.is_dir():
+                    if not _is_ignored_directory(child.name):
+                        pending.append(child)
+                    continue
+                if (
+                    not child.is_file()
+                    or child.suffix.lower() not in MEDIA_EXTENSIONS
+                    or _is_ignored_file(child.name)
+                    or _is_hidden_media_file(child.name)
+                ):
+                    continue
+                selected.add(child.relative_to(self.root).as_posix())
+                if len(selected) > self.maximum_files:
+                    raise ValueError(
+                        "한 번에 등록할 수 있는 파일 수를 초과했습니다."
+                    )
+        return sorted(selected, key=str.casefold)
 
     def _describe_media(self, path: Path) -> dict[str, object]:
         relative = path.relative_to(self.root).as_posix()

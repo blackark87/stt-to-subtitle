@@ -1,4 +1,4 @@
-"""NAS web UI with optional authentication for the subtitle pipeline."""
+"""Container-friendly web UI for the subtitle pipeline."""
 
 from __future__ import annotations
 
@@ -136,7 +136,7 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
             orchestrator.stop()
 
     app = FastAPI(
-        title="stt-to-subtitle NAS orchestrator",
+        title="stt-to-subtitle orchestrator",
         version="1.0.0",
         lifespan=lifespan,
         docs_url=None,
@@ -182,6 +182,23 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
 
     def login_redirect() -> RedirectResponse:
         return RedirectResponse("/login", status_code=status.HTTP_303_SEE_OTHER)
+
+    def dashboard_location(folder: str = "", **values: object) -> str:
+        query = {
+            key: value
+            for key, value in {"folder": folder, **values}.items()
+            if value not in (None, "")
+        }
+        return f"/?{urlencode(query)}" if query else "/"
+
+    def job_action_location(
+        job_id: str,
+        return_folder: str | None,
+        **values: object,
+    ) -> str:
+        if return_folder is None:
+            return f"/jobs/{job_id}"
+        return dashboard_location(return_folder, **values)
 
     def validate_csrf(request: Request, csrf_token: str) -> None:
         if not authentication_enabled:
@@ -247,7 +264,7 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
         error: str | None = None,
         notice: str | None = None,
         folder: str = "",
-        completed_page: int = 1,
+        jobs_page: int = 1,
     ) -> dict[str, Any]:
         service = orchestrator(request)
         browser = service.library.browse(folder)
@@ -274,26 +291,29 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
             media["job_id"] = linked_job.id if linked_job else None
             media["selectable"] = media["subtitle_state"] == "pending"
 
-        completed_page = max(1, completed_page)
-        completed_count = service.store.count_successful_jobs()
-        completed_offset = (completed_page - 1) * RECENT_JOB_LIMIT
+        jobs_page = max(1, jobs_page)
+        job_count = service.store.count_jobs()
+        jobs_offset = (jobs_page - 1) * RECENT_JOB_LIMIT
+        open_jobs = service.store.list_open_jobs()
         return {
             "request": request,
-            "open_jobs": service.store.list_open_jobs(),
-            "completed_jobs": service.store.list_successful_jobs(
+            "recent_jobs": service.store.list_jobs(
                 limit=RECENT_JOB_LIMIT,
-                offset=completed_offset,
+                offset=jobs_offset,
             ),
-            "completed_page": completed_page,
-            "completed_has_previous": completed_page > 1,
-            "completed_has_next": (
-                completed_offset + RECENT_JOB_LIMIT < completed_count
+            "stoppable_job_count": sum(job.can_stop for job in open_jobs),
+            "pausable_translation_count": sum(
+                job.can_pause_translation for job in open_jobs
             ),
-            "completed_count": completed_count,
+            "jobs_page": jobs_page,
+            "jobs_has_previous": jobs_page > 1,
+            "jobs_has_next": jobs_offset + RECENT_JOB_LIMIT < job_count,
+            "job_count": job_count,
             "csrf_token": request.session.get("csrf_token", ""),
             "error": error,
             "notice": notice,
             "remote_servers": service.remote_servers_view(),
+            "prompt_categories": service.active_prompt_categories(),
             **browser,
         }
 
@@ -353,22 +373,37 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
     def dashboard(
         request: Request,
         queued: int | None = None,
+        translation_pause_requested: int | None = None,
+        translations_paused: int | None = None,
+        jobs_stopped: int | None = None,
+        skipped: int | None = None,
         folder: str = "",
-        completed_page: int = 1,
+        jobs_page: int = 1,
+        completed_page: int | None = None,
     ) -> Any:
         if not is_authenticated(request):
             return login_redirect()
-        notice = (
-            f"작업 {queued}개를 등록했습니다."
-            if queued is not None and queued > 0
-            else None
-        )
+        notice = None
+        if queued is not None and queued > 0:
+            notice = f"작업 {queued}개를 등록했습니다."
+            if skipped:
+                notice += f" 기존 작업·자막 {skipped}개는 제외했습니다."
+        elif translation_pause_requested is not None:
+            notice = "번역 중단 요청을 반영했습니다."
+        elif translations_paused is not None:
+            notice = f"번역 작업 {translations_paused}개에 중단을 요청했습니다."
+        elif jobs_stopped is not None:
+            notice = f"진행 중인 작업 {jobs_stopped}개에 중단을 요청했습니다."
         try:
             context = dashboard_context(
                 request,
                 notice=notice,
                 folder=folder,
-                completed_page=completed_page,
+                jobs_page=(
+                    completed_page
+                    if completed_page is not None and jobs_page == 1
+                    else jobs_page
+                ),
             )
             response_status = status.HTTP_200_OK
         except ValueError as error:
@@ -398,12 +433,14 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
             "error": error,
             "notice": notice,
             "remote_servers": server_values,
+            "prompt_categories": service.all_prompt_categories(),
         }
 
     @app.get("/settings", response_class=HTMLResponse)
     def server_settings_page(
         request: Request,
         saved: bool = False,
+        prompt_saved: bool = False,
     ) -> Any:
         if not is_authenticated(request):
             return login_redirect()
@@ -412,7 +449,13 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
             "settings.html",
             settings_context(
                 request,
-                notice="서버 설정을 저장했습니다." if saved else None,
+                notice=(
+                    "서버 설정을 저장했습니다."
+                    if saved
+                    else "번역 프롬프트 설정을 저장했습니다."
+                    if prompt_saved
+                    else None
+                ),
             ),
         )
 
@@ -506,6 +549,112 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
             status_code=status.HTTP_303_SEE_OTHER,
         )
 
+    def render_prompt_settings_error(
+        request: Request,
+        error: ValueError,
+    ) -> Any:
+        return TEMPLATES.TemplateResponse(
+            request,
+            "settings.html",
+            settings_context(request, error=str(error)),
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+    @app.post("/settings/prompt-categories", response_class=HTMLResponse)
+    def create_prompt_category(
+        request: Request,
+        csrf_token: str = Form(""),
+        name: str = Form(...),
+        translation_prompt: str = Form(...),
+        review_prompt: str = Form(...),
+    ) -> Any:
+        if not is_authenticated(request):
+            return login_redirect()
+        validate_csrf(request, csrf_token)
+        try:
+            orchestrator(request).store.create_prompt_category(
+                name=name,
+                translation_prompt=translation_prompt,
+                review_prompt=review_prompt,
+            )
+        except ValueError as error:
+            return render_prompt_settings_error(request, error)
+        return RedirectResponse(
+            "/settings?prompt_saved=true#prompt-categories",
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+
+    @app.post(
+        "/settings/prompt-categories/{category_id}",
+        response_class=HTMLResponse,
+    )
+    def update_prompt_category(
+        request: Request,
+        category_id: str,
+        csrf_token: str = Form(""),
+        name: str = Form(...),
+        translation_prompt: str = Form(...),
+        review_prompt: str = Form(...),
+    ) -> Any:
+        if not is_authenticated(request):
+            return login_redirect()
+        validate_csrf(request, csrf_token)
+        try:
+            orchestrator(request).store.update_prompt_category(
+                category_id,
+                name=name,
+                translation_prompt=translation_prompt,
+                review_prompt=review_prompt,
+            )
+        except ValueError as error:
+            return render_prompt_settings_error(request, error)
+        return RedirectResponse(
+            "/settings?prompt_saved=true#prompt-categories",
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+
+    @app.post("/settings/prompt-categories/{category_id}/archive")
+    def archive_prompt_category(
+        request: Request,
+        category_id: str,
+        csrf_token: str = Form(""),
+    ) -> Any:
+        if not is_authenticated(request):
+            return login_redirect()
+        validate_csrf(request, csrf_token)
+        try:
+            orchestrator(request).store.set_prompt_category_archived(
+                category_id,
+                archived=True,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        return RedirectResponse(
+            "/settings?prompt_saved=true#prompt-categories",
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+
+    @app.post("/settings/prompt-categories/{category_id}/restore")
+    def restore_prompt_category(
+        request: Request,
+        category_id: str,
+        csrf_token: str = Form(""),
+    ) -> Any:
+        if not is_authenticated(request):
+            return login_redirect()
+        validate_csrf(request, csrf_token)
+        try:
+            orchestrator(request).store.set_prompt_category_archived(
+                category_id,
+                archived=False,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        return RedirectResponse(
+            "/settings?prompt_saved=true#prompt-categories",
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+
     @app.get(
         "/media/posters/{poster_path:path}",
         name="media_poster",
@@ -525,30 +674,38 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
     @app.get("/jobs-fragment", response_class=HTMLResponse)
     def jobs_fragment(
         request: Request,
-        completed_page: int = 1,
+        jobs_page: int = 1,
+        completed_page: int | None = None,
         folder: str = "",
     ) -> Any:
         if not is_authenticated(request):
             raise HTTPException(status_code=401, detail="authentication required")
         service = orchestrator(request)
-        completed_page = max(1, completed_page)
-        completed_count = service.store.count_successful_jobs()
-        completed_offset = (completed_page - 1) * RECENT_JOB_LIMIT
+        if completed_page is not None and jobs_page == 1:
+            jobs_page = completed_page
+        jobs_page = max(1, jobs_page)
+        job_count = service.store.count_jobs()
+        jobs_offset = (jobs_page - 1) * RECENT_JOB_LIMIT
+        open_jobs = service.store.list_open_jobs()
         return TEMPLATES.TemplateResponse(
             request,
             "_jobs_table.html",
             {
-                "open_jobs": service.store.list_open_jobs(),
-                "completed_jobs": service.store.list_successful_jobs(
+                "recent_jobs": service.store.list_jobs(
                     limit=RECENT_JOB_LIMIT,
-                    offset=completed_offset,
+                    offset=jobs_offset,
                 ),
-                "completed_page": completed_page,
-                "completed_has_previous": completed_page > 1,
-                "completed_has_next": (
-                    completed_offset + RECENT_JOB_LIMIT < completed_count
+                "stoppable_job_count": sum(job.can_stop for job in open_jobs),
+                "pausable_translation_count": sum(
+                    job.can_pause_translation for job in open_jobs
                 ),
-                "completed_count": completed_count,
+                "jobs_page": jobs_page,
+                "jobs_has_previous": jobs_page > 1,
+                "jobs_has_next": (
+                    jobs_offset + RECENT_JOB_LIMIT < job_count
+                ),
+                "job_count": job_count,
+                "prompt_categories": service.active_prompt_categories(),
                 "current_folder": folder,
                 "csrf_token": request.session.get("csrf_token", ""),
             },
@@ -558,6 +715,7 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
     def create_job(
         request: Request,
         source_rels: list[str] | None = Form(None),
+        folder_rels: list[str] | None = Form(None),
         return_folder: str = Form(""),
         csrf_token: str = Form(""),
         force_overwrite: bool = Form(False),
@@ -571,6 +729,7 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
         add_punctuation: bool = Form(False),
         noise_filter: list[bool] | None = Form(None),
         operation: str = Form("full"),
+        prompt_category_id: str = Form(""),
     ) -> Any:
         if not is_authenticated(request):
             return login_redirect()
@@ -587,11 +746,23 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
             "noise_filter": noise_filter[-1] if noise_filter else True,
         }
         try:
-            jobs = orchestrator(request).create_jobs(
+            service = orchestrator(request)
+            if operation != "extract" and not prompt_category_id.strip():
+                raise ValueError("번역 프롬프트 카테고리를 선택하세요.")
+            selected_sources, skipped = service.expand_job_sources(
                 source_rels or [],
+                folder_rels or [],
+                force_overwrite=force_overwrite,
+                operation=operation,
+            )
+            jobs = service.create_jobs(
+                selected_sources,
                 force_overwrite=force_overwrite,
                 options=options,
                 operation=operation,
+                prompt_category_id=(
+                    prompt_category_id if operation != "extract" else None
+                ),
             )
         except (FileExistsError, OSError, ValueError) as error:
             try:
@@ -609,6 +780,8 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
                 status_code=status.HTTP_400_BAD_REQUEST,
             )
         query = {"queued": len(jobs)}
+        if skipped:
+            query["skipped"] = skipped
         if return_folder:
             query["folder"] = return_folder
         return RedirectResponse(
@@ -770,6 +943,7 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
                     )
                 ],
                 "csrf_token": request.session.get("csrf_token", ""),
+                "prompt_categories": service.active_prompt_categories(),
                 "video_mime_type": guess_media_type(job.source_rel),
                 "artifact_names": {
                     "transcript": artifact_filename(
@@ -805,6 +979,7 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
                     )
                 ],
                 "csrf_token": request.session.get("csrf_token", ""),
+                "prompt_categories": service.active_prompt_categories(),
                 "video_mime_type": guess_media_type(job.source_rel),
                 "artifact_names": {
                     "transcript": artifact_filename(
@@ -842,16 +1017,42 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
         request: Request,
         job_id: str,
         csrf_token: str = Form(""),
+        return_folder: str | None = Form(None),
+        prompt_category_id: str = Form(""),
     ) -> Any:
         if not is_authenticated(request):
             return login_redirect()
         validate_csrf(request, csrf_token)
         try:
-            orchestrator(request).restart_translation(job_id)
+            if not prompt_category_id.strip():
+                raise ValueError("번역 프롬프트 카테고리를 선택하세요.")
+            orchestrator(request).restart_translation(
+                job_id,
+                prompt_category_id,
+            )
         except (OSError, UnicodeError, ValueError) as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
         return RedirectResponse(
-            f"/jobs/{job_id}",
+            job_action_location(job_id, return_folder),
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+
+    @app.post("/jobs/{job_id}/delete")
+    def delete_job(
+        request: Request,
+        job_id: str,
+        csrf_token: str = Form(""),
+        return_folder: str | None = Form(None),
+    ) -> Any:
+        if not is_authenticated(request):
+            return login_redirect()
+        validate_csrf(request, csrf_token)
+        try:
+            orchestrator(request).delete_missing_remote_transcription(job_id)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        return RedirectResponse(
+            dashboard_location(return_folder or ""),
             status_code=status.HTTP_303_SEE_OTHER,
         )
 
@@ -860,6 +1061,7 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
         request: Request,
         job_id: str,
         csrf_token: str = Form(""),
+        return_folder: str | None = Form(None),
     ) -> Any:
         if not is_authenticated(request):
             return login_redirect()
@@ -869,7 +1071,11 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
         except ValueError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
         return RedirectResponse(
-            f"/jobs/{job_id}",
+            job_action_location(
+                job_id,
+                return_folder,
+                translation_pause_requested=1,
+            ),
             status_code=status.HTTP_303_SEE_OTHER,
         )
 
@@ -878,6 +1084,7 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
         request: Request,
         job_id: str,
         csrf_token: str = Form(""),
+        return_folder: str | None = Form(None),
     ) -> Any:
         if not is_authenticated(request):
             return login_redirect()
@@ -887,7 +1094,40 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
         except ValueError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
         return RedirectResponse(
-            f"/jobs/{job_id}",
+            job_action_location(job_id, return_folder),
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+
+    @app.post("/jobs/pause-all-translations")
+    def pause_all_translations(
+        request: Request,
+        csrf_token: str = Form(""),
+        return_folder: str = Form(""),
+    ) -> Any:
+        if not is_authenticated(request):
+            return login_redirect()
+        validate_csrf(request, csrf_token)
+        paused_count = orchestrator(request).pause_all_translations()
+        return RedirectResponse(
+            dashboard_location(
+                return_folder,
+                translations_paused=paused_count,
+            ),
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+
+    @app.post("/jobs/stop-all")
+    def stop_all_jobs(
+        request: Request,
+        csrf_token: str = Form(""),
+        return_folder: str = Form(""),
+    ) -> Any:
+        if not is_authenticated(request):
+            return login_redirect()
+        validate_csrf(request, csrf_token)
+        stopped_count = orchestrator(request).stop_all_jobs()
+        return RedirectResponse(
+            dashboard_location(return_folder, jobs_stopped=stopped_count),
             status_code=status.HTTP_303_SEE_OTHER,
         )
 
@@ -897,12 +1137,21 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
         job_id: str,
         csrf_token: str = Form(""),
         operation: str = Form(...),
+        prompt_category_id: str = Form(""),
     ) -> Any:
         if not is_authenticated(request):
             return login_redirect()
         validate_csrf(request, csrf_token)
         try:
-            created = orchestrator(request).reprocess(job_id, operation)
+            if operation != "extract" and not prompt_category_id.strip():
+                raise ValueError("번역 프롬프트 카테고리를 선택하세요.")
+            created = orchestrator(request).reprocess(
+                job_id,
+                operation,
+                prompt_category_id=(
+                    prompt_category_id if operation != "extract" else None
+                ),
+            )
         except (FileExistsError, OSError, ValueError) as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
         return RedirectResponse(

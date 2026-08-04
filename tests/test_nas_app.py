@@ -67,7 +67,7 @@ class NASAppTests(unittest.TestCase):
                 poster = client.get("/media/posters/show/poster.jpg")
 
             self.assertEqual(root_response.status_code, 200)
-            self.assertIn('class="folder-card"', root_response.text)
+            self.assertIn('class="folder-card media-card', root_response.text)
             self.assertIn("data-folder-link", root_response.text)
             self.assertIn("data-folder-loading", root_response.text)
             self.assertIn("folder-browser.js", root_response.text)
@@ -154,6 +154,62 @@ class NASAppTests(unittest.TestCase):
             )
             self.assertEqual(reloaded.lm_client.model, "new-model")
             self.assertIn("http://new-stt.test:8100", reloaded_page.text)
+
+    def test_manages_prompt_categories_without_nas_ui_labels(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+
+            with TestClient(
+                create_app(self.settings(root, media_root))
+            ) as client:
+                page = client.get("/settings")
+                created = client.post(
+                    "/settings/prompt-categories",
+                    data={
+                        "name": "드라마",
+                        "translation_prompt": "translate drama",
+                        "review_prompt": "review drama",
+                    },
+                    follow_redirects=False,
+                )
+                service = client.app.state.orchestrator
+                category = next(
+                    item
+                    for item in service.all_prompt_categories()
+                    if item.name == "드라마"
+                )
+                updated = client.post(
+                    f"/settings/prompt-categories/{category.id}",
+                    data={
+                        "name": "일본 드라마",
+                        "translation_prompt": "translate drama v2",
+                        "review_prompt": "review drama v2",
+                    },
+                    follow_redirects=False,
+                )
+                archived = client.post(
+                    f"/settings/prompt-categories/{category.id}/archive",
+                    follow_redirects=False,
+                )
+                dashboard = client.get("/")
+                restored = client.post(
+                    f"/settings/prompt-categories/{category.id}/restore",
+                    follow_redirects=False,
+                )
+
+            self.assertEqual(page.status_code, 200)
+            self.assertIn("번역 프롬프트 카테고리", page.text)
+            self.assertNotIn("NAS", page.text)
+            self.assertEqual(created.status_code, 303)
+            self.assertEqual(updated.status_code, 303)
+            self.assertEqual(archived.status_code, 303)
+            self.assertNotIn(
+                f'<option value="{category.id}">',
+                dashboard.text,
+            )
+            self.assertEqual(restored.status_code, 303)
 
     def test_queries_openai_compatible_models_for_settings_list(self) -> None:
         with TemporaryDirectory() as directory:
@@ -242,7 +298,7 @@ class NASAppTests(unittest.TestCase):
             self.assertEqual(dashboard.status_code, 200)
             self.assertIn('class="recent-job-list"', dashboard.text)
             self.assertNotIn("<table", dashboard.text)
-            self.assertIn("진행·대기", dashboard.text)
+            self.assertIn("전체 작업", dashboard.text)
             self.assertIn("전사 중", dashboard.text)
             self.assertIn("확인 필요", dashboard.text)
             self.assertIn("전사 청크", dashboard.text)
@@ -317,6 +373,7 @@ class NASAppTests(unittest.TestCase):
                         "source_rels": ["one.mkv", "two.mp4"],
                         "duration_seconds": "0",
                         "noise_filter": ["false", "true"],
+                        "prompt_category_id": "jav",
                     },
                     follow_redirects=False,
                 )
@@ -339,6 +396,70 @@ class NASAppTests(unittest.TestCase):
             )
             self.assertTrue(
                 all(job["options"]["noise_filter"] for job in jobs)
+            )
+            self.assertTrue(
+                all(
+                    job["options"]["translation_prompt"]["category_id"]
+                    == "jav"
+                    for job in jobs
+                )
+            )
+
+    def test_folder_submission_recurses_and_reports_skipped_files(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            nested = media_root / "Shows" / "Season 1"
+            nested.mkdir(parents=True)
+            (nested / "pending.mkv").write_bytes(b"media")
+            (nested / "running.mkv").write_bytes(b"media")
+            (nested / "subtitled.mkv").write_bytes(b"media")
+            (nested / "subtitled.ko.srt").write_text(
+                "subtitle",
+                encoding="utf-8",
+            )
+
+            with TestClient(
+                create_app(self.settings(root, media_root))
+            ) as client:
+                service = client.app.state.orchestrator
+                service.stop()
+                running = service.store.create(
+                    job_id="running-job",
+                    source_rel="Shows/Season 1/running.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                service.store.update(
+                    running.id,
+                    status="transcription_running",
+                )
+                response = client.post(
+                    "/jobs",
+                    data={
+                        "folder_rels": "Shows",
+                        "prompt_category_id": "variety",
+                    },
+                    follow_redirects=False,
+                )
+                jobs = service.store.list_jobs(limit=None)
+
+            self.assertEqual(response.status_code, 303)
+            self.assertEqual(
+                response.headers["location"],
+                "/?queued=1&skipped=2",
+            )
+            created = next(
+                job for job in jobs if job.id != "running-job"
+            )
+            self.assertEqual(
+                created.source_rel,
+                "Shows/Season 1/pending.mkv",
+            )
+            self.assertEqual(created.prompt_category_name, "버라이어티")
+            self.assertEqual(
+                created.options["translation_prompt"]["review_rounds"],
+                2,
             )
 
     def test_completed_job_streams_video_range_and_webvtt(self) -> None:
@@ -556,6 +677,7 @@ class NASAppTests(unittest.TestCase):
                 completed_jobs = client.get("/jobs-fragment")
                 restart = client.post(
                     f"/jobs/{job.id}/restart-translation",
+                    data={"prompt_category_id": "variety"},
                     follow_redirects=False,
                 )
                 restarted_job = service.store.get(job.id)
@@ -649,7 +771,177 @@ class NASAppTests(unittest.TestCase):
             self.assertIn('value="pending.mp4"', page.text)
             self.assertNotIn('value="done.mp4"', page.text)
 
-    def test_open_jobs_are_unlimited_and_completed_jobs_are_paginated(self) -> None:
+    def test_deletes_only_jobs_missing_from_remote_transcription_server(
+        self,
+    ) -> None:
+        missing_error = (
+            "transcription status request failed: HTTP 404: "
+            "{'detail': 'job not found'}"
+        )
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            source = media_root / "movie.mp4"
+            source.write_bytes(b"media")
+
+            with TestClient(create_app(self.settings(root, media_root))) as client:
+                service = client.app.state.orchestrator
+                service.stop()
+                missing = service.store.create(
+                    job_id="missing-job",
+                    source_rel=source.name,
+                    force_overwrite=False,
+                    options={},
+                )
+                service.store.update(
+                    missing.id,
+                    status="blocked",
+                    blocked_stage="transcription",
+                    error=missing_error,
+                )
+                other = service.store.create(
+                    job_id="other-job",
+                    source_rel=source.name,
+                    force_overwrite=False,
+                    options={},
+                )
+                service.store.update(
+                    other.id,
+                    status="blocked",
+                    blocked_stage="transcription",
+                    error="transcription server is unavailable",
+                )
+                artifact = root / "state" / "jobs" / missing.id / "audio.wav"
+                artifact.parent.mkdir(parents=True)
+                artifact.write_bytes(b"audio")
+
+                dashboard = client.get("/jobs-fragment")
+                detail = client.get(f"/jobs/{missing.id}")
+                rejected = client.post(
+                    f"/jobs/{other.id}/delete",
+                    follow_redirects=False,
+                )
+                deleted = client.post(
+                    f"/jobs/{missing.id}/delete",
+                    follow_redirects=False,
+                )
+
+                self.assertIsNotNone(service.store.get(other.id))
+                self.assertIsNone(service.store.get(missing.id))
+
+            self.assertIn(
+                f'action="/jobs/{missing.id}/delete"',
+                dashboard.text,
+            )
+            self.assertNotIn(
+                f'action="/jobs/{other.id}/delete"',
+                dashboard.text,
+            )
+            self.assertIn(
+                f'action="/jobs/{missing.id}/delete"',
+                detail.text,
+            )
+            self.assertEqual(rejected.status_code, 400)
+            self.assertEqual(deleted.status_code, 303)
+            self.assertEqual(deleted.headers["location"], "/")
+            self.assertTrue(source.is_file())
+            self.assertTrue(artifact.is_file())
+
+    def test_dashboard_actions_return_immediately_and_bulk_stop_jobs(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            (media_root / "series").mkdir()
+
+            with TestClient(create_app(self.settings(root, media_root))) as client:
+                service = client.app.state.orchestrator
+                service.stop()
+                single = service.store.create(
+                    job_id="single",
+                    source_rel="single.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                service.store.update(single.id, status="transcribed")
+                queued = service.store.create(
+                    job_id="queued",
+                    source_rel="queued.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                running = service.store.create(
+                    job_id="running",
+                    source_rel="running.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                service.store.update(
+                    running.id,
+                    status="transcription_running",
+                )
+                extraction = service.store.create(
+                    job_id="extract",
+                    source_rel="extract.mkv",
+                    force_overwrite=False,
+                    options={},
+                    operation="extract",
+                )
+
+                fragment = client.get("/jobs-fragment?folder=series")
+                single_pause = client.post(
+                    f"/jobs/{single.id}/pause-translation",
+                    data={"return_folder": "series"},
+                    follow_redirects=False,
+                )
+                bulk_pause = client.post(
+                    "/jobs/pause-all-translations",
+                    data={"return_folder": "series"},
+                    follow_redirects=False,
+                )
+                bulk_stop = client.post(
+                    "/jobs/stop-all",
+                    data={"return_folder": "series"},
+                    follow_redirects=False,
+                )
+                refreshed = client.get("/jobs-fragment?folder=series")
+
+                single = service.store.get(single.id)
+                queued = service.store.get(queued.id)
+                running = service.store.get(running.id)
+                extraction = service.store.get(extraction.id)
+
+            self.assertIn("전체 번역 중단 (3)", fragment.text)
+            self.assertIn("전체 작업 중단 (4)", fragment.text)
+            self.assertIn(
+                'name="return_folder" value="series"',
+                fragment.text,
+            )
+            self.assertEqual(single_pause.status_code, 303)
+            self.assertEqual(
+                single_pause.headers["location"],
+                "/?folder=series&translation_pause_requested=1",
+            )
+            self.assertEqual(bulk_pause.status_code, 303)
+            self.assertEqual(
+                bulk_pause.headers["location"],
+                "/?folder=series&translations_paused=2",
+            )
+            self.assertEqual(bulk_stop.status_code, 303)
+            self.assertEqual(
+                bulk_stop.headers["location"],
+                "/?folder=series&jobs_stopped=3",
+            )
+            self.assertEqual(single.status, "translation_paused")
+            self.assertEqual(queued.status, "blocked")
+            self.assertTrue(running.job_stop_requested)
+            self.assertEqual(extraction.status, "blocked")
+            self.assertIn("전체 작업 중단 요청됨", refreshed.text)
+
+    def test_all_jobs_are_merged_and_paginated_by_creation_time(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
             media_root = root / "media"
@@ -673,16 +965,16 @@ class NASAppTests(unittest.TestCase):
                     )
                     service.store.update(completed.id, status="completed")
 
-                first = client.get("/jobs-fragment?completed_page=1")
-                second = client.get("/jobs-fragment?completed_page=2")
+                first = client.get("/jobs-fragment?jobs_page=1")
+                second = client.get("/jobs-fragment?jobs_page=2")
 
-            self.assertEqual(first.text.count('class="recent-job-item'), 45)
-            self.assertIn("active-00.mp4", first.text)
+            self.assertEqual(first.text.count('class="recent-job-item'), 20)
             self.assertIn("active-24.mp4", first.text)
             self.assertIn("completed-24.mp4", first.text)
             self.assertNotIn("completed-00.mp4", first.text)
-            self.assertIn("completed-00.mp4", second.text)
-            self.assertIn("completed_page=2", first.text)
+            self.assertIn("active-14.mp4", second.text)
+            self.assertIn("completed-14.mp4", second.text)
+            self.assertIn("jobs_page=2", first.text)
 
     def test_audio_only_submission_stays_on_dashboard_without_servers(self) -> None:
         with TemporaryDirectory() as directory:

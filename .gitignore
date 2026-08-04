@@ -43,6 +43,7 @@ buildNumber.properties
 [Ss]cripts
 pyvenv.cfg
 .venv
+.venv-whisperx/
 pip-selfcheck.json
 
 ### Diff template
@@ -1331,6 +1332,8 @@ tags
 !/requirements-nas.txt
 !/requirements-macos.txt
 !/requirements-cuda.txt
+!/requirements-whisperx-cuda.in
+!/requirements-whisperx-cuda.txt
 !/requirements-test.txt
 !/.env.nas.example
 !/.env.macos.example

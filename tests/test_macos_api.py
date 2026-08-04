@@ -1,19 +1,22 @@
+import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 import wave
 
 from fastapi.testclient import TestClient
 
 from stt_to_subtitle.macos_api import (
     MacOSAPISettings,
+    TranscriptionService,
     _device_unavailable_reason,
     _parse_options,
     _validate_wav,
     create_app,
 )
+from stt_to_subtitle.transcription_store import TranscriptionJob
 
 
 class MacOSAPIHelpersTests(unittest.TestCase):
@@ -34,6 +37,48 @@ class MacOSAPIHelpersTests(unittest.TestCase):
         self.assertEqual(options["chunk_length_seconds"], 20)
         self.assertEqual(options["num_speakers"], 2)
         self.assertTrue(options["noise_filter"])
+        self.assertEqual(options["backend"], "kotoba")
+
+    def test_accepts_request_level_whisperx_backend_case_insensitively(self) -> None:
+        settings = MacOSAPISettings(
+            state_dir=Path("/tmp/not-used"),
+            api_token="",
+            hf_token="hf-token",
+        )
+
+        options = _parse_options('{"backend": "whisperX"}', settings)
+
+        self.assertEqual(options["backend"], "whisperx")
+        self.assertTrue(options["noise_filter"])
+
+    def test_rejects_unknown_transcription_backend(self) -> None:
+        settings = MacOSAPISettings(
+            state_dir=Path("/tmp/not-used"),
+            api_token="",
+            hf_token="hf-token",
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "backend must be either 'kotoba' or 'whisperx'",
+        ):
+            _parse_options('{"backend": "other"}', settings)
+
+    def test_whisperx_backend_requires_vad(self) -> None:
+        settings = MacOSAPISettings(
+            state_dir=Path("/tmp/not-used"),
+            api_token="",
+            hf_token="hf-token",
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "WhisperX backend requires noise_filter=true",
+        ):
+            _parse_options(
+                '{"backend": "whisperx", "noise_filter": false}',
+                settings,
+            )
 
     def test_defaults_to_sixty_seconds_and_accepts_disabled_filter(self) -> None:
         settings = MacOSAPISettings(
@@ -138,6 +183,69 @@ class MacOSAPIHelpersTests(unittest.TestCase):
             "CUDA device cuda:1 is not available; found 1 CUDA device(s)",
         )
 
+    def test_whisperx_worker_is_isolated_and_releases_kotoba(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            whisperx_python = root / "python"
+            whisperx_python.write_text("placeholder", encoding="utf-8")
+            settings = MacOSAPISettings(
+                state_dir=root / "state",
+                api_token="",
+                hf_token="secret-hf-token",
+                device="cpu",
+                diarization_device="cpu",
+                whisperx_python=whisperx_python,
+            )
+            service = TranscriptionService(settings)
+            job = TranscriptionJob(
+                id="job-id",
+                idempotency_key="key",
+                status="running",
+                audio_path=str(root / "audio.wav"),
+                audio_sha256="hash",
+                options={
+                    "backend": "whisperx",
+                    "batch_size": 1,
+                    "chunk_length_seconds": 30,
+                },
+                result_path=None,
+                error=None,
+                chunks_created=0,
+                chunks_completed=0,
+                created_at=0.0,
+                updated_at=0.0,
+            )
+
+            def fake_run(command, **kwargs):
+                output = Path(command[command.index("--output") + 1])
+                output.write_text(
+                    json.dumps(
+                        {
+                            "model": {"id": "large-v3"},
+                            "timing": {"postprocessor": "whisperx"},
+                            "runtime": {"backend": "whisperx"},
+                            "noise_filter": {"enabled": True},
+                            "segments": [],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with patch.object(service, "_release_pipeline") as release:
+                with patch(
+                    "stt_to_subtitle.macos_api.subprocess.run",
+                    side_effect=fake_run,
+                ) as run:
+                    result = service._run_whisperx_worker(job)
+
+            release.assert_called_once_with()
+            command = run.call_args.args[0]
+            environment = run.call_args.kwargs["env"]
+            self.assertNotIn("secret-hf-token", command)
+            self.assertEqual(environment["HF_TOKEN"], "secret-hf-token")
+            self.assertEqual(result["model"]["id"], "large-v3")
+
 
 class MacOSAPIRouteTests(unittest.TestCase):
     def test_health_is_public_and_job_status_requires_bearer_token(self) -> None:
@@ -166,3 +274,45 @@ class MacOSAPIRouteTests(unittest.TestCase):
                 response = client.get("/v1/transcriptions/missing")
 
             self.assertEqual(response.status_code, 404)
+
+    def test_whisperx_request_reports_missing_isolated_python(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            wav_path = root / "audio.wav"
+            with wave.open(str(wav_path), "wb") as wav_file:
+                wav_file.setnchannels(1)
+                wav_file.setsampwidth(2)
+                wav_file.setframerate(16000)
+                wav_file.writeframes(b"\x00\x00" * 100)
+            settings = MacOSAPISettings(
+                state_dir=root / "state",
+                api_token="",
+                hf_token="hf-token",
+                device="cpu",
+                diarization_device="cpu",
+                whisperx_python=root / "missing-python",
+            )
+
+            with patch.dict("sys.modules", {"torch": SimpleNamespace()}):
+                with TestClient(create_app(settings)) as client:
+                    ready = client.get("/readyz")
+                    response = client.post(
+                        "/v1/transcriptions",
+                        headers={"Idempotency-Key": "whisperx-missing"},
+                        files={
+                            "audio": (
+                                "audio.wav",
+                                wav_path.read_bytes(),
+                                "audio/wav",
+                            )
+                        },
+                        data={"options": '{"backend":"whisperx"}'},
+                    )
+
+            self.assertEqual(ready.status_code, 200)
+            self.assertEqual(
+                ready.json()["backends"]["whisperx"]["status"],
+                "unavailable",
+            )
+            self.assertEqual(response.status_code, 503)
+            self.assertIn("WhisperX Python was not found", response.text)
