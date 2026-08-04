@@ -230,7 +230,8 @@ macOS 방화벽이 Python 또는 포트 `8100`의 수신 연결 허용 여부를
 
 - `GET /healthz`
 - `GET /readyz`
-- `POST /v1/transcriptions` — multipart WAV, `options` JSON, `Idempotency-Key`
+- `POST /v1/transcriptions` — multipart WAV, `options` JSON, `Idempotency-Key`.
+  `options.backend`은 `kotoba`(기본값) 또는 `whisperx`를 받습니다.
 - `GET /v1/transcriptions/{id}` — `chunk_progress.created/completed/in_progress` 포함
 - `GET /v1/transcriptions/{id}/result`
 
@@ -331,6 +332,54 @@ GPU 인덱스가 범위를 벗어나면 `/readyz`는 이유와 함께 503을 반
 ```bash
 curl http://127.0.0.1:8100/readyz
 ```
+
+### 요청별 WhisperX 백엔드
+
+WhisperX 3.8.6은 Kotoba와 다른 PyTorch/Pyannote 버전을 요구하므로 같은
+가상환경에 설치하지 않습니다. CUDA STT API는 기존 `.venv-cuda`에서 실행하고,
+WhisperX 요청만 격리된 `.venv-whisperx` 작업 프로세스로 처리합니다. Linux에서
+다음 환경을 추가합니다. CUDA 12.8 휠과 호환되는 NVIDIA 드라이버 및 FFmpeg가
+호스트에 준비되어 있어야 합니다.
+
+```bash
+python3.11 -m venv .venv-whisperx
+.venv-whisperx/bin/python -m pip install --upgrade pip
+.venv-whisperx/bin/python -m pip install -r requirements-whisperx-cuda.txt
+```
+
+Windows에서는 실행 파일 경로를 바꿉니다.
+
+```powershell
+py -3.11 -m venv .venv-whisperx
+.\.venv-whisperx\Scripts\python.exe -m pip install --upgrade pip
+.\.venv-whisperx\Scripts\python.exe -m pip install -r requirements-whisperx-cuda.txt
+```
+
+Windows용 `.env.cuda`에서는 다음 경로를 사용합니다.
+
+```dotenv
+WHISPERX_PYTHON=.venv-whisperx/Scripts/python.exe
+```
+
+서버를 다시 실행하면 `/readyz`의 `backends.whisperx`에서 작업 환경의 준비
+상태를 확인할 수 있습니다. 서버 전체 준비 상태는 Kotoba가 정상이라면
+WhisperX가 아직 설치되지 않아도 `ready`를 유지합니다.
+
+요청마다 `options.backend`로 백엔드를 선택합니다. 값이 없으면 기존 Kotoba를
+사용합니다.
+
+```bash
+curl -X POST http://127.0.0.1:8100/v1/transcriptions \
+  -H 'Idempotency-Key: example-whisperx-001' \
+  -F 'audio=@audio.16k.wav;type=audio/wav' \
+  -F 'options={"backend":"whisperx","chunk_length_seconds":30,"noise_filter":true}'
+```
+
+WhisperX는 자체 VAD를 항상 사용하므로 `backend=whisperx`에서
+`noise_filter=false`는 거부됩니다. 요청이 Kotoba에서 WhisperX로 전환되면
+상주 중인 Kotoba 모델을 먼저 해제하고 CUDA 캐시를 비웁니다. WhisperX 작업은
+완료 후 프로세스가 종료되어 VRAM을 반환하며, 다음 Kotoba 요청에서 Kotoba를
+다시 지연 로드합니다.
 
 NAS의 전사 API 주소에는 Mac 대신 이 CUDA PC의 내부 IP와 포트 `8100`을
 설정하면 됩니다. `.env.cuda`, `var/cuda-cache/`, `var/cuda-stt/`,

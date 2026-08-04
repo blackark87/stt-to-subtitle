@@ -11,6 +11,7 @@
   const submits = Array.from(
     document.querySelectorAll("[data-batch-submit]")
   );
+  const promptCategory = document.querySelector("[data-prompt-category]");
 
   const update = () => {
     const selected = checkboxes.filter((checkbox) => checkbox.checked).length;
@@ -27,13 +28,16 @@
       const missingServers =
         submit.hasAttribute("data-requires-servers") &&
         submit.dataset.serverConfigured !== "true";
-      submit.disabled = selected === 0 || missingServers;
+      const missingPrompt =
+        submit.value !== "extract" && !promptCategory?.value;
+      submit.disabled = selected === 0 || missingServers || missingPrompt;
     }
   };
 
   for (const checkbox of checkboxes) {
     checkbox.addEventListener("change", update);
   }
+  promptCategory?.addEventListener("change", update);
 
   picker.querySelector("[data-select-all]")?.addEventListener("click", () => {
     for (const checkbox of checkboxes) {

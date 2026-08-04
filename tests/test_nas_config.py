@@ -14,6 +14,50 @@ from stt_to_subtitle.nas_config import (
 
 
 class MediaLibraryTests(unittest.TestCase):
+    def test_recursively_lists_selected_folders_without_metadata_or_links(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            season = root / "Series" / "Season 1"
+            season.mkdir(parents=True)
+            (root / "Series" / "root.mkv").write_bytes(b"media")
+            (season / "episode.mp4").write_bytes(b"media")
+            metadata = root / "Series" / "@eaDir"
+            metadata.mkdir()
+            (metadata / "ignored.mp4").write_bytes(b"media")
+            (season / "episode-trailer.mp4").write_bytes(b"media")
+            outside = root / "Outside"
+            outside.mkdir()
+            (outside / "outside.mkv").write_bytes(b"media")
+            try:
+                (root / "Series" / "outside-link").symlink_to(
+                    outside,
+                    target_is_directory=True,
+                )
+            except OSError:
+                pass
+
+            files = MediaLibrary(root).list_media_recursive(["Series"])
+
+            self.assertEqual(
+                files,
+                ["Series/root.mkv", "Series/Season 1/episode.mp4"],
+            )
+
+    def test_recursive_listing_rejects_an_over_limit_selection(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            folder = root / "folder"
+            folder.mkdir()
+            (folder / "one.mkv").write_bytes(b"media")
+            (folder / "two.mkv").write_bytes(b"media")
+
+            with self.assertRaisesRegex(ValueError, "초과"):
+                MediaLibrary(root, maximum_files=1).list_media_recursive(
+                    ["folder"]
+                )
+
     def test_browses_only_the_entered_folder_without_recursive_scan(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)

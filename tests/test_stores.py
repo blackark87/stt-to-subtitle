@@ -101,6 +101,123 @@ class TranscriptionStoreTests(unittest.TestCase):
 
 
 class NASStoreTests(unittest.TestCase):
+    def test_seeds_edits_and_archives_prompt_categories(self) -> None:
+        with TemporaryDirectory() as directory:
+            database_path = Path(directory) / "jobs.sqlite3"
+            store = NASStore(database_path)
+
+            self.assertEqual(
+                {category.id for category in store.list_prompt_categories()},
+                {"jav", "variety"},
+            )
+            created = store.create_prompt_category(
+                name="애니메이션",
+                translation_prompt="translate",
+                review_prompt="review",
+            )
+            updated = store.update_prompt_category(
+                created.id,
+                name="드라마",
+                translation_prompt="translate v2",
+                review_prompt="review v2",
+            )
+            archived = store.set_prompt_category_archived(
+                created.id,
+                archived=True,
+            )
+
+            self.assertEqual(updated.name, "드라마")
+            self.assertEqual(updated.translation_prompt, "translate v2")
+            self.assertTrue(archived.archived)
+            self.assertNotIn(
+                created.id,
+                {
+                    category.id
+                    for category in store.list_prompt_categories()
+                },
+            )
+            self.assertIn(
+                created.id,
+                {
+                    category.id
+                    for category in NASStore(
+                        database_path
+                    ).list_prompt_categories(include_archived=True)
+                },
+            )
+
+    def test_lists_all_jobs_in_one_paginated_creation_order(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = NASStore(Path(directory) / "jobs.sqlite3")
+            for index in range(3):
+                store.create(
+                    job_id=f"job-{index}",
+                    source_rel=f"movie-{index}.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+
+            self.assertEqual(store.count_jobs(), 3)
+            self.assertEqual(
+                [job.id for job in store.list_jobs(limit=2)],
+                ["job-2", "job-1"],
+            )
+            self.assertEqual(
+                [job.id for job in store.list_jobs(limit=2, offset=2)],
+                ["job-0"],
+            )
+
+    def test_does_not_dispatch_a_stopped_or_translation_paused_job(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = NASStore(Path(directory) / "jobs.sqlite3")
+            stopped = store.create(
+                job_id="stopped",
+                source_rel="stopped.mkv",
+                force_overwrite=False,
+                options={},
+            )
+            paused = store.create(
+                job_id="paused",
+                source_rel="paused.mkv",
+                force_overwrite=False,
+                options={},
+            )
+            store.update(stopped.id, job_stop_requested=1)
+            store.update(
+                paused.id,
+                status="transcribed",
+                translation_pause_requested=1,
+            )
+
+            self.assertFalse(
+                store.claim_for_dispatch(stopped.id, "queued", "extracting")
+            )
+            self.assertFalse(
+                store.claim_for_dispatch(
+                    paused.id,
+                    "transcribed",
+                    "translation_running",
+                )
+            )
+            self.assertEqual(store.get(stopped.id).status, "queued")
+            self.assertEqual(store.get(paused.id).status, "transcribed")
+
+    def test_deletes_a_job_and_its_events(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = NASStore(Path(directory) / "jobs.sqlite3")
+            store.create(
+                job_id="job-1",
+                source_rel="movie.mkv",
+                force_overwrite=False,
+                options={},
+            )
+            store.add_event("job-1", "warning", "remote job disappeared")
+
+            self.assertTrue(store.delete("job-1"))
+            self.assertIsNone(store.get("job-1"))
+            self.assertEqual(store.events("job-1"), [])
+            self.assertFalse(store.delete("job-1"))
+
     def test_persists_remote_server_settings(self) -> None:
         with TemporaryDirectory() as directory:
             database_path = Path(directory) / "jobs.sqlite3"
@@ -210,4 +327,5 @@ class NASStoreTests(unittest.TestCase):
             self.assertEqual(job.translation_chunks_total, 0)
             self.assertEqual(job.translation_chunks_completed, 0)
             self.assertFalse(job.translation_pause_requested)
+            self.assertFalse(job.job_stop_requested)
             self.assertIsNone(job.ass_path)

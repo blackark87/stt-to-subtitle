@@ -8,6 +8,14 @@ from pathlib import Path
 import sqlite3
 import time
 from typing import Any, Mapping
+from uuid import uuid4
+
+from .translation_prompt import (
+    KOREAN_JAV_SYSTEM_PROMPT,
+    KOREAN_JAV_REVIEW_PROMPT,
+    KOREAN_VARIETY_REVIEW_PROMPT,
+    KOREAN_VARIETY_SYSTEM_PROMPT,
+)
 
 RUNNING_STATUSES = {
     "extracting",
@@ -17,6 +25,37 @@ RUNNING_STATUSES = {
 }
 
 SUCCESS_STATUSES = {"audio_completed", "completed"}
+STOPPABLE_STATUSES = {
+    "queued",
+    "extracting",
+    "audio_ready",
+    "transcription_running",
+    "transcribed",
+    "translation_running",
+    "translated",
+    "rendering",
+}
+TRANSLATION_PAUSABLE_STATUSES = {
+    "queued",
+    "extracting",
+    "audio_ready",
+    "transcription_running",
+    "transcribed",
+    "translation_running",
+}
+PROMPT_NAME_MAX_LENGTH = 80
+PROMPT_TEXT_MAX_LENGTH = 50_000
+
+
+@dataclass(frozen=True)
+class PromptCategory:
+    id: str
+    name: str
+    translation_prompt: str
+    review_prompt: str
+    archived: bool
+    created_at: float
+    updated_at: float
 
 
 @dataclass(frozen=True)
@@ -42,6 +81,7 @@ class NASJob:
     translation_chunks_total: int
     translation_chunks_completed: int
     translation_pause_requested: bool
+    job_stop_requested: bool
     created_at: float
     updated_at: float
 
@@ -55,6 +95,40 @@ class NASJob:
             0,
             self.translation_chunks_total - self.translation_chunks_completed,
         )
+
+    @property
+    def remote_transcription_missing(self) -> bool:
+        error = (self.error or "").lower()
+        return (
+            self.status in {"blocked", "failed"}
+            and self.blocked_stage == "transcription"
+            and error.startswith(
+                "transcription status request failed: http 404:"
+            )
+            and "job not found" in error
+        )
+
+    @property
+    def can_stop(self) -> bool:
+        return self.status in STOPPABLE_STATUSES and not self.job_stop_requested
+
+    @property
+    def can_pause_translation(self) -> bool:
+        return (
+            self.operation != "extract"
+            and self.status in TRANSLATION_PAUSABLE_STATUSES
+            and not self.translation_pause_requested
+            and not self.job_stop_requested
+        )
+
+    @property
+    def prompt_category_name(self) -> str:
+        snapshot = self.options.get("translation_prompt")
+        if isinstance(snapshot, Mapping):
+            name = str(snapshot.get("category_name", "")).strip()
+            if name:
+                return name
+        return "JAV (기존 작업)"
 
 
 class NASStore:
@@ -78,6 +152,7 @@ class NASStore:
         "translation_chunks_total",
         "translation_chunks_completed",
         "translation_pause_requested",
+        "job_stop_requested",
     }
 
     def __init__(self, database_path: Path) -> None:
@@ -117,6 +192,7 @@ class NASStore:
                     translation_chunks_total INTEGER NOT NULL DEFAULT 0,
                     translation_chunks_completed INTEGER NOT NULL DEFAULT 0,
                     translation_pause_requested INTEGER NOT NULL DEFAULT 0,
+                    job_stop_requested INTEGER NOT NULL DEFAULT 0,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL
                 );
@@ -138,6 +214,16 @@ class NASStore:
                     lm_token TEXT NOT NULL,
                     lm_model TEXT NOT NULL,
                     translation_workers INTEGER NOT NULL DEFAULT 1,
+                    updated_at REAL NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS prompt_categories (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+                    translation_prompt TEXT NOT NULL,
+                    review_prompt TEXT NOT NULL,
+                    archived INTEGER NOT NULL DEFAULT 0,
+                    created_at REAL NOT NULL,
                     updated_at REAL NOT NULL
                 );
 
@@ -181,6 +267,10 @@ class NASStore:
                     "ALTER TABLE jobs ADD COLUMN translation_pause_requested "
                     "INTEGER NOT NULL DEFAULT 0"
                 ),
+                "job_stop_requested": (
+                    "ALTER TABLE jobs ADD COLUMN job_stop_requested "
+                    "INTEGER NOT NULL DEFAULT 0"
+                ),
             }
             for column, statement in migrations.items():
                 if column not in columns:
@@ -196,6 +286,185 @@ class NASStore:
                     "ALTER TABLE remote_server_settings ADD COLUMN "
                     "translation_workers INTEGER NOT NULL DEFAULT 1"
                 )
+            now = time.time()
+            connection.executemany(
+                """
+                INSERT OR IGNORE INTO prompt_categories (
+                    id, name, translation_prompt, review_prompt,
+                    archived, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 0, ?, ?)
+                """,
+                (
+                    (
+                        "jav",
+                        "JAV",
+                        KOREAN_JAV_SYSTEM_PROMPT,
+                        KOREAN_JAV_REVIEW_PROMPT,
+                        now,
+                        now,
+                    ),
+                    (
+                        "variety",
+                        "버라이어티",
+                        KOREAN_VARIETY_SYSTEM_PROMPT,
+                        KOREAN_VARIETY_REVIEW_PROMPT,
+                        now,
+                        now,
+                    ),
+                ),
+            )
+
+    @staticmethod
+    def _prompt_category_from_row(
+        row: sqlite3.Row | None,
+    ) -> PromptCategory | None:
+        if row is None:
+            return None
+        return PromptCategory(
+            id=str(row["id"]),
+            name=str(row["name"]),
+            translation_prompt=str(row["translation_prompt"]),
+            review_prompt=str(row["review_prompt"]),
+            archived=bool(row["archived"]),
+            created_at=float(row["created_at"]),
+            updated_at=float(row["updated_at"]),
+        )
+
+    @staticmethod
+    def _normalize_prompt_category_values(
+        name: str,
+        translation_prompt: str,
+        review_prompt: str,
+    ) -> tuple[str, str, str]:
+        normalized_name = name.strip()
+        normalized_translation = translation_prompt.strip()
+        normalized_review = review_prompt.strip()
+        if not normalized_name:
+            raise ValueError("프롬프트 카테고리 이름을 입력하세요.")
+        if len(normalized_name) > PROMPT_NAME_MAX_LENGTH:
+            raise ValueError("프롬프트 카테고리 이름이 너무 깁니다.")
+        if not normalized_translation:
+            raise ValueError("번역 프롬프트를 입력하세요.")
+        if not normalized_review:
+            raise ValueError("검토 프롬프트를 입력하세요.")
+        if (
+            len(normalized_translation) > PROMPT_TEXT_MAX_LENGTH
+            or len(normalized_review) > PROMPT_TEXT_MAX_LENGTH
+        ):
+            raise ValueError("프롬프트는 각각 50,000자 이하여야 합니다.")
+        return normalized_name, normalized_translation, normalized_review
+
+    def list_prompt_categories(
+        self,
+        *,
+        include_archived: bool = False,
+    ) -> list[PromptCategory]:
+        where = "" if include_archived else "WHERE archived = 0"
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM prompt_categories {where} "
+                "ORDER BY archived, name COLLATE NOCASE, created_at"
+            ).fetchall()
+        return [
+            category
+            for row in rows
+            if (category := self._prompt_category_from_row(row)) is not None
+        ]
+
+    def get_prompt_category(self, category_id: str) -> PromptCategory | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM prompt_categories WHERE id = ?",
+                (category_id,),
+            ).fetchone()
+        return self._prompt_category_from_row(row)
+
+    def create_prompt_category(
+        self,
+        *,
+        name: str,
+        translation_prompt: str,
+        review_prompt: str,
+    ) -> PromptCategory:
+        values = self._normalize_prompt_category_values(
+            name,
+            translation_prompt,
+            review_prompt,
+        )
+        category_id = uuid4().hex
+        now = time.time()
+        try:
+            with self._connect() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO prompt_categories (
+                        id, name, translation_prompt, review_prompt,
+                        archived, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, 0, ?, ?)
+                    """,
+                    (category_id, *values, now, now),
+                )
+        except sqlite3.IntegrityError as error:
+            raise ValueError("같은 이름의 프롬프트 카테고리가 있습니다.") from error
+        created = self.get_prompt_category(category_id)
+        if created is None:
+            raise RuntimeError("created prompt category could not be read")
+        return created
+
+    def update_prompt_category(
+        self,
+        category_id: str,
+        *,
+        name: str,
+        translation_prompt: str,
+        review_prompt: str,
+    ) -> PromptCategory:
+        values = self._normalize_prompt_category_values(
+            name,
+            translation_prompt,
+            review_prompt,
+        )
+        try:
+            with self._connect() as connection:
+                result = connection.execute(
+                    """
+                    UPDATE prompt_categories
+                    SET name = ?, translation_prompt = ?, review_prompt = ?,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (*values, time.time(), category_id),
+                )
+        except sqlite3.IntegrityError as error:
+            raise ValueError("같은 이름의 프롬프트 카테고리가 있습니다.") from error
+        if result.rowcount != 1:
+            raise ValueError("프롬프트 카테고리를 찾을 수 없습니다.")
+        updated = self.get_prompt_category(category_id)
+        if updated is None:
+            raise RuntimeError("updated prompt category could not be read")
+        return updated
+
+    def set_prompt_category_archived(
+        self,
+        category_id: str,
+        *,
+        archived: bool,
+    ) -> PromptCategory:
+        with self._connect() as connection:
+            result = connection.execute(
+                """
+                UPDATE prompt_categories
+                SET archived = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (int(archived), time.time(), category_id),
+            )
+        if result.rowcount != 1:
+            raise ValueError("프롬프트 카테고리를 찾을 수 없습니다.")
+        updated = self.get_prompt_category(category_id)
+        if updated is None:
+            raise RuntimeError("updated prompt category could not be read")
+        return updated
 
     def get_remote_server_settings(self) -> dict[str, Any] | None:
         with self._connect() as connection:
@@ -294,6 +563,7 @@ class NASStore:
             translation_pause_requested=bool(
                 row["translation_pause_requested"]
             ),
+            job_stop_requested=bool(row["job_stop_requested"]),
             created_at=float(row["created_at"]),
             updated_at=float(row["updated_at"]),
         )
@@ -330,7 +600,7 @@ class NASStore:
         self.add_event(job_id, "info", "job queued")
         job = self.get(job_id)
         if job is None:
-            raise RuntimeError("created NAS job could not be read")
+            raise RuntimeError("created job could not be read")
         return job
 
     def get(self, job_id: str) -> NASJob | None:
@@ -341,7 +611,12 @@ class NASStore:
             ).fetchone()
         return self._from_row(row)
 
-    def list_jobs(self, limit: int | None = 100) -> list[NASJob]:
+    def list_jobs(
+        self,
+        limit: int | None = 100,
+        *,
+        offset: int = 0,
+    ) -> list[NASJob]:
         with self._connect() as connection:
             if limit is None:
                 rows = connection.execute(
@@ -349,10 +624,17 @@ class NASStore:
                 ).fetchall()
             else:
                 rows = connection.execute(
-                    "SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?",
-                    (limit,),
+                    "SELECT * FROM jobs ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                    (limit, offset),
                 ).fetchall()
         return [job for row in rows if (job := self._from_row(row)) is not None]
+
+    def count_jobs(self) -> int:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) AS count FROM jobs"
+            ).fetchone()
+        return int(row["count"]) if row is not None else 0
 
     def list_open_jobs(self) -> list[NASJob]:
         placeholders = ", ".join("?" for _ in SUCCESS_STATUSES)
@@ -431,12 +713,43 @@ class NASStore:
             ).fetchall()
         return [str(row["id"]) for row in rows]
 
+    def dispatchable_ids_with_status(self, status: str) -> list[str]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT id FROM jobs "
+                "WHERE status = ? AND job_stop_requested = 0 "
+                "ORDER BY created_at",
+                (status,),
+            ).fetchall()
+        return [str(row["id"]) for row in rows]
+
+    def claim_for_dispatch(
+        self,
+        job_id: str,
+        waiting_status: str,
+        running_status: str,
+    ) -> bool:
+        translation_condition = (
+            " AND translation_pause_requested = 0"
+            if waiting_status == "transcribed"
+            else ""
+        )
+        with self._connect() as connection:
+            result = connection.execute(
+                "UPDATE jobs SET status = ?, blocked_stage = NULL, "
+                "error = NULL, updated_at = ? "
+                "WHERE id = ? AND status = ? AND job_stop_requested = 0"
+                f"{translation_condition}",
+                (running_status, time.time(), job_id, waiting_status),
+            )
+        return result.rowcount == 1
+
     def update(self, job_id: str, **fields: Any) -> None:
         if not fields:
             return
         unknown = set(fields) - self._UPDATABLE_FIELDS
         if unknown:
-            raise ValueError(f"unsupported NAS job fields: {sorted(unknown)}")
+            raise ValueError(f"unsupported job fields: {sorted(unknown)}")
         assignments = [f"{field} = ?" for field in fields]
         values = [fields[field] for field in fields]
         assignments.append("updated_at = ?")
@@ -446,6 +759,42 @@ class NASStore:
                 f"UPDATE jobs SET {', '.join(assignments)} WHERE id = ?",
                 values,
             )
+
+    def update_if_status(
+        self,
+        job_id: str,
+        statuses: set[str],
+        **fields: Any,
+    ) -> bool:
+        if not statuses or not fields:
+            return False
+        unknown = set(fields) - self._UPDATABLE_FIELDS
+        if unknown:
+            raise ValueError(f"unsupported job fields: {sorted(unknown)}")
+        assignments = [f"{field} = ?" for field in fields]
+        values = [fields[field] for field in fields]
+        assignments.append("updated_at = ?")
+        placeholders = ", ".join("?" for _ in statuses)
+        values.extend([time.time(), job_id, *sorted(statuses)])
+        with self._connect() as connection:
+            result = connection.execute(
+                f"UPDATE jobs SET {', '.join(assignments)} "
+                f"WHERE id = ? AND status IN ({placeholders})",
+                values,
+            )
+        return result.rowcount == 1
+
+    def delete(self, job_id: str) -> bool:
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM job_events WHERE job_id = ?",
+                (job_id,),
+            )
+            result = connection.execute(
+                "DELETE FROM jobs WHERE id = ?",
+                (job_id,),
+            )
+        return result.rowcount == 1
 
     def add_event(self, job_id: str, level: str, message: str) -> None:
         with self._connect() as connection:
@@ -492,7 +841,8 @@ class NASStore:
                     """
                     UPDATE jobs
                     SET status = 'blocked', blocked_stage = ?,
-                        error = 'NAS service restarted during this stage',
+                        error = 'service restarted during this stage',
+                        job_stop_requested = 0,
                         updated_at = ?
                     WHERE id = ?
                     """,

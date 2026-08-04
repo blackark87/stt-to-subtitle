@@ -29,6 +29,10 @@ class TranslationPaused(RuntimeError):
     """Translation stopped cleanly after a persisted logical batch."""
 
 
+class OperationStopped(RuntimeError):
+    """A local pipeline stage reached a safe user-requested stop point."""
+
+
 def _safe_error(response: requests.Response) -> str:
     try:
         body = response.json()
@@ -120,11 +124,14 @@ class STTAPIClient(RetryingJSONClient):
         existing_job_id: str | None = None,
         on_job_created: Callable[[str], None] | None = None,
         on_progress: Callable[[Mapping[str, Any]], None] | None = None,
+        should_stop: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
         job_id = existing_job_id
         may_requeue_existing = existing_job_id is not None
         last_progress: tuple[int, int, int, int, bool] | None = None
         while True:
+            if should_stop is not None and should_stop():
+                raise OperationStopped("transcription stop requested")
             if job_id is None:
                 job_id = self._submit(
                     audio_path,
@@ -205,6 +212,8 @@ class STTAPIClient(RetryingJSONClient):
                 )
             time.sleep(self.poll_interval)
 
+        if should_stop is not None and should_stop():
+            raise OperationStopped("transcription stop requested")
         response = self.request(
             "GET",
             f"{self.base_url}/v1/transcriptions/{job_id}/result",
@@ -459,11 +468,21 @@ class OpenAICompatibleClient(RetryingJSONClient):
         self,
         segments: Sequence[Mapping[str, Any]],
         *,
+        system_prompt: str = KOREAN_JAV_SYSTEM_PROMPT,
+        review_prompt: str = "",
+        review_rounds: int = 0,
         existing: Mapping[str, str] | None = None,
         on_batch: Callable[[list[dict[str, str]]], None] | None = None,
         on_progress: Callable[[int, int], None] | None = None,
         should_pause: Callable[[], bool] | None = None,
+        on_review_warning: Callable[[str], None] | None = None,
     ) -> list[dict[str, str]]:
+        if not system_prompt.strip():
+            raise ValueError("translation system prompt is required")
+        if not 0 <= review_rounds <= 2:
+            raise ValueError("review_rounds must be between 0 and 2")
+        if review_rounds and not review_prompt.strip():
+            raise ValueError("translation review prompt is required")
         expected_ids = [str(segment["id"]) for segment in segments]
         expected_set = set(expected_ids)
         known = {
@@ -491,7 +510,38 @@ class OpenAICompatibleClient(RetryingJSONClient):
         if on_progress is not None:
             on_progress(0, len(batches))
         for completed_batches, batch in enumerate(batches, start=1):
-            translated = self._translate_batch_with_recovery(batch)
+            reference_context = self._reference_context(
+                segments,
+                batch,
+                before=5,
+                after=3,
+            )
+            draft = self._translate_batch_with_recovery(
+                batch,
+                reference_context,
+                system_prompt,
+            )
+            translated = draft
+            if review_rounds:
+                try:
+                    for _round in range(review_rounds):
+                        reviewed = self._review_batch_with_recovery(
+                            batch,
+                            reference_context,
+                            translated,
+                            review_prompt,
+                        )
+                        if reviewed == translated:
+                            break
+                        translated = reviewed
+                except ExternalServiceError as error:
+                    translated = draft
+                    LOGGER.warning(
+                        "translation review failed; using initial translation: %s",
+                        error,
+                    )
+                    if on_review_warning is not None:
+                        on_review_warning(str(error))
             for item in translated:
                 known[item["id"]] = item["text"]
             if on_batch is not None:
@@ -514,12 +564,42 @@ class OpenAICompatibleClient(RetryingJSONClient):
         ]
         return validate_translation_items(result, expected_ids)
 
+    @staticmethod
+    def _reference_context(
+        all_segments: Sequence[Mapping[str, Any]],
+        targets: Sequence[Mapping[str, Any]],
+        *,
+        before: int,
+        after: int,
+    ) -> list[Mapping[str, Any]]:
+        if not targets:
+            return []
+        indices = {
+            str(segment["id"]): index
+            for index, segment in enumerate(all_segments)
+        }
+        target_indices = [indices[str(segment["id"])] for segment in targets]
+        target_ids = {str(segment["id"]) for segment in targets}
+        start = max(0, min(target_indices) - before)
+        end = min(len(all_segments), max(target_indices) + after + 1)
+        return [
+            segment
+            for segment in all_segments[start:end]
+            if str(segment["id"]) not in target_ids
+        ]
+
     def _translate_batch_with_recovery(
         self,
         segments: Sequence[Mapping[str, Any]],
+        reference_context: Sequence[Mapping[str, Any]] = (),
+        system_prompt: str = KOREAN_JAV_SYSTEM_PROMPT,
     ) -> list[dict[str, str]]:
         try:
-            return self._translate_batch(segments)
+            return self._translate_batch(
+                segments,
+                reference_context,
+                system_prompt,
+            )
         except TranslationResponseIDError:
             if len(segments) <= 1:
                 raise
@@ -531,15 +611,111 @@ class OpenAICompatibleClient(RetryingJSONClient):
                 len(segments) - midpoint,
             )
             return [
-                *self._translate_batch_with_recovery(segments[:midpoint]),
-                *self._translate_batch_with_recovery(segments[midpoint:]),
+                *self._translate_batch_with_recovery(
+                    segments[:midpoint],
+                    [*reference_context, *segments[midpoint:]],
+                    system_prompt,
+                ),
+                *self._translate_batch_with_recovery(
+                    segments[midpoint:],
+                    [*reference_context, *segments[:midpoint]],
+                    system_prompt,
+                ),
+            ]
+
+    def _review_batch_with_recovery(
+        self,
+        segments: Sequence[Mapping[str, Any]],
+        reference_context: Sequence[Mapping[str, Any]],
+        drafts: Sequence[Mapping[str, str]],
+        review_prompt: str,
+    ) -> list[dict[str, str]]:
+        try:
+            return self._review_batch(
+                segments,
+                reference_context,
+                drafts,
+                review_prompt,
+            )
+        except TranslationResponseIDError:
+            if len(segments) <= 1:
+                raise
+            midpoint = len(segments) // 2
+            draft_by_id = {str(item["id"]): item for item in drafts}
+            left = segments[:midpoint]
+            right = segments[midpoint:]
+            return [
+                *self._review_batch_with_recovery(
+                    left,
+                    [*reference_context, *right],
+                    [draft_by_id[str(segment["id"])] for segment in left],
+                    review_prompt,
+                ),
+                *self._review_batch_with_recovery(
+                    right,
+                    [*reference_context, *left],
+                    [draft_by_id[str(segment["id"])] for segment in right],
+                    review_prompt,
+                ),
             ]
 
     def _translate_batch(
         self,
         segments: Sequence[Mapping[str, Any]],
+        reference_context: Sequence[Mapping[str, Any]] = (),
+        system_prompt: str = KOREAN_JAV_SYSTEM_PROMPT,
     ) -> list[dict[str, str]]:
-        expected_ids = [str(segment["id"]) for segment in segments]
+        return self._request_translation_items(
+            system_prompt=system_prompt,
+            schema_name="subtitle_translation",
+            error_label="translation",
+            expected_ids=[str(segment["id"]) for segment in segments],
+            user_payload={
+                "target_segments": [
+                    {"id": str(segment["id"]), "text": str(segment["text"])}
+                    for segment in segments
+                ],
+                "reference_context": [
+                    {"id": str(segment["id"]), "text": str(segment["text"])}
+                    for segment in reference_context
+                ],
+            },
+        )
+
+    def _review_batch(
+        self,
+        segments: Sequence[Mapping[str, Any]],
+        reference_context: Sequence[Mapping[str, Any]],
+        drafts: Sequence[Mapping[str, str]],
+        review_prompt: str,
+    ) -> list[dict[str, str]]:
+        return self._request_translation_items(
+            system_prompt=review_prompt,
+            schema_name="subtitle_translation_review",
+            error_label="translation review",
+            expected_ids=[str(segment["id"]) for segment in segments],
+            user_payload={
+                "target_segments": [
+                    {"id": str(segment["id"]), "text": str(segment["text"])}
+                    for segment in segments
+                ],
+                "reference_context": [
+                    {"id": str(segment["id"]), "text": str(segment["text"])}
+                    for segment in reference_context
+                ],
+                "draft_translations": [dict(item) for item in drafts],
+            },
+        )
+
+    def _request_translation_items(
+        self,
+        *,
+        system_prompt: str,
+        schema_name: str,
+        error_label: str,
+        expected_ids: list[str],
+        user_payload: Mapping[str, Any],
+    ) -> list[dict[str, str]]:
         schema = {
             "type": "object",
             "properties": {
@@ -565,28 +741,17 @@ class OpenAICompatibleClient(RetryingJSONClient):
             "messages": [
                 {
                     "role": "system",
-                    "content": KOREAN_JAV_SYSTEM_PROMPT,
+                    "content": system_prompt,
                 },
                 {
                     "role": "user",
-                    "content": json.dumps(
-                        {
-                            "segments": [
-                                {
-                                    "id": str(segment["id"]),
-                                    "text": str(segment["text"]),
-                                }
-                                for segment in segments
-                            ]
-                        },
-                        ensure_ascii=False,
-                    ),
+                    "content": json.dumps(user_payload, ensure_ascii=False),
                 },
             ],
             "response_format": {
                 "type": "json_schema",
                 "json_schema": {
-                    "name": "subtitle_translation",
+                    "name": schema_name,
                     "strict": True,
                     "schema": schema,
                 },
@@ -600,7 +765,7 @@ class OpenAICompatibleClient(RetryingJSONClient):
         )
         if response.status_code != 200:
             raise ExternalServiceError(
-                "OpenAI-compatible translation failed: "
+                f"OpenAI-compatible {error_label} failed: "
                 f"HTTP {response.status_code}: {_safe_error(response)}"
             )
         try:
@@ -609,8 +774,8 @@ class OpenAICompatibleClient(RetryingJSONClient):
             translations = decoded["translations"]
         except (KeyError, IndexError, TypeError, ValueError) as error:
             raise ExternalServiceError(
-                "OpenAI-compatible server returned invalid structured "
-                "translation JSON"
+                f"OpenAI-compatible {error_label} server returned invalid "
+                "structured translation JSON"
             ) from error
         return normalize_translation_response(translations, expected_ids)
 

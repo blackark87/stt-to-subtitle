@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
+import gc
 import hashlib
 import hmac
 import json
@@ -11,6 +12,7 @@ import logging
 import os
 from pathlib import Path
 import queue
+import subprocess
 import threading
 import time
 from typing import Any, AsyncIterator, Mapping
@@ -38,8 +40,14 @@ from .kotoba import (
 )
 from .transcription_store import TranscriptionJob, TranscriptionStore
 from .time_display import configure_kst_logging
+from .whisperx_worker import (
+    DEFAULT_WHISPERX_COMPUTE_TYPE,
+    DEFAULT_WHISPERX_LANGUAGE,
+    DEFAULT_WHISPERX_MODEL,
+)
 
 LOGGER = logging.getLogger(__name__)
+STT_BACKENDS = {"kotoba", "whisperx"}
 
 
 @dataclass(frozen=True)
@@ -55,6 +63,11 @@ class MacOSAPISettings:
     progress_interval: float = 30.0
     chunk_progress_every: int = 10
     noise_filter_trigger_level: float = DEFAULT_NOISE_FILTER_TRIGGER_LEVEL
+    whisperx_python: Path = Path(".venv-whisperx/bin/python")
+    whisperx_model: str = DEFAULT_WHISPERX_MODEL
+    whisperx_language: str = DEFAULT_WHISPERX_LANGUAGE
+    whisperx_compute_type: str = DEFAULT_WHISPERX_COMPUTE_TYPE
+    whisperx_cache_dir: Path = Path("./var/cuda-cache/whisperx")
 
     @classmethod
     def from_env(cls) -> MacOSAPISettings:
@@ -89,6 +102,30 @@ class MacOSAPISettings:
                     str(DEFAULT_NOISE_FILTER_TRIGGER_LEVEL),
                 )
             ),
+            whisperx_python=Path(
+                os.environ.get(
+                    "WHISPERX_PYTHON",
+                    ".venv-whisperx/bin/python",
+                )
+            ).expanduser(),
+            whisperx_model=os.environ.get(
+                "WHISPERX_MODEL",
+                DEFAULT_WHISPERX_MODEL,
+            ).strip(),
+            whisperx_language=os.environ.get(
+                "WHISPERX_LANGUAGE",
+                DEFAULT_WHISPERX_LANGUAGE,
+            ).strip(),
+            whisperx_compute_type=os.environ.get(
+                "WHISPERX_COMPUTE_TYPE",
+                DEFAULT_WHISPERX_COMPUTE_TYPE,
+            ).strip(),
+            whisperx_cache_dir=Path(
+                os.environ.get(
+                    "WHISPERX_CACHE_DIR",
+                    "./var/cuda-cache/whisperx",
+                )
+            ).expanduser(),
         )
 
     def validate(self) -> None:
@@ -113,6 +150,12 @@ class MacOSAPISettings:
             raise ValueError(
                 "STT_NOISE_FILTER_TRIGGER_LEVEL must be positive"
             )
+        if not self.whisperx_model:
+            raise ValueError("WHISPERX_MODEL must not be empty")
+        if not self.whisperx_language:
+            raise ValueError("WHISPERX_LANGUAGE must not be empty")
+        if not self.whisperx_compute_type:
+            raise ValueError("WHISPERX_COMPUTE_TYPE must not be empty")
 
 
 def _device_unavailable_reason(torch: Any, device: str) -> str | None:
@@ -139,6 +182,17 @@ def _device_unavailable_reason(torch: Any, device: str) -> str | None:
     return None
 
 
+def _whisperx_unavailable_reason(settings: MacOSAPISettings) -> str | None:
+    if settings.device == "mps" or settings.diarization_device == "mps":
+        return "WhisperX backend supports only cpu or CUDA devices"
+    if not settings.whisperx_python.is_file():
+        return (
+            "WhisperX Python was not found: "
+            f"{settings.whisperx_python}"
+        )
+    return None
+
+
 def _parse_options(raw_options: str, settings: MacOSAPISettings) -> dict[str, Any]:
     try:
         decoded = json.loads(raw_options)
@@ -148,6 +202,7 @@ def _parse_options(raw_options: str, settings: MacOSAPISettings) -> dict[str, An
         raise ValueError("options must be a JSON object")
 
     allowed = {
+        "backend",
         "chunk_length_seconds",
         "num_speakers",
         "min_speakers",
@@ -158,9 +213,16 @@ def _parse_options(raw_options: str, settings: MacOSAPISettings) -> dict[str, An
     unknown = set(decoded) - allowed
     if unknown:
         raise ValueError(f"unsupported transcription options: {sorted(unknown)}")
+    backend = str(decoded.get("backend", "kotoba")).strip().lower()
+    if backend not in STT_BACKENDS:
+        raise ValueError(
+            "backend must be either 'kotoba' or 'whisperx'"
+        )
     noise_filter = decoded.get("noise_filter", True)
     if not isinstance(noise_filter, bool):
         raise ValueError("noise_filter must be a JSON boolean")
+    if backend == "whisperx" and not noise_filter:
+        raise ValueError("WhisperX backend requires noise_filter=true for VAD")
     options = TranscriptionOptions(
         batch_size=settings.batch_size,
         chunk_length_seconds=int(
@@ -190,7 +252,7 @@ def _parse_options(raw_options: str, settings: MacOSAPISettings) -> dict[str, An
         threads=settings.threads,
     )
     options.validate()
-    return asdict(options)
+    return {"backend": backend, **asdict(options)}
 
 
 def _validate_wav(path: Path) -> None:
@@ -248,6 +310,7 @@ class TranscriptionService:
             "status": "ok",
             "uptime_seconds": round(time.time() - self._started_at, 3),
             "queued_jobs": self._queue.qsize(),
+            "loaded_backend": "kotoba" if self._pipeline is not None else None,
         }
 
     def readiness(self) -> tuple[bool, dict[str, Any]]:
@@ -255,6 +318,10 @@ class TranscriptionService:
             "device": self.settings.device,
             "diarization_device": self.settings.diarization_device,
             "hf_token_configured": bool(self.settings.hf_token.strip()),
+            "backends": {
+                "kotoba": {"status": "ready"},
+                "whisperx": {"status": "ready"},
+            },
         }
         if not detail["hf_token_configured"]:
             detail["status"] = "not_ready"
@@ -281,8 +348,21 @@ class TranscriptionService:
                 f"{reason} for STT_DIARIZATION_DEVICE"
             )
             return False, detail
+        whisperx_reason = _whisperx_unavailable_reason(self.settings)
+        if whisperx_reason is not None:
+            detail["backends"]["whisperx"] = {
+                "status": "unavailable",
+                "reason": whisperx_reason,
+            }
         detail["status"] = "ready"
         return True, detail
+
+    def backend_unavailable_reason(self, backend: str) -> str | None:
+        if backend == "kotoba":
+            return None
+        if backend == "whisperx":
+            return _whisperx_unavailable_reason(self.settings)
+        return f"unsupported transcription backend: {backend}"
 
     async def submit(
         self,
@@ -355,6 +435,88 @@ class TranscriptionService:
             LOGGER.info("transcription model loaded")
         return self._pipeline
 
+    def _release_pipeline(self) -> None:
+        if self._pipeline is None:
+            return
+        LOGGER.info("unloading Kotoba transcription model before backend switch")
+        self._pipeline = None
+        gc.collect()
+        try:
+            import torch
+        except ImportError:
+            return
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            ipc_collect = getattr(torch.cuda, "ipc_collect", None)
+            if callable(ipc_collect):
+                ipc_collect()
+
+    def _run_whisperx_worker(
+        self,
+        job: TranscriptionJob,
+    ) -> Mapping[str, Any]:
+        reason = self.backend_unavailable_reason("whisperx")
+        if reason is not None:
+            raise RuntimeError(reason)
+        self._release_pipeline()
+        worker_result = self.result_dir / f".{job.id}.whisperx.json"
+        worker_result.unlink(missing_ok=True)
+        environment = os.environ.copy()
+        source_root = str(Path(__file__).resolve().parents[1])
+        existing_pythonpath = environment.get("PYTHONPATH", "")
+        environment["PYTHONPATH"] = (
+            source_root
+            if not existing_pythonpath
+            else f"{source_root}{os.pathsep}{existing_pythonpath}"
+        )
+        environment.update(
+            {
+                "HF_TOKEN": self.settings.hf_token,
+                "STT_DEVICE": self.settings.device,
+                "STT_DIARIZATION_DEVICE": self.settings.diarization_device,
+                "WHISPERX_MODEL": self.settings.whisperx_model,
+                "WHISPERX_LANGUAGE": self.settings.whisperx_language,
+                "WHISPERX_COMPUTE_TYPE": self.settings.whisperx_compute_type,
+                "WHISPERX_CACHE_DIR": str(self.settings.whisperx_cache_dir),
+            }
+        )
+        command = [
+            str(self.settings.whisperx_python),
+            "-m",
+            "stt_to_subtitle.whisperx_worker",
+            "--audio",
+            job.audio_path,
+            "--output",
+            str(worker_result),
+            "--options",
+            json.dumps(job.options, sort_keys=True),
+        ]
+        try:
+            completed = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+            if completed.returncode != 0:
+                detail = (completed.stderr or completed.stdout).strip()
+                raise RuntimeError(
+                    "WhisperX worker failed"
+                    + (f": {detail[-2000:]}" if detail else "")
+                )
+            try:
+                payload = json.loads(worker_result.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as error:
+                raise RuntimeError(
+                    "WhisperX worker returned an invalid result"
+                ) from error
+            if not isinstance(payload, Mapping):
+                raise RuntimeError("WhisperX worker result must be an object")
+            return payload
+        finally:
+            worker_result.unlink(missing_ok=True)
+
     def _worker_loop(self) -> None:
         while True:
             job_id = self._queue.get()
@@ -380,46 +542,84 @@ class TranscriptionService:
         )
         heartbeat.start()
         try:
-            options = TranscriptionOptions(**job.options)
-            raw_result = run_pipeline(
-                self._get_pipeline(),
-                Path(job.audio_path),
-                options,
-                progress_callback=lambda progress: self._record_chunk_progress(
-                    job.id,
-                    progress,
-                ),
-                progress_every=self.settings.chunk_progress_every,
-            )
-            segments = add_segment_ids(normalize_segments(raw_result))
-            noise_filter = raw_result.get(
-                "noise_filter",
-                {
-                    "enabled": options.noise_filter,
-                    "trigger_level": options.noise_filter_trigger_level,
-                    "removed_count": 0,
-                    "removed_spans": [],
-                },
-            )
-            payload = {
-                "schema_version": TRANSCRIPT_SCHEMA_VERSION,
-                "job_id": job.id,
-                "audio_sha256": job.audio_sha256,
-                "model": {
-                    "id": MODEL_ID,
-                    "revision": MODEL_REVISION,
-                },
-                "timing": {
+            backend = str(job.options.get("backend", "kotoba"))
+            option_values = {
+                key: value
+                for key, value in job.options.items()
+                if key != "backend"
+            }
+            options = TranscriptionOptions(**option_values)
+            if backend == "whisperx":
+                backend_result = self._run_whisperx_worker(job)
+                raw_segments = backend_result.get("segments")
+                if not isinstance(raw_segments, list):
+                    raise RuntimeError(
+                        "WhisperX worker result has no segments list"
+                    )
+                segments = add_segment_ids(raw_segments)
+                model = backend_result.get("model")
+                timing = backend_result.get("timing")
+                runtime = backend_result.get("runtime")
+                noise_filter = backend_result.get("noise_filter")
+                if not isinstance(model, Mapping):
+                    raise RuntimeError("WhisperX worker result has no model")
+                if not isinstance(timing, Mapping):
+                    raise RuntimeError("WhisperX worker result has no timing")
+                if not isinstance(runtime, Mapping):
+                    raise RuntimeError("WhisperX worker result has no runtime")
+                if not isinstance(noise_filter, Mapping):
+                    raise RuntimeError(
+                        "WhisperX worker result has no noise_filter"
+                    )
+                runtime = {
+                    **runtime,
+                    "elapsed_seconds": round(time.monotonic() - started, 3),
+                }
+            elif backend == "kotoba":
+                raw_result = run_pipeline(
+                    self._get_pipeline(),
+                    Path(job.audio_path),
+                    options,
+                    progress_callback=lambda progress: self._record_chunk_progress(
+                        job.id,
+                        progress,
+                    ),
+                    progress_every=self.settings.chunk_progress_every,
+                )
+                segments = add_segment_ids(normalize_segments(raw_result))
+                model = {"id": MODEL_ID, "revision": MODEL_REVISION}
+                timing = {
                     "postprocessor": raw_result.get(
                         "timestamp_postprocessor",
                         "model-default",
                     ),
-                },
-                "runtime": {
+                }
+                runtime = {
+                    "backend": "kotoba",
                     "device": self.settings.device,
                     "diarization_device": self.settings.diarization_device,
                     "elapsed_seconds": round(time.monotonic() - started, 3),
-                },
+                }
+                noise_filter = raw_result.get(
+                    "noise_filter",
+                    {
+                        "enabled": options.noise_filter,
+                        "trigger_level": options.noise_filter_trigger_level,
+                        "removed_count": 0,
+                        "removed_spans": [],
+                    },
+                )
+            else:
+                raise RuntimeError(
+                    f"unsupported transcription backend: {backend}"
+                )
+            payload = {
+                "schema_version": TRANSCRIPT_SCHEMA_VERSION,
+                "job_id": job.id,
+                "audio_sha256": job.audio_sha256,
+                "model": model,
+                "timing": timing,
+                "runtime": runtime,
                 "options": job.options,
                 "noise_filter": noise_filter,
                 "segments": segments,
@@ -432,9 +632,10 @@ class TranscriptionService:
                 result_path=result_path,
             )
             LOGGER.info(
-                "transcription job %s completed with %d segments",
+                "transcription job %s completed with %d segments using %s",
                 job.id,
                 len(segments),
+                backend,
             )
             if (
                 isinstance(noise_filter, Mapping)
@@ -603,6 +804,14 @@ def create_app(
             )
         try:
             parsed_options = _parse_options(options, service.settings)
+            backend_reason = service.backend_unavailable_reason(
+                str(parsed_options["backend"])
+            )
+            if backend_reason is not None:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail=backend_reason,
+                )
             job = await service.submit(audio, idempotency_key, parsed_options)
         except ValueError as error:
             raise HTTPException(
