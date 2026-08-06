@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 from datetime import datetime, timezone
 import gc
 import hashlib
@@ -27,6 +27,15 @@ from fastapi.responses import JSONResponse
 
 from .contracts import TRANSCRIPT_SCHEMA_VERSION, add_segment_ids
 from .files import write_json_atomic
+from .hybrid_stt import (
+    HYBRID_POLICY_VERSION,
+    HybridRescueOptions,
+    debounce_word_speakers,
+    detect_hybrid_issues,
+    fuse_hybrid_segments,
+    mark_rescued_words,
+    merge_issue_windows,
+)
 from .kotoba import (
     ChunkProgress,
     DEFAULT_CHUNK_LENGTH_SECONDS,
@@ -53,10 +62,18 @@ from .whisperx_worker import (
     DEFAULT_WHISPERX_LANGUAGE,
     DEFAULT_WHISPERX_MODEL,
     WhisperXSegmentationOptions,
+    rebuild_whisperx_segments,
 )
 
 LOGGER = logging.getLogger(__name__)
-STT_BACKENDS = {"kotoba", "whisperx"}
+STT_BACKENDS = {"hybrid", "kotoba", "whisperx"}
+DEFAULT_HYBRID_SEGMENTATION = {
+    "split_on_speaker_change": True,
+    "max_gap_sec": 0.8,
+    "max_duration_sec": 8.0,
+    "max_chars": 36,
+    "prefer_punctuation_boundary": True,
+}
 
 
 def _env_boolean(name: str, default: bool = False) -> bool:
@@ -246,6 +263,7 @@ def _parse_options(raw_options: str, settings: MacOSAPISettings) -> dict[str, An
         "subtitle_segmentation",
         "repetition_policy",
         "repetition_min_count",
+        "hybrid_rescue",
     }
     unknown = set(decoded) - allowed
     if unknown:
@@ -253,13 +271,17 @@ def _parse_options(raw_options: str, settings: MacOSAPISettings) -> dict[str, An
     backend = str(decoded.get("backend", "kotoba")).strip().lower()
     if backend not in STT_BACKENDS:
         raise ValueError(
-            "backend must be either 'kotoba' or 'whisperx'"
+            "backend must be 'kotoba', 'whisperx', or 'hybrid'"
         )
     noise_filter = decoded.get("noise_filter", True)
     if not isinstance(noise_filter, bool):
         raise ValueError("noise_filter must be a JSON boolean")
-    if backend == "whisperx" and not noise_filter:
-        raise ValueError("WhisperX backend requires noise_filter=true for VAD")
+    if backend in {"hybrid", "whisperx"} and not noise_filter:
+        if backend == "whisperx":
+            raise ValueError(
+                "WhisperX backend requires noise_filter=true for VAD"
+            )
+        raise ValueError("hybrid backend requires noise_filter=true for VAD")
     options = TranscriptionOptions(
         batch_size=settings.batch_size,
         chunk_length_seconds=int(
@@ -291,11 +313,25 @@ def _parse_options(raw_options: str, settings: MacOSAPISettings) -> dict[str, An
     )
     options.validate()
     parsed = {"backend": backend, **asdict(options)}
-    if backend == "whisperx":
-        segmentation = WhisperXSegmentationOptions.from_options(decoded)
+    if backend in {"hybrid", "whisperx"}:
+        if backend == "whisperx" and "hybrid_rescue" in decoded:
+            raise ValueError("hybrid_rescue requires backend='hybrid'")
+        segmentation_input = dict(decoded)
+        if backend == "hybrid" and "subtitle_segmentation" not in decoded:
+            segmentation_input["subtitle_segmentation"] = (
+                DEFAULT_HYBRID_SEGMENTATION
+            )
+        segmentation = WhisperXSegmentationOptions.from_options(
+            segmentation_input
+        )
         repetition_policy = str(decoded.get("repetition_policy", "flag"))
         if repetition_policy not in {"flag", "reject"}:
             raise ValueError("repetition_policy must be 'flag' or 'reject'")
+        if backend == "hybrid" and repetition_policy != "flag":
+            raise ValueError(
+                "hybrid backend requires repetition_policy='flag' so failed "
+                "windows can be rescued"
+            )
         repetition_min_count = int(decoded.get("repetition_min_count", 8))
         if repetition_min_count < 2:
             raise ValueError("repetition_min_count must be at least 2")
@@ -306,16 +342,23 @@ def _parse_options(raw_options: str, settings: MacOSAPISettings) -> dict[str, An
                 "repetition_min_count": repetition_min_count,
             }
         )
+        if backend == "hybrid":
+            hybrid = HybridRescueOptions.from_options(decoded)
+            parsed["hybrid_rescue"] = asdict(hybrid)
+            parsed["chunk_length_seconds"] = (
+                hybrid.kotoba_chunk_length_seconds
+            )
     elif any(
         key in decoded
         for key in (
             "subtitle_segmentation",
             "repetition_policy",
             "repetition_min_count",
+            "hybrid_rescue",
         )
     ):
         raise ValueError(
-            "WhisperX quality options require backend='whisperx'"
+            "WhisperX quality options require backend='whisperx' or 'hybrid'"
         )
     return parsed
 
@@ -415,6 +458,7 @@ class TranscriptionService:
             "diarization_device": self.settings.diarization_device,
             "hf_token_configured": bool(self.settings.hf_token.strip()),
             "backends": {
+                "hybrid": {"status": "ready"},
                 "kotoba": {"status": "ready"},
                 "whisperx": {"status": "ready"},
             },
@@ -446,17 +490,18 @@ class TranscriptionService:
             return False, detail
         whisperx_reason = _whisperx_unavailable_reason(self.settings)
         if whisperx_reason is not None:
-            detail["backends"]["whisperx"] = {
-                "status": "unavailable",
-                "reason": whisperx_reason,
-            }
+            for backend in ("hybrid", "whisperx"):
+                detail["backends"][backend] = {
+                    "status": "unavailable",
+                    "reason": whisperx_reason,
+                }
         detail["status"] = "ready"
         return True, detail
 
     def backend_unavailable_reason(self, backend: str) -> str | None:
         if backend == "kotoba":
             return None
-        if backend == "whisperx":
+        if backend in {"hybrid", "whisperx"}:
             return _whisperx_unavailable_reason(self.settings)
         return f"unsupported transcription backend: {backend}"
 
@@ -550,11 +595,15 @@ class TranscriptionService:
     def _run_whisperx_worker(
         self,
         job: TranscriptionJob,
+        *,
+        release_kotoba: bool = True,
+        options: Mapping[str, Any] | None = None,
     ) -> Mapping[str, Any]:
         reason = self.backend_unavailable_reason("whisperx")
         if reason is not None:
             raise RuntimeError(reason)
-        self._release_pipeline()
+        if release_kotoba:
+            self._release_pipeline()
         worker_result = self.result_dir / f".{job.id}.whisperx.json"
         worker_result.unlink(missing_ok=True)
         environment = os.environ.copy()
@@ -585,7 +634,10 @@ class TranscriptionService:
             "--output",
             str(worker_result),
             "--options",
-            json.dumps(job.options, sort_keys=True),
+            json.dumps(
+                job.options if options is None else options,
+                sort_keys=True,
+            ),
         ]
         if self.settings.debug_artifacts:
             command.extend(
@@ -647,7 +699,11 @@ class TranscriptionService:
         try:
             backend = str(job.options.get("backend", "kotoba"))
             audio_duration = _wav_duration(Path(job.audio_path))
-            warm_start = backend == "kotoba" and self._pipeline is not None
+            warm_start = (
+                backend in {"hybrid", "kotoba"}
+                and self._pipeline is not None
+            )
+            stt_call_count = 2 if backend == "hybrid" else 1
             artifact_dir = (
                 self.settings.artifacts_dir / job.id
                 if self.settings.debug_artifacts
@@ -670,14 +726,14 @@ class TranscriptionService:
                 "options": job.options,
                 "option_semantics": {
                     "chunk_length_seconds": "model_internal",
-                    "stt_call_count": 1,
+                    "stt_call_count": stt_call_count,
                 },
             }
             LOGGER.info(
                 "stt_request job_id=%s request_id=%s attempt=%d "
                 "delivery_mode=single_wav audio_sha256=%s "
                 "duration_sec=%.3f provider=%s chunk_length_seconds=%s "
-                "call_count=1",
+                "call_count=%d",
                 job.id,
                 job.id,
                 job.attempt,
@@ -685,6 +741,7 @@ class TranscriptionService:
                 audio_duration,
                 backend,
                 job.options.get("chunk_length_seconds"),
+                stt_call_count,
                 extra=request_trace,
             )
             if artifact_dir is not None:
@@ -732,6 +789,230 @@ class TranscriptionService:
                 runtime = {
                     **runtime,
                     "elapsed_seconds": round(time.monotonic() - started, 3),
+                }
+            elif backend == "hybrid":
+                hybrid_options = HybridRescueOptions.from_options(job.options)
+                segmentation = WhisperXSegmentationOptions.from_options(
+                    job.options
+                )
+                repetition_min_count = int(
+                    job.options.get("repetition_min_count", 8)
+                )
+                kotoba_options = replace(
+                    options,
+                    chunk_length_seconds=(
+                        hybrid_options.kotoba_chunk_length_seconds
+                    ),
+                )
+                pipeline = self._get_pipeline()
+                whisperx_options = {
+                    **job.options,
+                    "chunk_length_seconds": (
+                        hybrid_options.whisperx_chunk_length_seconds
+                    ),
+                    "repetition_policy": "flag",
+                }
+                primary_result = self._run_whisperx_worker(
+                    job,
+                    release_kotoba=False,
+                    options=whisperx_options,
+                )
+                raw_primary_segments = primary_result.get("segments")
+                if not isinstance(raw_primary_segments, list):
+                    raise RuntimeError(
+                        "WhisperX worker result has no segments list"
+                    )
+                raw_primary_words = primary_result.get("words", [])
+                if not isinstance(raw_primary_words, list):
+                    raw_primary_words = []
+                words, speaker_debounce = debounce_word_speakers(
+                    raw_primary_words,
+                    maximum_flash_duration_sec=(
+                        hybrid_options.speaker_debounce_sec
+                    ),
+                )
+                rebuilt_primary = (
+                    rebuild_whisperx_segments(words, segmentation)
+                    if words
+                    else raw_primary_segments
+                )
+                primary_segments = add_segment_ids(rebuilt_primary)
+                for segment in primary_segments:
+                    source_id = f"whisperx-{segment['id']}"
+                    segment["id"] = source_id
+                    segment["span_id"] = source_id
+                    segment["parent_span_ids"] = list(
+                        dict.fromkeys(
+                            [*segment.get("parent_span_ids", []), source_id]
+                        )
+                    )
+                    segment.setdefault(
+                        "provider", "whisperx-word-segmentation-v1"
+                    )
+                primary_issues = detect_hybrid_issues(
+                    primary_segments,
+                    words,
+                    options=hybrid_options,
+                    repetition_min_count=repetition_min_count,
+                )
+                rescue_windows = merge_issue_windows(
+                    primary_issues,
+                    padding_seconds=hybrid_options.window_padding_sec,
+                    audio_duration=audio_duration,
+                )
+
+                kotoba_started = time.monotonic()
+                fallback_result = run_pipeline(
+                    pipeline,
+                    Path(job.audio_path),
+                    kotoba_options,
+                    progress_callback=lambda progress: self._record_chunk_progress(
+                        job.id,
+                        progress,
+                    ),
+                    progress_every=self.settings.chunk_progress_every,
+                    debug_artifact_dir=(
+                        artifact_dir / "kotoba"
+                        if artifact_dir is not None
+                        else None
+                    ),
+                )
+                fallback_segments = add_segment_ids(
+                    normalize_segments(fallback_result)
+                )
+                for segment in fallback_segments:
+                    source_id = f"kotoba-{segment['id']}"
+                    segment["id"] = source_id
+                    segment["span_id"] = source_id
+                    segment["parent_span_ids"] = list(
+                        dict.fromkeys(
+                            [*segment.get("parent_span_ids", []), source_id]
+                        )
+                    )
+                    segment.setdefault("provider", "kotoba")
+                fallback_issues = detect_hybrid_issues(
+                    fallback_segments,
+                    [],
+                    options=hybrid_options,
+                    repetition_min_count=repetition_min_count,
+                )
+                fused_segments, hybrid_quality = fuse_hybrid_segments(
+                    primary_segments,
+                    fallback_segments,
+                    rescue_windows,
+                    fallback_issues=fallback_issues,
+                    audio_duration=audio_duration,
+                    primary_words=words,
+                )
+                words = mark_rescued_words(
+                    words,
+                    hybrid_quality["decisions"],
+                )
+                segments = add_segment_ids(fused_segments)
+
+                primary_model = primary_result.get("model")
+                primary_timing = primary_result.get("timing")
+                primary_runtime = primary_result.get("runtime")
+                primary_noise_filter = primary_result.get("noise_filter")
+                if not isinstance(primary_model, Mapping):
+                    raise RuntimeError("WhisperX worker result has no model")
+                if not isinstance(primary_timing, Mapping):
+                    raise RuntimeError("WhisperX worker result has no timing")
+                if not isinstance(primary_runtime, Mapping):
+                    raise RuntimeError("WhisperX worker result has no runtime")
+                if not isinstance(primary_noise_filter, Mapping):
+                    raise RuntimeError(
+                        "WhisperX worker result has no noise_filter"
+                    )
+                fallback_noise_filter = fallback_result.get(
+                    "noise_filter",
+                    {
+                        "enabled": kotoba_options.noise_filter,
+                        "provider": "kotoba-noise-filter-v1",
+                        "execution_state": "not_configured",
+                        "removed_count": None,
+                        "removed_spans": [],
+                    },
+                )
+                model = {
+                    "id": "whisperx+kotoba",
+                    "revision": (
+                        f"{primary_model.get('revision', 'unknown')}+"
+                        f"{MODEL_REVISION}"
+                    ),
+                    "primary": dict(primary_model),
+                    "rescue": {
+                        "id": MODEL_ID,
+                        "revision": MODEL_REVISION,
+                    },
+                }
+                timing = {
+                    "postprocessor": HYBRID_POLICY_VERSION,
+                    "primary": dict(primary_timing),
+                    "rescue": {
+                        "postprocessor": fallback_result.get(
+                            "timestamp_postprocessor", "model-default"
+                        )
+                    },
+                }
+                runtime = {
+                    "backend": "hybrid",
+                    "device": self.settings.device,
+                    "diarization_device": self.settings.diarization_device,
+                    "elapsed_seconds": round(time.monotonic() - started, 3),
+                    "simultaneous_model_residency": True,
+                    "primary": dict(primary_runtime),
+                    "rescue": {
+                        "backend": "kotoba",
+                        "elapsed_seconds": round(
+                            time.monotonic() - kotoba_started, 3
+                        ),
+                    },
+                }
+                noise_filter = {
+                    "enabled": True,
+                    "provider": HYBRID_POLICY_VERSION,
+                    "execution_state": "composite",
+                    "candidate_count": None,
+                    "kept_count": None,
+                    "removed_count": None,
+                    "removed_duration_sum_sec": None,
+                    "removed_duration_union_sec": None,
+                    "removed_spans": [],
+                    "primary": dict(primary_noise_filter),
+                    "rescue": (
+                        dict(fallback_noise_filter)
+                        if isinstance(fallback_noise_filter, Mapping)
+                        else {}
+                    ),
+                }
+                primary_quality = primary_result.get("quality", {})
+                if not isinstance(primary_quality, Mapping):
+                    primary_quality = {}
+                fallback_encoding = fallback_result.get("encoding_warning")
+                backend_quality = {
+                    "encoding_warning": dict(
+                        primary_quality.get("encoding_warning", {})
+                    )
+                    if isinstance(
+                        primary_quality.get("encoding_warning"), Mapping
+                    )
+                    else {},
+                    "whisperx": dict(primary_quality),
+                    "kotoba": {
+                        "encoding_warning": (
+                            dict(fallback_encoding)
+                            if isinstance(fallback_encoding, Mapping)
+                            else {}
+                        ),
+                        "issues": fallback_issues,
+                    },
+                    "hybrid": {
+                        **hybrid_quality,
+                        "options": asdict(hybrid_options),
+                        "primary_issues": primary_issues,
+                        "speaker_debounce": speaker_debounce,
+                    },
                 }
             elif backend == "kotoba":
                 raw_result = run_pipeline(

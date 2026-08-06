@@ -168,6 +168,14 @@
       </fieldset>
 
       <h3 class="form-section-title wide">처리 설정</h3>
+      <label class="wide">전사 엔진
+        <select name="backend">
+          <option value="hybrid" selected>하이브리드 (WhisperX + Kotoba 보정)</option>
+          <option value="whisperx">WhisperX</option>
+          <option value="kotoba">Kotoba</option>
+        </select>
+        <span class="field-help">전사와 전체 작업에 적용됩니다. 하이브리드는 WhisperX 30초·Kotoba 15초 결과를 비교해 이상 구간을 보정합니다.</span>
+      </label>
       <details class="advanced-options wide">
         <summary>
           <strong>고급 옵션</strong>
@@ -183,8 +191,15 @@
           <label>길이(초)
             <input name="duration_seconds" type="number" min="0" step="0.1" placeholder="비우거나 0 = 끝까지">
           </label>
-          <label>청크(초)
+          <label>단독 엔진 청크(초)
             <input name="chunk_length_seconds" type="number" min="1" value="60" required>
+            <span class="field-help">Kotoba 또는 WhisperX 단독 선택 시 적용됩니다.</span>
+          </label>
+          <label>하이브리드 Kotoba 청크(초)
+            <input name="hybrid_kotoba_chunk_length_seconds" type="number" min="1" value="15" required>
+          </label>
+          <label>하이브리드 WhisperX 청크(초)
+            <input name="hybrid_whisperx_chunk_length_seconds" type="number" min="1" value="30" required>
           </label>
           <label>화자 수
             <input name="num_speakers" type="number" min="1" placeholder="자동">

@@ -22,6 +22,23 @@ Target Python 3.11, use four-space indentation, type annotations, and focused mo
 
 Use `unittest`; name files `test_<module>.py` and methods after observable behavior. Mock model loading and network access. Cover FFmpeg command construction, invalid speaker options, timestamp offsets, Unicode serialization, and output naming. Real quality tests must use legally available, short fixtures and must not commit copyrighted media or sensitive transcripts.
 
+Do not rerun the full test suite solely because an already validated change is
+moved to a new branch, its version metadata or matching release assertion is
+updated, documentation is edited, or commit/push/PR work begins. Reuse the
+existing result and run only the smallest check covering the follow-up change.
+Rerun the full suite only when runtime behavior, dependencies, behavior-affecting
+configuration, or substantive test logic changed after the last complete run,
+when the prior result was incomplete or failed, or when the user explicitly
+requests it.
+
+## Documentation Relevance
+
+Keep repository documentation and pull requests limited to code behavior,
+public configuration contracts, reproducible constraints, and verification
+evidence. Omit deployment-local facts such as host addresses, machine roles,
+hardware capacity, and where a test happened unless they materially change a
+supported requirement or are necessary to reproduce a verified limitation.
+
 ## Security & Configuration
 
 Pass `HF_TOKEN` only at runtime and never store it in source, images, logs, or committed environment files. Pin revisions whenever `trust_remote_code=True` is required. Preserve read-only input mounts and persistent model-cache volumes.

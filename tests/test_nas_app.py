@@ -86,7 +86,17 @@ class NASAppTests(unittest.TestCase):
             self.assertIn("생성 완료", response.text)
             self.assertIn("일본어 구두점 모델 사용", response.text)
             self.assertIn("소음 오인식 필터 사용", response.text)
+            self.assertIn('<select name="backend">', response.text)
+            self.assertIn(
+                '<option value="hybrid" selected>', response.text
+            )
             self.assertIn('name="chunk_length_seconds"', response.text)
+            self.assertIn(
+                'name="hybrid_kotoba_chunk_length_seconds"', response.text
+            )
+            self.assertIn(
+                'name="hybrid_whisperx_chunk_length_seconds"', response.text
+            )
             self.assertIn('value="60"', response.text)
             self.assertIn(
                 'name="noise_filter" type="checkbox" value="true" checked',
@@ -376,6 +386,7 @@ class NASAppTests(unittest.TestCase):
                     "/jobs",
                     data={
                         "source_rels": ["one.mkv", "two.mp4"],
+                        "backend": "hybrid",
                         "duration_seconds": "0",
                         "noise_filter": ["false", "true"],
                         "prompt_category_id": "jav",
@@ -397,10 +408,16 @@ class NASAppTests(unittest.TestCase):
                 all(job["updated_at"].endswith("+09:00") for job in jobs)
             )
             self.assertTrue(
-                all(job["options"]["chunk_length_seconds"] == 60 for job in jobs)
+                all(
+                    job["options"]["chunk_length_seconds"] == 15
+                    for job in jobs
+                )
             )
             self.assertTrue(
                 all(job["options"]["noise_filter"] for job in jobs)
+            )
+            self.assertTrue(
+                all(job["options"]["backend"] == "hybrid" for job in jobs)
             )
             self.assertTrue(
                 all(
@@ -466,6 +483,7 @@ class NASAppTests(unittest.TestCase):
                 created.options["translation_prompt"]["review_rounds"],
                 2,
             )
+            self.assertEqual(created.options["backend"], "kotoba")
 
     def test_completed_job_streams_video_range_and_webvtt(self) -> None:
         with TemporaryDirectory() as directory:

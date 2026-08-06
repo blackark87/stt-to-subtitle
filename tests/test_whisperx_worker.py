@@ -77,9 +77,29 @@ class WhisperXWorkerTests(unittest.TestCase):
         self.assertEqual(words[0]["word_id"], "word-000001")
         self.assertEqual(words[0]["speaker"], "SPEAKER_01")
         self.assertEqual(words[0]["score"], 0.9)
+        self.assertFalse(words[0]["timestamp_fallback"])
+        self.assertEqual(words[0]["timestamp_source"], "word_alignment")
         self.assertEqual(
             words[0]["parent_span_ids"],
             ["whisperx-segment-000001"],
+        )
+
+    def test_marks_parent_segment_timestamp_fallback(self) -> None:
+        words = extract_whisperx_words(
+            [
+                {
+                    "start": 1.0,
+                    "end": 5.0,
+                    "speaker": "SPEAKER_00",
+                    "words": [{"word": "時刻なし"}],
+                }
+            ]
+        )
+
+        self.assertEqual((words[0]["start"], words[0]["end"]), (1.0, 5.0))
+        self.assertTrue(words[0]["timestamp_fallback"])
+        self.assertEqual(
+            words[0]["timestamp_source"], "parent_segment_fallback"
         )
 
     def test_rebuild_splits_when_speaker_changes(self) -> None:

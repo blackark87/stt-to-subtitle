@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "stt-to-subtitle"
-version = "0.14.0"
+version = "0.15.0"
 description = "Distributed local transcription, translation, and styled subtitle pipeline"
 readme = "README.md"
 requires-python = ">=3.11,<3.12"

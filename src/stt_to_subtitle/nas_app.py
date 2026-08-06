@@ -744,10 +744,13 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
         return_folder: str = Form(""),
         csrf_token: str = Form(""),
         force_overwrite: bool = Form(False),
+        backend: str = Form("kotoba"),
         audio_stream: str = Form("0"),
         start_seconds: str = Form("0"),
         duration_seconds: str = Form(""),
         chunk_length_seconds: str = Form("60"),
+        hybrid_kotoba_chunk_length_seconds: str = Form("15"),
+        hybrid_whisperx_chunk_length_seconds: str = Form("30"),
         num_speakers: str = Form(""),
         min_speakers: str = Form(""),
         max_speakers: str = Form(""),
@@ -760,6 +763,7 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
             return login_redirect()
         validate_csrf(request, csrf_token)
         options = {
+            "backend": backend,
             "audio_stream": audio_stream,
             "start_seconds": start_seconds,
             "duration_seconds": duration_seconds,
@@ -770,6 +774,15 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
             "add_punctuation": add_punctuation,
             "noise_filter": noise_filter[-1] if noise_filter else True,
         }
+        if backend.strip().lower() == "hybrid":
+            options["hybrid_rescue"] = {
+                "kotoba_chunk_length_seconds": (
+                    hybrid_kotoba_chunk_length_seconds
+                ),
+                "whisperx_chunk_length_seconds": (
+                    hybrid_whisperx_chunk_length_seconds
+                ),
+            }
         try:
             service = orchestrator(request)
             if (
