@@ -11,6 +11,13 @@ import re
 from types import MethodType
 from typing import Any, Mapping, Protocol, Sequence
 
+from .stt_quality import (
+    annotate_span_diagnostics,
+    interval_durations,
+    short_span_diagnostics,
+)
+from .stt_trace import StageArtifactRecorder
+
 MODEL_ID = "kotoba-tech/kotoba-whisper-v2.2"
 MODEL_REVISION = "9d33482a0eb9b57f1ad80708e8ac5538246d8355"
 DEVICE_PATTERN = re.compile(r"^(?:cpu|mps|cuda(?::\d+)?)$")
@@ -30,6 +37,7 @@ class TranscriptionOptions:
     add_punctuation: bool = False
     noise_filter: bool = True
     noise_filter_trigger_level: float = DEFAULT_NOISE_FILTER_TRIGGER_LEVEL
+    short_span_policy: str = "observe"
     threads: int | None = None
 
     def validate(self) -> None:
@@ -41,6 +49,11 @@ class TranscriptionOptions:
             raise ValueError("noise_filter_trigger_level must be positive")
         if self.threads is not None and self.threads < 1:
             raise ValueError("threads must be at least 1")
+        if self.short_span_policy != "observe":
+            raise ValueError(
+                "short_span_policy currently supports only non-destructive "
+                "'observe' mode"
+            )
         speaker_values = (
             self.num_speakers,
             self.min_speakers,
@@ -178,6 +191,10 @@ class NoiseFilteringSpeakerDiarization:
         self.enabled = True
         self.trigger_level = DEFAULT_NOISE_FILTER_TRIGGER_LEVEL
         self.removed_spans: list[dict[str, Any]] = []
+        self.candidate_spans: list[dict[str, Any]] = []
+        self.kept_spans: list[dict[str, Any]] = []
+        self.execution_state = "not_run"
+        self.error_count = 0
 
     def __call__(
         self,
@@ -194,14 +211,46 @@ class NoiseFilteringSpeakerDiarization:
             **kwargs,
         )
         self.removed_spans = []
+        self.candidate_spans = []
+        self.kept_spans = []
+        self.error_count = 0
+        entries = list(annotation.itertracks(yield_label=True))
+        for index, (segment, _track, speaker) in enumerate(entries, start=1):
+            start = round(float(segment.start), 3)
+            end = round(float(segment.end), 3)
+            self.candidate_spans.append(
+                {
+                    "span_id": f"dia-{index:06d}",
+                    "parent_span_ids": [],
+                    "stage": "diarization_raw",
+                    "start": start,
+                    "end": end,
+                    "duration": round(max(0.0, end - start), 3),
+                    "speaker": str(speaker),
+                    "provider": "pyannote",
+                    "decision": "keep",
+                    "reason_codes": [],
+                }
+            )
+        self.candidate_spans = annotate_span_diagnostics(
+            self.candidate_spans
+        )
         if not self.enabled:
+            self.execution_state = "not_run"
+            self.kept_spans = [
+                {
+                    **span,
+                    "stage": "asr_input",
+                    "parent_span_ids": [span["span_id"]],
+                }
+                for span in self.candidate_spans
+            ]
             return annotation
 
         filtered = annotation.empty()
         total_samples = int(audio.shape[-1])
-        for segment, track, speaker in annotation.itertracks(
-            yield_label=True
-        ):
+        for index, (segment, track, speaker) in enumerate(entries):
+            candidate = self.candidate_spans[index]
             start_sample = max(
                 0,
                 min(total_samples, round(float(segment.start) * sampling_rate)),
@@ -224,9 +273,20 @@ class NoiseFilteringSpeakerDiarization:
                     error,
                 )
                 contains_voice = True
+                self.error_count += 1
             if contains_voice:
                 filtered[segment, track] = speaker
+                kept = dict(candidate)
+                kept.update(
+                    {
+                        "stage": "asr_input",
+                        "parent_span_ids": [candidate["span_id"]],
+                    }
+                )
+                self.kept_spans.append(kept)
                 continue
+            candidate["decision"] = "remove"
+            candidate["reason_codes"] = ["SECONDARY_VAD_REJECTED"]
             self.removed_spans.append(
                 {
                     "start": round(float(segment.start), 3),
@@ -234,6 +294,13 @@ class NoiseFilteringSpeakerDiarization:
                     "speaker": str(speaker),
                 }
             )
+
+        if self.error_count:
+            self.execution_state = "error"
+        elif self.removed_spans:
+            self.execution_state = "run_removed"
+        else:
+            self.execution_state = "run_no_removal"
 
         if self.removed_spans:
             LOGGER.info(
@@ -252,13 +319,39 @@ class NoiseFilteringSpeakerDiarization:
         self.enabled = enabled
         self.trigger_level = trigger_level
         self.removed_spans = []
+        self.candidate_spans = []
+        self.kept_spans = []
+        self.execution_state = "not_run"
+        self.error_count = 0
+
+    def span_id_for(self, speaker: str, start: float, end: float) -> str | None:
+        """Resolve the stable diarization ID used by the latest invocation."""
+        for span in self.candidate_spans:
+            if (
+                span["speaker"] == speaker
+                and abs(float(span["start"]) - start) <= 0.001
+                and abs(float(span["end"]) - end) <= 0.001
+            ):
+                return str(span["span_id"])
+        return None
 
     def public_dict(self) -> dict[str, Any]:
+        duration_sum, duration_union = interval_durations(self.removed_spans)
         return {
+            "provider": "kotoba-noise-filter-v1",
+            "execution_state": self.execution_state,
             "enabled": self.enabled,
             "trigger_level": self.trigger_level,
+            "thresholds": {"trigger_level": self.trigger_level},
+            "candidate_count": len(self.candidate_spans),
+            "kept_count": len(self.kept_spans),
             "removed_count": len(self.removed_spans),
+            "removed_duration_sum_sec": duration_sum,
+            "removed_duration_union_sec": duration_union,
+            "error_count": self.error_count,
             "removed_spans": list(self.removed_spans),
+            "candidates": list(self.candidate_spans),
+            "short_spans": short_span_diagnostics(self.candidate_spans),
         }
 
 
@@ -430,6 +523,38 @@ def corrected_kotoba_postprocess(
             return_language=return_language,
             return_timestamps=return_timestamps,
         )
+        diarizer = getattr(speech_pipeline, "__dict__", {}).get(
+            "model_speaker_diarization"
+        )
+        parent_span_id = (
+            diarizer.span_id_for(speaker, span_start, span_end)
+            if isinstance(diarizer, NoiseFilteringSpeakerDiarization)
+            else None
+        )
+        for chunk in chunks:
+            start, end = (float(value) for value in chunk["timestamp"])
+            epsilon = 0.001
+            if (
+                start < span_start - epsilon
+                or end > span_end + epsilon
+                or end < start
+            ):
+                raise ValueError(
+                    "Kotoba global timestamp escaped its parent speaker span"
+                )
+            chunk.update(
+                {
+                    "parent_span_ids": (
+                        [parent_span_id] if parent_span_id is not None else []
+                    ),
+                    "local_start": round(start - span_start, 3),
+                    "local_end": round(end - span_start, 3),
+                    "global_start": round(start, 3),
+                    "global_end": round(end, 3),
+                    "stage": "asr_raw",
+                    "provider": TIMESTAMP_POSTPROCESSOR,
+                }
+            )
         output_chunks.extend(chunks)
         if text.strip():
             speaker_texts.setdefault(speaker, []).append((span_start, text))
@@ -441,6 +566,8 @@ def corrected_kotoba_postprocess(
             str(item["speaker_id"]),
         )
     )
+    for index, chunk in enumerate(output_chunks, start=1):
+        chunk["span_id"] = f"asr-{index:06d}"
     speaker_ids = sorted(
         {
             str(chunk["speaker_id"])
@@ -666,6 +793,7 @@ def run_pipeline(
     *,
     progress_callback: Callable[[ChunkProgress], None] | None = None,
     progress_every: int = 10,
+    debug_artifact_dir: Path | None = None,
 ) -> Mapping[str, Any]:
     """Run one validated transcription against an already loaded pipeline."""
     options.validate()
@@ -690,9 +818,65 @@ def run_pipeline(
             max_speakers=options.max_speakers,
         )
     if noise_filter is None:
-        return result
+        noise_report: dict[str, Any] = {
+            "provider": "kotoba-noise-filter-v1",
+            "execution_state": "not_configured",
+            "enabled": options.noise_filter,
+            "candidate_count": None,
+            "kept_count": None,
+            "removed_count": None,
+            "removed_duration_sum_sec": None,
+            "removed_duration_union_sec": None,
+            "removed_spans": [],
+            "short_span_policy": options.short_span_policy,
+        }
+    else:
+        noise_report = noise_filter.public_dict()
+        noise_report["short_span_policy"] = options.short_span_policy
     enriched_result = dict(result)
-    enriched_result["noise_filter"] = noise_filter.public_dict()
+    if noise_filter is not None:
+        enriched_result["noise_filter"] = noise_report
+
+    recorder = StageArtifactRecorder(debug_artifact_dir)
+    unavailable = {
+        "execution_state": "not_observable",
+        "reason": (
+            "the pinned remote Kotoba pipeline does not expose a callback for "
+            "this intermediate stage"
+        ),
+    }
+    candidates = noise_filter.candidate_spans if noise_filter is not None else []
+    kept = noise_filter.kept_spans if noise_filter is not None else []
+    recorder.record("01_diarization_raw.json", "diarization_raw", candidates)
+    recorder.record(
+        "02_speaker_spans_processed.json",
+        "span_processed",
+        unavailable,
+    )
+    recorder.record(
+        "03_noise_filter_candidates.json",
+        "noise_filter_candidates",
+        candidates,
+    )
+    recorder.record(
+        "04_noise_filter_result.json",
+        "noise_filtered",
+        noise_report,
+    )
+    recorder.record("05_asr_input_spans.json", "asr_input", kept)
+    recorder.record(
+        "06_asr_raw_segments.json",
+        "asr_raw",
+        enriched_result.get("chunks", []),
+    )
+    recorder.record(
+        "07_final_segments.json",
+        "subtitle_final",
+        normalize_segments(enriched_result),
+    )
+    if noise_filter is None:
+        return result
+    enriched_result["encoding_warning"] = recorder.encoding_warning()
     return enriched_result
 
 
@@ -736,14 +920,17 @@ def normalize_segments(
             continue
         start = max(0.0, float(timestamp[0])) + offset_seconds
         end = max(float(timestamp[1]), float(timestamp[0])) + offset_seconds
-        normalized.append(
-            {
-                "start": round(start, 3),
-                "end": round(end, 3),
-                "speaker": str(chunk.get("speaker_id", "UNKNOWN")),
-                "text": text,
-            }
-        )
+        item: dict[str, Any] = {
+            "start": round(start, 3),
+            "end": round(end, 3),
+            "speaker": str(chunk.get("speaker_id", "UNKNOWN")),
+            "text": text,
+        }
+        if "parent_span_ids" in chunk:
+            item["parent_span_ids"] = list(chunk["parent_span_ids"])
+        if "provider" in chunk:
+            item["provider"] = str(chunk["provider"])
+        normalized.append(item)
 
     return sorted(
         normalized,
