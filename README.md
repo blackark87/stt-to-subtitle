@@ -386,7 +386,7 @@ curl -X POST http://127.0.0.1:8100/v1/transcriptions \
   -F 'options={"backend":"whisperx","chunk_length_seconds":30,"noise_filter":true,"subtitle_segmentation":{"split_on_speaker_change":true,"max_gap_sec":0.8,"max_duration_sec":8.0,"max_chars":36,"prefer_punctuation_boundary":true},"repetition_policy":"flag"}'
 ```
 
-24GB VRAM에서 두 모델을 함께 사용하는 하이브리드 요청은 다음과 같습니다.
+두 모델을 함께 상주시켜 사용하는 하이브리드 요청은 다음과 같습니다.
 Kotoba는 15초, WhisperX는 30초 청크를 각각 사용합니다.
 
 ```bash
