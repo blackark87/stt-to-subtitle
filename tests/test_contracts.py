@@ -49,6 +49,27 @@ class ContractTests(unittest.TestCase):
 
         self.assertEqual(segments[0]["end"], 1.5)
 
+    def test_segment_ids_preserve_word_lineage_without_changing_translation_id(
+        self,
+    ) -> None:
+        segment = add_segment_ids(
+            [
+                {
+                    "start": 0.0,
+                    "end": 1.0,
+                    "speaker": "A",
+                    "text": "はい",
+                    "word_ids": ["word-000001"],
+                    "parent_span_ids": ["word-000001"],
+                }
+            ]
+        )[0]
+
+        self.assertEqual(segment["id"], "segment-000001")
+        self.assertEqual(segment["span_id"], "segment-000001")
+        self.assertEqual(segment["word_ids"], ["word-000001"])
+        self.assertEqual(segment["parent_span_ids"], ["word-000001"])
+
     def test_translation_ids_must_match_in_order(self) -> None:
         with self.assertRaisesRegex(ValueError, "exactly match"):
             validate_translation_items(

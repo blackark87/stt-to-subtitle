@@ -9,6 +9,7 @@ from pathlib import Path
 import threading
 from typing import Any, Callable, Mapping, Sequence
 from uuid import uuid4
+import wave
 
 from .artifacts import artifact_path
 from .audio import AudioExtraction, extract_audio
@@ -1146,6 +1147,46 @@ class NASOrchestrator:
             "add_punctuation": job.options["add_punctuation"],
             "noise_filter": job.options.get("noise_filter", True),
         }
+        try:
+            with wave.open(job.audio_path, "rb") as wav_file:
+                audio_duration: float | None = round(
+                    wav_file.getnframes() / wav_file.getframerate(),
+                    3,
+                )
+        except (EOFError, wave.Error, ZeroDivisionError):
+            audio_duration = None
+        source_start = float(job.options["start_seconds"])
+        source_end = (
+            round(source_start + audio_duration, 3)
+            if audio_duration is not None
+            else None
+        )
+        request_metadata = {
+            "job_id": job.id,
+            "request_id": f"nas-{job.id}",
+            "delivery_mode": "single_wav",
+            "audio_sha256": job.audio_sha256,
+            "audio_duration_sec": audio_duration,
+            "source_start_sec": source_start,
+            "source_end_sec": source_end,
+            "provider": "remote_stt",
+            "chunk_length_seconds": options["chunk_length_seconds"],
+            "chunk_length_semantics": "model_internal",
+            "stt_call_count": 1,
+        }
+        LOGGER.info(
+            "stt_request job_id=%s request_id=%s delivery_mode=single_wav "
+            "audio_sha256=%s duration_sec=%s source_start_sec=%.3f "
+            "source_end_sec=%s chunk_length_seconds=%s call_count=1",
+            job.id,
+            request_metadata["request_id"],
+            job.audio_sha256,
+            audio_duration if audio_duration is not None else "unknown",
+            source_start,
+            source_end if source_end is not None else "unknown",
+            options["chunk_length_seconds"],
+            extra=request_metadata,
+        )
 
         def save_remote_job(remote_job_id: str) -> None:
             self.store.update(job.id, stt_job_id=remote_job_id)
@@ -1187,6 +1228,28 @@ class NASOrchestrator:
             "relative_path": job.source_rel,
             "offset_seconds": offset,
         }
+        input_metadata = payload.get("input")
+        if isinstance(input_metadata, dict):
+            remote_duration = input_metadata.get("duration_sec")
+            effective_duration = (
+                audio_duration
+                if audio_duration is not None
+                else (
+                    float(remote_duration)
+                    if remote_duration is not None
+                    else None
+                )
+            )
+            input_metadata.update(
+                {
+                    "source_start_sec": offset,
+                    "source_end_sec": (
+                        round(offset + effective_duration, 3)
+                        if effective_duration is not None
+                        else None
+                    ),
+                }
+            )
         validate_transcript(payload)
         transcript_path = artifact_path(
             self.settings.state_dir,

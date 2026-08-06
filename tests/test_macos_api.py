@@ -50,6 +50,50 @@ class MacOSAPIHelpersTests(unittest.TestCase):
 
         self.assertEqual(options["backend"], "whisperx")
         self.assertTrue(options["noise_filter"])
+        self.assertTrue(
+            options["subtitle_segmentation"]["split_on_speaker_change"]
+        )
+        self.assertEqual(options["repetition_policy"], "flag")
+
+    def test_accepts_configurable_whisperx_segmentation_and_reject_policy(
+        self,
+    ) -> None:
+        settings = MacOSAPISettings(
+            state_dir=Path("/tmp/not-used"),
+            api_token="",
+            hf_token="hf-token",
+        )
+
+        options = _parse_options(
+            json.dumps(
+                {
+                    "backend": "whisperx",
+                    "subtitle_segmentation": {
+                        "max_gap_sec": 0.7,
+                        "max_duration_sec": 8.0,
+                        "max_chars": 36,
+                    },
+                    "repetition_policy": "reject",
+                    "repetition_min_count": 12,
+                }
+            ),
+            settings,
+        )
+
+        self.assertEqual(options["subtitle_segmentation"]["max_gap_sec"], 0.7)
+        self.assertEqual(options["subtitle_segmentation"]["max_chars"], 36)
+        self.assertEqual(options["repetition_policy"], "reject")
+        self.assertEqual(options["repetition_min_count"], 12)
+
+    def test_short_span_policy_is_observation_only(self) -> None:
+        settings = MacOSAPISettings(
+            state_dir=Path("/tmp/not-used"),
+            api_token="",
+            hf_token="hf-token",
+        )
+
+        with self.assertRaisesRegex(ValueError, "non-destructive 'observe'"):
+            _parse_options('{"short_span_policy":"drop"}', settings)
 
     def test_rejects_unknown_transcription_backend(self) -> None:
         settings = MacOSAPISettings(
@@ -245,6 +289,93 @@ class MacOSAPIHelpersTests(unittest.TestCase):
             self.assertNotIn("secret-hf-token", command)
             self.assertEqual(environment["HF_TOKEN"], "secret-hf-token")
             self.assertEqual(result["model"]["id"], "large-v3")
+
+    def test_completed_job_contains_additive_trace_and_debug_metrics(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_dir = root / "state"
+            audio_path = root / "audio.wav"
+            with wave.open(str(audio_path), "wb") as wav_file:
+                wav_file.setnchannels(1)
+                wav_file.setsampwidth(2)
+                wav_file.setframerate(16000)
+                wav_file.writeframes(b"\x00\x00" * 16000)
+            service = TranscriptionService(
+                MacOSAPISettings(
+                    state_dir=state_dir,
+                    api_token="",
+                    hf_token="hf-token",
+                    device="cpu",
+                    diarization_device="cpu",
+                    debug_artifacts=True,
+                )
+            )
+            service.store.create(
+                job_id="job-id",
+                idempotency_key="key",
+                audio_path=audio_path,
+                audio_sha256="abc",
+                options={
+                    "backend": "kotoba",
+                    "batch_size": 1,
+                    "chunk_length_seconds": 15,
+                    "num_speakers": None,
+                    "min_speakers": None,
+                    "max_speakers": None,
+                    "add_punctuation": False,
+                    "noise_filter": True,
+                    "noise_filter_trigger_level": 7.0,
+                    "short_span_policy": "observe",
+                    "threads": None,
+                },
+            )
+            result = {
+                "chunks": [
+                    {
+                        "timestamp": [0.0, 1.0],
+                        "speaker_id": "SPEAKER_00",
+                        "text": "はい",
+                    }
+                ],
+                "timestamp_postprocessor": "test-postprocessor",
+                "noise_filter": {
+                    "provider": "kotoba-noise-filter-v1",
+                    "execution_state": "run_no_removal",
+                    "enabled": True,
+                    "candidate_count": 1,
+                    "kept_count": 1,
+                    "removed_count": 0,
+                    "removed_spans": [],
+                },
+            }
+
+            with patch.object(service, "_get_pipeline", return_value=Mock()):
+                with patch(
+                    "stt_to_subtitle.macos_api.run_pipeline",
+                    return_value=result,
+                ):
+                    service._run_job("job-id")
+
+            completed = service.store.get("job-id")
+            payload = json.loads(
+                Path(completed.result_path).read_text(encoding="utf-8")
+            )
+            artifact_dir = state_dir / "artifacts" / "job-id"
+
+            self.assertEqual(payload["schema_version"], 1)
+            self.assertEqual(payload["trace_schema_version"], "stt-trace-v1")
+            self.assertEqual(payload["input"]["delivery_mode"], "single_wav")
+            self.assertEqual(payload["input"]["duration_sec"], 1.0)
+            self.assertEqual(payload["request"]["attempt"], 1)
+            self.assertEqual(
+                payload["noise_filter"]["execution_state"],
+                "run_no_removal",
+            )
+            self.assertTrue((artifact_dir / "00_request.json").is_file())
+            self.assertTrue((artifact_dir / "00_runtime.json").is_file())
+            self.assertTrue(
+                (artifact_dir / "metrics" / "metric_result.json").is_file()
+            )
 
 
 class MacOSAPIRouteTests(unittest.TestCase):

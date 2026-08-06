@@ -62,6 +62,7 @@ class TranscriptionStoreTests(unittest.TestCase):
             job = store.get("job-1")
             self.assertEqual(job.chunks_created, 0)
             self.assertEqual(job.chunks_completed, 0)
+            self.assertEqual(job.attempt, 2)
 
     def test_adds_chunk_columns_to_an_existing_database(self) -> None:
         with TemporaryDirectory() as directory:
@@ -98,6 +99,7 @@ class TranscriptionStoreTests(unittest.TestCase):
 
             self.assertEqual(job.chunks_created, 0)
             self.assertEqual(job.chunks_completed, 0)
+            self.assertEqual(job.attempt, 1)
 
 
 class NASStoreTests(unittest.TestCase):

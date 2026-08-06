@@ -2,6 +2,7 @@ import sys
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -327,6 +328,12 @@ class NoiseFilteringSpeakerDiarizationTests(unittest.TestCase):
         )
         self.assertEqual(wrapper.public_dict()["removed_count"], 1)
         self.assertEqual(
+            wrapper.public_dict()["execution_state"],
+            "run_removed",
+        )
+        self.assertEqual(wrapper.public_dict()["candidate_count"], 2)
+        self.assertEqual(wrapper.public_dict()["kept_count"], 1)
+        self.assertEqual(
             wrapper.public_dict()["removed_spans"],
             [
                 {
@@ -353,9 +360,86 @@ class NoiseFilteringSpeakerDiarizationTests(unittest.TestCase):
             annotation,
         )
         detector.assert_not_called()
+        self.assertEqual(wrapper.public_dict()["execution_state"], "not_run")
+
+    def test_enabled_filter_reports_run_with_no_removal(self) -> None:
+        annotation = self.Annotation(
+            [(self.Segment(0.0, 1.0), "_", "SPEAKER_00")]
+        )
+        wrapper = NoiseFilteringSpeakerDiarization(
+            Mock(return_value=annotation),
+            detector=Mock(return_value=True),
+        )
+
+        wrapper(self.Audio(), sampling_rate=16_000)
+
+        report = wrapper.public_dict()
+        self.assertEqual(report["execution_state"], "run_no_removal")
+        self.assertEqual(report["removed_count"], 0)
+        self.assertEqual(report["candidate_count"], 1)
 
 
 class TranscribeTests(unittest.TestCase):
+    def test_debug_mode_writes_observable_kotoba_stage_artifacts(self) -> None:
+        annotation = NoiseFilteringSpeakerDiarizationTests.Annotation(
+            [
+                (
+                    NoiseFilteringSpeakerDiarizationTests.Segment(0.0, 1.0),
+                    "_",
+                    "SPEAKER_00",
+                )
+            ]
+        )
+        wrapper = NoiseFilteringSpeakerDiarization(
+            Mock(return_value=annotation),
+            detector=Mock(return_value=True),
+        )
+
+        class FakePipeline:
+            def __init__(self):
+                self.model_speaker_diarization = wrapper
+
+            def __call__(self, _audio_path, **_kwargs):
+                self.model_speaker_diarization(
+                    NoiseFilteringSpeakerDiarizationTests.Audio(),
+                    sampling_rate=16_000,
+                )
+                return {
+                    "chunks": [
+                        {
+                            "timestamp": [0.0, 1.0],
+                            "speaker_id": "SPEAKER_00",
+                            "text": "はい",
+                        }
+                    ]
+                }
+
+        with TemporaryDirectory() as directory:
+            result = run_pipeline(
+                FakePipeline(),
+                Path("/output/sample.wav"),
+                TranscriptionOptions(),
+                debug_artifact_dir=Path(directory),
+            )
+            names = {path.name for path in Path(directory).iterdir()}
+
+        self.assertEqual(
+            names,
+            {
+                "01_diarization_raw.json",
+                "02_speaker_spans_processed.json",
+                "03_noise_filter_candidates.json",
+                "04_noise_filter_result.json",
+                "05_asr_input_spans.json",
+                "06_asr_raw_segments.json",
+                "07_final_segments.json",
+            },
+        )
+        self.assertEqual(
+            result["noise_filter"]["execution_state"],
+            "run_no_removal",
+        )
+
     def test_reports_actual_pipeline_chunk_progress_at_configured_interval(
         self,
     ) -> None:

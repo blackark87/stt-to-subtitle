@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
+from datetime import datetime, timezone
 import gc
 import hashlib
 import hmac
@@ -11,6 +12,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import platform
 import queue
 import subprocess
 import threading
@@ -40,14 +42,33 @@ from .kotoba import (
 )
 from .transcription_store import TranscriptionJob, TranscriptionStore
 from .time_display import configure_kst_logging
+from .stt_quality import (
+    NORMALIZATION_VERSION,
+    overlap_duplicate_metrics,
+    short_span_diagnostics,
+)
+from .stt_trace import TRACE_SCHEMA_VERSION
 from .whisperx_worker import (
     DEFAULT_WHISPERX_COMPUTE_TYPE,
     DEFAULT_WHISPERX_LANGUAGE,
     DEFAULT_WHISPERX_MODEL,
+    WhisperXSegmentationOptions,
 )
 
 LOGGER = logging.getLogger(__name__)
 STT_BACKENDS = {"kotoba", "whisperx"}
+
+
+def _env_boolean(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean value")
 
 
 @dataclass(frozen=True)
@@ -68,6 +89,8 @@ class MacOSAPISettings:
     whisperx_language: str = DEFAULT_WHISPERX_LANGUAGE
     whisperx_compute_type: str = DEFAULT_WHISPERX_COMPUTE_TYPE
     whisperx_cache_dir: Path = Path("./var/cuda-cache/whisperx")
+    debug_artifacts: bool = False
+    debug_artifacts_dir: Path | None = None
 
     @classmethod
     def from_env(cls) -> MacOSAPISettings:
@@ -126,7 +149,17 @@ class MacOSAPISettings:
                     "./var/cuda-cache/whisperx",
                 )
             ).expanduser(),
+            debug_artifacts=_env_boolean("STT_DEBUG_ARTIFACTS"),
+            debug_artifacts_dir=(
+                Path(os.environ["STT_DEBUG_ARTIFACTS_DIR"]).expanduser()
+                if os.environ.get("STT_DEBUG_ARTIFACTS_DIR", "").strip()
+                else None
+            ),
         )
+
+    @property
+    def artifacts_dir(self) -> Path:
+        return self.debug_artifacts_dir or self.state_dir / "artifacts"
 
     def validate(self) -> None:
         if not self.hf_token.strip():
@@ -209,6 +242,10 @@ def _parse_options(raw_options: str, settings: MacOSAPISettings) -> dict[str, An
         "max_speakers",
         "add_punctuation",
         "noise_filter",
+        "short_span_policy",
+        "subtitle_segmentation",
+        "repetition_policy",
+        "repetition_min_count",
     }
     unknown = set(decoded) - allowed
     if unknown:
@@ -249,10 +286,38 @@ def _parse_options(raw_options: str, settings: MacOSAPISettings) -> dict[str, An
         add_punctuation=bool(decoded.get("add_punctuation", False)),
         noise_filter=noise_filter,
         noise_filter_trigger_level=settings.noise_filter_trigger_level,
+        short_span_policy=str(decoded.get("short_span_policy", "observe")),
         threads=settings.threads,
     )
     options.validate()
-    return {"backend": backend, **asdict(options)}
+    parsed = {"backend": backend, **asdict(options)}
+    if backend == "whisperx":
+        segmentation = WhisperXSegmentationOptions.from_options(decoded)
+        repetition_policy = str(decoded.get("repetition_policy", "flag"))
+        if repetition_policy not in {"flag", "reject"}:
+            raise ValueError("repetition_policy must be 'flag' or 'reject'")
+        repetition_min_count = int(decoded.get("repetition_min_count", 8))
+        if repetition_min_count < 2:
+            raise ValueError("repetition_min_count must be at least 2")
+        parsed.update(
+            {
+                "subtitle_segmentation": asdict(segmentation),
+                "repetition_policy": repetition_policy,
+                "repetition_min_count": repetition_min_count,
+            }
+        )
+    elif any(
+        key in decoded
+        for key in (
+            "subtitle_segmentation",
+            "repetition_policy",
+            "repetition_min_count",
+        )
+    ):
+        raise ValueError(
+            "WhisperX quality options require backend='whisperx'"
+        )
+    return parsed
 
 
 def _validate_wav(path: Path) -> None:
@@ -272,6 +337,35 @@ def _validate_wav(path: Path) -> None:
         raise ValueError("uploaded file is not a valid PCM WAV") from error
 
 
+def _wav_duration(path: Path) -> float:
+    with wave.open(str(path), "rb") as wav_file:
+        return round(wav_file.getnframes() / wav_file.getframerate(), 3)
+
+
+def _git_commit() -> str:
+    return os.environ.get("GIT_COMMIT", "unknown").strip() or "unknown"
+
+
+def _runtime_trace(
+    settings: MacOSAPISettings,
+    *,
+    backend: str,
+    elapsed_seconds: float | None = None,
+    warm_start: bool,
+) -> dict[str, Any]:
+    return {
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+        "backend": backend,
+        "device": settings.device,
+        "diarization_device": settings.diarization_device,
+        "python": platform.python_version(),
+        "platform": platform.platform(),
+        "git_commit": _git_commit(),
+        "warm_start": warm_start,
+        "elapsed_seconds": elapsed_seconds,
+    }
+
+
 class TranscriptionService:
     """Own the persistent queue and the single lazy model instance."""
 
@@ -283,6 +377,8 @@ class TranscriptionService:
         self.result_dir = self.settings.state_dir / "results"
         self.incoming_dir.mkdir(parents=True, exist_ok=True)
         self.result_dir.mkdir(parents=True, exist_ok=True)
+        if self.settings.debug_artifacts:
+            self.settings.artifacts_dir.mkdir(parents=True, exist_ok=True)
         self.store = TranscriptionStore(self.settings.state_dir / "jobs.sqlite3")
         self._queue: queue.Queue[str | None] = queue.Queue()
         self._pipeline: SpeechPipeline | None = None
@@ -491,6 +587,13 @@ class TranscriptionService:
             "--options",
             json.dumps(job.options, sort_keys=True),
         ]
+        if self.settings.debug_artifacts:
+            command.extend(
+                [
+                    "--debug-dir",
+                    str(self.settings.artifacts_dir / job.id / "whisperx"),
+                ]
+            )
         try:
             completed = subprocess.run(
                 command,
@@ -543,12 +646,61 @@ class TranscriptionService:
         heartbeat.start()
         try:
             backend = str(job.options.get("backend", "kotoba"))
+            audio_duration = _wav_duration(Path(job.audio_path))
+            warm_start = backend == "kotoba" and self._pipeline is not None
+            artifact_dir = (
+                self.settings.artifacts_dir / job.id
+                if self.settings.debug_artifacts
+                else None
+            )
+            request_trace = {
+                "trace_schema_version": TRACE_SCHEMA_VERSION,
+                "job_id": job.id,
+                "request_id": job.id,
+                "attempt": job.attempt,
+                "parent_request_id": job.id if job.attempt > 1 else None,
+                "input": {
+                    "delivery_mode": "single_wav",
+                    "sha256": job.audio_sha256,
+                    "duration_sec": audio_duration,
+                    "source_start_sec": 0.0,
+                    "source_end_sec": audio_duration,
+                },
+                "provider": backend,
+                "options": job.options,
+                "option_semantics": {
+                    "chunk_length_seconds": "model_internal",
+                    "stt_call_count": 1,
+                },
+            }
+            LOGGER.info(
+                "stt_request job_id=%s request_id=%s attempt=%d "
+                "delivery_mode=single_wav audio_sha256=%s "
+                "duration_sec=%.3f provider=%s chunk_length_seconds=%s "
+                "call_count=1",
+                job.id,
+                job.id,
+                job.attempt,
+                job.audio_sha256,
+                audio_duration,
+                backend,
+                job.options.get("chunk_length_seconds"),
+                extra=request_trace,
+            )
+            if artifact_dir is not None:
+                write_json_atomic(
+                    artifact_dir / "00_request.json",
+                    request_trace,
+                )
+            option_names = {field.name for field in fields(TranscriptionOptions)}
             option_values = {
                 key: value
                 for key, value in job.options.items()
-                if key != "backend"
+                if key in option_names
             }
             options = TranscriptionOptions(**option_values)
+            words: list[dict[str, Any]] = []
+            backend_quality: dict[str, Any] = {}
             if backend == "whisperx":
                 backend_result = self._run_whisperx_worker(job)
                 raw_segments = backend_result.get("segments")
@@ -561,6 +713,12 @@ class TranscriptionService:
                 timing = backend_result.get("timing")
                 runtime = backend_result.get("runtime")
                 noise_filter = backend_result.get("noise_filter")
+                raw_words = backend_result.get("words", [])
+                if isinstance(raw_words, list):
+                    words = raw_words
+                raw_quality = backend_result.get("quality", {})
+                if isinstance(raw_quality, Mapping):
+                    backend_quality = dict(raw_quality)
                 if not isinstance(model, Mapping):
                     raise RuntimeError("WhisperX worker result has no model")
                 if not isinstance(timing, Mapping):
@@ -585,6 +743,11 @@ class TranscriptionService:
                         progress,
                     ),
                     progress_every=self.settings.chunk_progress_every,
+                    debug_artifact_dir=(
+                        artifact_dir / "kotoba"
+                        if artifact_dir is not None
+                        else None
+                    ),
                 )
                 segments = add_segment_ids(normalize_segments(raw_result))
                 model = {"id": MODEL_ID, "revision": MODEL_REVISION}
@@ -604,28 +767,97 @@ class TranscriptionService:
                     "noise_filter",
                     {
                         "enabled": options.noise_filter,
+                        "provider": "kotoba-noise-filter-v1",
+                        "execution_state": "not_configured",
                         "trigger_level": options.noise_filter_trigger_level,
-                        "removed_count": 0,
+                        "removed_count": None,
                         "removed_spans": [],
                     },
                 )
+                encoding_warning = raw_result.get("encoding_warning")
+                if isinstance(encoding_warning, Mapping):
+                    backend_quality["encoding_warning"] = dict(
+                        encoding_warning
+                    )
             else:
                 raise RuntimeError(
                     f"unsupported transcription backend: {backend}"
                 )
-            payload = {
+            duplicate_metrics = overlap_duplicate_metrics(segments)
+            quality = {
+                **backend_quality,
+                "normalization_version": NORMALIZATION_VERSION,
+                "short_span_policy": options.short_span_policy,
+                "short_spans": short_span_diagnostics(segments),
+                "overlap_duplicates": duplicate_metrics,
+            }
+            pipeline_trace = {
+                "provider": backend,
+                "model": str(model.get("id", "unknown")),
+                "model_version": str(model.get("revision", "unknown")),
+                "pipeline_version": str(
+                    timing.get("postprocessor", "unknown")
+                ),
+                "git_commit": _git_commit(),
+            }
+            payload: dict[str, Any] = {
                 "schema_version": TRANSCRIPT_SCHEMA_VERSION,
+                "trace_schema_version": TRACE_SCHEMA_VERSION,
                 "job_id": job.id,
+                "request_id": job.id,
+                "request": {
+                    "attempt": job.attempt,
+                    "parent_request_id": job.id if job.attempt > 1 else None,
+                },
+                "input": request_trace["input"],
+                "pipeline": pipeline_trace,
                 "audio_sha256": job.audio_sha256,
                 "model": model,
                 "timing": timing,
                 "runtime": runtime,
                 "options": job.options,
                 "noise_filter": noise_filter,
+                "quality": quality,
                 "segments": segments,
             }
+            if words:
+                payload["words"] = words
             result_path = self.result_dir / f"{job.id}.json"
             write_json_atomic(result_path, payload)
+            if artifact_dir is not None:
+                write_json_atomic(
+                    artifact_dir / "00_runtime.json",
+                    _runtime_trace(
+                        self.settings,
+                        backend=backend,
+                        elapsed_seconds=round(time.monotonic() - started, 3),
+                        warm_start=warm_start,
+                    ),
+                )
+                write_json_atomic(
+                    artifact_dir / "metrics" / "metric_config.json",
+                    {
+                        "normalization_version": NORMALIZATION_VERSION,
+                        "duplicate_metric_version": duplicate_metrics[
+                            "duplicate_metric_version"
+                        ],
+                        "similarity_threshold": duplicate_metrics[
+                            "similarity_threshold"
+                        ],
+                    },
+                )
+                write_json_atomic(
+                    artifact_dir / "metrics" / "metric_result.json",
+                    quality,
+                )
+                write_json_atomic(
+                    artifact_dir / "metrics" / "warnings.json",
+                    {
+                        key: value
+                        for key, value in quality.items()
+                        if key in {"encoding_warning", "repetition"}
+                    },
+                )
             self.store.update(
                 job.id,
                 status="completed",
@@ -637,15 +869,17 @@ class TranscriptionService:
                 len(segments),
                 backend,
             )
-            if (
-                isinstance(noise_filter, Mapping)
-                and int(noise_filter.get("removed_count", 0)) > 0
-            ):
+            removed_count = (
+                noise_filter.get("removed_count")
+                if isinstance(noise_filter, Mapping)
+                else None
+            )
+            if isinstance(removed_count, int) and removed_count > 0:
                 LOGGER.info(
                     "transcription job %s noise filter removed %d "
                     "non-speech span(s)",
                     job.id,
-                    int(noise_filter["removed_count"]),
+                    removed_count,
                 )
         except BaseException as error:
             message = str(error).replace(self.settings.hf_token, "[redacted]")

@@ -162,6 +162,7 @@ STT_DEVICE=mps
 STT_DIARIZATION_DEVICE=cpu
 STT_CHUNK_PROGRESS_EVERY=10
 STT_NOISE_FILTER_TRIGGER_LEVEL=7.0
+STT_DEBUG_ARTIFACTS=false
 ```
 
 `HF_TOKEN`은 gated 모델 다운로드에 필수입니다. Hugging Face 설정에서 read 권한 토큰을 발급해 `hf_replace_me`를 교체하십시오. 신뢰하는 내부망에서 서비스 간 인증이 필요 없다면 `STT_API_TOKEN`은 비워 둡니다. 값을 설정하면 작업 API에 Bearer 인증이 자동으로 활성화되며 웹 오케스트레이터에도 같은 값을 설정해야 합니다.
@@ -191,6 +192,13 @@ Pyannote로 화자와 실제 발화 구간을 찾고, 각 화자 구간을 Kotob
 작업 체크를 끄거나 Mac 실행 폴더의
 `STT_NOISE_FILTER_TRIGGER_LEVEL=7.0`을 낮춘 뒤 서버를 재시작하십시오.
 높은 값일수록 필터가 더 엄격하며 값은 양수여야 합니다.
+
+`STT_DEBUG_ARTIFACTS=true`는 재현 작업용 단계별 JSON을
+`STT_STATE_DIR/artifacts/{job_id}`에 저장합니다. 운영 기본값은 `false`이며
+원문이 포함될 수 있으므로 필요한 작업에서만 켜십시오. 저장 위치는
+`STT_DEBUG_ARTIFACTS_DIR`로 바꿀 수 있고 오디오 조각은 저장하지 않습니다.
+전사 결과의 `noise_filter.execution_state`는 필터 미실행, 실행 후 제거 없음,
+제거 발생, 내부 집계 비관측 상태를 구분합니다.
 
 실행 폴더를 다른 위치나 다른 Mac으로 복사할 수 있습니다. 단, Python 가상환경에는 생성 당시의 절대 경로가 포함될 수 있으므로 폴더를 옮긴 뒤에는 대상 위치에서 `./setup.sh`를 다시 실행하십시오. `.env`에는 토큰이 있으므로 복사와 백업 시 노출되지 않도록 주의합니다.
 
@@ -375,7 +383,7 @@ WhisperX가 아직 설치되지 않아도 `ready`를 유지합니다.
 curl -X POST http://127.0.0.1:8100/v1/transcriptions \
   -H 'Idempotency-Key: example-whisperx-001' \
   -F 'audio=@audio.16k.wav;type=audio/wav' \
-  -F 'options={"backend":"whisperx","chunk_length_seconds":30,"noise_filter":true}'
+  -F 'options={"backend":"whisperx","chunk_length_seconds":30,"noise_filter":true,"subtitle_segmentation":{"split_on_speaker_change":true,"max_gap_sec":0.8,"max_duration_sec":8.0,"max_chars":36,"prefer_punctuation_boundary":true},"repetition_policy":"flag"}'
 ```
 
 WhisperX는 자체 VAD를 항상 사용하므로 `backend=whisperx`에서
@@ -383,6 +391,15 @@ WhisperX는 자체 VAD를 항상 사용하므로 `backend=whisperx`에서
 상주 중인 Kotoba 모델을 먼저 해제하고 CUDA 캐시를 비웁니다. WhisperX 작업은
 완료 후 프로세스가 종료되어 VRAM을 반환하며, 다음 Kotoba 요청에서 Kotoba를
 다시 지연 로드합니다.
+
+WhisperX는 alignment 이후의 word-level 시각·화자·score를 결과의 `words`에
+보존하고, 기본적으로 화자가 바뀌는 지점에서 최종 자막 세그먼트를 다시
+구성합니다. `max_gap_sec`, `max_duration_sec`, `max_chars`는 `null`이면 해당
+제한을 적용하지 않습니다. 반복 진단은 원문을 축약하지 않으며 기본
+`repetition_policy=flag`로 경고만 기록합니다. `reject`는 반복 기준을 넘은
+작업을 실패 처리합니다. WhisperX 내부 VAD의 후보·제거 수는 현재 API로
+관측할 수 없으므로 `removed_count=0`으로 가장하지 않고
+`execution_state=not_observable`, `removed_count=null`로 기록합니다.
 
 웹 오케스트레이터의 전사 API 주소에는 Mac 대신 이 CUDA PC의 내부 IP와 포트 `8100`을
 설정하면 됩니다. `.env.cuda`, `var/cuda-cache/`, `var/cuda-stt/`,

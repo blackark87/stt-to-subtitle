@@ -12,17 +12,36 @@ TRANSLATION_SCHEMA_VERSION = 1
 def add_segment_ids(
     segments: Sequence[Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Copy normalized segments and add deterministic identifiers."""
-    return [
-        {
-            "id": f"segment-{index:06d}",
-            "start": float(segment["start"]),
-            "end": float(segment["end"]),
+    """Copy normalized segments and add deterministic IDs and lineage."""
+    identified: list[dict[str, Any]] = []
+    for index, segment in enumerate(segments, start=1):
+        segment_id = f"segment-{index:06d}"
+        start = float(segment["start"])
+        end = float(segment["end"])
+        parent_span_ids = segment.get("parent_span_ids", [])
+        if not isinstance(parent_span_ids, Sequence) or isinstance(
+            parent_span_ids, (str, bytes, bytearray)
+        ):
+            parent_span_ids = []
+        item: dict[str, Any] = {
+            "id": segment_id,
+            "span_id": segment_id,
+            "parent_span_ids": [str(value) for value in parent_span_ids],
+            "stage": "subtitle_final",
+            "start": start,
+            "end": end,
+            "duration": round(max(0.0, end - start), 3),
             "speaker": str(segment.get("speaker", "UNKNOWN")),
             "text": str(segment["text"]),
+            "decision": str(segment.get("decision", "keep")),
+            "reason_codes": list(segment.get("reason_codes", [])),
         }
-        for index, segment in enumerate(segments, start=1)
-    ]
+        for optional_key in ("provider", "word_ids"):
+            optional_value = segment.get(optional_key)
+            if optional_value is not None:
+                item[optional_key] = optional_value
+        identified.append(item)
+    return identified
 
 
 def validate_transcript(payload: Mapping[str, Any]) -> list[dict[str, Any]]:

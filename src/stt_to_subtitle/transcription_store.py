@@ -26,6 +26,7 @@ class TranscriptionJob:
     chunks_completed: int
     created_at: float
     updated_at: float
+    attempt: int = 1
 
     def public_dict(self, *, report_every: int = 10) -> dict[str, Any]:
         in_progress = max(0, self.chunks_created - self.chunks_completed)
@@ -34,6 +35,7 @@ class TranscriptionJob:
             "status": self.status,
             "audio_sha256": self.audio_sha256,
             "error": self.error,
+            "attempt": self.attempt,
             "chunk_progress": {
                 "created": self.chunks_created,
                 "completed": self.chunks_completed,
@@ -73,6 +75,7 @@ class TranscriptionStore:
                     error TEXT,
                     chunks_created INTEGER NOT NULL DEFAULT 0,
                     chunks_completed INTEGER NOT NULL DEFAULT 0,
+                    attempt INTEGER NOT NULL DEFAULT 1,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL
                 )
@@ -98,6 +101,13 @@ class TranscriptionStore:
                     ADD COLUMN chunks_completed INTEGER NOT NULL DEFAULT 0
                     """
                 )
+            if "attempt" not in columns:
+                connection.execute(
+                    """
+                    ALTER TABLE transcription_jobs
+                    ADD COLUMN attempt INTEGER NOT NULL DEFAULT 1
+                    """
+                )
 
     @staticmethod
     def _from_row(row: sqlite3.Row | None) -> TranscriptionJob | None:
@@ -118,6 +128,7 @@ class TranscriptionStore:
             chunks_completed=int(row["chunks_completed"]),
             created_at=float(row["created_at"]),
             updated_at=float(row["updated_at"]),
+            attempt=int(row["attempt"]),
         )
 
     def get(self, job_id: str) -> TranscriptionJob | None:
@@ -215,6 +226,7 @@ class TranscriptionStore:
                 UPDATE transcription_jobs
                 SET status = 'queued', error = NULL,
                     chunks_created = 0, chunks_completed = 0,
+                    attempt = attempt + 1,
                     updated_at = ?
                 WHERE id = ?
                 """,
