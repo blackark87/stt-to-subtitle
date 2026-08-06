@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict
 import json
 import logging
 from pathlib import Path
@@ -19,6 +20,7 @@ from .contracts import (
     validate_translation_items,
 )
 from .files import sha256_file, write_json_atomic
+from .hybrid_stt import HybridRescueOptions
 from .kotoba import DEFAULT_CHUNK_LENGTH_SECONDS, TranscriptionOptions
 from .nas_config import (
     MediaLibrary,
@@ -39,6 +41,7 @@ from .translation_prompt import (
     KOREAN_JAV_SYSTEM_PROMPT,
     KOREAN_TRANSLATION_REVIEW_PROMPT,
 )
+from .whisperx_worker import WhisperXSegmentationOptions
 
 LOGGER = logging.getLogger(__name__)
 MAX_EDITABLE_JSON_BYTES = 20 * 1024 * 1024
@@ -59,6 +62,24 @@ TRANSLATION_PROMPT_OPTION = "translation_prompt"
 TRANSLATION_REVIEW_ROUNDS = 2
 SUPPORTED_OPERATIONS = {"extract", "transcribe", "translate", "full"}
 TRANSLATION_OPERATIONS = {"translate", "full"}
+SUPPORTED_STT_BACKENDS = {"kotoba", "whisperx", "hybrid"}
+HYBRID_SUBTITLE_SEGMENTATION_DEFAULTS = {
+    "max_gap_sec": 0.8,
+    "max_duration_sec": 8.0,
+    "max_chars": 36,
+    "split_on_speaker_change": True,
+    "prefer_punctuation_boundary": True,
+}
+HYBRID_RESCUE_DEFAULTS = {
+    "window_padding_sec": 5.0,
+    "max_word_duration_sec": 8.0,
+    "short_segment_duration_sec": 0.2,
+    "short_segment_cluster_window_sec": 5.0,
+    "short_segment_cluster_count": 3,
+    "speaker_debounce_sec": 0.1,
+    "kotoba_chunk_length_seconds": 15,
+    "whisperx_chunk_length_seconds": 30,
+}
 
 
 class NASOrchestrator:
@@ -493,6 +514,11 @@ class NASOrchestrator:
         self,
         options: Mapping[str, Any],
     ) -> dict[str, Any]:
+        backend = str(options.get("backend", "kotoba")).strip().lower()
+        if backend not in SUPPORTED_STT_BACKENDS:
+            supported = ", ".join(sorted(SUPPORTED_STT_BACKENDS))
+            raise ValueError(f"backend must be one of: {supported}")
+
         raw_duration = options.get("duration_seconds")
         parsed_duration = (
             float(raw_duration)
@@ -535,7 +561,27 @@ class NASOrchestrator:
         )
         extraction.validate()
         transcription.validate()
+        if backend in {"hybrid", "whisperx"} and not transcription.noise_filter:
+            raise ValueError(
+                f"{backend} backend requires noise_filter=true for VAD"
+            )
+        if backend == "whisperx" and "hybrid_rescue" in options:
+            raise ValueError("hybrid_rescue requires backend='hybrid'")
+        if backend == "kotoba" and any(
+            key in options
+            for key in (
+                "subtitle_segmentation",
+                "repetition_policy",
+                "repetition_min_count",
+                "hybrid_rescue",
+            )
+        ):
+            raise ValueError(
+                "WhisperX quality options require backend='whisperx' or "
+                "'hybrid'"
+            )
         normalized_options = {
+            "backend": backend,
             "audio_stream": extraction.audio_stream,
             "start_seconds": extraction.start_seconds,
             "duration_seconds": extraction.duration_seconds,
@@ -546,6 +592,77 @@ class NASOrchestrator:
             "add_punctuation": transcription.add_punctuation,
             "noise_filter": transcription.noise_filter,
         }
+        raw_segmentation = options.get("subtitle_segmentation")
+        if raw_segmentation is not None and not isinstance(
+            raw_segmentation,
+            Mapping,
+        ):
+            raise ValueError("subtitle_segmentation must be an object")
+        if backend == "hybrid":
+            segmentation = dict(HYBRID_SUBTITLE_SEGMENTATION_DEFAULTS)
+            if isinstance(raw_segmentation, Mapping):
+                segmentation.update(raw_segmentation)
+            segmentation = asdict(
+                WhisperXSegmentationOptions.from_options(
+                    {"subtitle_segmentation": segmentation}
+                )
+            )
+
+            raw_rescue = options.get("hybrid_rescue")
+            if raw_rescue is not None and not isinstance(raw_rescue, Mapping):
+                raise ValueError("hybrid_rescue must be an object")
+            rescue = dict(HYBRID_RESCUE_DEFAULTS)
+            if isinstance(raw_rescue, Mapping):
+                rescue.update(raw_rescue)
+            rescue = asdict(
+                HybridRescueOptions.from_options({"hybrid_rescue": rescue})
+            )
+            kotoba_chunk_length = rescue["kotoba_chunk_length_seconds"]
+            repetition_policy = str(
+                options.get("repetition_policy", "flag")
+            ).strip().lower()
+            if repetition_policy != "flag":
+                raise ValueError(
+                    "hybrid backend requires repetition_policy='flag'"
+                )
+            repetition_min_count = int(
+                options.get("repetition_min_count", 8)
+            )
+            if repetition_min_count < 2:
+                raise ValueError(
+                    "repetition_min_count must be at least 2"
+                )
+
+            normalized_options.update(
+                {
+                    "chunk_length_seconds": kotoba_chunk_length,
+                    "subtitle_segmentation": segmentation,
+                    "repetition_policy": repetition_policy,
+                    "repetition_min_count": repetition_min_count,
+                    "hybrid_rescue": rescue,
+                }
+            )
+        elif backend == "whisperx":
+            if isinstance(raw_segmentation, Mapping):
+                normalized_options["subtitle_segmentation"] = asdict(
+                    WhisperXSegmentationOptions.from_options(
+                        {"subtitle_segmentation": raw_segmentation}
+                    )
+                )
+            repetition_policy = str(
+                options.get("repetition_policy", "flag")
+            ).strip().lower()
+            if repetition_policy not in {"flag", "reject"}:
+                raise ValueError(
+                    "repetition_policy must be 'flag' or 'reject'"
+                )
+            repetition_min_count = int(options.get("repetition_min_count", 8))
+            if repetition_min_count < 2:
+                raise ValueError(
+                    "repetition_min_count must be at least 2"
+                )
+            normalized_options["repetition_policy"] = repetition_policy
+            normalized_options["repetition_min_count"] = repetition_min_count
         return normalized_options
 
     def retry(self, job_id: str) -> NASJob:
@@ -1140,6 +1257,7 @@ class NASOrchestrator:
         if not job.audio_path or not Path(job.audio_path).is_file():
             raise RuntimeError("extracted WAV is unavailable")
         options = {
+            "backend": job.options.get("backend", "kotoba"),
             "chunk_length_seconds": job.options["chunk_length_seconds"],
             "num_speakers": job.options["num_speakers"],
             "min_speakers": job.options["min_speakers"],
@@ -1147,6 +1265,14 @@ class NASOrchestrator:
             "add_punctuation": job.options["add_punctuation"],
             "noise_filter": job.options.get("noise_filter", True),
         }
+        for key in (
+            "subtitle_segmentation",
+            "repetition_policy",
+            "repetition_min_count",
+            "hybrid_rescue",
+        ):
+            if key in job.options:
+                options[key] = job.options[key]
         try:
             with wave.open(job.audio_path, "rb") as wav_file:
                 audio_duration: float | None = round(
@@ -1161,6 +1287,7 @@ class NASOrchestrator:
             if audio_duration is not None
             else None
         )
+        stt_call_count = 2 if options["backend"] == "hybrid" else 1
         request_metadata = {
             "job_id": job.id,
             "request_id": f"nas-{job.id}",
@@ -1170,14 +1297,24 @@ class NASOrchestrator:
             "source_start_sec": source_start,
             "source_end_sec": source_end,
             "provider": "remote_stt",
+            "backend": options["backend"],
             "chunk_length_seconds": options["chunk_length_seconds"],
             "chunk_length_semantics": "model_internal",
-            "stt_call_count": 1,
+            "stt_call_count": stt_call_count,
         }
+        if options["backend"] == "hybrid":
+            request_metadata["backend_chunk_lengths"] = {
+                "kotoba": options["hybrid_rescue"][
+                    "kotoba_chunk_length_seconds"
+                ],
+                "whisperx": options["hybrid_rescue"][
+                    "whisperx_chunk_length_seconds"
+                ],
+            }
         LOGGER.info(
             "stt_request job_id=%s request_id=%s delivery_mode=single_wav "
             "audio_sha256=%s duration_sec=%s source_start_sec=%.3f "
-            "source_end_sec=%s chunk_length_seconds=%s call_count=1",
+            "source_end_sec=%s chunk_length_seconds=%s call_count=%s",
             job.id,
             request_metadata["request_id"],
             job.audio_sha256,
@@ -1185,6 +1322,7 @@ class NASOrchestrator:
             source_start,
             source_end if source_end is not None else "unknown",
             options["chunk_length_seconds"],
+            stt_call_count,
             extra=request_metadata,
         )
 

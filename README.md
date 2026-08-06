@@ -341,7 +341,7 @@ GPU 인덱스가 범위를 벗어나면 `/readyz`는 이유와 함께 503을 반
 curl http://127.0.0.1:8100/readyz
 ```
 
-### 요청별 WhisperX 백엔드
+### 요청별 WhisperX 및 하이브리드 백엔드
 
 WhisperX 3.8.6은 Kotoba와 다른 PyTorch/Pyannote 버전을 요구하므로 같은
 가상환경에 설치하지 않습니다. CUDA STT API는 기존 `.venv-cuda`에서 실행하고,
@@ -372,9 +372,9 @@ Windows용 `.env.cuda`에서는 다음 경로를 사용합니다.
 WHISPERX_PYTHON=.venv-whisperx/Scripts/python.exe
 ```
 
-서버를 다시 실행하면 `/readyz`의 `backends.whisperx`에서 작업 환경의 준비
-상태를 확인할 수 있습니다. 서버 전체 준비 상태는 Kotoba가 정상이라면
-WhisperX가 아직 설치되지 않아도 `ready`를 유지합니다.
+서버를 다시 실행하면 `/readyz`의 `backends.whisperx`와 `backends.hybrid`에서
+작업 환경의 준비 상태를 확인할 수 있습니다. 서버 전체 준비 상태는 Kotoba가
+정상이라면 WhisperX가 아직 설치되지 않아도 `ready`를 유지합니다.
 
 요청마다 `options.backend`로 백엔드를 선택합니다. 값이 없으면 기존 Kotoba를
 사용합니다.
@@ -386,11 +386,46 @@ curl -X POST http://127.0.0.1:8100/v1/transcriptions \
   -F 'options={"backend":"whisperx","chunk_length_seconds":30,"noise_filter":true,"subtitle_segmentation":{"split_on_speaker_change":true,"max_gap_sec":0.8,"max_duration_sec":8.0,"max_chars":36,"prefer_punctuation_boundary":true},"repetition_policy":"flag"}'
 ```
 
-WhisperX는 자체 VAD를 항상 사용하므로 `backend=whisperx`에서
-`noise_filter=false`는 거부됩니다. 요청이 Kotoba에서 WhisperX로 전환되면
-상주 중인 Kotoba 모델을 먼저 해제하고 CUDA 캐시를 비웁니다. WhisperX 작업은
-완료 후 프로세스가 종료되어 VRAM을 반환하며, 다음 Kotoba 요청에서 Kotoba를
-다시 지연 로드합니다.
+24GB VRAM에서 두 모델을 함께 사용하는 하이브리드 요청은 다음과 같습니다.
+Kotoba는 15초, WhisperX는 30초 청크를 각각 사용합니다.
+
+```bash
+curl -X POST http://127.0.0.1:8100/v1/transcriptions \
+  -H 'Idempotency-Key: example-hybrid-001' \
+  -F 'audio=@audio.16k.wav;type=audio/wav' \
+  -F 'options={"backend":"hybrid","noise_filter":true,"subtitle_segmentation":{"split_on_speaker_change":true,"max_gap_sec":0.8,"max_duration_sec":8.0,"max_chars":36,"prefer_punctuation_boundary":true},"repetition_policy":"flag","repetition_min_count":8,"hybrid_rescue":{"window_padding_sec":5,"max_word_duration_sec":8,"short_segment_duration_sec":0.2,"short_segment_cluster_window_sec":5,"short_segment_cluster_count":3,"speaker_debounce_sec":0.1,"kotoba_chunk_length_seconds":15,"whisperx_chunk_length_seconds":30}}'
+```
+
+WhisperX는 자체 VAD를 항상 사용하므로 `backend=whisperx`와
+`backend=hybrid`에서 `noise_filter=false`는 거부됩니다. 단독 WhisperX 요청은
+상주 중인 Kotoba 모델을 먼저 해제하고 CUDA 캐시를 비웁니다. 하이브리드 요청은
+Kotoba를 먼저 로드해 둔 뒤 해제하지 않고 WhisperX 작업 프로세스를 실행하므로
+WhisperX 실행 중 두 모델이 함께 VRAM에 올라갑니다. WhisperX 작업 프로세스는
+요청마다 종료되지만 Kotoba는 다음 요청을 위해 계속 상주합니다.
+
+하이브리드는 두 모델로 전체 WAV를 각각 한 번 전사합니다. WhisperX를 기본
+결과로 사용하고, 반복 폭주, `U+FFFD`, 8초를 넘는 word alignment, word 시각
+fallback을 치명 오류로 검출합니다. 5초 안에 밀집한 0.2초 미만 세그먼트는
+관찰용 warning으로만 기록하며 자동 교체를 일으키지 않습니다. 치명 오류의
+앞뒤 5초는 Kotoba 후보를 판단하는 문맥으로만 사용하고, 실제 삭제 대상은
+진단에 연결된 WhisperX 세그먼트 ID로 고정합니다. Kotoba 문장은 텍스트를
+시간만 잘라 쓰지 않고 완전한 세그먼트 경계로 넣습니다.
+이때 같은 화자의 인접 WhisperX 구간과 경계가 겹치면 word 시각을 근거로
+겹친 부분만 제거하고 나머지를 다시 구성합니다. word 근거가 불완전하면
+자동 교체하지 않고 `needs_review`로 남깁니다.
+
+Kotoba도 불안정하거나 대체 세그먼트가 없거나 WAV 범위를 벗어나면 WhisperX
+원문을 삭제하지 않고 `quality.hybrid.needs_review=true`로 남깁니다. Kotoba
+화자 ID는 시간 중첩을 기준으로 최대한 일대일 매핑하며, 중첩 신뢰도가 0.5
+미만이거나 일대일 대응이 불가능한 화자는 `KOTOBA_...` 로컬 ID로 보존합니다.
+실제 겹침이 있는 짧은 화자 발화는 디바운스하지 않습니다. 교체된 WhisperX
+word는 삭제하지 않고 `decision=superseded`로 표시합니다. 최종 세그먼트의
+`provider`, `parent_span_ids`, `source_segment_id`, `rescue_window_id`,
+`reason_codes`와 `quality.hybrid`에 교체 근거가 보존됩니다.
+
+이 정책은 관측된 구조적 실패를 자동 복구하는 장치입니다. 두 STT가 모두 같은
+의미 오류를 내는 경우까지 판별하는 정확도 보장은 아니므로, 사람 자막 대비 P80
+도달 여부는 실제 품질 세트로 별도 측정해야 합니다.
 
 WhisperX는 alignment 이후의 word-level 시각·화자·score를 결과의 `words`에
 보존하고, 기본적으로 화자가 바뀌는 지점에서 최종 자막 세그먼트를 다시

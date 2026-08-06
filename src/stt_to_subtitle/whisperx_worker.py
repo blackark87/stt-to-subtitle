@@ -116,6 +116,8 @@ def extract_whisperx_words(
                 continue
             start = _timestamp(raw_word.get("start"))
             end = _timestamp(raw_word.get("end"))
+            start_from_parent = start is None
+            end_from_parent = end is None
             if start is None:
                 start = segment_start
             if end is None:
@@ -139,6 +141,14 @@ def extract_whisperx_words(
                     "start": start,
                     "end": end,
                     "duration": round(max(0.0, end - start), 3),
+                    "timestamp_fallback": (
+                        start_from_parent or end_from_parent
+                    ),
+                    "timestamp_source": (
+                        "parent_segment_fallback"
+                        if start_from_parent or end_from_parent
+                        else "word_alignment"
+                    ),
                     "speaker": str(
                         raw_word.get(
                             "speaker",

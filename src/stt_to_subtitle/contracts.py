@@ -36,7 +36,12 @@ def add_segment_ids(
             "decision": str(segment.get("decision", "keep")),
             "reason_codes": list(segment.get("reason_codes", [])),
         }
-        for optional_key in ("provider", "word_ids"):
+        for optional_key in (
+            "provider",
+            "word_ids",
+            "source_segment_id",
+            "rescue_window_id",
+        ):
             optional_value = segment.get(optional_key)
             if optional_value is not None:
                 item[optional_key] = optional_value

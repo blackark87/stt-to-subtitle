@@ -58,8 +58,42 @@ class NASOrchestratorTests(unittest.TestCase):
                 orchestrator.stop()
 
             self.assertIsNone(job.options["duration_seconds"])
+            self.assertEqual(job.options["backend"], "kotoba")
             self.assertEqual(job.options["chunk_length_seconds"], 60)
             self.assertTrue(job.options["noise_filter"])
+
+    def test_rejects_invalid_backend_options_before_audio_work(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            (media_root / "movie.mkv").write_bytes(b"media")
+            orchestrator = self.make_orchestrator(root, media_root)
+            try:
+                with self.assertRaisesRegex(
+                    ValueError, "requires noise_filter=true"
+                ):
+                    orchestrator.create_job(
+                        "movie.mkv",
+                        force_overwrite=False,
+                        options={
+                            "backend": "hybrid",
+                            "noise_filter": False,
+                        },
+                    )
+                with self.assertRaisesRegex(
+                    ValueError, "hybrid_rescue requires"
+                ):
+                    orchestrator.create_job(
+                        "movie.mkv",
+                        force_overwrite=False,
+                        options={
+                            "backend": "whisperx",
+                            "hybrid_rescue": {},
+                        },
+                    )
+            finally:
+                orchestrator.stop()
 
     def test_updates_and_reloads_remote_servers_without_restart(self) -> None:
         with TemporaryDirectory() as directory:
@@ -771,7 +805,10 @@ class NASOrchestratorTests(unittest.TestCase):
                 job = orchestrator.create_job(
                     "movie.mkv",
                     force_overwrite=False,
-                    options={"start_seconds": "10"},
+                    options={
+                        "start_seconds": "10",
+                        "backend": "hybrid",
+                    },
                 )
                 audio_path = root / "state" / "jobs" / job.id / "audio.wav"
                 audio_path.parent.mkdir(parents=True)
@@ -849,8 +886,34 @@ class NASOrchestratorTests(unittest.TestCase):
             sent_options = (
                 orchestrator.stt_client.transcribe.call_args.kwargs["options"]
             )
-            self.assertEqual(sent_options["chunk_length_seconds"], 60)
+            self.assertEqual(sent_options["chunk_length_seconds"], 15)
             self.assertTrue(sent_options["noise_filter"])
+            self.assertEqual(sent_options["backend"], "hybrid")
+            self.assertEqual(
+                sent_options["subtitle_segmentation"],
+                {
+                    "max_gap_sec": 0.8,
+                    "max_duration_sec": 8.0,
+                    "max_chars": 36,
+                    "split_on_speaker_change": True,
+                    "prefer_punctuation_boundary": True,
+                },
+            )
+            self.assertEqual(sent_options["repetition_policy"], "flag")
+            self.assertEqual(sent_options["repetition_min_count"], 8)
+            self.assertEqual(
+                sent_options["hybrid_rescue"],
+                {
+                    "window_padding_sec": 5.0,
+                    "max_word_duration_sec": 8.0,
+                    "short_segment_duration_sec": 0.2,
+                    "short_segment_cluster_window_sec": 5.0,
+                    "short_segment_cluster_count": 3,
+                    "speaker_debounce_sec": 0.1,
+                    "kotoba_chunk_length_seconds": 15,
+                    "whisperx_chunk_length_seconds": 30,
+                },
+            )
             self.assertEqual(completed_job.status, "completed")
             self.assertEqual(
                 Path(completed_job.transcript_path).name,

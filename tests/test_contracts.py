@@ -61,6 +61,8 @@ class ContractTests(unittest.TestCase):
                     "text": "はい",
                     "word_ids": ["word-000001"],
                     "parent_span_ids": ["word-000001"],
+                    "source_segment_id": "kotoba-segment-000001",
+                    "rescue_window_id": "rescue-window-000001",
                 }
             ]
         )[0]
@@ -69,6 +71,12 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(segment["span_id"], "segment-000001")
         self.assertEqual(segment["word_ids"], ["word-000001"])
         self.assertEqual(segment["parent_span_ids"], ["word-000001"])
+        self.assertEqual(
+            segment["source_segment_id"], "kotoba-segment-000001"
+        )
+        self.assertEqual(
+            segment["rescue_window_id"], "rescue-window-000001"
+        )
 
     def test_translation_ids_must_match_in_order(self) -> None:
         with self.assertRaisesRegex(ValueError, "exactly match"):

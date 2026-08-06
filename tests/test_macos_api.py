@@ -55,6 +55,46 @@ class MacOSAPIHelpersTests(unittest.TestCase):
         )
         self.assertEqual(options["repetition_policy"], "flag")
 
+    def test_accepts_hybrid_backend_with_independent_chunk_defaults(self) -> None:
+        settings = MacOSAPISettings(
+            state_dir=Path("/tmp/not-used"),
+            api_token="",
+            hf_token="hf-token",
+        )
+
+        options = _parse_options('{"backend": "hybrid"}', settings)
+
+        self.assertEqual(options["backend"], "hybrid")
+        self.assertEqual(options["chunk_length_seconds"], 15)
+        self.assertEqual(
+            options["hybrid_rescue"]["kotoba_chunk_length_seconds"], 15
+        )
+        self.assertEqual(
+            options["hybrid_rescue"]["whisperx_chunk_length_seconds"], 30
+        )
+        self.assertEqual(
+            options["subtitle_segmentation"]["max_duration_sec"], 8.0
+        )
+        self.assertEqual(options["repetition_policy"], "flag")
+
+    def test_hybrid_reject_policy_is_invalid_because_rescue_needs_flags(
+        self,
+    ) -> None:
+        settings = MacOSAPISettings(
+            state_dir=Path("/tmp/not-used"),
+            api_token="",
+            hf_token="hf-token",
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "requires repetition_policy='flag'",
+        ):
+            _parse_options(
+                '{"backend":"hybrid","repetition_policy":"reject"}',
+                settings,
+            )
+
     def test_accepts_configurable_whisperx_segmentation_and_reject_policy(
         self,
     ) -> None:
@@ -104,7 +144,7 @@ class MacOSAPIHelpersTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             ValueError,
-            "backend must be either 'kotoba' or 'whisperx'",
+            "backend must be 'kotoba', 'whisperx', or 'hybrid'",
         ):
             _parse_options('{"backend": "other"}', settings)
 
@@ -290,6 +330,155 @@ class MacOSAPIHelpersTests(unittest.TestCase):
             self.assertEqual(environment["HF_TOKEN"], "secret-hf-token")
             self.assertEqual(result["model"]["id"], "large-v3")
 
+            with patch.object(service, "_release_pipeline") as release:
+                with patch(
+                    "stt_to_subtitle.macos_api.subprocess.run",
+                    side_effect=fake_run,
+                ) as run:
+                    service._run_whisperx_worker(
+                        job,
+                        release_kotoba=False,
+                        options={
+                            **job.options,
+                            "chunk_length_seconds": 30,
+                        },
+                    )
+
+            release.assert_not_called()
+            command = run.call_args.args[0]
+            worker_options = json.loads(
+                command[command.index("--options") + 1]
+            )
+            self.assertEqual(worker_options["chunk_length_seconds"], 30)
+
+    def test_hybrid_job_runs_both_backends_and_rescues_failed_window(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_dir = root / "state"
+            audio_path = root / "audio.wav"
+            with wave.open(str(audio_path), "wb") as wav_file:
+                wav_file.setnchannels(1)
+                wav_file.setsampwidth(2)
+                wav_file.setframerate(16000)
+                wav_file.writeframes(b"\x00\x00" * 16000)
+            settings = MacOSAPISettings(
+                state_dir=state_dir,
+                api_token="",
+                hf_token="hf-token",
+                device="cpu",
+                diarization_device="cpu",
+                debug_artifacts=True,
+            )
+            service = TranscriptionService(settings)
+            options = _parse_options('{"backend":"hybrid"}', settings)
+            service.store.create(
+                job_id="hybrid-job",
+                idempotency_key="hybrid-key",
+                audio_path=audio_path,
+                audio_sha256="hybrid-sha",
+                options=options,
+            )
+            primary_result = {
+                "model": {"id": "large-v3", "revision": "whisperx-test"},
+                "timing": {"postprocessor": "whisperx-align"},
+                "runtime": {"backend": "whisperx", "device": "cpu"},
+                "noise_filter": {
+                    "enabled": True,
+                    "provider": "whisperx-vad",
+                },
+                "quality": {"encoding_warning": {"flagged": False}},
+                "words": [],
+                "segments": [
+                    {
+                        "start": 0.1,
+                        "end": 0.9,
+                        "speaker": "WX_A",
+                        "text": "い" * 8,
+                        "provider": "whisperx",
+                    }
+                ],
+            }
+            fallback_result = {
+                "chunks": [
+                    {
+                        "timestamp": [0.0, 1.0],
+                        "speaker_id": "K_A",
+                        "text": "はい",
+                    }
+                ],
+                "timestamp_postprocessor": "kotoba-test",
+                "noise_filter": {
+                    "enabled": True,
+                    "provider": "kotoba-noise-filter-v1",
+                },
+            }
+
+            with patch.object(
+                service, "_get_pipeline", return_value=Mock()
+            ) as get_pipeline:
+                with patch.object(
+                    service,
+                    "_run_whisperx_worker",
+                    return_value=primary_result,
+                ) as run_whisperx:
+                    with patch(
+                        "stt_to_subtitle.macos_api.run_pipeline",
+                        return_value=fallback_result,
+                    ) as run_kotoba:
+                        service._run_job("hybrid-job")
+
+            get_pipeline.assert_called_once_with()
+            run_whisperx.assert_called_once()
+            self.assertFalse(
+                run_whisperx.call_args.kwargs["release_kotoba"]
+            )
+            self.assertEqual(
+                run_whisperx.call_args.kwargs["options"][
+                    "chunk_length_seconds"
+                ],
+                30,
+            )
+            self.assertEqual(
+                run_kotoba.call_args.args[2].chunk_length_seconds,
+                15,
+            )
+            completed = service.store.get("hybrid-job")
+            payload = json.loads(
+                Path(completed.result_path).read_text(encoding="utf-8")
+            )
+            request_trace = json.loads(
+                (
+                    state_dir
+                    / "artifacts"
+                    / "hybrid-job"
+                    / "00_request.json"
+                ).read_text(encoding="utf-8")
+            )
+
+            self.assertEqual(payload["runtime"]["backend"], "hybrid")
+            self.assertTrue(
+                payload["runtime"]["simultaneous_model_residency"]
+            )
+            self.assertEqual(payload["segments"][0]["text"], "はい")
+            self.assertEqual(
+                payload["segments"][0]["provider"], "hybrid-rescue-v1"
+            )
+            self.assertEqual(
+                payload["segments"][0]["source_segment_id"],
+                "kotoba-segment-000001",
+            )
+            self.assertEqual(
+                payload["segments"][0]["rescue_window_id"],
+                "rescue-window-000001",
+            )
+            self.assertEqual(
+                payload["quality"]["hybrid"]["replaced_window_count"],
+                1,
+            )
+            self.assertEqual(
+                request_trace["option_semantics"]["stt_call_count"], 2
+            )
+
     def test_completed_job_contains_additive_trace_and_debug_metrics(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -443,6 +632,10 @@ class MacOSAPIRouteTests(unittest.TestCase):
             self.assertEqual(ready.status_code, 200)
             self.assertEqual(
                 ready.json()["backends"]["whisperx"]["status"],
+                "unavailable",
+            )
+            self.assertEqual(
+                ready.json()["backends"]["hybrid"]["status"],
                 "unavailable",
             )
             self.assertEqual(response.status_code, 503)
