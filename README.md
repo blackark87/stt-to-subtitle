@@ -10,16 +10,16 @@ Compose 프로젝트로 빌드하고 실행합니다. 애플리케이션 이미�
 ## 구성
 
 ```text
-브라우저 ──▶ web:8080
-               │
-               ├─ FFmpeg 오디오 추출
-               ├─ 작업·번역·자막 렌더링
-               │
-               ├──▶ stt:8100
-               │      Kotoba + Pyannote
-               │      WhisperX + Pyannote
-               │
-               └──▶ 외부 OpenAI 호환 번역 API
+브라우저 ──▶ Traefik(HTTPS) ──▶ web:8080
+                                  │
+                                  ├─ FFmpeg 오디오 추출
+                                  ├─ 작업·번역·자막 렌더링
+                                  │
+                                  ├──▶ stt:8100
+                                  │      Kotoba + Pyannote
+                                  │      WhisperX + Pyannote
+                                  │
+                                  └──▶ 외부 OpenAI 호환 번역 API
 ```
 
 Compose 프로젝트에는 두 컨테이너가 있습니다.
@@ -28,7 +28,8 @@ Compose 프로젝트에는 두 컨테이너가 있습니다.
 - `stt`: Kotoba, WhisperX, 하이브리드 전사를 제공하는 CUDA FastAPI 서버
 
 두 서비스는 Compose 내부 네트워크의 `http://stt:8100`으로 연결됩니다.
-전사 API 포트는 호스트에 게시하지 않고 웹 포트 `8080`만 게시합니다.
+전사 API와 웹 포트는 호스트에 직접 게시하지 않습니다. 웹 서비스만 기존
+Traefik 외부 네트워크에 연결되고 HTTPS 라우터를 통해 제공됩니다.
 
 Kotoba와 WhisperX는 요구하는 PyTorch·Pyannote 버전이 다르므로 STT 이미지
 안에서도 각각 `/opt/venvs/kotoba`와 `/opt/venvs/whisperx`에 설치됩니다.
@@ -39,6 +40,7 @@ HTTP 서버는 Kotoba 환경에서 실행하고 WhisperX 요청만 격리된 Pyt
 
 - Linux/amd64 호스트
 - Docker Engine과 Compose 플러그인
+- Docker provider가 활성화된 Traefik과 외부 Docker 네트워크
 - NVIDIA GPU, 호환 드라이버, NVIDIA Container Toolkit
 - Pyannote 모델 이용 조건을 승인한 Hugging Face read 토큰
 - 일본어→한국어 모델을 제공하는 OpenAI 호환 API
@@ -60,6 +62,7 @@ chmod 600 .env.compose
 
 - `HF_TOKEN`: Pyannote 접근 권한이 있는 Hugging Face read 토큰
 - `MEDIA_PATH`: 영상과 자막을 읽고 쓸 호스트 디렉터리
+- `TRAEFIK_HOST`: 웹 애플리케이션에 사용할 DNS 호스트명
 - `OPENAI_COMPATIBLE_BASE_URL`: 번역 API 루트
 - `OPENAI_COMPATIBLE_MODEL`: 번역 모델 ID
 
@@ -92,12 +95,12 @@ STT 이미지는 두 ML 환경을 모두 설치하므로 최초 빌드 시간이
 상태를 확인합니다.
 
 ```bash
-curl http://127.0.0.1:8080/healthz
+curl https://stt.example.com/healthz
 ./scripts/compose.sh --env-file .env.compose exec stt \
   python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8100/readyz').read().decode())"
 ```
 
-브라우저에서 `http://DOCKER_HOST:8080`을 열고 **서버 설정**에서 번역
+브라우저에서 `https://TRAEFIK_HOST`를 열고 **서버 설정**에서 번역
 서버를 확인합니다. Compose의 전사 API 주소는 내부 서비스
 `http://stt:8100`으로 고정되므로 환경 파일에서 설정하지 않습니다. 설정은
 웹 상태 디렉터리의 `jobs.sqlite3`에 저장되며 컨테이너를 다시 만들어도
@@ -111,10 +114,13 @@ curl http://127.0.0.1:8080/healthz
 | --- | --- | --- |
 | `MEDIA_PATH` | `./media` | 입력 영상과 생성 자막 |
 | `WEB_STATE_PATH` | `./var/web-state` | 작업 DB, WAV, JSON 체크포인트 |
-| `WEB_PORT` | `8080` | 호스트 웹 포트 |
+| `TRAEFIK_HOST` | 필수 | 웹 HTTPS 라우터의 DNS 호스트명 |
+| `TRAEFIK_NETWORK` | `proxy` | Traefik이 연결된 외부 Docker 네트워크 |
+| `TRAEFIK_ENTRYPOINT` | `websecure` | Traefik HTTPS entrypoint |
+| `TRAEFIK_CERT_RESOLVER` | `letsencrypt` | Traefik 인증서 resolver |
 | `WEB_ADMIN_PASSWORD` | 빈 값 | 웹 로그인 비밀번호 |
 | `WEB_SESSION_SECRET` | 빈 값 | 로그인 사용 시 필요한 32자 이상 세션 키 |
-| `WEB_SECURE_COOKIE` | `false` | HTTPS에서만 세션 쿠키 전송 |
+| `WEB_SECURE_COOKIE` | `true` | HTTPS에서만 세션 쿠키 전송 |
 
 `WEB_ADMIN_PASSWORD`를 설정하면 `WEB_SESSION_SECRET`도 반드시 32자
 이상으로 설정해야 합니다. 다음과 같이 생성할 수 있습니다.

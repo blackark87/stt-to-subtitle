@@ -19,6 +19,18 @@ class ReleaseConfigurationTests(unittest.TestCase):
         self.assertNotIn("${STT_BASE_URL", compose)
         self.assertNotIn("STT_API_TOKEN:", compose)
         self.assertIn("${PUID:-1000}:${PGID:-1000}", compose)
+        self.assertNotIn("${WEB_PORT", compose)
+        self.assertIn('traefik.enable: "true"', compose)
+        self.assertIn("${TRAEFIK_HOST:?TRAEFIK_HOST must be set}", compose)
+        self.assertIn(
+            "WEB_SECURE_COOKIE: ${WEB_SECURE_COOKIE:-true}", compose
+        )
+        self.assertIn(
+            "traefik.http.services.stt-to-subtitle."
+            'loadbalancer.server.port: "8080"',
+            compose,
+        )
+        self.assertIn("external: true", compose)
         self.assertNotIn("packages" + ": write", workflow)
         self.assertNotIn("build-push-action", workflow)
         registry_name = "gh" + "cr.io"
@@ -40,11 +52,11 @@ class ReleaseConfigurationTests(unittest.TestCase):
         self.assertFalse((ROOT / "requirements-cuda.txt").exists())
         self.assertFalse((ROOT / "requirements-macos.txt").exists())
 
-    def test_project_version_is_1_0_2(self) -> None:
+    def test_project_version_is_2_0_0(self) -> None:
         project = tomllib.loads(
             (ROOT / "pyproject.toml").read_text(encoding="utf-8")
         )
-        self.assertEqual(project["project"]["version"], "1.0.2")
+        self.assertEqual(project["project"]["version"], "2.0.0")
 
 
 if __name__ == "__main__":
