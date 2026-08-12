@@ -1,6 +1,7 @@
 from importlib.util import find_spec
 import json
 from pathlib import Path
+import os
 from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
@@ -15,7 +16,7 @@ if WEB_TESTS_AVAILABLE:
 from stt_to_subtitle.web_config import WebSettings
 
 if WEB_TESTS_AVAILABLE:
-    from stt_to_subtitle.web_app import create_app
+    from stt_to_subtitle.web_app import create_app, main
 
 
 @unittest.skipUnless(
@@ -259,6 +260,17 @@ class WebAppTests(unittest.TestCase):
             self.assertIn('name="lm_model"', page.text)
             self.assertIn("모델 조회", page.text)
             self.assertIn("server-settings.js", page.text)
+
+    def test_main_trusts_the_configured_reverse_proxy(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"WEB_FORWARDED_ALLOW_IPS": "*"},
+            clear=False,
+        ), patch("uvicorn.run") as run:
+            main()
+
+        self.assertTrue(run.call_args.kwargs["proxy_headers"])
+        self.assertEqual(run.call_args.kwargs["forwarded_allow_ips"], "*")
 
     def test_recent_jobs_and_history_use_readable_responsive_layout(self) -> None:
         with TemporaryDirectory() as directory:

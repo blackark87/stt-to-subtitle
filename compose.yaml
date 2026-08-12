@@ -2,11 +2,12 @@ name: stt-to-subtitle
 
 services:
   web:
+    container_name: stt-web
     platform: linux/amd64
     build:
       context: .
       dockerfile: Dockerfile.web
-    user: "${PUID:-1000}:${PGID:-1000}"
+    user: "${WEB_PUID:-1026}:${WEB_PGID:-100}"
     init: true
     restart: unless-stopped
     read_only: true
@@ -29,10 +30,11 @@ services:
       traefik.http.services.stt-to-subtitle.loadbalancer.server.port: "8080"
     environment:
       MEDIA_ROOT: /media
-      WEB_STATE_DIR: /var/lib/stt
+      WEB_STATE_DIR: /data/stt-to-subtitle/web-state
       WEB_ADMIN_PASSWORD: ${WEB_ADMIN_PASSWORD:-}
       WEB_SESSION_SECRET: ${WEB_SESSION_SECRET:-}
       WEB_SECURE_COOKIE: ${WEB_SECURE_COOKIE:-true}
+      WEB_FORWARDED_ALLOW_IPS: "${WEB_FORWARDED_ALLOW_IPS:-*}"
       STT_BASE_URL: http://stt:8100
       OPENAI_COMPATIBLE_BASE_URL: ${OPENAI_COMPATIBLE_BASE_URL:-}
       OPENAI_COMPATIBLE_TOKEN: ${OPENAI_COMPATIBLE_TOKEN:-}
@@ -41,7 +43,9 @@ services:
       TRANSLATION_BATCH_CHARACTERS: ${TRANSLATION_BATCH_CHARACTERS:-6000}
     volumes:
       - ${MEDIA_PATH:-./media}:/media:rw
-      - ${WEB_STATE_PATH:-./var/web-state}:/var/lib/stt:rw
+      - type: bind
+        source: ${WEB_STATE_PATH:-/data/stt-to-subtitle/web-state}
+        target: /data/stt-to-subtitle/web-state
     tmpfs:
       - /tmp:size=256m,mode=1777
     networks:
@@ -49,6 +53,7 @@ services:
       - traefik
 
   stt:
+    container_name: stt-backend
     platform: linux/amd64
     build:
       context: .
@@ -63,7 +68,7 @@ services:
       HF_TOKEN: ${HF_TOKEN:?HF_TOKEN must be set}
       STT_HOST: 0.0.0.0
       STT_PORT: 8100
-      STT_STATE_DIR: /var/lib/stt
+      STT_STATE_DIR: /data/stt-to-subtitle/stt-state
       STT_DEVICE: ${STT_DEVICE:-cuda}
       STT_DIARIZATION_DEVICE: ${STT_DIARIZATION_DEVICE:-cuda}
       STT_BATCH_SIZE: ${STT_BATCH_SIZE:-1}
@@ -71,18 +76,22 @@ services:
       STT_CHUNK_PROGRESS_EVERY: ${STT_CHUNK_PROGRESS_EVERY:-10}
       STT_NOISE_FILTER_TRIGGER_LEVEL: ${STT_NOISE_FILTER_TRIGGER_LEVEL:-7.0}
       STT_DEBUG_ARTIFACTS: ${STT_DEBUG_ARTIFACTS:-false}
-      HF_HOME: /var/cache/stt/huggingface
-      PYANNOTE_CACHE: /var/cache/stt/pyannote
-      TORCH_HOME: /var/cache/stt/torch
+      HF_HOME: /data/stt-to-subtitle/model/huggingface
+      PYANNOTE_CACHE: /data/stt-to-subtitle/model/pyannote
+      TORCH_HOME: /data/stt-to-subtitle/model/torch
       WHISPERX_PYTHON: /opt/venvs/whisperx/bin/python
       WHISPERX_MODEL: ${WHISPERX_MODEL:-large-v3}
       WHISPERX_LANGUAGE: ${WHISPERX_LANGUAGE:-ja}
       WHISPERX_COMPUTE_TYPE: ${WHISPERX_COMPUTE_TYPE:-float16}
-      WHISPERX_CACHE_DIR: /var/cache/stt/whisperx
+      WHISPERX_CACHE_DIR: /data/stt-to-subtitle/model/whisperx
       NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
     volumes:
-      - ${STT_STATE_PATH:-./var/stt-state}:/var/lib/stt:rw
-      - ${MODEL_CACHE_PATH:-./var/model-cache}:/var/cache/stt:rw
+      - type: bind
+        source: ${STT_STATE_PATH:-/data/stt-to-subtitle/stt-state}
+        target: /data/stt-to-subtitle/stt-state
+      - type: bind
+        source: ${MODEL_CACHE_PATH:-/data/stt-to-subtitle/model}
+        target: /data/stt-to-subtitle/model
     tmpfs:
       - /tmp:size=1g,mode=1777
     deploy:

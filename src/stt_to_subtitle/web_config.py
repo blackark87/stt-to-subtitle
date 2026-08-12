@@ -197,7 +197,9 @@ class WebSettings:
     def from_env(cls) -> WebSettings:
         return cls(
             state_dir=Path(
-                os.environ.get("WEB_STATE_DIR", "/var/lib/stt")
+                os.environ.get(
+                    "WEB_STATE_DIR", "/data/stt-to-subtitle/web-state"
+                )
             ).expanduser(),
             media_root=Path(
                 os.environ.get("MEDIA_ROOT", "/media")

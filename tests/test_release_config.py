@@ -16,14 +16,29 @@ class ReleaseConfigurationTests(unittest.TestCase):
         self.assertIn("dockerfile: Dockerfile.web", compose)
         self.assertIn("dockerfile: Dockerfile", compose)
         self.assertIn("STT_BASE_URL: http://stt:8100", compose)
+        self.assertIn("container_name: stt-web", compose)
+        self.assertIn("container_name: stt-backend", compose)
+        self.assertIn(
+            "WEB_STATE_DIR: /data/stt-to-subtitle/web-state", compose
+        )
+        self.assertIn(
+            "STT_STATE_DIR: /data/stt-to-subtitle/stt-state", compose
+        )
+        self.assertNotIn("/var/lib/stt", compose)
+        self.assertNotIn("/var/cache/stt", compose)
         self.assertNotIn("${STT_BASE_URL", compose)
         self.assertNotIn("STT_API_TOKEN:", compose)
+        self.assertIn("${WEB_PUID:-1026}:${WEB_PGID:-100}", compose)
         self.assertIn("${PUID:-1000}:${PGID:-1000}", compose)
         self.assertNotIn("${WEB_PORT", compose)
         self.assertIn('traefik.enable: "true"', compose)
         self.assertIn("${TRAEFIK_HOST:?TRAEFIK_HOST must be set}", compose)
         self.assertIn(
             "WEB_SECURE_COOKIE: ${WEB_SECURE_COOKIE:-true}", compose
+        )
+        self.assertIn(
+            "WEB_FORWARDED_ALLOW_IPS: \"${WEB_FORWARDED_ALLOW_IPS:-*}\"",
+            compose,
         )
         self.assertIn(
             "traefik.http.services.stt-to-subtitle."
