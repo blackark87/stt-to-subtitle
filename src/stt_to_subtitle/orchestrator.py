@@ -1420,8 +1420,8 @@ class SubtitleOrchestrator:
         )
         noise_filter = payload.get("noise_filter")
         if isinstance(noise_filter, Mapping):
-            removed_count = int(noise_filter.get("removed_count", 0))
-            if removed_count > 0:
+            removed_count = noise_filter.get("removed_count")
+            if isinstance(removed_count, int) and removed_count > 0:
                 self.store.add_event(
                     job.id,
                     "info",
