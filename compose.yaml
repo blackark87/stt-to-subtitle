@@ -6,7 +6,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.web
-    user: "${PUID:-1000}:${PGID:-1000}"
+    user: "${PUID:?run Compose through scripts/compose.sh}:${PGID:?run Compose through scripts/compose.sh}"
     init: true
     restart: unless-stopped
     read_only: true
@@ -24,8 +24,7 @@ services:
       WEB_ADMIN_PASSWORD: ${WEB_ADMIN_PASSWORD:-}
       WEB_SESSION_SECRET: ${WEB_SESSION_SECRET:-}
       WEB_SECURE_COOKIE: ${WEB_SECURE_COOKIE:-false}
-      STT_BASE_URL: ${STT_BASE_URL:-http://stt:8100}
-      STT_API_TOKEN: ${STT_API_TOKEN:-}
+      STT_BASE_URL: http://stt:8100
       OPENAI_COMPATIBLE_BASE_URL: ${OPENAI_COMPATIBLE_BASE_URL:-}
       OPENAI_COMPATIBLE_TOKEN: ${OPENAI_COMPATIBLE_TOKEN:-}
       OPENAI_COMPATIBLE_MODEL: ${OPENAI_COMPATIBLE_MODEL:-}
@@ -42,7 +41,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    user: "${PUID:-1000}:${PGID:-1000}"
+    user: "${PUID:?run Compose through scripts/compose.sh}:${PGID:?run Compose through scripts/compose.sh}"
     init: true
     restart: unless-stopped
     read_only: true
@@ -50,7 +49,6 @@ services:
       - no-new-privileges:true
     environment:
       HF_TOKEN: ${HF_TOKEN:?HF_TOKEN must be set}
-      STT_API_TOKEN: ${STT_API_TOKEN:-}
       STT_HOST: 0.0.0.0
       STT_PORT: 8100
       STT_STATE_DIR: /var/lib/stt

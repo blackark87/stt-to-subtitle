@@ -13,8 +13,13 @@ RUN apt-get update \
     && python -m venv /opt/venvs/kotoba
 
 WORKDIR /build
-COPY requirements.txt requirements-cuda.txt ./
-RUN /opt/venvs/kotoba/bin/python -m pip install -r requirements-cuda.txt
+COPY requirements-kotoba.txt requirements-api.txt ./
+RUN /opt/venvs/kotoba/bin/python -m pip install \
+        --extra-index-url https://download.pytorch.org/whl/cu121 \
+        -r requirements-kotoba.txt \
+        -r requirements-api.txt \
+    && /opt/venvs/kotoba/bin/python -m pip install --no-deps \
+        "git+https://github.com/huggingface/diarizers.git@f3c8ae500f55ad2b02b719fce1495ea2794ca9fe"
 
 COPY pyproject.toml README.md ./
 COPY src ./src

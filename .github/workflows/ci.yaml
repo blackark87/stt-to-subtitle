@@ -28,6 +28,7 @@ jobs:
           cache: pip
           cache-dependency-path: |
             requirements-test.txt
+            requirements-api.txt
             requirements-web.txt
 
       - name: Install test dependencies
@@ -39,4 +40,4 @@ jobs:
         run: |
           make test
           make check
-          docker compose --env-file .env.compose.example config
+          ./scripts/compose.sh --env-file .env.compose.example config

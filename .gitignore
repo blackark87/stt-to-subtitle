@@ -1328,10 +1328,9 @@ tags
 !/compose.yaml
 !/Makefile
 !/pyproject.toml
-!/requirements.txt
+!/requirements-api.txt
+!/requirements-kotoba.txt
 !/requirements-web.txt
-!/requirements-macos.txt
-!/requirements-cuda.txt
 !/requirements-whisperx-cuda.in
 !/requirements-whisperx-cuda.txt
 !/requirements-test.txt

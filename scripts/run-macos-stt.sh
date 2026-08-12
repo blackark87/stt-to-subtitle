@@ -8,7 +8,7 @@ python_bin=${MACOS_STT_PYTHON:-"$project_dir/.venv-macos/bin/python"}
 
 if [ ! -x "$python_bin" ]; then
     echo "macOS STT Python was not found: $python_bin" >&2
-    echo "Create .venv-macos and install requirements-macos.txt first." >&2
+    echo "Create .venv-macos and install requirements-kotoba.txt and requirements-api.txt first." >&2
     exit 1
 fi
 
