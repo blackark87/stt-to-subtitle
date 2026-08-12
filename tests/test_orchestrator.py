@@ -250,6 +250,10 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                     return_value={
                         "schema_version": 1,
                         "job_id": "remote-job",
+                        "noise_filter": {
+                            "enabled": True,
+                            "removed_count": None,
+                        },
                         "segments": [
                             {
                                 "id": "segment-000001",
