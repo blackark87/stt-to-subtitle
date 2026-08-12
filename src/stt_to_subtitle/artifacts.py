@@ -1,4 +1,4 @@
-"""Stable names and paths for editable NAS JSON artifacts."""
+"""Stable names and paths for editable web JSON artifacts."""
 
 from __future__ import annotations
 

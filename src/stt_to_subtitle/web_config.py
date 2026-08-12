@@ -1,4 +1,4 @@
-"""Configuration and media-root access for the NAS web service."""
+"""Configuration and media-root access for the web service."""
 
 from __future__ import annotations
 
@@ -177,7 +177,7 @@ class RemoteServerSettings:
 
 
 @dataclass(frozen=True)
-class NASSettings:
+class WebSettings:
     state_dir: Path
     media_root: Path
     admin_password: str
@@ -194,16 +194,16 @@ class NASSettings:
     translation_batch_characters: int = 6000
 
     @classmethod
-    def from_env(cls) -> NASSettings:
+    def from_env(cls) -> WebSettings:
         return cls(
             state_dir=Path(
-                os.environ.get("NAS_STATE_DIR", "/var/lib/stt")
+                os.environ.get("WEB_STATE_DIR", "/var/lib/stt")
             ).expanduser(),
             media_root=Path(
                 os.environ.get("MEDIA_ROOT", "/media")
             ).expanduser(),
-            admin_password=os.environ.get("NAS_ADMIN_PASSWORD", ""),
-            session_secret=os.environ.get("NAS_SESSION_SECRET", ""),
+            admin_password=os.environ.get("WEB_ADMIN_PASSWORD", ""),
+            session_secret=os.environ.get("WEB_SESSION_SECRET", ""),
             stt_base_url=os.environ.get("STT_BASE_URL", "").strip(),
             stt_token=os.environ.get("STT_API_TOKEN", ""),
             lm_base_url=_first_configured_env(
@@ -218,9 +218,9 @@ class NASSettings:
                 "OPENAI_COMPATIBLE_MODEL",
                 "LM_STUDIO_MODEL",
             ).strip(),
-            secure_cookie=_env_bool("NAS_SECURE_COOKIE"),
+            secure_cookie=_env_bool("WEB_SECURE_COOKIE"),
             maximum_listed_files=int(
-                os.environ.get("NAS_MAXIMUM_LISTED_FILES", "5000")
+                os.environ.get("WEB_MAXIMUM_LISTED_FILES", "5000")
             ),
             stt_poll_interval=float(
                 os.environ.get("STT_POLL_INTERVAL_SECONDS", "5")
@@ -236,12 +236,12 @@ class NASSettings:
     def validate(self) -> None:
         if self.admin_password.strip() and not self.session_secret.strip():
             raise ValueError(
-                "NAS_SESSION_SECRET is required when NAS_ADMIN_PASSWORD is set"
+                "WEB_SESSION_SECRET is required when WEB_ADMIN_PASSWORD is set"
             )
         if self.session_secret and len(self.session_secret) < 32:
-            raise ValueError("NAS_SESSION_SECRET must be at least 32 characters")
+            raise ValueError("WEB_SESSION_SECRET must be at least 32 characters")
         if self.maximum_listed_files < 1:
-            raise ValueError("NAS_MAXIMUM_LISTED_FILES must be positive")
+            raise ValueError("WEB_MAXIMUM_LISTED_FILES must be positive")
         if self.stt_poll_interval <= 0:
             raise ValueError("STT_POLL_INTERVAL_SECONDS must be positive")
         if (

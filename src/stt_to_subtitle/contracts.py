@@ -1,4 +1,4 @@
-"""Stable JSON contracts shared by the transcription and NAS services."""
+"""Stable JSON contracts shared by the transcription and web services."""
 
 from __future__ import annotations
 

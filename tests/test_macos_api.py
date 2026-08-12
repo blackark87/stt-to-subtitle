@@ -1,3 +1,4 @@
+import os
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -327,6 +328,10 @@ class MacOSAPIHelpersTests(unittest.TestCase):
             command = run.call_args.args[0]
             environment = run.call_args.kwargs["env"]
             self.assertNotIn("secret-hf-token", command)
+            self.assertEqual(
+                environment.get("PYTHONPATH"),
+                os.environ.get("PYTHONPATH"),
+            )
             self.assertEqual(environment["HF_TOKEN"], "secret-hf-token")
             self.assertEqual(result["model"]["id"], "large-v3")
 

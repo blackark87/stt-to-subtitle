@@ -5,9 +5,9 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from stt_to_subtitle.nas_config import (
+from stt_to_subtitle.web_config import (
     MediaLibrary,
-    NASSettings,
+    WebSettings,
     RemoteServerSettings,
     probe_media_duration,
 )
@@ -72,7 +72,7 @@ class MediaLibraryTests(unittest.TestCase):
             (season / "episode-02.mkv").write_bytes(b"media")
 
             library = MediaLibrary(root)
-            with patch("stt_to_subtitle.nas_config.os.walk") as walk:
+            with patch("stt_to_subtitle.web_config.os.walk") as walk:
                 root_view = library.browse()
             walk.assert_not_called()
             series_view = library.browse("Series")
@@ -186,7 +186,7 @@ class MediaLibraryTests(unittest.TestCase):
             )
 
             with patch(
-                "stt_to_subtitle.nas_config.subprocess.run",
+                "stt_to_subtitle.web_config.subprocess.run",
                 return_value=completed,
             ):
                 duration = probe_media_duration(media)
@@ -203,7 +203,7 @@ class MediaLibraryTests(unittest.TestCase):
             )
 
             with patch(
-                "stt_to_subtitle.nas_config.subprocess.run",
+                "stt_to_subtitle.web_config.subprocess.run",
                 return_value=completed,
             ) as run:
                 duration = probe_media_duration(media)
@@ -339,7 +339,7 @@ class MediaLibraryTests(unittest.TestCase):
                 MediaLibrary(root).resolve_file("linked.mkv")
 
 
-class NASSettingsTests(unittest.TestCase):
+class WebSettingsTests(unittest.TestCase):
     def test_reads_openai_compatible_environment_settings(self) -> None:
         with patch.dict(
             os.environ,
@@ -350,7 +350,7 @@ class NASSettingsTests(unittest.TestCase):
             },
             clear=True,
         ):
-            settings = NASSettings.from_env()
+            settings = WebSettings.from_env()
 
         self.assertEqual(
             settings.lm_base_url,
@@ -369,14 +369,14 @@ class NASSettingsTests(unittest.TestCase):
             },
             clear=True,
         ):
-            settings = NASSettings.from_env()
+            settings = WebSettings.from_env()
 
         self.assertEqual(settings.lm_base_url, "http://legacy.test/v1")
         self.assertEqual(settings.lm_token, "legacy-token")
         self.assertEqual(settings.lm_model, "legacy-model")
 
     def test_allows_server_configuration_after_startup(self) -> None:
-        settings = NASSettings(
+        settings = WebSettings(
             state_dir=Path("/state"),
             media_root=Path("/media"),
             admin_password="",
@@ -391,7 +391,7 @@ class NASSettingsTests(unittest.TestCase):
         settings.validate()
 
     def test_allows_blank_credentials_on_trusted_network(self) -> None:
-        settings = NASSettings(
+        settings = WebSettings(
             state_dir=Path("/state"),
             media_root=Path("/media"),
             admin_password="",
@@ -406,7 +406,7 @@ class NASSettingsTests(unittest.TestCase):
         settings.validate()
 
     def test_web_password_requires_session_secret(self) -> None:
-        settings = NASSettings(
+        settings = WebSettings(
             state_dir=Path("/state"),
             media_root=Path("/media"),
             admin_password="password",
@@ -418,7 +418,7 @@ class NASSettingsTests(unittest.TestCase):
             lm_model="model",
         )
 
-        with self.assertRaisesRegex(ValueError, "NAS_SESSION_SECRET"):
+        with self.assertRaisesRegex(ValueError, "WEB_SESSION_SECRET"):
             settings.validate()
 
     def test_normalizes_remote_server_urls(self) -> None:

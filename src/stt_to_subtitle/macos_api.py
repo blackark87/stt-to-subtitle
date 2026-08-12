@@ -607,13 +607,6 @@ class TranscriptionService:
         worker_result = self.result_dir / f".{job.id}.whisperx.json"
         worker_result.unlink(missing_ok=True)
         environment = os.environ.copy()
-        source_root = str(Path(__file__).resolve().parents[1])
-        existing_pythonpath = environment.get("PYTHONPATH", "")
-        environment["PYTHONPATH"] = (
-            source_root
-            if not existing_pythonpath
-            else f"{source_root}{os.pathsep}{existing_pythonpath}"
-        )
         environment.update(
             {
                 "HF_TOKEN": self.settings.hf_token,
