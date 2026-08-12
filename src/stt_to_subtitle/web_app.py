@@ -34,12 +34,12 @@ from .media_preview import (
     parse_byte_range,
     srt_to_webvtt,
 )
-from .nas_config import (
-    NASSettings,
+from .web_config import (
+    WebSettings,
     RemoteServerSettings,
     normalize_server_url,
 )
-from .orchestrator import NASOrchestrator
+from .orchestrator import SubtitleOrchestrator
 from .service_clients import (
     ExternalServiceError,
     list_openai_compatible_models,
@@ -131,13 +131,13 @@ def format_media_duration(value: object) -> str:
 TEMPLATES.env.filters["duration"] = format_media_duration
 
 
-def create_app(settings: NASSettings | None = None) -> FastAPI:
-    configured_settings = settings or NASSettings.from_env()
+def create_app(settings: WebSettings | None = None) -> FastAPI:
+    configured_settings = settings or WebSettings.from_env()
     authentication_enabled = bool(configured_settings.admin_password.strip())
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        orchestrator = NASOrchestrator(configured_settings)
+        orchestrator = SubtitleOrchestrator(configured_settings)
         app.state.orchestrator = orchestrator
         orchestrator.start()
         try:
@@ -170,7 +170,7 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
         SessionMiddleware,
         secret_key=configured_settings.session_secret
         or secrets.token_urlsafe(48),
-        session_cookie="stt_nas_session",
+        session_cookie="stt_web_session",
         same_site="strict",
         https_only=configured_settings.secure_cookie,
         max_age=12 * 60 * 60,
@@ -181,7 +181,7 @@ def create_app(settings: NASSettings | None = None) -> FastAPI:
         name="static",
     )
 
-    def orchestrator(request: Request) -> NASOrchestrator:
+    def orchestrator(request: Request) -> SubtitleOrchestrator:
         return request.app.state.orchestrator
 
     def is_authenticated(request: Request) -> bool:
@@ -1332,9 +1332,9 @@ def main() -> None:
         os.environ.get("LOG_LEVEL", "INFO").upper(),
     )
     uvicorn.run(
-        "stt_to_subtitle.nas_app:app",
-        host=os.environ.get("NAS_HOST", "0.0.0.0"),
-        port=int(os.environ.get("NAS_PORT", "8080")),
+        "stt_to_subtitle.web_app:app",
+        host=os.environ.get("WEB_HOST", "0.0.0.0"),
+        port=int(os.environ.get("WEB_PORT", "8080")),
         workers=1,
     )
 

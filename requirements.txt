@@ -1,4 +1,4 @@
-# Resolved for CPython 3.11 on aarch64-manylinux_2_28.
+# Resolved for the pinned Kotoba Python 3.11 runtime.
 # Source packages are limited to releases available on 2024-10-24, matching
 # the kotoba-whisper-v2.2 release stack.
 accelerate==1.0.1

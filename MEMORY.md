@@ -15,7 +15,7 @@
 
 - The translation integration is provider-neutral and uses an
   OpenAI-compatible API.
-- The NAS settings UI queries `GET /models` and presents the returned model IDs
+- The web settings UI queries `GET /models` and presents the returned model IDs
   as a selection list.
 - Legacy `LM_STUDIO_*` environment variables remain supported as fallbacks for
   the `OPENAI_COMPATIBLE_*` settings.

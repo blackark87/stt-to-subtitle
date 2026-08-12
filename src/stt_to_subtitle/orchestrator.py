@@ -1,4 +1,4 @@
-"""Stage-based NAS orchestration with independent bounded workers."""
+"""Stage-based web orchestration with independent bounded workers."""
 
 from __future__ import annotations
 
@@ -22,13 +22,13 @@ from .contracts import (
 from .files import sha256_file, write_json_atomic
 from .hybrid_stt import HybridRescueOptions
 from .kotoba import DEFAULT_CHUNK_LENGTH_SECONDS, TranscriptionOptions
-from .nas_config import (
+from .web_config import (
     MediaLibrary,
-    NASSettings,
+    WebSettings,
     RemoteServerSettings,
     probe_media_duration,
 )
-from .nas_store import NASJob, NASStore, PromptCategory, SUCCESS_STATUSES
+from .job_store import PipelineJob, JobStore, PromptCategory, SUCCESS_STATUSES
 from .service_clients import (
     ExternalServiceError,
     OpenAICompatibleClient,
@@ -82,10 +82,10 @@ HYBRID_RESCUE_DEFAULTS = {
 }
 
 
-class NASOrchestrator:
+class SubtitleOrchestrator:
     """Advance persisted jobs while keeping each remote resource independent."""
 
-    def __init__(self, settings: NASSettings) -> None:
+    def __init__(self, settings: WebSettings) -> None:
         settings.validate()
         self.settings = settings
         self.settings.state_dir.mkdir(parents=True, exist_ok=True)
@@ -94,7 +94,7 @@ class NASOrchestrator:
             settings.maximum_listed_files,
             duration_probe=probe_media_duration,
         )
-        self.store = NASStore(settings.state_dir / "jobs.sqlite3")
+        self.store = JobStore(settings.state_dir / "jobs.sqlite3")
         saved_servers = self.store.get_remote_server_settings()
         initial_servers = (
             RemoteServerSettings(**saved_servers)
@@ -114,20 +114,20 @@ class NASOrchestrator:
         self._stop_event = threading.Event()
         self._scheduler = threading.Thread(
             target=self._scheduler_loop,
-            name="nas-job-scheduler",
+            name="pipeline-job-scheduler",
             daemon=True,
         )
         self._audio_executor = ThreadPoolExecutor(
             max_workers=1,
-            thread_name_prefix="nas-audio",
+            thread_name_prefix="pipeline-audio",
         )
         self._stt_executor = ThreadPoolExecutor(
             max_workers=1,
-            thread_name_prefix="nas-stt",
+            thread_name_prefix="pipeline-stt",
         )
         self._translation_executor = ThreadPoolExecutor(
             max_workers=8,
-            thread_name_prefix="nas-translation",
+            thread_name_prefix="pipeline-translation",
         )
 
     @property
@@ -251,7 +251,7 @@ class NASOrchestrator:
         options: Mapping[str, Any],
         operation: str = "full",
         prompt_category_id: str | None = None,
-    ) -> NASJob:
+    ) -> PipelineJob:
         return self.create_jobs(
             [source_rel],
             force_overwrite=force_overwrite,
@@ -313,7 +313,7 @@ class NASOrchestrator:
         options: Mapping[str, Any],
         operation: str = "full",
         prompt_category_id: str | None = None,
-    ) -> list[NASJob]:
+    ) -> list[PipelineJob]:
         if operation not in SUPPORTED_OPERATIONS:
             raise ValueError("unsupported job operation")
         if operation != "extract" and not self.remote_servers_configured:
@@ -367,7 +367,7 @@ class NASOrchestrator:
             if operation == "translate"
             else {}
         )
-        reusable_audio_jobs: dict[str, NASJob] = {}
+        reusable_audio_jobs: dict[str, PipelineJob] = {}
         if operation == "transcribe":
             latest_jobs = self.store.latest_jobs_by_source()
             for source_rel in unique_source_rels:
@@ -380,7 +380,7 @@ class NASOrchestrator:
                 ):
                     reusable_audio_jobs[source_rel] = reusable_audio
 
-        jobs: list[NASJob] = []
+        jobs: list[PipelineJob] = []
         for source_rel in unique_source_rels:
             reusable_audio = reusable_audio_jobs.get(source_rel)
             if reusable_audio is not None:
@@ -490,7 +490,7 @@ class NASOrchestrator:
     def _reusable_transcript(
         self,
         source_rel: str,
-    ) -> tuple[NASJob, dict[str, Any]]:
+    ) -> tuple[PipelineJob, dict[str, Any]]:
         reusable = self.store.latest_transcript_job(source_rel)
         message = (
             f"{source_rel}: 번역에 사용할 유효한 전사 결과가 없습니다. "
@@ -665,7 +665,7 @@ class NASOrchestrator:
             normalized_options["repetition_min_count"] = repetition_min_count
         return normalized_options
 
-    def retry(self, job_id: str) -> NASJob:
+    def retry(self, job_id: str) -> PipelineJob:
         job = self.store.get(job_id)
         if job is None:
             raise ValueError("job not found")
@@ -764,7 +764,7 @@ class NASOrchestrator:
         self,
         job_id: str,
         prompt_category_id: str | None = None,
-    ) -> NASJob:
+    ) -> PipelineJob:
         """Reset translation only while preserving a completed transcript."""
         job = self.store.get(job_id)
         if job is None:
@@ -852,7 +852,7 @@ class NASOrchestrator:
         job_id: str,
         operation: str,
         prompt_category_id: str | None = None,
-    ) -> NASJob:
+    ) -> PipelineJob:
         original = self.store.get(job_id)
         if original is None:
             raise ValueError("job not found")
@@ -876,7 +876,7 @@ class NASOrchestrator:
             ),
         )
 
-    def pause_translation(self, job_id: str) -> NASJob:
+    def pause_translation(self, job_id: str) -> PipelineJob:
         job = self.store.get(job_id)
         if job is None:
             raise ValueError("job not found")
@@ -961,7 +961,7 @@ class NASOrchestrator:
                     break
         return stopped_count
 
-    def resume_translation(self, job_id: str) -> NASJob:
+    def resume_translation(self, job_id: str) -> PipelineJob:
         job = self.store.get(job_id)
         if job is None:
             raise ValueError("job not found")
@@ -1143,7 +1143,7 @@ class NASOrchestrator:
         running: str,
         stage: str,
         executor: ThreadPoolExecutor,
-        operation: Callable[[NASJob], None],
+        operation: Callable[[PipelineJob], None],
     ) -> bool:
         waiting_ids = self.store.dispatchable_ids_with_status(waiting)
         for job_id in waiting_ids:
@@ -1163,7 +1163,7 @@ class NASOrchestrator:
         self,
         job_id: str,
         stage: str,
-        operation: Callable[[NASJob], None],
+        operation: Callable[[PipelineJob], None],
     ) -> None:
         job = self.store.get(job_id)
         if job is None:
@@ -1224,7 +1224,7 @@ class NASOrchestrator:
         )
         self.store.add_event(job_id, "warning", "job stopped by user request")
 
-    def _extract(self, job: NASJob) -> None:
+    def _extract(self, job: PipelineJob) -> None:
         source = self.library.resolve_file(job.source_rel)
         artifact_dir = self.settings.state_dir / "jobs" / job.id
         audio_path = artifact_dir / "audio.16k.wav"
@@ -1250,7 +1250,7 @@ class NASOrchestrator:
             f"audio extraction completed ({audio_path.stat().st_size} bytes)",
         )
 
-    def _transcribe(self, job: NASJob) -> None:
+    def _transcribe(self, job: PipelineJob) -> None:
         stt_client = self.stt_client
         if stt_client is None:
             raise ExternalServiceError("transcription server is not configured")
@@ -1290,7 +1290,7 @@ class NASOrchestrator:
         stt_call_count = 2 if options["backend"] == "hybrid" else 1
         request_metadata = {
             "job_id": job.id,
-            "request_id": f"nas-{job.id}",
+            "request_id": f"pipeline-{job.id}",
             "delivery_mode": "single_wav",
             "audio_sha256": job.audio_sha256,
             "audio_duration_sec": audio_duration,
@@ -1348,7 +1348,7 @@ class NASOrchestrator:
         payload = stt_client.transcribe(
             Path(job.audio_path),
             options=options,
-            idempotency_key=f"nas-{job.id}",
+            idempotency_key=f"pipeline-{job.id}",
             existing_job_id=job.stt_job_id,
             on_job_created=save_remote_job,
             on_progress=update_chunk_progress,
@@ -1441,7 +1441,7 @@ class NASOrchestrator:
             max_characters=self.settings.translation_batch_characters,
         )
 
-    def _translate(self, job: NASJob) -> None:
+    def _translate(self, job: PipelineJob) -> None:
         remote_runtime = self._remote_runtime
         servers = remote_runtime[2]
         if remote_runtime[1] is None:
@@ -1580,7 +1580,7 @@ class NASOrchestrator:
             f"translation completed ({len(translations)} segments)",
         )
 
-    def _render(self, job: NASJob) -> None:
+    def _render(self, job: PipelineJob) -> None:
         self._render_artifacts(
             job,
             overwrite=(
@@ -1606,7 +1606,7 @@ class NASOrchestrator:
 
     def _render_artifacts(
         self,
-        job: NASJob,
+        job: PipelineJob,
         *,
         overwrite: bool,
     ) -> None:

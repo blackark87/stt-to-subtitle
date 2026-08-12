@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "stt-to-subtitle"
-version = "0.15.0"
+version = "1.0.0"
 description = "Distributed local transcription, translation, and styled subtitle pipeline"
 readme = "README.md"
 requires-python = ">=3.11,<3.12"
@@ -14,7 +14,7 @@ dependencies = []
 stt-transcribe = "stt_to_subtitle.cli:main"
 stt-api = "stt_to_subtitle.macos_api:main"
 stt-macos-api = "stt_to_subtitle.macos_api:main"
-stt-nas-web = "stt_to_subtitle.nas_app:main"
+stt-web = "stt_to_subtitle.web_app:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

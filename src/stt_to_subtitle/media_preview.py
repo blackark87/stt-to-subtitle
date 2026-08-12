@@ -1,4 +1,4 @@
-"""Helpers for authenticated browser playback of NAS media and subtitles."""
+"""Helpers for authenticated browser playback of web media and subtitles."""
 
 from __future__ import annotations
 

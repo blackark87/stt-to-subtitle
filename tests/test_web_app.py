@@ -5,26 +5,26 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
-NAS_WEB_TESTS_AVAILABLE = all(
+WEB_TESTS_AVAILABLE = all(
     find_spec(module) is not None
     for module in ("itsdangerous", "jinja2", "multipart")
 )
-if NAS_WEB_TESTS_AVAILABLE:
+if WEB_TESTS_AVAILABLE:
     from fastapi.testclient import TestClient
 
-from stt_to_subtitle.nas_config import NASSettings
+from stt_to_subtitle.web_config import WebSettings
 
-if NAS_WEB_TESTS_AVAILABLE:
-    from stt_to_subtitle.nas_app import create_app
+if WEB_TESTS_AVAILABLE:
+    from stt_to_subtitle.web_app import create_app
 
 
 @unittest.skipUnless(
-    NAS_WEB_TESTS_AVAILABLE,
-    "NAS web test dependencies are not installed",
+    WEB_TESTS_AVAILABLE,
+    "web test dependencies are not installed",
 )
-class NASAppTests(unittest.TestCase):
-    def settings(self, root: Path, media_root: Path) -> NASSettings:
-        return NASSettings(
+class WebAppTests(unittest.TestCase):
+    def settings(self, root: Path, media_root: Path) -> WebSettings:
+        return WebSettings(
             state_dir=root / "state",
             media_root=media_root,
             admin_password="",
@@ -165,7 +165,7 @@ class NASAppTests(unittest.TestCase):
             self.assertEqual(reloaded.lm_client.model, "new-model")
             self.assertIn("http://new-stt.test:8100", reloaded_page.text)
 
-    def test_manages_prompt_categories_without_nas_ui_labels(self) -> None:
+    def test_manages_prompt_categories(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
             media_root = root / "media"
@@ -211,7 +211,6 @@ class NASAppTests(unittest.TestCase):
 
             self.assertEqual(page.status_code, 200)
             self.assertIn("번역 프롬프트 카테고리", page.text)
-            self.assertNotIn("NAS", page.text)
             self.assertNotRegex(
                 page.text,
                 r'<details class="card settings-card prompt-category-card'
@@ -233,7 +232,7 @@ class NASAppTests(unittest.TestCase):
             media_root.mkdir()
 
             with patch(
-                "stt_to_subtitle.nas_app.list_openai_compatible_models",
+                "stt_to_subtitle.web_app.list_openai_compatible_models",
                 return_value=["model-a", "model-b"],
             ) as list_models, TestClient(
                 create_app(self.settings(root, media_root))
@@ -337,7 +336,7 @@ class NASAppTests(unittest.TestCase):
             media_root = root / "media"
             media_root.mkdir()
             (media_root / "movie.mp4").write_bytes(b"media")
-            settings = NASSettings(
+            settings = WebSettings(
                 state_dir=root / "state",
                 media_root=media_root,
                 admin_password="",

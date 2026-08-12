@@ -1,4 +1,4 @@
-"""SQLite job and event persistence for the NAS orchestrator."""
+"""SQLite job and event persistence for the web orchestrator."""
 
 from __future__ import annotations
 
@@ -63,7 +63,7 @@ class PromptCategory:
 
 
 @dataclass(frozen=True)
-class NASJob:
+class PipelineJob:
     id: str
     source_rel: str
     status: str
@@ -142,7 +142,7 @@ class NASJob:
         return "JAV (기존 작업)"
 
 
-class NASStore:
+class JobStore:
     _UPDATABLE_FIELDS = {
         "status",
         "force_overwrite",
@@ -537,10 +537,10 @@ class NASStore:
             )
 
     @staticmethod
-    def _from_row(row: sqlite3.Row | None) -> NASJob | None:
+    def _from_row(row: sqlite3.Row | None) -> PipelineJob | None:
         if row is None:
             return None
-        return NASJob(
+        return PipelineJob(
             id=str(row["id"]),
             source_rel=str(row["source_rel"]),
             status=str(row["status"]),
@@ -587,7 +587,7 @@ class NASStore:
         force_overwrite: bool,
         options: Mapping[str, Any],
         operation: str = "full",
-    ) -> NASJob:
+    ) -> PipelineJob:
         now = time.time()
         with self._connect() as connection:
             connection.execute(
@@ -614,7 +614,7 @@ class NASStore:
             raise RuntimeError("created job could not be read")
         return job
 
-    def get(self, job_id: str) -> NASJob | None:
+    def get(self, job_id: str) -> PipelineJob | None:
         with self._connect() as connection:
             row = connection.execute(
                 "SELECT * FROM jobs WHERE id = ?",
@@ -627,7 +627,7 @@ class NASStore:
         limit: int | None = 100,
         *,
         offset: int = 0,
-    ) -> list[NASJob]:
+    ) -> list[PipelineJob]:
         with self._connect() as connection:
             if limit is None:
                 rows = connection.execute(
@@ -647,7 +647,7 @@ class NASStore:
             ).fetchone()
         return int(row["count"]) if row is not None else 0
 
-    def list_open_jobs(self) -> list[NASJob]:
+    def list_open_jobs(self) -> list[PipelineJob]:
         placeholders = ", ".join("?" for _ in SUCCESS_STATUSES)
         with self._connect() as connection:
             rows = connection.execute(
@@ -660,7 +660,7 @@ class NASStore:
             ).fetchall()
         return [job for row in rows if (job := self._from_row(row)) is not None]
 
-    def list_successful_jobs(self, *, limit: int, offset: int) -> list[NASJob]:
+    def list_successful_jobs(self, *, limit: int, offset: int) -> list[PipelineJob]:
         placeholders = ", ".join("?" for _ in SUCCESS_STATUSES)
         with self._connect() as connection:
             rows = connection.execute(
@@ -684,8 +684,8 @@ class NASStore:
             ).fetchone()
         return int(row["count"]) if row is not None else 0
 
-    def latest_jobs_by_source(self) -> dict[str, NASJob]:
-        latest: dict[str, NASJob] = {}
+    def latest_jobs_by_source(self) -> dict[str, PipelineJob]:
+        latest: dict[str, PipelineJob] = {}
         with self._connect() as connection:
             rows = connection.execute(
                 "SELECT * FROM jobs ORDER BY updated_at DESC, created_at DESC"
@@ -696,14 +696,14 @@ class NASStore:
                 latest.setdefault(job.source_rel, job)
         return latest
 
-    def latest_completed_subtitle_jobs(self) -> dict[str, NASJob]:
-        latest: dict[str, NASJob] = {}
+    def latest_completed_subtitle_jobs(self) -> dict[str, PipelineJob]:
+        latest: dict[str, PipelineJob] = {}
         for job in self.list_jobs(limit=None):
             if job.status == "completed" and (job.srt_path or job.ass_path):
                 latest.setdefault(job.source_rel, job)
         return latest
 
-    def latest_audio_job(self, source_rel: str) -> NASJob | None:
+    def latest_audio_job(self, source_rel: str) -> PipelineJob | None:
         with self._connect() as connection:
             row = connection.execute(
                 """
@@ -716,7 +716,7 @@ class NASStore:
             ).fetchone()
         return self._from_row(row)
 
-    def latest_transcript_job(self, source_rel: str) -> NASJob | None:
+    def latest_transcript_job(self, source_rel: str) -> PipelineJob | None:
         with self._connect() as connection:
             row = connection.execute(
                 """

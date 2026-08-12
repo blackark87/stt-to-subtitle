@@ -4,7 +4,7 @@ from tempfile import TemporaryDirectory
 import time
 import unittest
 
-from stt_to_subtitle.nas_store import NASStore
+from stt_to_subtitle.job_store import JobStore
 from stt_to_subtitle.transcription_store import TranscriptionStore
 
 
@@ -102,11 +102,11 @@ class TranscriptionStoreTests(unittest.TestCase):
             self.assertEqual(job.attempt, 1)
 
 
-class NASStoreTests(unittest.TestCase):
+class JobStoreTests(unittest.TestCase):
     def test_seeds_edits_and_archives_prompt_categories(self) -> None:
         with TemporaryDirectory() as directory:
             database_path = Path(directory) / "jobs.sqlite3"
-            store = NASStore(database_path)
+            store = JobStore(database_path)
 
             self.assertEqual(
                 {category.id for category in store.list_prompt_categories()},
@@ -142,7 +142,7 @@ class NASStoreTests(unittest.TestCase):
                 created.id,
                 {
                     category.id
-                    for category in NASStore(
+                    for category in JobStore(
                         database_path
                     ).list_prompt_categories(include_archived=True)
                 },
@@ -150,7 +150,7 @@ class NASStoreTests(unittest.TestCase):
 
     def test_lists_all_jobs_in_one_paginated_creation_order(self) -> None:
         with TemporaryDirectory() as directory:
-            store = NASStore(Path(directory) / "jobs.sqlite3")
+            store = JobStore(Path(directory) / "jobs.sqlite3")
             for index in range(3):
                 store.create(
                     job_id=f"job-{index}",
@@ -173,7 +173,7 @@ class NASStoreTests(unittest.TestCase):
         self,
     ) -> None:
         with TemporaryDirectory() as directory:
-            store = NASStore(Path(directory) / "jobs.sqlite3")
+            store = JobStore(Path(directory) / "jobs.sqlite3")
             older = store.create(
                 job_id="older",
                 source_rel="movie.mkv",
@@ -208,7 +208,7 @@ class NASStoreTests(unittest.TestCase):
 
     def test_does_not_dispatch_a_stopped_or_translation_paused_job(self) -> None:
         with TemporaryDirectory() as directory:
-            store = NASStore(Path(directory) / "jobs.sqlite3")
+            store = JobStore(Path(directory) / "jobs.sqlite3")
             stopped = store.create(
                 job_id="stopped",
                 source_rel="stopped.mkv",
@@ -243,7 +243,7 @@ class NASStoreTests(unittest.TestCase):
 
     def test_deletes_a_job_and_its_events(self) -> None:
         with TemporaryDirectory() as directory:
-            store = NASStore(Path(directory) / "jobs.sqlite3")
+            store = JobStore(Path(directory) / "jobs.sqlite3")
             store.create(
                 job_id="job-1",
                 source_rel="movie.mkv",
@@ -260,7 +260,7 @@ class NASStoreTests(unittest.TestCase):
     def test_persists_remote_server_settings(self) -> None:
         with TemporaryDirectory() as directory:
             database_path = Path(directory) / "jobs.sqlite3"
-            store = NASStore(database_path)
+            store = JobStore(database_path)
 
             store.save_remote_server_settings(
                 stt_base_url="http://stt.test",
@@ -271,7 +271,7 @@ class NASStoreTests(unittest.TestCase):
             )
 
             self.assertEqual(
-                NASStore(database_path).get_remote_server_settings(),
+                JobStore(database_path).get_remote_server_settings(),
                 {
                     "stt_base_url": "http://stt.test",
                     "stt_token": "stt-token",
@@ -284,7 +284,7 @@ class NASStoreTests(unittest.TestCase):
 
     def test_recovers_running_stage_as_manually_retryable(self) -> None:
         with TemporaryDirectory() as directory:
-            store = NASStore(Path(directory) / "jobs.sqlite3")
+            store = JobStore(Path(directory) / "jobs.sqlite3")
             store.create(
                 job_id="job-1",
                 source_rel="movie.mkv",
@@ -300,7 +300,7 @@ class NASStoreTests(unittest.TestCase):
 
     def test_persists_chunk_progress_for_the_job_panel(self) -> None:
         with TemporaryDirectory() as directory:
-            store = NASStore(Path(directory) / "jobs.sqlite3")
+            store = JobStore(Path(directory) / "jobs.sqlite3")
             store.create(
                 job_id="job-1",
                 source_rel="movie.mkv",
@@ -321,7 +321,7 @@ class NASStoreTests(unittest.TestCase):
             self.assertEqual(job.chunks_in_progress, 1)
             self.assertEqual(job.chunk_progress_every, 10)
 
-    def test_adds_progress_columns_to_an_existing_nas_database(self) -> None:
+    def test_adds_progress_columns_to_an_existing_web_database(self) -> None:
         with TemporaryDirectory() as directory:
             database_path = Path(directory) / "jobs.sqlite3"
             now = time.time()
@@ -357,7 +357,7 @@ class NASStoreTests(unittest.TestCase):
                     (now, now),
                 )
 
-            job = NASStore(database_path).get("job-1")
+            job = JobStore(database_path).get("job-1")
 
             self.assertEqual(job.chunks_created, 0)
             self.assertEqual(job.chunks_completed, 0)

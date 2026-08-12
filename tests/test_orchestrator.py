@@ -4,19 +4,19 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import Mock, patch
 
-from stt_to_subtitle.nas_config import NASSettings, RemoteServerSettings
-from stt_to_subtitle.orchestrator import NASOrchestrator
+from stt_to_subtitle.web_config import WebSettings, RemoteServerSettings
+from stt_to_subtitle.orchestrator import SubtitleOrchestrator
 from stt_to_subtitle.service_clients import TranslationPaused
 
 
-class NASOrchestratorTests(unittest.TestCase):
+class SubtitleOrchestratorTests(unittest.TestCase):
     def make_orchestrator(
         self,
         root: Path,
         media_root: Path,
-    ) -> NASOrchestrator:
-        return NASOrchestrator(
-            NASSettings(
+    ) -> SubtitleOrchestrator:
+        return SubtitleOrchestrator(
+            WebSettings(
                 state_dir=root / "state",
                 media_root=media_root,
                 admin_password="admin-password",
@@ -35,8 +35,8 @@ class NASOrchestratorTests(unittest.TestCase):
             media_root = root / "media"
             media_root.mkdir()
             (media_root / "movie.mkv").write_bytes(b"not-read-in-this-test")
-            orchestrator = NASOrchestrator(
-                NASSettings(
+            orchestrator = SubtitleOrchestrator(
+                WebSettings(
                     state_dir=root / "state",
                     media_root=media_root,
                     admin_password="admin-password",
@@ -196,8 +196,8 @@ class NASOrchestratorTests(unittest.TestCase):
             media_root = root / "media"
             media_root.mkdir()
             (media_root / "movie.mkv").write_bytes(b"media")
-            orchestrator = NASOrchestrator(
-                NASSettings(
+            orchestrator = SubtitleOrchestrator(
+                WebSettings(
                     state_dir=root / "state",
                     media_root=media_root,
                     admin_password="",
@@ -788,8 +788,8 @@ class NASOrchestratorTests(unittest.TestCase):
             media_root.mkdir()
             source = media_root / "movie.mkv"
             source.write_bytes(b"not-read-in-this-test")
-            orchestrator = NASOrchestrator(
-                NASSettings(
+            orchestrator = SubtitleOrchestrator(
+                WebSettings(
                     state_dir=root / "state",
                     media_root=media_root,
                     admin_password="admin-password",

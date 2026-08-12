@@ -2,17 +2,17 @@
 
 ## Project Structure & Module Organization
 
-Application code lives in `src/stt_to_subtitle/`. `audio.py` builds and runs FFmpeg extraction, `kotoba.py` loads the pinned Kotoba/Pyannote pipeline, `output.py` serializes transcripts, and `cli.py` coordinates the workflow. Tests under `tests/` mirror these responsibilities and use only short synthetic data or mocks. Container definitions are in `Dockerfile` and `compose.yaml`; dependency versions are locked in `requirements.txt`. Keep input media, generated WAV files, transcripts, model caches, and IDE metadata out of Git.
+Application code lives in `src/stt_to_subtitle/`. `audio.py` builds and runs FFmpeg extraction, `kotoba.py` loads the pinned Kotoba/Pyannote pipeline, `output.py` serializes transcripts, and `cli.py` coordinates the workflow. Tests under `tests/` mirror these responsibilities and use only short synthetic data or mocks. `Dockerfile` builds the CUDA STT runtime, `Dockerfile.web` builds the web runtime, and `compose.yaml` runs both services as one project. Dependency versions are locked in the `requirements*.txt` files. Keep input media, generated WAV files, transcripts, model caches, and IDE metadata out of Git.
 
 ## Architecture & Data Flow
 
-Maintain explicit boundaries between audio extraction, speech transcription, transcript normalization, translation, and subtitle rendering. The Mac transcription API runs natively with Whisper on MPS and Pyannote on CPU. Correct model-relative timestamps at the Mac transcript-normalization boundary; do not defer known model timestamp defects to translation. Subtitle rendering must preserve real cross-speaker overlap, replace overlapping lines from the same speaker, and emit both compatible SRT and styled ASS without changing translation IDs. The NAS Docker service orchestrates files, transcription, OpenAI-compatible translation, and subtitle rendering without running the ML models locally. Provider or model integrations should not leak credentials into output metadata.
+Maintain explicit boundaries between audio extraction, speech transcription, transcript normalization, translation, and subtitle rendering. The Compose project runs the web orchestrator and CUDA transcription API as separate containers; the STT image isolates Kotoba and WhisperX in separate Python environments. The Mac transcription API runs natively with Whisper on MPS and Pyannote on CPU. Correct model-relative timestamps at the transcript-normalization boundary; do not defer known model timestamp defects to translation. Subtitle rendering must preserve real cross-speaker overlap, replace overlapping lines from the same speaker, and emit both compatible SRT and styled ASS without changing translation IDs. Provider or model integrations should not leak credentials into output metadata.
 
 ## Build, Test, and Development Commands
 
 - `make test` — run the standard-library unit test suite without downloading models.
 - `make check` — compile Python sources and check changed files for whitespace errors.
-- `docker compose --env-file .env.nas.example config` — validate the GHCR-only NAS Compose definition.
+- `docker compose --env-file .env.compose.example config` — validate the integrated local-build Compose definition.
 
 ## Coding Style & Naming Conventions
 
@@ -41,7 +41,7 @@ supported requirement or are necessary to reproduce a verified limitation.
 
 ## Security & Configuration
 
-Pass `HF_TOKEN` only at runtime and never store it in source, images, logs, or committed environment files. Pin revisions whenever `trust_remote_code=True` is required. Preserve read-only input mounts and persistent model-cache volumes.
+Pass `HF_TOKEN` only at runtime and never store it in source, images, logs, or committed environment files. Pin revisions whenever `trust_remote_code=True` is required. Preserve persistent state and model-cache volumes. Do not put credentials into Compose image build arguments.
 
 ## Agent Communication
 
@@ -58,11 +58,11 @@ explicitly provides a browser-enabled environment.
 
 ## Commit & Pull Request Guidelines
 
-Use concise, imperative commit subjects, optionally prefixed with `feat:`, `fix:`, or `docs:`. Pull requests must describe the affected pipeline stage, validation results, operational constraints, and any output-format changes. Link relevant issues and include small, sanitized examples when useful.
+Use concise, imperative commit subjects, optionally prefixed with `feat:`, `fix:`, or `docs:`. Pull requests must describe the affected pipeline stage, validation results, operational constraints, local image changes, and any output-format changes. Link relevant issues and include small, sanitized examples when useful.
 
 Every new pull request must update the project version in `pyproject.toml`
-exactly once and list both the version change and resulting GHCR tag in the PR
-description. Follow Semantic Versioning:
+exactly once and list the version change in the PR description. Follow Semantic
+Versioning:
 
 - increment `MAJOR` for backward-incompatible API, configuration, storage, or
   output-format changes that require migration;
@@ -72,7 +72,4 @@ description. Follow Semantic Versioning:
 
 Select the next unused version relative to the latest `main` and existing
 release tags. Do not increment the version again for follow-up commits on the
-same PR unless the PR's compatibility scope changes. The GHCR workflow must
-publish `ghcr.io/blackark87/stt-to-subtitle:X.Y.Z` from the
-`pyproject.toml` version while retaining moving and immutable traceability tags
-such as `latest` and the full commit SHA.
+same PR unless the PR's compatibility scope changes.

@@ -1,4 +1,4 @@
-# Fully pinned pure-Python runtime for the linux/amd64 NAS orchestrator.
+# Fully pinned pure-Python runtime for the linux/amd64 web service.
 annotated-types==0.7.0
 anyio==4.6.2.post1
 certifi==2024.8.30
