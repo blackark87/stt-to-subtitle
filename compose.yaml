@@ -6,7 +6,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.web
-    user: "${PUID:?run Compose through scripts/compose.sh}:${PGID:?run Compose through scripts/compose.sh}"
+    user: "${PUID:-1000}:${PGID:-1000}"
     init: true
     restart: unless-stopped
     read_only: true
@@ -41,7 +41,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    user: "${PUID:?run Compose through scripts/compose.sh}:${PGID:?run Compose through scripts/compose.sh}"
+    user: "${PUID:-1000}:${PGID:-1000}"
     init: true
     restart: unless-stopped
     read_only: true

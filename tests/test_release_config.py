@@ -18,8 +18,7 @@ class ReleaseConfigurationTests(unittest.TestCase):
         self.assertIn("STT_BASE_URL: http://stt:8100", compose)
         self.assertNotIn("${STT_BASE_URL", compose)
         self.assertNotIn("STT_API_TOKEN:", compose)
-        self.assertIn("${PUID:?", compose)
-        self.assertIn("${PGID:?", compose)
+        self.assertIn("${PUID:-1000}:${PGID:-1000}", compose)
         self.assertNotIn("packages" + ": write", workflow)
         self.assertNotIn("build-push-action", workflow)
         registry_name = "gh" + "cr.io"
