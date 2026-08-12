@@ -1336,6 +1336,10 @@ def main() -> None:
         host=os.environ.get("WEB_HOST", "0.0.0.0"),
         port=int(os.environ.get("WEB_PORT", "8080")),
         workers=1,
+        proxy_headers=True,
+        forwarded_allow_ips=os.environ.get(
+            "WEB_FORWARDED_ALLOW_IPS", "127.0.0.1"
+        ),
     )
 
 

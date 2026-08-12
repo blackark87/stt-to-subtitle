@@ -69,10 +69,12 @@ chmod 600 .env.compose
 상태와 모델 캐시 디렉터리를 만들고 쓰기 권한을 확인합니다.
 
 ```bash
-mkdir -p ./var/web-state ./var/stt-state ./var/model-cache
-test -w ./var/web-state
-test -w ./var/stt-state
-test -w ./var/model-cache
+mkdir -p /data/stt-to-subtitle/web-state \
+  /data/stt-to-subtitle/stt-state \
+  /data/stt-to-subtitle/model
+test -w /data/stt-to-subtitle/web-state
+test -w /data/stt-to-subtitle/stt-state
+test -w /data/stt-to-subtitle/model
 ```
 
 이미지를 로컬에서 빌드하고 두 서비스를 함께 실행합니다.
@@ -113,11 +115,14 @@ curl https://stt.example.com/healthz
 | 변수 | 기본값 | 용도 |
 | --- | --- | --- |
 | `MEDIA_PATH` | `./media` | 입력 영상과 생성 자막 |
-| `WEB_STATE_PATH` | `./var/web-state` | 작업 DB, WAV, JSON 체크포인트 |
+| `WEB_STATE_PATH` | `/data/stt-to-subtitle/web-state` | 작업 DB, WAV, JSON 체크포인트 |
+| `WEB_PUID` | `1026` | 웹 컨테이너 프로세스 UID |
+| `WEB_PGID` | `100` | 웹 컨테이너 프로세스 GID |
 | `TRAEFIK_HOST` | 필수 | 웹 HTTPS 라우터의 DNS 호스트명 |
 | `TRAEFIK_NETWORK` | `proxy` | Traefik이 연결된 외부 Docker 네트워크 |
 | `TRAEFIK_ENTRYPOINT` | `websecure` | Traefik HTTPS entrypoint |
 | `TRAEFIK_CERT_RESOLVER` | `letsencrypt` | Traefik 인증서 resolver |
+| `WEB_FORWARDED_ALLOW_IPS` | `*` | 호스트에 직접 게시되지 않은 웹 컨테이너에서 신뢰할 프록시 주소 |
 | `WEB_ADMIN_PASSWORD` | 빈 값 | 웹 로그인 비밀번호 |
 | `WEB_SESSION_SECRET` | 빈 값 | 로그인 사용 시 필요한 32자 이상 세션 키 |
 | `WEB_SECURE_COOKIE` | `true` | HTTPS에서만 세션 쿠키 전송 |
@@ -133,8 +138,8 @@ python3 -c 'import secrets; print(secrets.token_urlsafe(48))'
 
 | 변수 | 기본값 | 용도 |
 | --- | --- | --- |
-| `STT_STATE_PATH` | `./var/stt-state` | 전사 작업 DB와 결과 |
-| `MODEL_CACHE_PATH` | `./var/model-cache` | Hugging Face·PyTorch·WhisperX 캐시 |
+| `STT_STATE_PATH` | `/data/stt-to-subtitle/stt-state` | 전사 작업 DB와 결과 |
+| `MODEL_CACHE_PATH` | `/data/stt-to-subtitle/model` | Hugging Face·PyTorch·WhisperX 캐시 |
 | `STT_DEVICE` | `cuda` | `cuda` 또는 `cuda:<index>` |
 | `STT_DIARIZATION_DEVICE` | `cuda` | 화자 분리 장치, VRAM 절약 시 `cpu` |
 | `STT_BATCH_SIZE` | `1` | 모델 배치 크기 |
@@ -200,9 +205,9 @@ JSON·번역 체크포인트부터 이어집니다.
 마운트 용도는 다음과 같습니다.
 
 - `${MEDIA_PATH}:/media:rw`: 영상 조회 및 원본 옆 자막 저장
-- `${WEB_STATE_PATH}:/var/lib/stt:rw`: 작업 DB, WAV, 전사·번역 JSON
-- `${STT_STATE_PATH}:/var/lib/stt:rw`: STT 작업 DB와 결과
-- `${MODEL_CACHE_PATH}:/var/cache/stt:rw`: 모델 캐시
+- `${WEB_STATE_PATH}:/data/stt-to-subtitle/web-state:rw`: 작업 DB, WAV, 전사·번역 JSON
+- `${STT_STATE_PATH}:/data/stt-to-subtitle/stt-state:rw`: STT 작업 DB와 결과
+- `${MODEL_CACHE_PATH}:/data/stt-to-subtitle/model:rw`: 모델 캐시
 
 기존 배포의 `jobs.sqlite3`와 `jobs/` 디렉터리를 새
 `WEB_STATE_PATH`로 옮기거나 그 기존 경로를 직접 지정하면 작업 기록과

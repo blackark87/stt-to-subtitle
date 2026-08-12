@@ -358,6 +358,10 @@ class WebSettingsTests(unittest.TestCase):
         )
         self.assertEqual(settings.lm_token, "token")
         self.assertEqual(settings.lm_model, "model")
+        self.assertEqual(
+            settings.state_dir,
+            Path("/data/stt-to-subtitle/web-state"),
+        )
 
     def test_keeps_legacy_lm_studio_environment_fallback(self) -> None:
         with patch.dict(
