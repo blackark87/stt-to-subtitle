@@ -12,7 +12,7 @@ Maintain explicit boundaries between audio extraction, speech transcription, tra
 
 - `make test` — run the standard-library unit test suite without downloading models.
 - `make check` — compile Python sources and check changed files for whitespace errors.
-- `docker compose --env-file .env.compose.example config` — validate the integrated local-build Compose definition.
+- `./scripts/compose.sh --env-file .env.compose.example config` — validate Compose with the current non-root UID/GID.
 
 ## Coding Style & Naming Conventions
 
@@ -22,14 +22,15 @@ Target Python 3.11, use four-space indentation, type annotations, and focused mo
 
 Use `unittest`; name files `test_<module>.py` and methods after observable behavior. Mock model loading and network access. Cover FFmpeg command construction, invalid speaker options, timestamp offsets, Unicode serialization, and output naming. Real quality tests must use legally available, short fixtures and must not commit copyrighted media or sensitive transcripts.
 
-Do not rerun the full test suite solely because an already validated change is
-moved to a new branch, its version metadata or matching release assertion is
-updated, documentation is edited, or commit/push/PR work begins. Reuse the
-existing result and run only the smallest check covering the follow-up change.
-Rerun the full suite only when runtime behavior, dependencies, behavior-affecting
-configuration, or substantive test logic changed after the last complete run,
-when the prior result was incomplete or failed, or when the user explicitly
-requests it.
+Do not rerun the full test suite unless application runtime code or substantive
+test logic changed after the last complete run, the previous run was incomplete
+or failed, or the user explicitly requests it. Dependency manifests, Dockerfiles,
+Compose files, environment examples, workflows, documentation, version metadata,
+branch moves, and commit/push/PR work do not by themselves justify another full
+run. Validate those changes with the smallest direct check, such as dependency
+resolution, an image build, a runtime import, Compose config rendering, or a
+focused test. Reuse the latest successful full-suite result and never rerun the
+full suite speculatively.
 
 ## Documentation Relevance
 

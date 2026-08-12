@@ -23,6 +23,9 @@ class CreateMacOSRuntimeTests(unittest.TestCase):
             self.assertTrue((target / ".env.example").is_file())
             self.assertTrue((target / "setup.sh").is_file())
             self.assertTrue((target / "run.sh").is_file())
+            self.assertTrue((target / "requirements-api.txt").is_file())
+            self.assertTrue((target / "requirements-kotoba.txt").is_file())
+            self.assertFalse((target / "requirements-macos.txt").exists())
             self.assertTrue(
                 (target / "src" / "stt_to_subtitle" / "macos_api.py").is_file()
             )

@@ -62,7 +62,6 @@ chmod 600 .env.compose
 - `MEDIA_PATH`: 영상과 자막을 읽고 쓸 호스트 디렉터리
 - `OPENAI_COMPATIBLE_BASE_URL`: 번역 API 루트
 - `OPENAI_COMPATIBLE_MODEL`: 번역 모델 ID
-- 필요한 경우 `PUID`, `PGID`: 마운트 경로에 접근할 호스트 사용자
 
 상태와 모델 캐시 디렉터리를 만들고 쓰기 권한을 확인합니다.
 
@@ -76,11 +75,15 @@ test -w ./var/model-cache
 이미지를 로컬에서 빌드하고 두 서비스를 함께 실행합니다.
 
 ```bash
-docker compose --env-file .env.compose config
-docker compose --env-file .env.compose build
-docker compose --env-file .env.compose up -d
-docker compose --env-file .env.compose ps
+./scripts/compose.sh --env-file .env.compose config
+./scripts/compose.sh --env-file .env.compose build
+./scripts/compose.sh --env-file .env.compose up -d
+./scripts/compose.sh --env-file .env.compose ps
 ```
+
+`scripts/compose.sh`는 현재 실행 계정의 UID/GID를 두 컨테이너에 주입하며
+root 실행은 거부합니다. 따라서 `.env.compose`에 UID/GID를 설정할 필요가
+없고, 마운트 경로를 소유한 일반 사용자로 실행해야 합니다.
 
 STT 이미지는 두 ML 환경을 모두 설치하므로 최초 빌드 시간이 길고 이미지가
 클 수 있습니다. 모델 가중치는 이미지에 포함하지 않으며 최초 전사 요청 때
@@ -90,14 +93,15 @@ STT 이미지는 두 ML 환경을 모두 설치하므로 최초 빌드 시간이
 
 ```bash
 curl http://127.0.0.1:8080/healthz
-docker compose --env-file .env.compose exec stt \
+./scripts/compose.sh --env-file .env.compose exec stt \
   python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8100/readyz').read().decode())"
 ```
 
 브라우저에서 `http://DOCKER_HOST:8080`을 열고 **서버 설정**에서 번역
-서버를 확인합니다. 전사 API 주소의 기본값은 `http://stt:8100`입니다.
-설정은 웹 상태 디렉터리의 `jobs.sqlite3`에 저장되며 컨테이너를 다시
-만들어도 유지됩니다.
+서버를 확인합니다. Compose의 전사 API 주소는 내부 서비스
+`http://stt:8100`으로 고정되므로 환경 파일에서 설정하지 않습니다. 설정은
+웹 상태 디렉터리의 `jobs.sqlite3`에 저장되며 컨테이너를 다시 만들어도
+유지됩니다.
 
 ## 환경 설정
 
@@ -105,15 +109,12 @@ docker compose --env-file .env.compose exec stt \
 
 | 변수 | 기본값 | 용도 |
 | --- | --- | --- |
-| `PUID`, `PGID` | `1000` | 두 컨테이너의 런타임 UID/GID |
 | `MEDIA_PATH` | `./media` | 입력 영상과 생성 자막 |
 | `WEB_STATE_PATH` | `./var/web-state` | 작업 DB, WAV, JSON 체크포인트 |
 | `WEB_PORT` | `8080` | 호스트 웹 포트 |
 | `WEB_ADMIN_PASSWORD` | 빈 값 | 웹 로그인 비밀번호 |
 | `WEB_SESSION_SECRET` | 빈 값 | 로그인 사용 시 필요한 32자 이상 세션 키 |
 | `WEB_SECURE_COOKIE` | `false` | HTTPS에서만 세션 쿠키 전송 |
-| `STT_BASE_URL` | `http://stt:8100` | 웹에서 사용하는 전사 API |
-| `STT_API_TOKEN` | 빈 값 | 웹과 STT가 공유하는 선택적 Bearer 토큰 |
 
 `WEB_ADMIN_PASSWORD`를 설정하면 `WEB_SESSION_SECRET`도 반드시 32자
 이상으로 설정해야 합니다. 다음과 같이 생성할 수 있습니다.
@@ -229,24 +230,24 @@ cd /path/to/runtime
 소스가 변경되면 이미지를 다시 로컬 빌드해 재생성합니다.
 
 ```bash
-docker compose --env-file .env.compose build
-docker compose --env-file .env.compose up -d
+./scripts/compose.sh --env-file .env.compose build
+./scripts/compose.sh --env-file .env.compose up -d
 ```
 
 자주 사용하는 명령은 다음과 같습니다.
 
 ```bash
-docker compose --env-file .env.compose logs --tail=200 web stt
-docker compose --env-file .env.compose restart web stt
-docker compose --env-file .env.compose down
+./scripts/compose.sh --env-file .env.compose logs --tail=200 web stt
+./scripts/compose.sh --env-file .env.compose restart web stt
+./scripts/compose.sh --env-file .env.compose down
 ```
 
 `down`은 바인드 마운트된 상태·캐시·미디어를 삭제하지 않습니다.
 
-웹 로그인이나 STT 인증을 사용하지 않는 구성은 신뢰할 수 있는 사설망 또는
-VPN에서만 실행하십시오. 인터넷에 직접 노출할 때는 HTTPS reverse proxy,
-`WEB_ADMIN_PASSWORD`, `WEB_SESSION_SECRET`, `WEB_SECURE_COOKIE=true`,
-`STT_API_TOKEN`을 설정합니다.
+웹 로그인을 사용하지 않는 구성은 신뢰할 수 있는 사설망 또는 VPN에서만
+실행하십시오. 인터넷에 직접 노출할 때는 HTTPS reverse proxy,
+`WEB_ADMIN_PASSWORD`, `WEB_SESSION_SECRET`, `WEB_SECURE_COOKIE=true`를
+설정합니다. STT 포트는 호스트에 게시하지 않습니다.
 
 ## 개발 검증
 
@@ -255,7 +256,7 @@ VPN에서만 실행하십시오. 인터넷에 직접 노출할 때는 HTTPS reve
 ```bash
 make test
 make check
-docker compose --env-file .env.compose.example config
+./scripts/compose.sh --env-file .env.compose.example config
 ```
 
 실제 품질 테스트에는 합법적으로 사용할 수 있는 짧은 미디어만 사용하고,

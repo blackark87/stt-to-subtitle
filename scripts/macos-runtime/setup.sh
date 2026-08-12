@@ -18,7 +18,11 @@ fi
 
 venv_python="$runtime_dir/.venv-macos/bin/python"
 "$venv_python" -m pip install --upgrade pip
-"$venv_python" -m pip install -r "$runtime_dir/requirements-macos.txt"
+"$venv_python" -m pip install \
+    -r "$runtime_dir/requirements-kotoba.txt" \
+    -r "$runtime_dir/requirements-api.txt"
+"$venv_python" -m pip install --no-deps \
+    "git+https://github.com/huggingface/diarizers.git@f3c8ae500f55ad2b02b719fce1495ea2794ca9fe"
 
 mkdir -p \
     "$runtime_dir/var/macos-cache/huggingface" \

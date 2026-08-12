@@ -13,10 +13,12 @@ RUNTIME_MARKER = "stt-to-subtitle macos runtime v1\n"
 def _copy_runtime_files(repository_root: Path, target: Path) -> None:
     file_mappings = {
         repository_root / "pyproject.toml": target / "pyproject.toml",
-        repository_root / "requirements-macos.txt": (
-            target / "requirements-macos.txt"
+        repository_root / "requirements-api.txt": (
+            target / "requirements-api.txt"
         ),
-        repository_root / "requirements.txt": target / "requirements.txt",
+        repository_root / "requirements-kotoba.txt": (
+            target / "requirements-kotoba.txt"
+        ),
         repository_root / ".env.macos.example": target / ".env.example",
         repository_root / "scripts" / "run-macos-stt.sh": (
             target / "scripts" / "run-macos-stt.sh"

@@ -8,7 +8,7 @@ ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1
 
 WORKDIR /build
-COPY requirements-web.txt ./
+COPY requirements-api.txt requirements-web.txt ./
 RUN python -m pip install --prefix=/install -r requirements-web.txt
 
 COPY pyproject.toml README.md ./
