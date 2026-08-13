@@ -1,3 +1,4 @@
+import asyncio
 from importlib.util import find_spec
 import json
 from pathlib import Path
@@ -16,7 +17,22 @@ if WEB_TESTS_AVAILABLE:
 from stt_to_subtitle.web_config import WebSettings
 
 if WEB_TESTS_AVAILABLE:
-    from stt_to_subtitle.web_app import create_app, main
+    from stt_to_subtitle.web_app import JobChangeHook, create_app, main
+
+
+@unittest.skipUnless(
+    WEB_TESTS_AVAILABLE,
+    "web test dependencies are not installed",
+)
+class JobChangeHookTests(unittest.IsolatedAsyncioTestCase):
+    async def test_wakes_waiters_when_a_job_changes(self) -> None:
+        hook = JobChangeHook(asyncio.get_running_loop())
+        version = hook.version
+
+        hook.publish("job-1")
+        updated_version = await hook.wait(version, timeout=0.1)
+
+        self.assertEqual(updated_version, version + 1)
 
 
 @unittest.skipUnless(
@@ -36,6 +52,38 @@ class WebAppTests(unittest.TestCase):
             lm_token="",
             lm_model="model",
         )
+
+    def test_job_pages_use_change_events_instead_of_timed_polling(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+
+            with TestClient(create_app(self.settings(root, media_root))) as client:
+                service = client.app.state.orchestrator
+                service.stop()
+                job = service.store.create(
+                    job_id="active-job",
+                    source_rel="active.mp4",
+                    force_overwrite=False,
+                    options={},
+                )
+                dashboard = client.get("/")
+                detail = client.get(f"/jobs/{job.id}")
+                updates = client.get("/static/live-updates.js")
+                route_paths = {route.path for route in client.app.routes}
+
+            self.assertIn("변경 즉시 갱신", dashboard.text)
+            self.assertIn('data-update-url="/jobs-fragment?', dashboard.text)
+            self.assertIn(
+                f'data-update-url="/jobs/{job.id}/panel"',
+                detail.text,
+            )
+            self.assertNotIn("data-poll", dashboard.text + detail.text)
+            self.assertNotIn("5초마다 갱신", dashboard.text)
+            self.assertIn("/jobs/events", route_paths)
+            self.assertIn("new window.EventSource", updates.text)
+            self.assertNotIn("setInterval", updates.text)
 
     def test_dashboard_renders_media_cards_and_local_poster(self) -> None:
         with TemporaryDirectory() as directory:
@@ -1007,6 +1055,76 @@ class WebAppTests(unittest.TestCase):
             self.assertTrue(running.job_stop_requested)
             self.assertEqual(extraction.status, "blocked")
             self.assertIn("전체 작업 중단 요청됨", refreshed.text)
+
+    def test_bulk_retry_restarts_all_attention_jobs(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            (media_root / "series").mkdir()
+
+            with TestClient(create_app(self.settings(root, media_root))) as client:
+                service = client.app.state.orchestrator
+                service.stop()
+                blocked = service.store.create(
+                    job_id="blocked",
+                    source_rel="blocked.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                service.store.update(
+                    blocked.id,
+                    status="blocked",
+                    blocked_stage="transcription",
+                    error="stopped",
+                )
+                failed = service.store.create(
+                    job_id="failed",
+                    source_rel="failed.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                service.store.update(
+                    failed.id,
+                    status="failed",
+                    blocked_stage="translation",
+                    error="failed",
+                )
+                queued = service.store.create(
+                    job_id="queued",
+                    source_rel="queued.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+
+                fragment = client.get("/jobs-fragment?folder=series")
+                response = client.post(
+                    "/jobs/retry-all",
+                    data={"return_folder": "series"},
+                    follow_redirects=False,
+                )
+                notice = client.get(response.headers["location"])
+                refreshed = client.get("/jobs-fragment?folder=series")
+                blocked = service.store.get(blocked.id)
+                failed = service.store.get(failed.id)
+                queued = service.store.get(queued.id)
+
+            self.assertIn('action="/jobs/retry-all"', fragment.text)
+            self.assertIn("중단 작업 일괄 재시도 (2)", fragment.text)
+            self.assertIn(
+                'name="return_folder" value="series"',
+                fragment.text,
+            )
+            self.assertEqual(response.status_code, 303)
+            self.assertEqual(
+                response.headers["location"],
+                "/?folder=series&jobs_retried=2",
+            )
+            self.assertIn("중단·실패 작업 2개를 재시도했습니다.", notice.text)
+            self.assertIn("중단 작업 일괄 재시도 (0)", refreshed.text)
+            self.assertEqual(blocked.status, "queued")
+            self.assertEqual(failed.status, "queued")
+            self.assertEqual(queued.status, "queued")
 
     def test_all_jobs_are_merged_and_paginated_by_creation_time(self) -> None:
         with TemporaryDirectory() as directory:

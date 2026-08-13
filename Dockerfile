@@ -84,6 +84,17 @@ RUN /opt/venvs/kotoba/bin/python -m pip install --no-cache-dir --no-deps \
         /tmp/stt-wheel/*.whl \
     && rm -rf /tmp/stt-wheel
 
+# Keep persistent container paths stable. The preceding runtime layer is left
+# unchanged so existing multi-gigabyte ML dependency layers remain reusable.
+ENV HF_HOME=/var/cache/stt/huggingface \
+    PYANNOTE_CACHE=/var/cache/stt/pyannote \
+    TORCH_HOME=/var/cache/stt/torch \
+    WHISPERX_CACHE_DIR=/var/cache/stt/whisperx \
+    STT_STATE_DIR=/var/lib/stt
+RUN mkdir -p /var/cache/stt /var/lib/stt \
+    && chown -R app:app /var/cache/stt /var/lib/stt \
+    && rm -rf /data/stt-to-subtitle
+
 USER app
 WORKDIR /app
 EXPOSE 8100

@@ -28,7 +28,13 @@ from .web_config import (
     RemoteServerSettings,
     probe_media_duration,
 )
-from .job_store import PipelineJob, JobStore, PromptCategory, SUCCESS_STATUSES
+from .job_store import (
+    JobStore,
+    PipelineJob,
+    PromptCategory,
+    RETRYABLE_STATUSES,
+    SUCCESS_STATUSES,
+)
 from .service_clients import (
     ExternalServiceError,
     OpenAICompatibleClient,
@@ -669,7 +675,7 @@ class SubtitleOrchestrator:
         job = self.store.get(job_id)
         if job is None:
             raise ValueError("job not found")
-        if job.status not in {"blocked", "failed"}:
+        if job.status not in RETRYABLE_STATUSES:
             raise ValueError("only blocked or failed jobs can be retried")
 
         target_status = "queued"
@@ -738,6 +744,21 @@ class SubtitleOrchestrator:
         if retried is None:
             raise RuntimeError("retried job could not be read")
         return retried
+
+    def retry_all_jobs(self) -> int:
+        retried_count = 0
+        for listed in self.store.list_open_jobs():
+            if not listed.can_retry:
+                continue
+            try:
+                self.retry(listed.id)
+            except ValueError:
+                current = self.store.get(listed.id)
+                if current is None or not current.can_retry:
+                    continue
+                raise
+            retried_count += 1
+        return retried_count
 
     def delete_job_record(self, job_id: str) -> None:
         job = self.store.get(job_id)

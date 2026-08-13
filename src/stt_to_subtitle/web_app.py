@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import asdict
@@ -131,6 +132,38 @@ def format_media_duration(value: object) -> str:
 TEMPLATES.env.filters["duration"] = format_media_duration
 
 
+class JobChangeHook:
+    def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
+        self._loop = loop
+        self._version = 0
+        self._changed = asyncio.Event()
+
+    @property
+    def version(self) -> int:
+        return self._version
+
+    def publish(self, _job_id: str) -> None:
+        try:
+            self._loop.call_soon_threadsafe(self._mark_changed)
+        except RuntimeError:
+            return
+
+    def _mark_changed(self) -> None:
+        self._version += 1
+        self._changed.set()
+
+    async def wait(self, version: int, timeout: float = 15.0) -> int:
+        while self._version == version:
+            self._changed.clear()
+            if self._version != version:
+                break
+            try:
+                await asyncio.wait_for(self._changed.wait(), timeout=timeout)
+            except TimeoutError:
+                break
+        return self._version
+
+
 def create_app(settings: WebSettings | None = None) -> FastAPI:
     configured_settings = settings or WebSettings.from_env()
     authentication_enabled = bool(configured_settings.admin_password.strip())
@@ -138,11 +171,15 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         orchestrator = SubtitleOrchestrator(configured_settings)
+        job_change_hook = JobChangeHook(asyncio.get_running_loop())
+        orchestrator.store.set_change_hook(job_change_hook.publish)
         app.state.orchestrator = orchestrator
+        app.state.job_change_hook = job_change_hook
         orchestrator.start()
         try:
             yield
         finally:
+            orchestrator.store.set_change_hook(None)
             orchestrator.stop()
 
     app = FastAPI(
@@ -321,6 +358,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                 offset=jobs_offset,
             ),
             "stoppable_job_count": sum(job.can_stop for job in open_jobs),
+            "retriable_job_count": sum(job.can_retry for job in open_jobs),
             "pausable_translation_count": sum(
                 job.can_pause_translation for job in open_jobs
             ),
@@ -401,6 +439,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         translation_pause_requested: int | None = None,
         translations_paused: int | None = None,
         jobs_stopped: int | None = None,
+        jobs_retried: int | None = None,
         skipped: int | None = None,
         folder: str = "",
         jobs_page: int = 1,
@@ -419,6 +458,8 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             notice = f"번역 작업 {translations_paused}개에 중단을 요청했습니다."
         elif jobs_stopped is not None:
             notice = f"진행 중인 작업 {jobs_stopped}개에 중단을 요청했습니다."
+        elif jobs_retried is not None:
+            notice = f"중단·실패 작업 {jobs_retried}개를 재시도했습니다."
         try:
             context = dashboard_context(
                 request,
@@ -721,6 +762,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                     offset=jobs_offset,
                 ),
                 "stoppable_job_count": sum(job.can_stop for job in open_jobs),
+                "retriable_job_count": sum(job.can_retry for job in open_jobs),
                 "pausable_translation_count": sum(
                     job.can_pause_translation for job in open_jobs
                 ),
@@ -733,6 +775,32 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                 "prompt_categories": service.active_prompt_categories(),
                 "current_folder": folder,
                 "csrf_token": request.session.get("csrf_token", ""),
+            },
+        )
+
+    @app.get("/jobs/events")
+    def job_events(request: Request) -> Any:
+        if not is_authenticated(request):
+            raise HTTPException(status_code=401, detail="authentication required")
+        change_hook: JobChangeHook = request.app.state.job_change_hook
+
+        async def stream() -> AsyncIterator[str]:
+            version = change_hook.version
+            yield f"retry: 3000\nevent: ready\ndata: {version}\n\n"
+            while True:
+                updated_version = await change_hook.wait(version)
+                if updated_version == version:
+                    yield ": keep-alive\n\n"
+                    continue
+                version = updated_version
+                yield f"id: {version}\nevent: jobs\ndata: changed\n\n"
+
+        return StreamingResponse(
+            stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "X-Accel-Buffering": "no",
             },
         )
 
@@ -1171,6 +1239,21 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         stopped_count = orchestrator(request).stop_all_jobs()
         return RedirectResponse(
             dashboard_location(return_folder, jobs_stopped=stopped_count),
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+
+    @app.post("/jobs/retry-all")
+    def retry_all_jobs(
+        request: Request,
+        csrf_token: str = Form(""),
+        return_folder: str = Form(""),
+    ) -> Any:
+        if not is_authenticated(request):
+            return login_redirect()
+        validate_csrf(request, csrf_token)
+        retried_count = orchestrator(request).retry_all_jobs()
+        return RedirectResponse(
+            dashboard_location(return_folder, jobs_retried=retried_count),
             status_code=status.HTTP_303_SEE_OTHER,
         )
 

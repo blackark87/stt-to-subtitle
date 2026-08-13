@@ -5,7 +5,7 @@ services:
     container_name: stt-web
     platform: linux/amd64
     build:
-      context: .
+      context: ${WORKSPACE:-.}
       dockerfile: Dockerfile.web
     user: "${WEB_PUID:-1026}:${WEB_PGID:-100}"
     init: true
@@ -30,7 +30,7 @@ services:
       traefik.http.services.stt-to-subtitle.loadbalancer.server.port: "8080"
     environment:
       MEDIA_ROOT: /media
-      WEB_STATE_DIR: /data/stt-to-subtitle/web-state
+      WEB_STATE_DIR: /var/lib/stt
       WEB_ADMIN_PASSWORD: ${WEB_ADMIN_PASSWORD:-}
       WEB_SESSION_SECRET: ${WEB_SESSION_SECRET:-}
       WEB_SECURE_COOKIE: ${WEB_SECURE_COOKIE:-true}
@@ -45,7 +45,7 @@ services:
       - ${MEDIA_PATH:-./media}:/media:rw
       - type: bind
         source: ${WEB_STATE_PATH:-/data/stt-to-subtitle/web-state}
-        target: /data/stt-to-subtitle/web-state
+        target: /var/lib/stt
     tmpfs:
       - /tmp:size=256m,mode=1777
     networks:
@@ -56,7 +56,7 @@ services:
     container_name: stt-backend
     platform: linux/amd64
     build:
-      context: .
+      context: ${WORKSPACE:-.}
       dockerfile: Dockerfile
     user: "${PUID:-1000}:${PGID:-1000}"
     init: true
@@ -68,7 +68,7 @@ services:
       HF_TOKEN: ${HF_TOKEN:?HF_TOKEN must be set}
       STT_HOST: 0.0.0.0
       STT_PORT: 8100
-      STT_STATE_DIR: /data/stt-to-subtitle/stt-state
+      STT_STATE_DIR: /var/lib/stt
       STT_DEVICE: ${STT_DEVICE:-cuda}
       STT_DIARIZATION_DEVICE: ${STT_DIARIZATION_DEVICE:-cuda}
       STT_BATCH_SIZE: ${STT_BATCH_SIZE:-1}
@@ -76,22 +76,22 @@ services:
       STT_CHUNK_PROGRESS_EVERY: ${STT_CHUNK_PROGRESS_EVERY:-10}
       STT_NOISE_FILTER_TRIGGER_LEVEL: ${STT_NOISE_FILTER_TRIGGER_LEVEL:-7.0}
       STT_DEBUG_ARTIFACTS: ${STT_DEBUG_ARTIFACTS:-false}
-      HF_HOME: /data/stt-to-subtitle/model/huggingface
-      PYANNOTE_CACHE: /data/stt-to-subtitle/model/pyannote
-      TORCH_HOME: /data/stt-to-subtitle/model/torch
+      HF_HOME: /var/cache/stt/huggingface
+      PYANNOTE_CACHE: /var/cache/stt/pyannote
+      TORCH_HOME: /var/cache/stt/torch
       WHISPERX_PYTHON: /opt/venvs/whisperx/bin/python
       WHISPERX_MODEL: ${WHISPERX_MODEL:-large-v3}
       WHISPERX_LANGUAGE: ${WHISPERX_LANGUAGE:-ja}
       WHISPERX_COMPUTE_TYPE: ${WHISPERX_COMPUTE_TYPE:-float16}
-      WHISPERX_CACHE_DIR: /data/stt-to-subtitle/model/whisperx
+      WHISPERX_CACHE_DIR: /var/cache/stt/whisperx
       NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
     volumes:
       - type: bind
         source: ${STT_STATE_PATH:-/data/stt-to-subtitle/stt-state}
-        target: /data/stt-to-subtitle/stt-state
+        target: /var/lib/stt
       - type: bind
         source: ${MODEL_CACHE_PATH:-/data/stt-to-subtitle/model}
-        target: /data/stt-to-subtitle/model
+        target: /var/cache/stt
     tmpfs:
       - /tmp:size=1g,mode=1777
     deploy:

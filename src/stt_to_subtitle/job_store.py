@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 import sqlite3
 import time
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 from uuid import uuid4
 
 from .translation_prompt import (
@@ -29,6 +29,7 @@ SUCCESS_STATUSES = {
     "transcription_completed",
     "completed",
 }
+RETRYABLE_STATUSES = {"blocked", "failed"}
 STOPPABLE_STATUSES = {
     "queued",
     "extracting",
@@ -117,6 +118,10 @@ class PipelineJob:
         return self.status in STOPPABLE_STATUSES and not self.job_stop_requested
 
     @property
+    def can_retry(self) -> bool:
+        return self.status in RETRYABLE_STATUSES
+
+    @property
     def can_pause_translation(self) -> bool:
         return (
             self.operation in {"translate", "full"}
@@ -168,8 +173,19 @@ class JobStore:
 
     def __init__(self, database_path: Path) -> None:
         self.database_path = database_path
+        self._change_hook: Callable[[str], None] | None = None
         database_path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
+
+    def set_change_hook(
+        self,
+        hook: Callable[[str], None] | None,
+    ) -> None:
+        self._change_hook = hook
+
+    def _notify_change(self, job_id: str) -> None:
+        if self._change_hook is not None:
+            self._change_hook(job_id)
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.database_path, timeout=30)
@@ -766,7 +782,10 @@ class JobStore:
                 f"{translation_condition}",
                 (running_status, time.time(), job_id, waiting_status),
             )
-        return result.rowcount == 1
+        claimed = result.rowcount == 1
+        if claimed:
+            self._notify_change(job_id)
+        return claimed
 
     def update(self, job_id: str, **fields: Any) -> None:
         if not fields:
@@ -779,10 +798,12 @@ class JobStore:
         assignments.append("updated_at = ?")
         values.extend([time.time(), job_id])
         with self._connect() as connection:
-            connection.execute(
+            result = connection.execute(
                 f"UPDATE jobs SET {', '.join(assignments)} WHERE id = ?",
                 values,
             )
+        if result.rowcount == 1:
+            self._notify_change(job_id)
 
     def update_if_status(
         self,
@@ -806,7 +827,10 @@ class JobStore:
                 f"WHERE id = ? AND status IN ({placeholders})",
                 values,
             )
-        return result.rowcount == 1
+        updated = result.rowcount == 1
+        if updated:
+            self._notify_change(job_id)
+        return updated
 
     def delete(self, job_id: str) -> bool:
         with self._connect() as connection:
@@ -818,7 +842,10 @@ class JobStore:
                 "DELETE FROM jobs WHERE id = ?",
                 (job_id,),
             )
-        return result.rowcount == 1
+        deleted = result.rowcount == 1
+        if deleted:
+            self._notify_change(job_id)
+        return deleted
 
     def add_event(self, job_id: str, level: str, message: str) -> None:
         with self._connect() as connection:
@@ -829,6 +856,7 @@ class JobStore:
                 """,
                 (job_id, level, message[:4000], time.time()),
             )
+        self._notify_change(job_id)
 
     def events(self, job_id: str, limit: int = 200) -> list[dict[str, Any]]:
         with self._connect() as connection:

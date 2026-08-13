@@ -103,6 +103,24 @@ class TranscriptionStoreTests(unittest.TestCase):
 
 
 class JobStoreTests(unittest.TestCase):
+    def test_calls_change_hook_after_job_mutations(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = JobStore(Path(directory) / "jobs.sqlite3")
+            changed_job_ids: list[str] = []
+            store.set_change_hook(changed_job_ids.append)
+
+            job = store.create(
+                job_id="job-1",
+                source_rel="movie.mkv",
+                force_overwrite=False,
+                options={},
+            )
+            store.update(job.id, status="blocked")
+            store.add_event(job.id, "warning", "stopped")
+            store.delete(job.id)
+
+            self.assertEqual(changed_job_ids, [job.id] * 4)
+
     def test_seeds_edits_and_archives_prompt_categories(self) -> None:
         with TemporaryDirectory() as directory:
             database_path = Path(directory) / "jobs.sqlite3"

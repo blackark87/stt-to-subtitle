@@ -93,6 +93,11 @@
       <p class="muted">최신순, 페이지당 20개 · 중단 요청은 안전한 지점에서 반영됩니다.</p>
     </div>
     <div class="job-bulk-actions">
+      <form method="post" action="/jobs/retry-all" data-confirm-message="확인 필요·실패 상태의 모든 작업을 마지막으로 저장된 단계부터 재시도하시겠습니까?">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="return_folder" value="{{ current_folder }}">
+        <button type="submit" class="compact"{% if not retriable_job_count %} disabled{% endif %}>{{ icons.refresh(14) }}중단 작업 일괄 재시도 ({{ retriable_job_count }})</button>
+      </form>
       <form method="post" action="/jobs/pause-all-translations" data-confirm-message="대기·실행 중인 모든 번역을 중단하시겠습니까? 오디오 추출과 전사는 계속 진행됩니다.">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <input type="hidden" name="return_folder" value="{{ current_folder }}">

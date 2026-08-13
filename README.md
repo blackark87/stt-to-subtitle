@@ -205,9 +205,9 @@ JSON·번역 체크포인트부터 이어집니다.
 마운트 용도는 다음과 같습니다.
 
 - `${MEDIA_PATH}:/media:rw`: 영상 조회 및 원본 옆 자막 저장
-- `${WEB_STATE_PATH}:/data/stt-to-subtitle/web-state:rw`: 작업 DB, WAV, 전사·번역 JSON
-- `${STT_STATE_PATH}:/data/stt-to-subtitle/stt-state:rw`: STT 작업 DB와 결과
-- `${MODEL_CACHE_PATH}:/data/stt-to-subtitle/model:rw`: 모델 캐시
+- `${WEB_STATE_PATH}:/var/lib/stt:rw`: 작업 DB, WAV, 전사·번역 JSON
+- `${STT_STATE_PATH}:/var/lib/stt:rw`: STT 작업 DB와 결과
+- `${MODEL_CACHE_PATH}:/var/cache/stt:rw`: 모델 캐시
 
 기존 배포의 `jobs.sqlite3`와 `jobs/` 디렉터리를 새
 `WEB_STATE_PATH`로 옮기거나 그 기존 경로를 직접 지정하면 작업 기록과

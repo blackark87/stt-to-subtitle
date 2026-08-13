@@ -509,7 +509,7 @@ th, td { border-bottom: 1px solid var(--line); padding: 10px 8px; text-align: le
 .status-transcription_completed { background: color-mix(in srgb, var(--success) 16%, var(--card)); color: var(--success); }
 .status-translation_paused { background: color-mix(in srgb, var(--warning-strong) 18%, var(--card)); color: var(--warning); }
 .status-blocked, .status-failed { background: color-mix(in srgb, var(--danger) 14%, var(--card)); color: var(--danger); }
-.polling-indicator,
+.live-update-indicator,
 .history-count {
   display: inline-flex;
   align-items: center;
@@ -522,11 +522,14 @@ th, td { border-bottom: 1px solid var(--line); padding: 10px 8px; text-align: le
   font-size: .78rem;
   white-space: nowrap;
 }
-.polling-indicator > span {
+.live-update-indicator > span:first-child {
   width: 7px;
   height: 7px;
   border-radius: 50%;
   background: var(--success);
+}
+.live-update-indicator.is-disconnected > span:first-child {
+  background: var(--warning);
 }
 .recent-jobs-summary { display: flex; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; }
 .summary-chip {

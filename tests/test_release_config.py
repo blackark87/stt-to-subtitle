@@ -15,17 +15,17 @@ class ReleaseConfigurationTests(unittest.TestCase):
 
         self.assertIn("dockerfile: Dockerfile.web", compose)
         self.assertIn("dockerfile: Dockerfile", compose)
+        self.assertEqual(compose.count("context: ${WORKSPACE:-.}"), 2)
         self.assertIn("STT_BASE_URL: http://stt:8100", compose)
         self.assertIn("container_name: stt-web", compose)
         self.assertIn("container_name: stt-backend", compose)
         self.assertIn(
-            "WEB_STATE_DIR: /data/stt-to-subtitle/web-state", compose
+            "WEB_STATE_DIR: /var/lib/stt", compose
         )
         self.assertIn(
-            "STT_STATE_DIR: /data/stt-to-subtitle/stt-state", compose
+            "STT_STATE_DIR: /var/lib/stt", compose
         )
-        self.assertNotIn("/var/lib/stt", compose)
-        self.assertNotIn("/var/cache/stt", compose)
+        self.assertIn("target: /var/cache/stt", compose)
         self.assertNotIn("${STT_BASE_URL", compose)
         self.assertNotIn("STT_API_TOKEN:", compose)
         self.assertIn("${WEB_PUID:-1026}:${WEB_PGID:-100}", compose)
@@ -67,11 +67,11 @@ class ReleaseConfigurationTests(unittest.TestCase):
         self.assertFalse((ROOT / "requirements-cuda.txt").exists())
         self.assertFalse((ROOT / "requirements-macos.txt").exists())
 
-    def test_project_version_is_2_0_0(self) -> None:
+    def test_project_version_is_3_1_0(self) -> None:
         project = tomllib.loads(
             (ROOT / "pyproject.toml").read_text(encoding="utf-8")
         )
-        self.assertEqual(project["project"]["version"], "2.0.0")
+        self.assertEqual(project["project"]["version"], "3.1.0")
 
 
 if __name__ == "__main__":
