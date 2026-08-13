@@ -73,7 +73,11 @@ class WebAppTests(unittest.TestCase):
                 updates = client.get("/static/live-updates.js")
                 route_paths = {route.path for route in client.app.routes}
 
-            self.assertIn("변경 즉시 갱신", dashboard.text)
+            self.assertNotIn("변경 즉시 갱신", dashboard.text)
+            self.assertIn(
+                'data-update-url="/job-stats-fragment"',
+                dashboard.text,
+            )
             self.assertIn('data-update-url="/jobs-fragment?', dashboard.text)
             self.assertIn(
                 f'data-update-url="/jobs/{job.id}/panel"',
@@ -84,6 +88,51 @@ class WebAppTests(unittest.TestCase):
             self.assertIn("/jobs/events", route_paths)
             self.assertIn("new window.EventSource", updates.text)
             self.assertNotIn("setInterval", updates.text)
+
+    def test_status_tiles_link_to_filtered_job_pages(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            with TestClient(create_app(self.settings(root, media_root))) as client:
+                service = client.app.state.orchestrator
+                service.stop()
+                running = service.store.create(
+                    job_id="running-job",
+                    source_rel="running.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                service.store.update(
+                    running.id,
+                    status="transcription_running",
+                )
+                attention = service.store.create(
+                    job_id="attention-job",
+                    source_rel="attention.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                service.store.update(attention.id, status="blocked")
+
+                dashboard = client.get("/")
+                running_page = client.get("/jobs?status_group=running")
+                attention_page = client.get("/jobs?status_group=attention")
+                invalid_page = client.get("/jobs?status_group=unknown")
+
+            self.assertIn('href="/jobs?status_group=running"', dashboard.text)
+            self.assertIn('href="/jobs?status_group=attention"', dashboard.text)
+            self.assertIn('href="/jobs?status_group=waiting"', dashboard.text)
+            self.assertIn('href="/jobs?status_group=completed"', dashboard.text)
+            self.assertIn("running.mkv", running_page.text)
+            self.assertNotIn("attention.mkv", running_page.text)
+            self.assertIn("attention.mkv", attention_page.text)
+            self.assertNotIn("running.mkv", attention_page.text)
+            self.assertIn(
+                "data-update-url=\"/jobs-fragment?status_group=running",
+                running_page.text,
+            )
+            self.assertEqual(invalid_page.status_code, 400)
 
     def test_dashboard_renders_media_cards_and_local_poster(self) -> None:
         with TemporaryDirectory() as directory:

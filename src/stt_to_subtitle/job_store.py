@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 import sqlite3
 import time
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Collection, Mapping
 from uuid import uuid4
 
 from .translation_prompt import (
@@ -643,24 +643,54 @@ class JobStore:
         limit: int | None = 100,
         *,
         offset: int = 0,
+        statuses: Collection[str] | None = None,
     ) -> list[PipelineJob]:
+        status_values = (
+            tuple(sorted(set(statuses))) if statuses is not None else None
+        )
+        if status_values == ():
+            return []
         with self._connect() as connection:
-            if limit is None:
+            if status_values is None and limit is None:
                 rows = connection.execute(
                     "SELECT * FROM jobs ORDER BY created_at DESC"
                 ).fetchall()
-            else:
+            elif status_values is None:
                 rows = connection.execute(
                     "SELECT * FROM jobs ORDER BY created_at DESC LIMIT ? OFFSET ?",
                     (limit, offset),
                 ).fetchall()
+            else:
+                placeholders = ", ".join("?" for _ in status_values)
+                limit_clause = "" if limit is None else " LIMIT ? OFFSET ?"
+                parameters: tuple[object, ...] = status_values
+                if limit is not None:
+                    parameters += (limit, offset)
+                rows = connection.execute(
+                    f"SELECT * FROM jobs WHERE status IN ({placeholders}) "
+                    f"ORDER BY created_at DESC{limit_clause}",
+                    parameters,
+                ).fetchall()
         return [job for row in rows if (job := self._from_row(row)) is not None]
 
-    def count_jobs(self) -> int:
+    def count_jobs(self, *, statuses: Collection[str] | None = None) -> int:
+        status_values = (
+            tuple(sorted(set(statuses))) if statuses is not None else None
+        )
+        if status_values == ():
+            return 0
         with self._connect() as connection:
-            row = connection.execute(
-                "SELECT COUNT(*) AS count FROM jobs"
-            ).fetchone()
+            if status_values is None:
+                row = connection.execute(
+                    "SELECT COUNT(*) AS count FROM jobs"
+                ).fetchone()
+            else:
+                placeholders = ", ".join("?" for _ in status_values)
+                row = connection.execute(
+                    f"SELECT COUNT(*) AS count FROM jobs "
+                    f"WHERE status IN ({placeholders})",
+                    status_values,
+                ).fetchone()
         return int(row["count"]) if row is not None else 0
 
     def list_open_jobs(self) -> list[PipelineJob]:

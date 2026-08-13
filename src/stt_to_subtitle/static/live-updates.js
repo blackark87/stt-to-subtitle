@@ -6,32 +6,17 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   });
 
-  const status = document.querySelector("[data-live-update-status]");
-  const statusLabel = status?.querySelector("[data-live-update-label]");
   const targets = Array.from(document.querySelectorAll("[data-update-url]"));
   if (!targets.length) {
     return;
   }
   if (!("EventSource" in window)) {
-    status?.classList.add("is-disconnected");
-    if (statusLabel) {
-      statusLabel.textContent = "실시간 갱신 미지원";
-    }
     return;
   }
 
   let eventSource = null;
   let refreshing = false;
   let refreshQueued = false;
-
-  const updateConnectionStatus = (connected) => {
-    status?.classList.toggle("is-disconnected", !connected);
-    if (statusLabel) {
-      statusLabel.textContent = connected
-        ? "변경 즉시 갱신"
-        : "실시간 연결 재시도 중";
-    }
-  };
 
   const refreshTargets = async () => {
     if (refreshing) {
@@ -73,8 +58,6 @@ document.addEventListener("DOMContentLoaded", () => {
   };
 
   eventSource = new window.EventSource("/jobs/events");
-  eventSource.addEventListener("open", () => updateConnectionStatus(true));
-  eventSource.addEventListener("error", () => updateConnectionStatus(false));
   eventSource.addEventListener("ready", refreshTargets);
   eventSource.addEventListener("jobs", refreshTargets);
 });

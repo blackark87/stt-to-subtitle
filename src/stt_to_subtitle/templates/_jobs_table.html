@@ -89,9 +89,10 @@
 <section class="job-list-section">
   <div class="section-heading compact-heading job-list-heading">
     <div>
-      <h3>전체 작업</h3>
-      <p class="muted">최신순, 페이지당 20개 · 중단 요청은 안전한 지점에서 반영됩니다.</p>
+      <h3>{{ job_list_title|default("전체 작업") }}</h3>
+      <p class="muted">{{ job_list_description|default("최신순, 페이지당 20개 · 중단 요청은 안전한 지점에서 반영됩니다.") }}</p>
     </div>
+    {% if show_bulk_actions|default(true) %}
     <div class="job-bulk-actions">
       <form method="post" action="/jobs/retry-all" data-confirm-message="확인 필요·실패 상태의 모든 작업을 마지막으로 저장된 단계부터 재시도하시겠습니까?">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
@@ -109,17 +110,18 @@
         <button type="submit" class="danger compact"{% if not stoppable_job_count %} disabled{% endif %}>{{ icons.alert_triangle(14) }}전체 작업 중단 ({{ stoppable_job_count }})</button>
       </form>
     </div>
+    {% endif %}
   </div>
   {% if recent_jobs %}
     <div class="recent-job-list">{% for job in recent_jobs %}{{ job_item(job) }}{% endfor %}</div>
     {% if jobs_has_previous or jobs_has_next %}
       <nav class="pagination" aria-label="전체 작업 페이지">
-        {% if jobs_has_previous %}<a class="button secondary compact" href="/?folder={{ current_folder|urlencode }}&amp;jobs_page={{ jobs_page - 1 }}">{{ icons.chevron_left(14) }}이전</a>{% endif %}
+        {% if jobs_has_previous %}<a class="button secondary compact" href="{{ jobs_previous_url }}">{{ icons.chevron_left(14) }}이전</a>{% endif %}
         <span>{{ jobs_page }}페이지 · 총 {{ job_count }}개</span>
-        {% if jobs_has_next %}<a class="button secondary compact" href="/?folder={{ current_folder|urlencode }}&amp;jobs_page={{ jobs_page + 1 }}">다음{{ icons.chevron_right(14) }}</a>{% endif %}
+        {% if jobs_has_next %}<a class="button secondary compact" href="{{ jobs_next_url }}">다음{{ icons.chevron_right(14) }}</a>{% endif %}
       </nav>
     {% endif %}
   {% else %}
-    <div class="recent-jobs-empty"><strong>등록된 작업이 없습니다.</strong><span>미디어나 폴더를 선택해 새 작업을 등록하세요.</span></div>
+    <div class="recent-jobs-empty"><strong>{{ job_list_empty_message|default("등록된 작업이 없습니다.") }}</strong><span>{% if selected_status_group %}다른 상태 필터를 선택해 보세요.{% else %}미디어나 폴더를 선택해 새 작업을 등록하세요.{% endif %}</span></div>
   {% endif %}
 </section>

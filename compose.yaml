@@ -1,6 +1,15 @@
 name: stt-to-subtitle
 
 services:
+  stt-runtime:
+    profiles:
+      - build
+    platform: linux/amd64
+    image: ${STT_RUNTIME_IMAGE:-stt-to-subtitle-stt-runtime:py311-cuda-v1}
+    build:
+      context: ${WORKSPACE:-.}
+      dockerfile: Dockerfile.stt-runtime
+
   web:
     container_name: stt-web
     platform: linux/amd64
@@ -58,6 +67,8 @@ services:
     build:
       context: ${WORKSPACE:-.}
       dockerfile: Dockerfile
+      args:
+        STT_RUNTIME_IMAGE: ${STT_RUNTIME_IMAGE:-stt-to-subtitle-stt-runtime:py311-cuda-v1}
     user: "${PUID:-1000}:${PGID:-1000}"
     init: true
     restart: unless-stopped

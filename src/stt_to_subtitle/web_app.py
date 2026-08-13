@@ -29,6 +29,7 @@ from starlette.middleware.sessions import SessionMiddleware
 
 from .artifacts import artifact_filename
 from .contracts import validate_transcript, validate_translation_items
+from .job_store import RETRYABLE_STATUSES, RUNNING_STATUSES, SUCCESS_STATUSES
 from .media_preview import (
     guess_media_type,
     iter_file_range,
@@ -55,6 +56,25 @@ from .time_display import (
 LOGGER = logging.getLogger(__name__)
 PACKAGE_DIR = Path(__file__).parent
 RECENT_JOB_LIMIT = 20
+WAITING_STATUSES = {
+    "queued",
+    "audio_ready",
+    "transcribed",
+    "translation_paused",
+    "translated",
+}
+JOB_STATUS_GROUPS = {
+    "running": RUNNING_STATUSES,
+    "attention": RETRYABLE_STATUSES,
+    "waiting": WAITING_STATUSES,
+    "completed": SUCCESS_STATUSES,
+}
+JOB_STATUS_GROUP_LABELS = {
+    "running": "진행 중",
+    "attention": "확인 필요",
+    "waiting": "대기",
+    "completed": "완료",
+}
 JOB_STATUS_LABELS = {
     "queued": "대기 중",
     "extracting": "오디오 추출 중",
@@ -247,6 +267,82 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             return f"/jobs/{job_id}"
         return dashboard_location(return_folder, **values)
 
+    def job_stats(service: SubtitleOrchestrator) -> dict[str, int]:
+        return {
+            group: service.store.count_jobs(statuses=statuses)
+            for group, statuses in JOB_STATUS_GROUPS.items()
+        }
+
+    def job_list_context(
+        service: SubtitleOrchestrator,
+        *,
+        jobs_page: int,
+        status_group: str | None = None,
+        folder: str = "",
+    ) -> dict[str, Any]:
+        if status_group is not None and status_group not in JOB_STATUS_GROUPS:
+            raise ValueError("지원하지 않는 작업 상태 필터입니다.")
+        statuses = (
+            JOB_STATUS_GROUPS[status_group]
+            if status_group is not None
+            else None
+        )
+        jobs_page = max(1, jobs_page)
+        job_count = service.store.count_jobs(statuses=statuses)
+        jobs_offset = (jobs_page - 1) * RECENT_JOB_LIMIT
+        open_jobs = service.store.list_open_jobs()
+
+        def page_location(page: int) -> str:
+            if status_group is None:
+                return dashboard_location(folder, jobs_page=page)
+            return "/jobs?" + urlencode(
+                {"status_group": status_group, "jobs_page": page}
+            )
+
+        label = (
+            JOB_STATUS_GROUP_LABELS[status_group]
+            if status_group is not None
+            else "전체"
+        )
+        return {
+            "recent_jobs": service.store.list_jobs(
+                limit=RECENT_JOB_LIMIT,
+                offset=jobs_offset,
+                statuses=statuses,
+            ),
+            "stoppable_job_count": sum(job.can_stop for job in open_jobs),
+            "retriable_job_count": sum(job.can_retry for job in open_jobs),
+            "pausable_translation_count": sum(
+                job.can_pause_translation for job in open_jobs
+            ),
+            "jobs_page": jobs_page,
+            "jobs_has_previous": jobs_page > 1,
+            "jobs_has_next": jobs_offset + RECENT_JOB_LIMIT < job_count,
+            "jobs_previous_url": (
+                page_location(jobs_page - 1) if jobs_page > 1 else None
+            ),
+            "jobs_next_url": (
+                page_location(jobs_page + 1)
+                if jobs_offset + RECENT_JOB_LIMIT < job_count
+                else None
+            ),
+            "job_count": job_count,
+            "job_list_title": f"{label} 작업",
+            "job_list_description": (
+                f"{label} 상태만 최신순으로, 페이지당 20개씩 표시합니다."
+                if status_group is not None
+                else "최신순, 페이지당 20개 · 중단 요청은 안전한 지점에서 반영됩니다."
+            ),
+            "job_list_empty_message": (
+                f"{label} 상태의 작업이 없습니다."
+                if status_group is not None
+                else "등록된 작업이 없습니다."
+            ),
+            "show_bulk_actions": status_group is None,
+            "selected_status_group": status_group,
+            "current_folder": folder,
+        }
+
     def validate_csrf(request: Request, csrf_token: str) -> None:
         if not authentication_enabled:
             return
@@ -339,39 +435,14 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             media["job_id"] = linked_job.id if linked_job else None
             media["selectable"] = media["subtitle_state"] == "pending"
 
-        jobs_page = max(1, jobs_page)
-        job_count = service.store.count_jobs()
-        jobs_offset = (jobs_page - 1) * RECENT_JOB_LIMIT
-        open_jobs = service.store.list_open_jobs()
-        running_count = sum(
-            job.status
-            in {"extracting", "transcription_running", "translation_running", "rendering"}
-            for job in open_jobs
-        )
-        attention_count = sum(job.status in {"blocked", "failed"} for job in open_jobs)
-        waiting_count = len(open_jobs) - running_count - attention_count
-        completed_count = service.store.count_successful_jobs()
         return {
             "request": request,
-            "recent_jobs": service.store.list_jobs(
-                limit=RECENT_JOB_LIMIT,
-                offset=jobs_offset,
+            **job_list_context(
+                service,
+                jobs_page=jobs_page,
+                folder=folder,
             ),
-            "stoppable_job_count": sum(job.can_stop for job in open_jobs),
-            "retriable_job_count": sum(job.can_retry for job in open_jobs),
-            "pausable_translation_count": sum(
-                job.can_pause_translation for job in open_jobs
-            ),
-            "job_stats": {
-                "running": running_count,
-                "attention": attention_count,
-                "waiting": waiting_count,
-                "completed": completed_count,
-            },
-            "jobs_page": jobs_page,
-            "jobs_has_previous": jobs_page > 1,
-            "jobs_has_next": jobs_offset + RECENT_JOB_LIMIT < job_count,
-            "job_count": job_count,
+            "job_stats": job_stats(service),
             "csrf_token": request.session.get("csrf_token", ""),
             "error": error,
             "notice": notice,
@@ -481,6 +552,32 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             context,
             status_code=response_status,
         )
+
+    @app.get("/jobs", response_class=HTMLResponse)
+    def jobs_page(
+        request: Request,
+        status_group: str = "running",
+        jobs_page: int = 1,
+    ) -> Any:
+        if not is_authenticated(request):
+            return login_redirect()
+        try:
+            context = {
+                "request": request,
+                **job_list_context(
+                    orchestrator(request),
+                    jobs_page=jobs_page,
+                    status_group=status_group,
+                ),
+                "status_groups": JOB_STATUS_GROUP_LABELS,
+                "csrf_token": request.session.get("csrf_token", ""),
+                "prompt_categories": orchestrator(
+                    request
+                ).active_prompt_categories(),
+            }
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        return TEMPLATES.TemplateResponse(request, "jobs.html", context)
 
     def settings_context(
         request: Request,
@@ -743,39 +840,44 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         jobs_page: int = 1,
         completed_page: int | None = None,
         folder: str = "",
+        status_group: str | None = None,
     ) -> Any:
         if not is_authenticated(request):
             raise HTTPException(status_code=401, detail="authentication required")
-        service = orchestrator(request)
         if completed_page is not None and jobs_page == 1:
             jobs_page = completed_page
-        jobs_page = max(1, jobs_page)
-        job_count = service.store.count_jobs()
-        jobs_offset = (jobs_page - 1) * RECENT_JOB_LIMIT
-        open_jobs = service.store.list_open_jobs()
+        service = orchestrator(request)
+        try:
+            context = job_list_context(
+                service,
+                jobs_page=jobs_page,
+                status_group=status_group,
+                folder=folder,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
         return TEMPLATES.TemplateResponse(
             request,
             "_jobs_table.html",
             {
-                "recent_jobs": service.store.list_jobs(
-                    limit=RECENT_JOB_LIMIT,
-                    offset=jobs_offset,
-                ),
-                "stoppable_job_count": sum(job.can_stop for job in open_jobs),
-                "retriable_job_count": sum(job.can_retry for job in open_jobs),
-                "pausable_translation_count": sum(
-                    job.can_pause_translation for job in open_jobs
-                ),
-                "jobs_page": jobs_page,
-                "jobs_has_previous": jobs_page > 1,
-                "jobs_has_next": (
-                    jobs_offset + RECENT_JOB_LIMIT < job_count
-                ),
-                "job_count": job_count,
+                "request": request,
+                **context,
                 "prompt_categories": service.active_prompt_categories(),
-                "current_folder": folder,
                 "csrf_token": request.session.get("csrf_token", ""),
             },
+        )
+
+    @app.get("/job-stats-fragment", response_class=HTMLResponse)
+    def job_stats_fragment(request: Request) -> Any:
+        if not is_authenticated(request):
+            raise HTTPException(
+                status_code=401,
+                detail="authentication required",
+            )
+        return TEMPLATES.TemplateResponse(
+            request,
+            "_job_stats.html",
+            {"job_stats": job_stats(orchestrator(request))},
         )
 
     @app.get("/jobs/events")

@@ -1324,6 +1324,7 @@ tags
 !/.dockerignore
 !/AGENTS.md
 !/Dockerfile
+!/Dockerfile.stt-runtime
 !/Dockerfile.web
 !/compose.yaml
 !/Makefile
