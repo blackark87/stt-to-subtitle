@@ -3,14 +3,30 @@
   {% set is_running = job.status in ['extracting', 'transcription_running', 'translation_running', 'rendering'] %}
   {% set is_attention = job.status in ['blocked', 'failed'] %}
   {% set is_completed = job.status in ['audio_completed', 'transcription_completed', 'completed'] %}
+  {% set can_translate = job.id in translatable_job_ids %}
+  {% set translation_transitioned = job.id in transitioned_transcription_job_ids %}
   {% set status_group = 'running' if is_running else ('attention' if is_attention else ('completed' if is_completed else 'waiting')) %}
   <article class="recent-job-item recent-job-{{ job.status }}{% if is_completed %} is-completed{% endif %}">
-    <div class="recent-job-status-icon recent-job-status-{{ status_group }}" aria-hidden="true">
-      {% if status_group == 'running' %}{{ icons.activity(18) }}
-      {% elif status_group == 'attention' %}{{ icons.alert_triangle(18) }}
-      {% elif status_group == 'completed' %}{{ icons.check(18) }}
-      {% else %}{{ icons.clock(18) }}
-      {% endif %}
+    <div class="recent-job-leading">
+      <div class="recent-job-select">
+        {% if can_translate %}
+          <input
+            type="checkbox"
+            name="job_ids"
+            value="{{ job.id }}"
+            form="selected-translation-form"
+            data-translation-job-checkbox
+            aria-label="{{ job.source_rel|filename }} 번역 선택"
+          >
+        {% endif %}
+      </div>
+      <div class="recent-job-status-icon recent-job-status-{{ status_group }}" aria-hidden="true">
+        {% if status_group == 'running' %}{{ icons.activity(18) }}
+        {% elif status_group == 'attention' %}{{ icons.alert_triangle(18) }}
+        {% elif status_group == 'completed' %}{{ icons.check(18) }}
+        {% else %}{{ icons.clock(18) }}
+        {% endif %}
+      </div>
     </div>
     <div class="recent-job-main">
       <div class="recent-job-heading">
@@ -18,7 +34,11 @@
           <a class="recent-job-title" href="/jobs/{{ job.id }}" title="{{ job.source_rel }}">{{ job.source_rel|filename }}</a>
           {% if job.source_rel|parent_path %}<span class="recent-job-path">{{ job.source_rel|parent_path }}</span>{% endif %}
         </div>
-        <span class="status status-{{ job.status }}" title="내부 상태: {{ job.status }}">{{ job.status|job_status }}</span>
+        {% if translation_transitioned %}
+          <span class="status status-completed" title="후속 번역 작업이 생성된 기존 전사 기록">번역 이행됨</span>
+        {% else %}
+          <span class="status status-{{ job.status }}" title="내부 상태: {{ job.status }}">{{ job.status|job_status }}</span>
+        {% endif %}
       </div>
       <div class="recent-job-meta">
         <span>최근 갱신 <time datetime="{{ job.updated_at|datetime_iso }}">{{ job.updated_at|datetime }}</time></span>
@@ -92,8 +112,34 @@
       <h3>{{ job_list_title|default("전체 작업") }}</h3>
       <p class="muted">{{ job_list_description|default("최신순, 페이지당 20개 · 중단 요청은 안전한 지점에서 반영됩니다.") }}</p>
     </div>
-    {% if show_bulk_actions|default(true) %}
+    {% if translatable_job_count or show_bulk_actions|default(true) %}
     <div class="job-bulk-actions">
+      {% if translatable_job_count %}
+      <form
+        id="selected-translation-form"
+        method="post"
+        action="/jobs/translate-selected"
+        class="job-translation-actions"
+        data-job-translation-form
+        data-confirm-message="선택한 전사 완료 작업을 번역하시겠습니까? 기존 한국어 자막 파일이 있으면 새 결과로 덮어씁니다."
+      >
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="return_folder" value="{{ current_folder }}">
+        <input type="hidden" name="return_status_group" value="{{ selected_status_group or '' }}">
+        <input type="hidden" name="return_jobs_page" value="{{ jobs_page }}">
+        <span class="job-selection-count"><strong data-job-selection-count>0</strong>개 선택</span>
+        <button type="button" class="secondary compact" data-select-translation-jobs>번역 대기 전체 선택</button>
+        <button type="button" class="secondary compact" data-clear-translation-jobs>선택 해제</button>
+        <select name="prompt_category_id" data-translation-prompt aria-label="번역 프롬프트 카테고리" required>
+          <option value="">프롬프트 선택</option>
+          {% for category in prompt_categories %}
+            <option value="{{ category.id }}">{{ category.name }}</option>
+          {% endfor %}
+        </select>
+        <button type="submit" class="compact" data-translate-selected disabled>{{ icons.play(14) }}선택 번역 하기</button>
+      </form>
+      {% endif %}
+      {% if show_bulk_actions|default(true) %}
       <form method="post" action="/jobs/retry-all" data-confirm-message="확인 필요·실패 상태의 모든 작업을 마지막으로 저장된 단계부터 재시도하시겠습니까?">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <input type="hidden" name="return_folder" value="{{ current_folder }}">
@@ -109,6 +155,7 @@
         <input type="hidden" name="return_folder" value="{{ current_folder }}">
         <button type="submit" class="danger compact"{% if not stoppable_job_count %} disabled{% endif %}>{{ icons.alert_triangle(14) }}전체 작업 중단 ({{ stoppable_job_count }})</button>
       </form>
+      {% endif %}
     </div>
     {% endif %}
   </div>

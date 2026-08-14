@@ -52,7 +52,10 @@
         {% set selectable_files = files|selectattr("selectable")|list %}
         {% if selectable_files or folders %}
           <div class="media-toolbar">
-            <span><strong data-selection-count>0</strong>개 선택</span>
+            <span>
+              <strong data-selection-count>0</strong>개 선택
+              <small class="media-selection-help">폴더 작업은 선택한 처리 단계가 이미 완료된 파일을 자동 제외합니다.</small>
+            </span>
             <span class="media-toolbar-actions">
               <button type="button" class="secondary compact" data-select-all>전체 선택</button>
               <button type="button" class="secondary compact" data-clear-selection>선택 해제</button>
@@ -71,7 +74,7 @@
                   value="{{ folder.path }}"
                   aria-label="{{ folder.name }} 폴더 전체 선택"
                 >
-                <span>하위 전체 선택</span>
+                <span>하위 미완료 작업 선택</span>
               </label>
               <a data-folder-link href="/?folder={{ folder.path|urlencode }}">
                 <span class="folder-visual folder-icon" aria-hidden="true">
@@ -117,8 +120,11 @@
                     <span class="media-filename" title="{{ file.name }}">{{ file.name }}</span>
                     <span class="media-size">{{ file.size|filesize }}</span>
                     <span class="media-duration">재생시간 {{ file.duration_seconds|duration }}</span>
-                    <span class="subtitle-state is-{{ file.subtitle_state }}">
-                      {% if file.subtitle_state == "running" %}생성 중{% elif file.subtitle_state == "completed" %}생성 완료{% elif file.subtitle_state == "attention" %}확인 필요{% else %}대기{% endif %}
+                    <span
+                      class="subtitle-state is-{{ file.subtitle_state }}"
+                      data-processing-stage="{{ file.processing_status }}"
+                    >
+                      {{ file.processing_label }}
                     </span>
                   </span>
                 {% else %}
@@ -129,8 +135,11 @@
                     <strong class="media-title">{{ file.name }}</strong>
                     <span class="media-size">{{ file.size|filesize }}</span>
                     <span class="media-duration">재생시간 {{ file.duration_seconds|duration }}</span>
-                    <span class="subtitle-state is-{{ file.subtitle_state }}">
-                      {% if file.subtitle_state == "running" %}생성 중{% elif file.subtitle_state == "completed" %}생성 완료{% elif file.subtitle_state == "attention" %}확인 필요{% else %}대기{% endif %}
+                    <span
+                      class="subtitle-state is-{{ file.subtitle_state }}"
+                      data-processing-stage="{{ file.processing_status }}"
+                    >
+                      {{ file.processing_label }}
                     </span>
                   </span>
                 {% endif %}

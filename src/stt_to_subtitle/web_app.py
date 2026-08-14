@@ -41,7 +41,7 @@ from .web_config import (
     RemoteServerSettings,
     normalize_server_url,
 )
-from .orchestrator import SubtitleOrchestrator
+from .orchestrator import SubtitleOrchestrator, TRANSLATION_OPERATIONS
 from .service_clients import (
     ExternalServiceError,
     list_openai_compatible_models,
@@ -90,6 +90,20 @@ JOB_STATUS_LABELS = {
     "completed": "완료",
     "blocked": "확인 필요",
     "failed": "실패",
+}
+MEDIA_PROCESSING_LABELS = {
+    "queued": "작업 대기",
+    "extracting": "오디오 추출 중",
+    "audio_ready": "오디오 추출 완료 · 전사 대기",
+    "audio_completed": "오디오 추출 완료",
+    "transcription_running": "전사 중",
+    "transcribed": "전사 완료 · 번역 대기",
+    "transcription_completed": "전사 완료",
+    "translation_running": "번역 중",
+    "translation_paused": "번역 중단됨",
+    "translated": "번역 완료 · 자막 생성 대기",
+    "rendering": "자막 생성 중",
+    "completed": "자막 생성 완료",
 }
 JOB_OPERATION_LABELS = {
     "extract": "오디오 추출 (기존 작업)",
@@ -267,6 +281,26 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             return f"/jobs/{job_id}"
         return dashboard_location(return_folder, **values)
 
+    def job_list_action_location(
+        *,
+        return_folder: str,
+        return_status_group: str,
+        return_jobs_page: int,
+        **values: object,
+    ) -> str:
+        if return_status_group:
+            query = {
+                "status_group": return_status_group,
+                "jobs_page": max(1, return_jobs_page),
+                **values,
+            }
+            return f"/jobs?{urlencode(query)}"
+        return dashboard_location(
+            return_folder,
+            jobs_page=(return_jobs_page if return_jobs_page > 1 else None),
+            **values,
+        )
+
     def job_stats(service: SubtitleOrchestrator) -> dict[str, int]:
         return {
             group: service.store.count_jobs(statuses=statuses)
@@ -291,6 +325,28 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         job_count = service.store.count_jobs(statuses=statuses)
         jobs_offset = (jobs_page - 1) * RECENT_JOB_LIMIT
         open_jobs = service.store.list_open_jobs()
+        recent_jobs = service.store.list_jobs(
+            limit=RECENT_JOB_LIMIT,
+            offset=jobs_offset,
+            statuses=statuses,
+        )
+        latest_jobs = service.store.latest_jobs_by_source()
+        translatable_job_ids = {
+            job.id
+            for job in recent_jobs
+            if job.can_start_translation
+            and latest_jobs.get(job.source_rel) is not None
+            and latest_jobs[job.source_rel].id == job.id
+        }
+        transitioned_transcription_job_ids = {
+            job.id
+            for job in recent_jobs
+            if job.status == "transcription_completed"
+            and latest_jobs.get(job.source_rel) is not None
+            and latest_jobs[job.source_rel].id != job.id
+            and latest_jobs[job.source_rel].operation
+            in TRANSLATION_OPERATIONS
+        }
 
         def page_location(page: int) -> str:
             if status_group is None:
@@ -305,11 +361,12 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             else "전체"
         )
         return {
-            "recent_jobs": service.store.list_jobs(
-                limit=RECENT_JOB_LIMIT,
-                offset=jobs_offset,
-                statuses=statuses,
+            "recent_jobs": recent_jobs,
+            "translatable_job_ids": translatable_job_ids,
+            "transitioned_transcription_job_ids": (
+                transitioned_transcription_job_ids
             ),
+            "translatable_job_count": len(translatable_job_ids),
             "stoppable_job_count": sum(job.can_stop for job in open_jobs),
             "retriable_job_count": sum(job.can_retry for job in open_jobs),
             "pausable_translation_count": sum(
@@ -419,6 +476,13 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             linked_job = None
             if latest is not None and latest.status in {"blocked", "failed"}:
                 media["subtitle_state"] = "attention"
+                stage = JOB_STAGE_LABELS.get(
+                    str(latest.blocked_stage),
+                    str(latest.blocked_stage or ""),
+                )
+                media["processing_label"] = JOB_STATUS_LABELS[latest.status]
+                if stage:
+                    media["processing_label"] += f" · {stage}"
                 linked_job = latest
             elif latest is not None and latest.status not in {
                 "audio_completed",
@@ -426,14 +490,45 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                 "completed",
             }:
                 media["subtitle_state"] = "running"
+                media["processing_label"] = MEDIA_PROCESSING_LABELS.get(
+                    latest.status,
+                    JOB_STATUS_LABELS.get(latest.status, latest.status),
+                )
                 linked_job = latest
             elif media["has_subtitle"]:
                 media["subtitle_state"] = "completed"
-                linked_job = completed_subtitles.get(source_rel)
+                media["processing_label"] = (
+                    "자막 생성 완료"
+                    if latest is not None and latest.status == "completed"
+                    else "한국어 자막 있음"
+                )
+                linked_job = completed_subtitles.get(source_rel) or latest
+            elif latest is not None:
+                media["subtitle_state"] = (
+                    "completed" if latest.status == "completed" else "progress"
+                )
+                media["processing_label"] = MEDIA_PROCESSING_LABELS.get(
+                    latest.status,
+                    JOB_STATUS_LABELS.get(latest.status, latest.status),
+                )
+                linked_job = latest
             else:
                 media["subtitle_state"] = "pending"
+                media["processing_label"] = "미처리"
+            media["processing_status"] = (
+                latest.status
+                if latest is not None
+                else ("subtitle_present" if media["has_subtitle"] else "pending")
+            )
             media["job_id"] = linked_job.id if linked_job else None
-            media["selectable"] = media["subtitle_state"] == "pending"
+            media["selectable"] = (
+                not media["has_subtitle"]
+                and (
+                    latest is None
+                    or latest.status
+                    in {"audio_completed", "transcription_completed"}
+                )
+            )
 
         return {
             "request": request,
@@ -511,6 +606,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         translations_paused: int | None = None,
         jobs_stopped: int | None = None,
         jobs_retried: int | None = None,
+        translations_queued: int | None = None,
         skipped: int | None = None,
         folder: str = "",
         jobs_page: int = 1,
@@ -531,6 +627,11 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             notice = f"진행 중인 작업 {jobs_stopped}개에 중단을 요청했습니다."
         elif jobs_retried is not None:
             notice = f"중단·실패 작업 {jobs_retried}개를 재시도했습니다."
+        elif translations_queued is not None:
+            notice = (
+                f"선택한 전사 작업 {translations_queued}개를 번역으로 "
+                "전환했습니다."
+            )
         try:
             context = dashboard_context(
                 request,
@@ -558,6 +659,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         request: Request,
         status_group: str = "running",
         jobs_page: int = 1,
+        translations_queued: int | None = None,
     ) -> Any:
         if not is_authenticated(request):
             return login_redirect()
@@ -574,6 +676,13 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                 "prompt_categories": orchestrator(
                     request
                 ).active_prompt_categories(),
+                "notice": (
+                    f"선택한 전사 작업 {translations_queued}개를 번역으로 "
+                    "전환했습니다."
+                    if translations_queued is not None
+                    else None
+                ),
+                "error": None,
             }
         except ValueError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
@@ -1308,6 +1417,81 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail=str(error)) from error
         return RedirectResponse(
             job_action_location(job_id, return_folder),
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+
+    @app.post("/jobs/translate-selected", response_class=HTMLResponse)
+    def translate_selected_jobs(
+        request: Request,
+        job_ids: list[str] | None = Form(None),
+        csrf_token: str = Form(""),
+        prompt_category_id: str = Form(""),
+        return_folder: str = Form(""),
+        return_status_group: str = Form(""),
+        return_jobs_page: int = Form(1),
+    ) -> Any:
+        if not is_authenticated(request):
+            return login_redirect()
+        validate_csrf(request, csrf_token)
+        if (
+            return_status_group
+            and return_status_group not in JOB_STATUS_GROUPS
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="지원하지 않는 작업 상태 필터입니다.",
+            )
+        service = orchestrator(request)
+        try:
+            if not prompt_category_id.strip():
+                raise ValueError("번역 프롬프트 카테고리를 선택하세요.")
+            created = service.create_selected_translation_jobs(
+                job_ids or [],
+                prompt_category_id=prompt_category_id,
+            )
+        except (OSError, UnicodeError, ValueError) as error:
+            if return_status_group:
+                context = {
+                    "request": request,
+                    **job_list_context(
+                        service,
+                        jobs_page=return_jobs_page,
+                        status_group=return_status_group,
+                    ),
+                    "status_groups": JOB_STATUS_GROUP_LABELS,
+                    "csrf_token": request.session.get("csrf_token", ""),
+                    "prompt_categories": service.active_prompt_categories(),
+                    "notice": None,
+                    "error": str(error),
+                }
+                return TEMPLATES.TemplateResponse(
+                    request,
+                    "jobs.html",
+                    context,
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                )
+            try:
+                context = dashboard_context(
+                    request,
+                    error=str(error),
+                    folder=return_folder,
+                    jobs_page=return_jobs_page,
+                )
+            except ValueError:
+                context = dashboard_context(request, error=str(error))
+            return TEMPLATES.TemplateResponse(
+                request,
+                "dashboard.html",
+                context,
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+        return RedirectResponse(
+            job_list_action_location(
+                return_folder=return_folder,
+                return_status_group=return_status_group,
+                return_jobs_page=return_jobs_page,
+                translations_queued=len(created),
+            ),
             status_code=status.HTTP_303_SEE_OTHER,
         )
 

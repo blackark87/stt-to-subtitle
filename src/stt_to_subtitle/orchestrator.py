@@ -88,6 +88,24 @@ HYBRID_RESCUE_DEFAULTS = {
 }
 
 
+def _operation_is_completed(
+    latest: PipelineJob | None,
+    operation: str,
+    *,
+    has_subtitle: bool,
+) -> bool:
+    """Return whether a source already reached the requested terminal stage."""
+    if has_subtitle:
+        return True
+    if latest is None:
+        return False
+    if operation == "extract":
+        return latest.status in SUCCESS_STATUSES
+    if operation == "transcribe":
+        return latest.status in {"transcription_completed", "completed"}
+    return latest.status == "completed"
+
+
 class SubtitleOrchestrator:
     """Advance persisted jobs while keeping each remote resource independent."""
 
@@ -298,8 +316,11 @@ class SubtitleOrchestrator:
                 )
             )
             if (
-                operation in TRANSLATION_OPERATIONS
-                and has_subtitle
+                _operation_is_completed(
+                    latest,
+                    operation,
+                    has_subtitle=has_subtitle,
+                )
                 and not force_overwrite
             ):
                 skipped += 1
@@ -492,6 +513,101 @@ class SubtitleOrchestrator:
                 )
             )
         return jobs
+
+    def create_selected_translation_jobs(
+        self,
+        job_ids: Sequence[str],
+        *,
+        prompt_category_id: str,
+    ) -> list[PipelineJob]:
+        """Move selected, latest completed transcripts into translation."""
+        if not self.remote_servers_configured:
+            raise ValueError(
+                "먼저 서버 설정에서 전사 서버와 번역 서버를 저장하세요."
+            )
+        selected_ids = list(
+            dict.fromkeys(job_id.strip() for job_id in job_ids if job_id.strip())
+        )
+        if not selected_ids:
+            raise ValueError("번역할 전사 완료 작업을 하나 이상 선택하세요.")
+        if len(selected_ids) > self.settings.maximum_listed_files:
+            raise ValueError("한 번에 등록할 수 있는 파일 수를 초과했습니다.")
+
+        prompt_snapshot = self._prompt_snapshot(prompt_category_id)
+        latest_jobs = self.store.latest_jobs_by_source()
+        reusable_transcripts: list[PipelineJob] = []
+        for job_id in selected_ids:
+            job = self.store.get(job_id)
+            if job is None:
+                raise ValueError("선택한 작업을 찾을 수 없습니다.")
+            latest = latest_jobs.get(job.source_rel)
+            if (
+                not job.can_start_translation
+                or latest is None
+                or latest.id != job.id
+            ):
+                raise ValueError(
+                    f"{job.source_rel}: 최신 전사 완료 작업만 번역할 수 있습니다."
+                )
+            self.library.resolve_file(job.source_rel)
+            transcript_path = Path(job.transcript_path or "")
+            try:
+                transcript_payload = json.loads(
+                    transcript_path.read_text(encoding="utf-8")
+                )
+                if not isinstance(transcript_payload, Mapping):
+                    raise ValueError(
+                        "transcript JSON document must be an object"
+                    )
+                validate_transcript(transcript_payload)
+            except (
+                OSError,
+                UnicodeError,
+                ValueError,
+                json.JSONDecodeError,
+            ) as error:
+                raise ValueError(
+                    f"{job.source_rel}: 번역에 사용할 유효한 전사 결과가 "
+                    "없습니다."
+                ) from error
+            reusable_transcripts.append(job)
+
+        transitioned_jobs: list[PipelineJob] = []
+        for reusable in reusable_transcripts:
+            options = dict(reusable.options)
+            options[TRANSLATION_PROMPT_OPTION] = dict(prompt_snapshot)
+            transitioned = self.store.update_if_status(
+                reusable.id,
+                {"transcription_completed"},
+                status="transcribed",
+                force_overwrite=True,
+                operation="translate",
+                options_json=json.dumps(options, sort_keys=True),
+                translation_path=None,
+                srt_path=None,
+                ass_path=None,
+                blocked_stage=None,
+                error=None,
+                translation_chunks_total=0,
+                translation_chunks_completed=0,
+                translation_pause_requested=0,
+                job_stop_requested=0,
+            )
+            if not transitioned:
+                raise ValueError(
+                    f"{reusable.source_rel}: 전사 완료 상태가 변경되어 "
+                    "번역으로 전환하지 못했습니다."
+                )
+            self.store.add_event(
+                reusable.id,
+                "info",
+                "selected completed transcription moved to translation queue",
+            )
+            refreshed = self.store.get(reusable.id)
+            if refreshed is None:
+                raise RuntimeError("transitioned translation job could not be read")
+            transitioned_jobs.append(refreshed)
+        return transitioned_jobs
 
     def _reusable_transcript(
         self,

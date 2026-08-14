@@ -18,6 +18,8 @@
       >{{ label }}</a>
     {% endfor %}
   </nav>
+  {% if error %}<p class="alert">{{ error }}</p>{% endif %}
+  {% if notice %}<p class="notice">{{ notice }}</p>{% endif %}
   <section class="card recent-jobs-card">
     <div
       data-update-url="/jobs-fragment?status_group={{ selected_status_group }}&amp;jobs_page={{ jobs_page }}"

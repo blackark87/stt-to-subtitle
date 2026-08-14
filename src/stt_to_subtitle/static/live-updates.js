@@ -39,6 +39,7 @@ document.addEventListener("DOMContentLoaded", () => {
           }
           target.innerHTML = await response.text();
           window.initializeResultPlayers?.(target);
+          window.initializeJobSelection?.(target);
           if (target.querySelector("[data-update-stop]")) {
             delete target.dataset.updateUrl;
           }

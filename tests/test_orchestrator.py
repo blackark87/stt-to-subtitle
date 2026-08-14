@@ -797,6 +797,61 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                 all(job.options["duration_seconds"] is None for job in jobs)
             )
 
+    def test_folder_expansion_skips_completed_requested_stage(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            folder = media_root / "season"
+            folder.mkdir(parents=True)
+            for name in (
+                "pending.mkv",
+                "audio-complete.mkv",
+                "transcribed.mkv",
+                "completed.mkv",
+            ):
+                (folder / name).write_bytes(b"media")
+            orchestrator = self.make_orchestrator(root, media_root)
+            try:
+                for job_id, source_rel, status in (
+                    (
+                        "audio-complete-job",
+                        "season/audio-complete.mkv",
+                        "audio_completed",
+                    ),
+                    (
+                        "transcribed-job",
+                        "season/transcribed.mkv",
+                        "transcription_completed",
+                    ),
+                    (
+                        "completed-job",
+                        "season/completed.mkv",
+                        "completed",
+                    ),
+                ):
+                    job = orchestrator.store.create(
+                        job_id=job_id,
+                        source_rel=source_rel,
+                        force_overwrite=False,
+                        options={},
+                    )
+                    orchestrator.store.update(job.id, status=status)
+
+                selected, skipped = orchestrator.expand_job_sources(
+                    [],
+                    ["season"],
+                    force_overwrite=False,
+                    operation="transcribe",
+                )
+            finally:
+                orchestrator.stop()
+
+            self.assertEqual(
+                set(selected),
+                {"season/audio-complete.mkv", "season/pending.mkv"},
+            )
+            self.assertEqual(skipped, 2)
+
     def test_batch_is_prevalidated_before_creating_any_job(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)

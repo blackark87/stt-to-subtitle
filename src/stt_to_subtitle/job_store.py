@@ -131,6 +131,12 @@ class PipelineJob:
         )
 
     @property
+    def can_start_translation(self) -> bool:
+        return self.status == "transcription_completed" and bool(
+            self.transcript_path
+        )
+
+    @property
     def can_delete_record(self) -> bool:
         return (
             self.status == "audio_completed"

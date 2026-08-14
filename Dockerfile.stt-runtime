@@ -35,7 +35,8 @@ RUN --mount=type=cache,id=stt-whisperx-pip,target=/root/.cache/pip \
 
 FROM ${PYTHON_IMAGE}
 
-ENV PIP_DISABLE_PIP_VERSION_CHECK=1
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    LD_LIBRARY_PATH=/opt/venvs/whisperx/lib/python3.11/site-packages/nvidia/npp/lib
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \

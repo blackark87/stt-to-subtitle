@@ -27,6 +27,13 @@ class ReleaseConfigurationTests(unittest.TestCase):
         self.assertNotIn("requirements-kotoba.txt", stt_dockerfile)
         self.assertIn("requirements-kotoba.txt", runtime_dockerfile)
         self.assertIn("requirements-whisperx-cuda.txt", runtime_dockerfile)
+        self.assertIn(
+            "nvidia-npp-cu12==12.3.3.100",
+            (ROOT / "requirements-whisperx-cuda.in").read_text(
+                encoding="utf-8"
+            ),
+        )
+        self.assertIn("nvidia/npp/lib", runtime_dockerfile)
         self.assertIn("STT_BASE_URL: http://stt:8100", compose)
         self.assertIn("container_name: stt-web", compose)
         self.assertIn("container_name: stt-backend", compose)
