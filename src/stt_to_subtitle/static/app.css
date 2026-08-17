@@ -443,7 +443,6 @@ button:disabled, .button:disabled { opacity: .5; cursor: not-allowed; box-shadow
 .advanced-options { border: 1px solid var(--line); border-radius: var(--radius-control); padding: 12px 14px; background: var(--surface-sunken); }
 .advanced-options[open] { padding-bottom: 16px; }
 .advanced-options summary { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; cursor: pointer; font-weight: 650; list-style: revert; }
-.advanced-options summary .muted { font-weight: 400; font-size: .84rem; }
 .advanced-options-grid { margin-top: 16px; }
 .option-checks { display: flex; align-items: flex-start; gap: 12px 28px; flex-wrap: wrap; }
 .submit-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
