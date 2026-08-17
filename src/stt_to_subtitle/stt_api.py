@@ -26,6 +26,7 @@ from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request
 from fastapi import UploadFile, status
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from . import __version__
 from .contracts import TRANSCRIPT_SCHEMA_VERSION, add_segment_ids
 from .files import write_json_atomic
 from .hybrid_stt import (
@@ -1288,7 +1289,7 @@ def create_app(
 
     app = FastAPI(
         title="stt-to-subtitle native transcription API",
-        version="1.0.0",
+        version=__version__,
         lifespan=lifespan,
     )
 

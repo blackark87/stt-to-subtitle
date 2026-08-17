@@ -27,6 +27,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
 
+from . import __version__
 from .artifacts import artifact_filename
 from .contracts import validate_transcript, validate_translation_items
 from .gpu_monitoring import PrometheusGpuMonitor
@@ -361,7 +362,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
 
     app = FastAPI(
         title="stt-to-subtitle orchestrator",
-        version="1.0.0",
+        version=__version__,
         lifespan=lifespan,
         docs_url=None,
         redoc_url=None,
@@ -663,9 +664,15 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         error: str | None = None,
         notice: str | None = None,
         folder: str = "",
+        query: str = "",
     ) -> dict[str, Any]:
         service = orchestrator(request)
-        browser = service.library.browse(folder)
+        normalized_query = query.strip()
+        browser = (
+            service.library.search_by_title(normalized_query, folder)
+            if normalized_query
+            else service.library.browse(folder)
+        )
         latest_jobs = service.store.latest_jobs_by_source()
         completed_subtitles = service.store.latest_completed_subtitle_jobs()
         for media in browser["files"]:
@@ -735,6 +742,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             "notice": notice,
             "remote_servers": service.remote_servers_view(),
             "prompt_categories": service.active_prompt_categories(),
+            "search_query": normalized_query,
             **browser,
         }
 
@@ -851,6 +859,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         jobs_retried: int | None = None,
         translations_queued: int | None = None,
         folder: str = "",
+        q: str = "",
     ) -> Any:
         if not is_authenticated(request):
             return login_redirect()
@@ -877,6 +886,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                 request,
                 notice=notice,
                 folder=folder,
+                query=q,
             )
             response_status = status.HTTP_200_OK
         except ValueError as error:
@@ -1284,6 +1294,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         source_rels: list[str] | None = Form(None),
         folder_rels: list[str] | None = Form(None),
         return_folder: str = Form(""),
+        return_query: str = Form(""),
         csrf_token: str = Form(""),
         force_overwrite: bool = Form(False),
         backend: str = Form("kotoba"),
@@ -1355,6 +1366,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                     request,
                     error=str(error),
                     folder=return_folder,
+                    query=return_query,
                 )
             except ValueError:
                 context = media_context(request, error=str(error))
@@ -1369,6 +1381,8 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             query["skipped"] = skipped
         if return_folder:
             query["folder"] = return_folder
+        if return_query.strip():
+            query["q"] = return_query.strip()
         return RedirectResponse(
             f"/media?{urlencode(query)}",
             status_code=status.HTTP_303_SEE_OTHER,

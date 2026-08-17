@@ -41,9 +41,28 @@
         <p class="muted">폴더를 이동하거나 여러 파일을 한 번에 선택할 수 있습니다.</p>
       </div>
     </div>
+    <form method="get" action="/media" class="media-search" role="search">
+      {% if current_folder %}
+        <input type="hidden" name="folder" value="{{ current_folder }}">
+      {% endif %}
+      <input
+        id="media-title-search"
+        name="q"
+        type="search"
+        value="{{ search_query }}"
+        maxlength="200"
+        placeholder="제목 검색"
+        aria-label="미디어 제목 검색"
+      >
+      <button type="submit" class="secondary">검색</button>
+      {% if search_query %}
+        <a class="button secondary" href="/media{% if current_folder %}?folder={{ current_folder|urlencode }}{% endif %}">검색 해제</a>
+      {% endif %}
+    </form>
     <form method="post" action="/jobs" class="grid-form">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <input type="hidden" name="return_folder" value="{{ current_folder }}">
+      <input type="hidden" name="return_query" value="{{ search_query }}">
       <fieldset class="media-picker wide">
         <legend>미디어 탐색</legend>
         <nav class="breadcrumbs" aria-label="미디어 폴더 경로">
@@ -56,6 +75,11 @@
             {% endif %}
           {% endfor %}
         </nav>
+        {% if search_query %}
+          <p class="media-search-summary">
+            <strong>“{{ search_query }}”</strong> 제목 검색 결과 {{ files|length }}개
+          </p>
+        {% endif %}
         {% set selectable_files = files|selectattr("selectable")|list %}
         {% if selectable_files or folders %}
           <div class="media-toolbar">
@@ -125,6 +149,7 @@
                     <span class="metadata-label">NFO</span>
                     <strong class="media-title">{{ file.title }}</strong>
                     <span class="media-filename" title="{{ file.name }}">{{ file.name }}</span>
+                    {% if search_query %}<span class="media-path" title="{{ file.path }}">{{ file.path }}</span>{% endif %}
                     <span class="media-size">{{ file.size|filesize }}</span>
                     <span class="media-duration">재생시간 {{ file.duration_seconds|duration }}</span>
                     <span
@@ -140,6 +165,7 @@
                   </span>
                   <span class="media-card-content">
                     <strong class="media-title">{{ file.name }}</strong>
+                    {% if search_query %}<span class="media-path" title="{{ file.path }}">{{ file.path }}</span>{% endif %}
                     <span class="media-size">{{ file.size|filesize }}</span>
                     <span class="media-duration">재생시간 {{ file.duration_seconds|duration }}</span>
                     <span
@@ -160,7 +186,13 @@
           {% endfor %}
           </div>
         {% else %}
-          <p class="empty-state">이 폴더에 하위 폴더나 지원 미디어 파일이 없습니다.</p>
+          <p class="empty-state">
+            {% if search_query %}
+              이 범위에서 제목이 “{{ search_query }}”인 미디어를 찾지 못했습니다.
+            {% else %}
+              이 폴더에 하위 폴더나 지원 미디어 파일이 없습니다.
+            {% endif %}
+          </p>
         {% endif %}
       </fieldset>
 

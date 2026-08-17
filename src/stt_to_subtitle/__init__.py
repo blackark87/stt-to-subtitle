@@ -1,3 +1,3 @@
 """Kotoba-Whisper transcription test pipeline."""
 
-__version__ = "0.1.0"
+__version__ = "3.3.0"

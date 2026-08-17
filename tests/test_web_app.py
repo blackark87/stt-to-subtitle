@@ -7,6 +7,8 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import Mock, patch
 
+from stt_to_subtitle import __version__
+
 WEB_TESTS_AVAILABLE = all(
     find_spec(module) is not None
     for module in ("itsdangerous", "jinja2", "multipart")
@@ -428,6 +430,59 @@ class WebAppTests(unittest.TestCase):
             )
             self.assertEqual(poster.status_code, 200)
             self.assertEqual(poster.content, b"poster-bytes")
+
+    def test_media_page_searches_nested_display_titles_and_preserves_query(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            show = media_root / "show"
+            show.mkdir(parents=True)
+            episode = show / "episode-01.mkv"
+            episode.write_bytes(b"media")
+            episode.with_suffix(".nfo").write_text(
+                "<episodedetails><title>첫 번째 에피소드</title></episodedetails>",
+                encoding="utf-8",
+            )
+            (show / "second.mkv").write_bytes(b"media")
+
+            with patch(
+                "stt_to_subtitle.orchestrator.probe_media_duration",
+                return_value=60.0,
+            ), TestClient(
+                create_app(self.settings(root, media_root))
+            ) as client:
+                client.app.state.orchestrator.stop()
+                response = client.get("/media?q=첫 번째")
+                queued = client.post(
+                    "/jobs",
+                    data={
+                        "source_rels": "show/episode-01.mkv",
+                        "return_query": "첫 번째",
+                        "operation": "transcribe",
+                    },
+                    follow_redirects=False,
+                )
+                app_version = client.app.version
+
+            self.assertEqual(response.status_code, 200)
+            self.assertIn('name="q"', response.text)
+            self.assertIn('value="첫 번째"', response.text)
+            self.assertIn("첫 번째 에피소드", response.text)
+            self.assertIn("show/episode-01.mkv", response.text)
+            self.assertNotIn("second.mkv", response.text)
+            self.assertIn(
+                'name="return_query" value="첫 번째"',
+                response.text,
+            )
+            self.assertIn("제목 검색 결과 1개", response.text)
+            self.assertEqual(app_version, __version__)
+            self.assertEqual(queued.status_code, 303)
+            self.assertEqual(
+                queued.headers["location"],
+                "/media?queued=1&q=%EC%B2%AB+%EB%B2%88%EC%A7%B8",
+            )
 
     def test_updates_remote_servers_from_settings_page(self) -> None:
         with TemporaryDirectory() as directory:

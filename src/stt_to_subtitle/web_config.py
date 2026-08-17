@@ -435,6 +435,72 @@ class MediaLibrary:
             "files": files,
         }
 
+    def search_by_title(
+        self,
+        query: str,
+        relative_directory: str = "",
+    ) -> dict[str, object]:
+        """Find media by display title below the selected directory."""
+        normalized_query = query.strip()
+        if not normalized_query:
+            return self.browse(relative_directory)
+        if len(normalized_query) > 200:
+            raise ValueError("검색어는 200자 이하로 입력하세요.")
+        if not self.root.is_dir():
+            if relative_directory:
+                raise ValueError("media folder does not exist")
+            return {
+                "current_folder": "",
+                "parent_folder": None,
+                "breadcrumbs": [{"name": "미디어 루트", "path": ""}],
+                "folders": [],
+                "files": [],
+            }
+
+        directory = self.resolve_directory(relative_directory)
+        location = self._directory_location(directory)
+        matching_paths: list[Path] = []
+        pending = [directory]
+        folded_query = normalized_query.casefold()
+        while pending and len(matching_paths) < self.maximum_files:
+            current = pending.pop()
+            try:
+                children = sorted(
+                    current.iterdir(),
+                    key=lambda path: path.name.casefold(),
+                    reverse=True,
+                )
+            except OSError as error:
+                raise ValueError("media folder cannot be read") from error
+            for child in children:
+                if child.is_symlink():
+                    continue
+                if child.is_dir():
+                    if not _is_ignored_directory(child.name):
+                        pending.append(child)
+                    continue
+                if (
+                    not child.is_file()
+                    or child.suffix.lower() not in MEDIA_EXTENSIONS
+                    or _is_ignored_file(child.name)
+                    or _is_hidden_media_file(child.name)
+                ):
+                    continue
+                if folded_query not in self._media_title(child).casefold():
+                    continue
+                matching_paths.append(child)
+                if len(matching_paths) >= self.maximum_files:
+                    break
+
+        matching_paths.sort(
+            key=lambda path: path.relative_to(self.root).as_posix().casefold()
+        )
+        return {
+            **location,
+            "folders": [],
+            "files": [self._describe_media(path) for path in matching_paths],
+        }
+
     def list_media_recursive(
         self,
         relative_directories: Sequence[str],
@@ -507,6 +573,45 @@ class MediaLibrary:
             "has_nfo": nfo_path is not None,
             "title": title or path.stem,
             "poster_path": poster_path,
+        }
+
+    def _media_title(self, path: Path) -> str:
+        nfo_path = self._find_nfo(path)
+        if nfo_path is not None:
+            title, _ = self._read_nfo(nfo_path)
+            if title:
+                return title
+        return path.stem
+
+    def _directory_location(self, directory: Path) -> dict[str, object]:
+        current_relative = directory.relative_to(self.root)
+        current_folder = (
+            "" if current_relative == Path(".") else current_relative.as_posix()
+        )
+        parent_relative = current_relative.parent
+        parent_folder: str | None
+        if current_relative == Path("."):
+            parent_folder = None
+        elif parent_relative == Path("."):
+            parent_folder = ""
+        else:
+            parent_folder = parent_relative.as_posix()
+
+        breadcrumbs: list[dict[str, str]] = [
+            {"name": "미디어 루트", "path": ""}
+        ]
+        accumulated = Path()
+        for part in current_relative.parts:
+            if part == ".":
+                continue
+            accumulated /= part
+            breadcrumbs.append(
+                {"name": part, "path": accumulated.as_posix()}
+            )
+        return {
+            "current_folder": current_folder,
+            "parent_folder": parent_folder,
+            "breadcrumbs": breadcrumbs,
         }
 
     def _media_duration(

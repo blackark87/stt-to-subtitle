@@ -102,6 +102,58 @@ class MediaLibraryTests(unittest.TestCase):
             )
             self.assertTrue(season_view["files"][0]["has_subtitle"])
 
+    def test_searches_display_titles_recursively_within_selected_folder(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            season = root / "Series" / "Season 1"
+            season.mkdir(parents=True)
+            titled = season / "unrelated-name.mkv"
+            titled.write_bytes(b"media")
+            titled.with_suffix(".nfo").write_text(
+                "<episodedetails><title>첫 번째 에피소드</title></episodedetails>",
+                encoding="utf-8",
+            )
+            (season / "Second Episode.mp4").write_bytes(b"media")
+            (root / "Outside Match.mp4").write_bytes(b"media")
+
+            library = MediaLibrary(root)
+            nfo_results = library.search_by_title("첫 번째", "Series")
+            filename_results = library.search_by_title("second", "Series")
+            filename_only = library.search_by_title("unrelated", "Series")
+
+            self.assertEqual(nfo_results["folders"], [])
+            self.assertEqual(
+                [item["path"] for item in nfo_results["files"]],
+                ["Series/Season 1/unrelated-name.mkv"],
+            )
+            self.assertEqual(
+                [item["path"] for item in filename_results["files"]],
+                ["Series/Season 1/Second Episode.mp4"],
+            )
+            self.assertEqual(filename_only["files"], [])
+            self.assertEqual(nfo_results["current_folder"], "Series")
+
+    def test_title_search_describes_only_matching_media(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "match.mp4").write_bytes(b"media")
+            (root / "other.mp4").write_bytes(b"media")
+            probed_paths: list[Path] = []
+            library = MediaLibrary(
+                root,
+                duration_probe=lambda path: probed_paths.append(path) or 1.0,
+            )
+
+            results = library.search_by_title("match")
+
+            self.assertEqual(
+                [item["name"] for item in results["files"]],
+                ["match.mp4"],
+            )
+            self.assertEqual(probed_paths, [(root / "match.mp4").resolve()])
+
     def test_excludes_synology_and_desktop_metadata_entries(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
