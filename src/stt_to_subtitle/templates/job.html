@@ -8,13 +8,13 @@
 {% block content %}
   <div class="page-heading job-page-heading">
     <div>
-      <p class="editor-kicker">작업 상세</p>
+      <p class="page-kicker">JOB DETAIL</p>
       <h1>{{ job.source_rel|filename }}</h1>
       {% if job.source_rel|parent_path %}
         <p class="job-source-path">{{ job.source_rel|parent_path }}</p>
       {% endif %}
     </div>
-    <a href="/" class="button secondary">{{ icons.chevron_left(16) }}최근 작업으로</a>
+    <a href="/jobs" class="button secondary">{{ icons.chevron_left(16) }}작업 목록으로</a>
   </div>
   <div
     {% if job.status not in ["audio_completed", "transcription_completed", "completed", "translation_paused", "blocked", "failed"] %}

@@ -35,6 +35,99 @@ class JobChangeHookTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(updated_version, version + 1)
 
 
+class _StageJob:
+    def __init__(self, **values: object) -> None:
+        self.status = "queued"
+        self.operation = "full"
+        self.blocked_stage = None
+        self.chunks_created = 0
+        self.chunks_completed = 0
+        self.translation_chunks_total = 0
+        self.translation_chunks_completed = 0
+        for key, value in values.items():
+            setattr(self, key, value)
+
+
+@unittest.skipUnless(
+    WEB_TESTS_AVAILABLE,
+    "web test dependencies are not installed",
+)
+class JobStageViewTests(unittest.TestCase):
+    def states(self, **values: object) -> list[tuple[str, str]]:
+        from stt_to_subtitle.web_app import job_stage_view
+
+        return [
+            (stage["label"], stage["state"])
+            for stage in job_stage_view(_StageJob(**values))
+        ]
+
+    def test_running_stage_marks_earlier_stages_done_and_later_pending(
+        self,
+    ) -> None:
+        self.assertEqual(
+            self.states(status="transcription_running"),
+            [
+                ("오디오 추출", "done"),
+                ("전사", "running"),
+                ("번역", "pending"),
+                ("자막 생성", "pending"),
+            ],
+        )
+
+    def test_blocked_job_marks_the_blocked_stage(self) -> None:
+        self.assertEqual(
+            self.states(status="blocked", blocked_stage="translation"),
+            [
+                ("오디오 추출", "done"),
+                ("전사", "done"),
+                ("번역", "failed"),
+                ("자막 생성", "pending"),
+            ],
+        )
+
+    def test_operation_scope_limits_the_listed_stages(self) -> None:
+        self.assertEqual(
+            self.states(status="transcription_completed", operation="transcribe"),
+            [("오디오 추출", "done"), ("전사", "done")],
+        )
+        self.assertEqual(
+            self.states(status="queued", operation="translate"),
+            [("번역", "waiting"), ("자막 생성", "pending")],
+        )
+
+    def test_chunk_counts_drive_the_stage_progress_percentage(self) -> None:
+        from stt_to_subtitle.web_app import job_stage_view
+
+        stages = job_stage_view(
+            _StageJob(
+                status="transcription_running",
+                chunks_created=12,
+                chunks_completed=3,
+            )
+        )
+        transcription = next(s for s in stages if s["key"] == "transcription")
+        self.assertEqual(transcription["percent"], 25)
+        self.assertEqual(transcription["completed"], 3)
+        self.assertEqual(transcription["total"], 12)
+
+    def test_completed_job_reports_every_stage_done(self) -> None:
+        self.assertEqual(
+            [state for _, state in self.states(status="completed")],
+            ["done", "done", "done", "done"],
+        )
+
+    def test_paused_translation_is_distinct_from_a_failure(self) -> None:
+        self.assertEqual(
+            self.states(status="translation_paused"),
+            [
+                ("오디오 추출", "done"),
+                ("전사", "done"),
+                ("번역", "paused"),
+                ("자막 생성", "pending"),
+            ],
+        )
+
+
 @unittest.skipUnless(
     WEB_TESTS_AVAILABLE,
     "web test dependencies are not installed",
@@ -453,8 +546,8 @@ class WebAppTests(unittest.TestCase):
             self.assertIn("최근 작업", dashboard.text)
             self.assertIn("전사 중", dashboard.text)
             self.assertIn("확인 필요", dashboard.text)
-            self.assertIn("전사 청크", dashboard.text)
-            self.assertIn('max="12"', dashboard.text)
+            self.assertIn('class="job-stage-strip"', dashboard.text)
+            self.assertIn(">7/12<", dashboard.text)
             self.assertIn("movie.mkv", dashboard.text)
             self.assertIn("show", dashboard.text)
 
