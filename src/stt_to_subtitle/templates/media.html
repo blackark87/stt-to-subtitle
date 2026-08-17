@@ -159,7 +159,7 @@
                     {% if file.name != file.title %}
                       <span class="media-filename" title="{{ file.paths|join(', ') }}">{{ file.name }}</span>
                     {% endif %}
-                    {% if search_query %}<span class="media-path" title="{{ file.actors|join(', ') if file.actors else file.path }}">{{ file.actors|join(' · ') if file.actors else file.path }}</span>{% endif %}
+                    {% if search_query %}<span class="media-path" title="{{ file.actors|join(', ') if file.actors else file.path }}">{{ file.actors|actor_label }}</span>{% endif %}
                     <span class="media-size">{{ file.size|filesize }}</span>
                     <span class="media-duration">총 재생시간 {{ file.duration_seconds|duration }}</span>
                     <span
@@ -185,7 +185,7 @@
                     <span class="metadata-label">NFO</span>
                     <strong class="media-title" title="{{ file.title }}">{{ file.title }}</strong>
                     <span class="media-filename" title="{{ file.name }}">{{ file.name }}</span>
-                    {% if search_query %}<span class="media-path" title="{{ file.actors|join(', ') if file.actors else file.path }}">{{ file.actors|join(' · ') if file.actors else file.path }}</span>{% endif %}
+                    {% if search_query %}<span class="media-path" title="{{ file.actors|join(', ') if file.actors else file.path }}">{{ file.actors|actor_label }}</span>{% endif %}
                     <span class="media-size">{{ file.size|filesize }}</span>
                     <span class="media-duration">재생시간 {{ file.duration_seconds|duration }}</span>
                     <span
@@ -202,7 +202,7 @@
                   <span class="media-card-content">
                     <span class="metadata-label is-empty" aria-hidden="true">&nbsp;</span>
                     <strong class="media-title" title="{{ file.name }}">{{ file.name }}</strong>
-                    {% if search_query %}<span class="media-path" title="{{ file.actors|join(', ') if file.actors else file.path }}">{{ file.actors|join(' · ') if file.actors else file.path }}</span>{% endif %}
+                    {% if search_query %}<span class="media-path" title="{{ file.actors|join(', ') if file.actors else file.path }}">{{ file.actors|actor_label }}</span>{% endif %}
                     <span class="media-size">{{ file.size|filesize }}</span>
                     <span class="media-duration">재생시간 {{ file.duration_seconds|duration }}</span>
                     <span

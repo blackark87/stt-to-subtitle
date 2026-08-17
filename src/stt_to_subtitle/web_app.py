@@ -268,6 +268,20 @@ EVENT_LEVEL_LABELS = {
     "warning": "주의",
     "error": "오류",
 }
+def media_actor_label(actors: Any) -> str:
+    """Return the actor line for a media card.
+
+    A single actor is named outright, two or more collapse to "Group" because
+    the card only has one line for it, and no actor at all reads "Unknown".
+    """
+    names = [
+        str(name).strip() for name in (actors or ()) if str(name).strip()
+    ]
+    if not names:
+        return "Unknown"
+    return names[0] if len(names) == 1 else "Group"
+
+
 TEMPLATES = Jinja2Templates(directory=PACKAGE_DIR / "templates")
 TEMPLATES.env.filters["datetime"] = format_kst_timestamp
 TEMPLATES.env.filters["datetime_iso"] = format_kst_iso
@@ -289,6 +303,7 @@ TEMPLATES.env.filters["job_stage"] = lambda value: JOB_STAGE_LABELS.get(
     str(value),
 )
 TEMPLATES.env.filters["job_stages"] = job_stage_view
+TEMPLATES.env.filters["actor_label"] = media_actor_label
 TEMPLATES.env.filters["job_progress"] = job_progress_view
 TEMPLATES.env.filters["event_level"] = lambda value: EVENT_LEVEL_LABELS.get(
     str(value),
