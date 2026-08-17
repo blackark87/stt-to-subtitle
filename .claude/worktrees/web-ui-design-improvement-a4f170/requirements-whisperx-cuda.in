@@ -1,9 +1,0 @@
-# Isolated CUDA worker selected by options.backend=whisperx.
-# Keep this in .venv-whisperx because WhisperX 3.8.6 requires PyTorch 2.8 and
-# Pyannote 4, which are incompatible with the pinned Kotoba runtime.
---extra-index-url https://download.pytorch.org/whl/cu128
-
-whisperx==3.8.6
-torch==2.8.0+cu128
-torchaudio==2.8.0+cu128
-torchvision==0.23.0+cu128
