@@ -56,6 +56,32 @@ class _StageJob:
     WEB_TESTS_AVAILABLE,
     "web test dependencies are not installed",
 )
+class MediaActorLabelTests(unittest.TestCase):
+    def label(self, actors: object) -> str:
+        from stt_to_subtitle.web_app import media_actor_label
+
+        return media_actor_label(actors)
+
+    def test_single_actor_is_named(self) -> None:
+        self.assertEqual(self.label(["모리 히나코"]), "모리 히나코")
+
+    def test_multiple_actors_collapse_to_group(self) -> None:
+        self.assertEqual(self.label(["미야시타 레나", "사토 아이"]), "Group")
+        self.assertEqual(self.label(["가", "나", "다"]), "Group")
+
+    def test_missing_or_blank_actors_read_unknown(self) -> None:
+        self.assertEqual(self.label([]), "Unknown")
+        self.assertEqual(self.label(None), "Unknown")
+        self.assertEqual(self.label(["", "   "]), "Unknown")
+
+    def test_blank_entries_do_not_trigger_the_group_label(self) -> None:
+        self.assertEqual(self.label(["모리 히나코", "  "]), "모리 히나코")
+
+
+@unittest.skipUnless(
+    WEB_TESTS_AVAILABLE,
+    "web test dependencies are not installed",
+)
 class JobStageViewTests(unittest.TestCase):
     def states(self, **values: object) -> list[tuple[str, str]]:
         from stt_to_subtitle.web_app import job_stage_view
