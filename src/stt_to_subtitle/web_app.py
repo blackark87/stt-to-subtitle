@@ -49,7 +49,6 @@ from .orchestrator import (
     COMPARISON_PARENT_ID_OPTION,
     SubtitleOrchestrator,
     TRANSCRIPTION_COMPARISON_BACKENDS,
-    TRANSLATION_OPERATIONS,
 )
 from .service_clients import (
     ExternalServiceError,
@@ -136,10 +135,10 @@ JOB_OPERATION_LABELS = {
     "full": "전체",
 }
 JOB_STAGE_LABELS = {
-    "audio extraction": "오디오 추출",
+    "audio extraction": "추출",
     "transcription": "전사",
     "translation": "번역",
-    "render": "자막 생성",
+    "render": "완료",
 }
 STAGE_SEQUENCE = (
     "audio extraction",
@@ -148,15 +147,16 @@ STAGE_SEQUENCE = (
     "render",
 )
 OPERATION_STAGES = {
-    "extract": ("audio extraction",),
-    "transcribe": ("audio extraction", "transcription"),
-    "translate": ("translation", "render"),
+    "extract": ("audio extraction", "render"),
+    "transcribe": STAGE_SEQUENCE,
+    "translate": STAGE_SEQUENCE,
     "full": STAGE_SEQUENCE,
 }
 STATUS_ACTIVE_STAGE = {
     "extracting": ("audio extraction", "running"),
     "audio_ready": ("transcription", "waiting"),
     "transcription_running": ("transcription", "running"),
+    "transcription_completed": ("translation", "waiting"),
     "transcribed": ("translation", "waiting"),
     "translation_running": ("translation", "running"),
     "translation_paused": ("translation", "paused"),
@@ -165,7 +165,6 @@ STATUS_ACTIVE_STAGE = {
 }
 STAGE_FINISHED_STATUSES = {
     "audio_completed",
-    "transcription_completed",
     "completed",
 }
 STAGE_STATE_LABELS = {
@@ -174,7 +173,7 @@ STAGE_STATE_LABELS = {
     "waiting": "대기",
     "paused": "중단됨",
     "failed": "확인 필요",
-    "pending": "예정",
+    "pending": "대기",
 }
 
 
@@ -200,7 +199,9 @@ def job_stage_view(job: Any) -> list[dict[str, Any]]:
         active = blocked if blocked in stages else stages[0]
         active_state = "failed"
     elif status == "queued":
-        active = stages[0]
+        active = (
+            "translation" if str(job.operation) == "translate" else stages[0]
+        )
         active_state = "waiting"
     else:
         active, active_state = STATUS_ACTIVE_STAGE.get(
@@ -590,17 +591,9 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             job.id
             for job in recent_jobs
             if job.can_start_translation
+            and not job.options.get("comparison_id")
             and latest_jobs.get(job.source_rel) is not None
             and latest_jobs[job.source_rel].id == job.id
-        }
-        transitioned_transcription_job_ids = {
-            job.id
-            for job in recent_jobs
-            if job.status == "transcription_completed"
-            and latest_jobs.get(job.source_rel) is not None
-            and latest_jobs[job.source_rel].id != job.id
-            and latest_jobs[job.source_rel].operation
-            in TRANSLATION_OPERATIONS
         }
 
         def page_location(page: int) -> str:
@@ -619,9 +612,6 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         return {
             "recent_jobs": recent_jobs,
             "translatable_job_ids": translatable_job_ids,
-            "transitioned_transcription_job_ids": (
-                transitioned_transcription_job_ids
-            ),
             "translatable_job_count": len(translatable_job_ids),
             "stoppable_job_count": sum(job.can_stop for job in open_jobs),
             "retriable_job_count": sum(job.can_retry for job in open_jobs),
@@ -2664,8 +2654,14 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         return RedirectResponse(
             job_list_action_location(
                 return_folder=return_folder,
-                return_status_group=return_status_group,
-                return_jobs_page=return_jobs_page,
+                return_status_group=(
+                    ""
+                    if return_status_group == "completed"
+                    else return_status_group
+                ),
+                return_jobs_page=(
+                    1 if return_status_group == "completed" else return_jobs_page
+                ),
                 translations_queued=len(created),
             ),
             status_code=status.HTTP_303_SEE_OTHER,

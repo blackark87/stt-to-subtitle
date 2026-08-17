@@ -409,7 +409,7 @@ class SubtitleOrchestratorTests(unittest.TestCase):
             self.assertIsNone(resumed.audio_sha256)
             self.assertEqual([job.id for job in jobs], [legacy.id])
 
-    def test_translation_reuses_validated_transcript_without_stt(self) -> None:
+    def test_translation_continues_completed_transcription_job(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
             media_root = root / "media"
@@ -469,25 +469,28 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                         prompt_category_id="jav",
                     )
                 original = orchestrator.store.get(transcribed.id)
+                all_jobs = orchestrator.store.list_jobs(limit=None)
             finally:
                 orchestrator.stop()
 
-            self.assertNotEqual(reused.id, transcribed.id)
+            self.assertEqual(reused.id, transcribed.id)
             self.assertEqual(reused.status, "transcribed")
-            self.assertEqual(reused.operation, "translate")
+            self.assertEqual(reused.operation, "full")
             self.assertEqual(reused.options["start_seconds"], 12.0)
             self.assertEqual(
                 reused.options["translation_prompt"]["category_id"],
                 "variety",
             )
-            self.assertNotEqual(reused.transcript_path, str(transcript_path))
+            self.assertEqual(reused.transcript_path, str(transcript_path))
             self.assertEqual(
                 json.loads(
                     Path(reused.transcript_path).read_text(encoding="utf-8")
                 ),
                 json.loads(transcript_path.read_text(encoding="utf-8")),
             )
-            self.assertEqual(original.status, "transcription_completed")
+            self.assertEqual(original.status, "transcribed")
+            self.assertEqual(original.id, reused.id)
+            self.assertEqual([job.id for job in all_jobs], [transcribed.id])
 
     def test_pauses_waiting_translation_and_resumes_checkpoint(self) -> None:
         with TemporaryDirectory() as directory:

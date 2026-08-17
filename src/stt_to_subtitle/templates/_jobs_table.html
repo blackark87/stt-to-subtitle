@@ -5,7 +5,6 @@
   {% set is_attention = job.status in ['blocked', 'failed'] %}
   {% set is_completed = job.status in ['audio_completed', 'transcription_completed', 'completed'] %}
   {% set can_translate = job.id in translatable_job_ids %}
-  {% set translation_transitioned = job.id in transitioned_transcription_job_ids %}
   {% set status_group = 'running' if is_running else ('attention' if is_attention else ('completed' if is_completed else 'waiting')) %}
   <article class="recent-job-item recent-job-{{ job.status }}{% if is_completed %} is-completed{% endif %}">
     <div class="recent-job-leading">
@@ -35,14 +34,10 @@
           <a class="recent-job-title" href="/jobs/{{ job.id }}" title="{{ job.source_rel }}">{{ job.source_rel|filename }}</a>
           {% if job.source_rel|parent_path %}<span class="recent-job-path">{{ job.source_rel|parent_path }}</span>{% endif %}
         </div>
-        {% if translation_transitioned %}
-          <span class="status status-completed" title="후속 번역 작업이 생성된 기존 전사 기록">번역 이행됨</span>
-        {% else %}
-          <span
-            class="status status-{{ job.status }}{% if job.error %} has-detail{% endif %}"
-            title="내부 상태: {{ job.status }}{% if job.error %}&#10;error: {{ job.error }}{% endif %}"
-          >{{ job.status|job_status }}</span>
-        {% endif %}
+        <span
+          class="status status-{{ job.status }}{% if job.error %} has-detail{% endif %}"
+          title="내부 상태: {{ job.status }}{% if job.error %}&#10;error: {{ job.error }}{% endif %}"
+        >{{ job.status|job_status }}</span>
       </div>
       <div class="recent-job-meta">
         <span>최근 갱신 <time datetime="{{ job.updated_at|datetime_iso }}">{{ job.updated_at|datetime }}</time></span>
@@ -89,7 +84,9 @@
               {%- else %}{{ icons.clock(13) }}{% endif -%}
             </span>
             <span class="job-stage-label">{{ stage.label }}</span>
-            {% if stage.total %}
+            {% if stage.key == 'render' and stage.state == 'done' %}
+              <span class="job-stage-count" aria-hidden="true"></span>
+            {% elif stage.total %}
               <span class="job-stage-count">{{ stage.completed }}/{% if stage.total_is_estimate %}≈{% endif %}{{ stage.total }}</span>
             {% else %}
               <span class="job-stage-count">{{ stage.state_label }}</span>

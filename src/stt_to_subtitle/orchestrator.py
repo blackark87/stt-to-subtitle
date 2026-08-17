@@ -508,9 +508,13 @@ class SubtitleOrchestrator:
             if operation == "translate"
             else {}
         )
+        latest_jobs = (
+            self.store.latest_jobs_by_source()
+            if operation in {"transcribe", "translate"}
+            else {}
+        )
         reusable_audio_jobs: dict[str, PipelineJob] = {}
         if operation == "transcribe":
-            latest_jobs = self.store.latest_jobs_by_source()
             for source_rel in unique_source_rels:
                 reusable_audio = self.store.latest_audio_job(source_rel)
                 latest = latest_jobs.get(source_rel)
@@ -591,6 +595,27 @@ class SubtitleOrchestrator:
             reusable_transcript = reusable_transcripts.get(source_rel)
             if reusable_transcript is not None:
                 reusable, transcript_payload = reusable_transcript
+                latest = latest_jobs.get(source_rel)
+                if (
+                    reusable.status == "transcription_completed"
+                    and latest is not None
+                    and latest.id == reusable.id
+                    and not reusable.options.get("comparison_id")
+                ):
+                    jobs.append(
+                        self._continue_completed_transcription(
+                            reusable,
+                            prompt_snapshot=normalized_options[
+                                TRANSLATION_PROMPT_OPTION
+                            ],
+                            force_overwrite=force_overwrite,
+                            event_message=(
+                                "translation requested; continuing completed "
+                                "transcription in the same job"
+                            ),
+                        )
+                    )
+                    continue
                 reusable_options = dict(reusable.options)
                 reusable_options[TRANSLATION_PROMPT_OPTION] = (
                     normalized_options[TRANSLATION_PROMPT_OPTION]
@@ -810,6 +835,11 @@ class SubtitleOrchestrator:
                 raise ValueError(
                     f"{job.source_rel}: 최신 전사 완료 작업만 번역할 수 있습니다."
                 )
+            if job.options.get("comparison_id"):
+                raise ValueError(
+                    f"{job.source_rel}: 전사 비교 결과는 비교 상세 화면에서 "
+                    "번역할 결과를 선택하세요."
+                )
             self.library.resolve_file(job.source_rel)
             transcript_path = Path(job.transcript_path or "")
             try:
@@ -835,40 +865,57 @@ class SubtitleOrchestrator:
 
         transitioned_jobs: list[PipelineJob] = []
         for reusable in reusable_transcripts:
-            options = dict(reusable.options)
-            options[TRANSLATION_PROMPT_OPTION] = dict(prompt_snapshot)
-            transitioned = self.store.update_if_status(
-                reusable.id,
-                {"transcription_completed"},
-                status="transcribed",
-                force_overwrite=True,
-                operation="translate",
-                options_json=json.dumps(options, sort_keys=True),
-                translation_path=None,
-                srt_path=None,
-                ass_path=None,
-                blocked_stage=None,
-                error=None,
-                translation_chunks_total=0,
-                translation_chunks_completed=0,
-                translation_pause_requested=0,
-                job_stop_requested=0,
-            )
-            if not transitioned:
-                raise ValueError(
-                    f"{reusable.source_rel}: 전사 완료 상태가 변경되어 "
-                    "번역으로 전환하지 못했습니다."
+            transitioned_jobs.append(
+                self._continue_completed_transcription(
+                    reusable,
+                    prompt_snapshot=prompt_snapshot,
+                    force_overwrite=True,
+                    event_message=(
+                        "selected completed transcription continued in "
+                        "translation queue"
+                    ),
                 )
-            self.store.add_event(
-                reusable.id,
-                "info",
-                "selected completed transcription moved to translation queue",
             )
-            refreshed = self.store.get(reusable.id)
-            if refreshed is None:
-                raise RuntimeError("transitioned translation job could not be read")
-            transitioned_jobs.append(refreshed)
         return transitioned_jobs
+
+    def _continue_completed_transcription(
+        self,
+        job: PipelineJob,
+        *,
+        prompt_snapshot: Mapping[str, Any],
+        force_overwrite: bool,
+        event_message: str,
+    ) -> PipelineJob:
+        """Continue translation in a completed transcription's job record."""
+        options = dict(job.options)
+        options[TRANSLATION_PROMPT_OPTION] = dict(prompt_snapshot)
+        transitioned = self.store.update_if_status(
+            job.id,
+            {"transcription_completed"},
+            status="transcribed",
+            force_overwrite=force_overwrite,
+            operation="full",
+            options_json=json.dumps(options, sort_keys=True),
+            translation_path=None,
+            srt_path=None,
+            ass_path=None,
+            blocked_stage=None,
+            error=None,
+            translation_chunks_total=0,
+            translation_chunks_completed=0,
+            translation_pause_requested=0,
+            job_stop_requested=0,
+        )
+        if not transitioned:
+            raise ValueError(
+                f"{job.source_rel}: 전사 완료 상태가 변경되어 "
+                "번역으로 전환하지 못했습니다."
+            )
+        self.store.add_event(job.id, "info", event_message)
+        refreshed = self.store.get(job.id)
+        if refreshed is None:
+            raise RuntimeError("continued translation job could not be read")
+        return refreshed
 
     def create_comparison_translation_jobs(
         self,

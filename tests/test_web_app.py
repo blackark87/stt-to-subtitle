@@ -97,10 +97,10 @@ class JobStageViewTests(unittest.TestCase):
         self.assertEqual(
             self.states(status="transcription_running"),
             [
-                ("오디오 추출", "done"),
+                ("추출", "done"),
                 ("전사", "running"),
                 ("번역", "pending"),
-                ("자막 생성", "pending"),
+                ("완료", "pending"),
             ],
         )
 
@@ -108,21 +108,31 @@ class JobStageViewTests(unittest.TestCase):
         self.assertEqual(
             self.states(status="blocked", blocked_stage="translation"),
             [
-                ("오디오 추출", "done"),
+                ("추출", "done"),
                 ("전사", "done"),
                 ("번역", "failed"),
-                ("자막 생성", "pending"),
+                ("완료", "pending"),
             ],
         )
 
-    def test_operation_scope_limits_the_listed_stages(self) -> None:
+    def test_completed_transcription_keeps_follow_up_stages_visible(self) -> None:
         self.assertEqual(
             self.states(status="transcription_completed", operation="transcribe"),
-            [("오디오 추출", "done"), ("전사", "done")],
+            [
+                ("추출", "done"),
+                ("전사", "done"),
+                ("번역", "waiting"),
+                ("완료", "pending"),
+            ],
         )
         self.assertEqual(
             self.states(status="queued", operation="translate"),
-            [("번역", "waiting"), ("자막 생성", "pending")],
+            [
+                ("추출", "done"),
+                ("전사", "done"),
+                ("번역", "waiting"),
+                ("완료", "pending"),
+            ],
         )
 
     def test_chunk_counts_drive_the_stage_progress_percentage(self) -> None:
@@ -211,10 +221,10 @@ class JobStageViewTests(unittest.TestCase):
         self.assertEqual(
             self.states(status="translation_paused"),
             [
-                ("오디오 추출", "done"),
+                ("추출", "done"),
                 ("전사", "done"),
                 ("번역", "paused"),
-                ("자막 생성", "pending"),
+                ("완료", "pending"),
             ],
         )
 
@@ -2077,7 +2087,7 @@ class WebAppTests(unittest.TestCase):
                 'name="qwen_max_group_duration_seconds"', waiting.text
             )
             self.assertEqual(waiting.text.count("오디오 추출"), 1)
-            self.assertEqual(waiting.text.count("전사 예정"), 4)
+            self.assertEqual(waiting.text.count("전사 대기"), 4)
             self.assertIn("실패 작업 재시도 (1)", failed_comparison.text)
             self.assertEqual(retry_response.status_code, 303)
             self.assertEqual(
@@ -2095,7 +2105,7 @@ class WebAppTests(unittest.TestCase):
             )
             self.assertEqual(extracting.text.count("오디오 추출"), 1)
             self.assertNotIn("오디오 추출 중", extracting.text)
-            self.assertEqual(extracting.text.count("전사 예정"), 4)
+            self.assertEqual(extracting.text.count("전사 대기"), 4)
             self.assertEqual(comparison_panel.status_code, 200)
             self.assertIn(
                 "comparison-audio-stage is-running",
@@ -2553,7 +2563,7 @@ class WebAppTests(unittest.TestCase):
             self.assertEqual(response.status_code, 303)
             self.assertEqual(
                 response.headers["location"],
-                "/jobs?status_group=completed&jobs_page=1&translations_queued=2",
+                "/jobs?translations_queued=2",
             )
             self.assertEqual(len(all_jobs), 3)
             self.assertEqual(
@@ -2562,7 +2572,7 @@ class WebAppTests(unittest.TestCase):
             )
             self.assertTrue(all(job.status == "transcribed" for job in translated))
             self.assertTrue(
-                all(job.operation == "translate" for job in translated)
+                all(job.operation == "full" for job in translated)
             )
             self.assertTrue(all(job.force_overwrite for job in translated))
             self.assertTrue(
@@ -2585,7 +2595,7 @@ class WebAppTests(unittest.TestCase):
                 stale_response.text,
             )
 
-    def test_job_list_marks_legacy_split_translation_as_transitioned(self) -> None:
+    def test_job_list_does_not_relabel_legacy_transcription_record(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
             media_root = root / "media"
@@ -2621,7 +2631,8 @@ class WebAppTests(unittest.TestCase):
                 page = client.get("/jobs?status_group=completed")
 
             self.assertEqual(page.status_code, 200)
-            self.assertIn("번역 이행됨", page.text)
+            self.assertNotIn("번역 이행됨", page.text)
+            self.assertIn("전사 완료", page.text)
             self.assertNotIn(
                 'value="legacy-transcription"',
                 page.text,
