@@ -1346,6 +1346,8 @@ tags
 !/src/**
 !/tests/
 !/tests/**
+!/gpu-observability/
+!/gpu-observability/**
 
 # Local media, transcripts, and model data
 /media/
