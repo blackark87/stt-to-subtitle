@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 import json
 from pathlib import Path
 import sqlite3
 import time
-from typing import Any, Callable, Collection, Mapping
+from typing import Any, Callable, Collection, Iterator, Mapping
 from uuid import uuid4
 
 from .translation_prompt import (
@@ -193,10 +194,15 @@ class JobStore:
         if self._change_hook is not None:
             self._change_hook(job_id)
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
         connection = sqlite3.connect(self.database_path, timeout=30)
         connection.row_factory = sqlite3.Row
-        return connection
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
 
     def _initialize(self) -> None:
         with self._connect() as connection:

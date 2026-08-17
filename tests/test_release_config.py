@@ -83,7 +83,6 @@ class ReleaseConfigurationTests(unittest.TestCase):
         self.assertTrue((ROOT / "requirements-api.txt").is_file())
         self.assertTrue((ROOT / "requirements-kotoba.txt").is_file())
         self.assertFalse((ROOT / "requirements-cuda.txt").exists())
-        self.assertFalse((ROOT / "requirements-macos.txt").exists())
 
     def test_project_version_is_3_1_0(self) -> None:
         project = tomllib.loads(

@@ -134,7 +134,29 @@ class WebAppTests(unittest.TestCase):
             )
             self.assertEqual(invalid_page.status_code, 400)
 
-    def test_dashboard_renders_media_cards_and_local_poster(self) -> None:
+    def test_primary_pages_separate_overview_media_and_job_history(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            (media_root / "movie.mp4").write_bytes(b"media")
+
+            with TestClient(create_app(self.settings(root, media_root))) as client:
+                dashboard = client.get("/")
+                media = client.get("/media")
+                jobs = client.get("/jobs")
+
+            self.assertIn("파이프라인 상태와 최근 작업", dashboard.text)
+            self.assertNotIn('class="media-board"', dashboard.text)
+            self.assertIn('aria-current="page"', dashboard.text)
+            self.assertIn('href="/media"', dashboard.text)
+            self.assertIn("movie.mp4", media.text)
+            self.assertIn('class="media-board"', media.text)
+            self.assertNotIn("최근 작업", media.text)
+            self.assertIn("상태별 작업", jobs.text)
+            self.assertIn('href="/jobs" class="is-active"', jobs.text)
+
+    def test_media_page_renders_media_cards_and_local_poster(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
             media_root = root / "media"
@@ -160,8 +182,8 @@ class WebAppTests(unittest.TestCase):
             ), TestClient(
                 create_app(self.settings(root, media_root))
             ) as client:
-                root_response = client.get("/")
-                response = client.get("/?folder=show")
+                root_response = client.get("/media")
+                response = client.get("/media?folder=show")
                 poster = client.get("/media/posters/show/poster.jpg")
 
             self.assertEqual(root_response.status_code, 200)
@@ -175,7 +197,7 @@ class WebAppTests(unittest.TestCase):
             self.assertIn("0.00 GiB", root_response.text)
             self.assertIn("재생시간 1:43:00", root_response.text)
             self.assertNotIn('class="media-directory"', response.text)
-            self.assertIn("대기", root_response.text)
+            self.assertIn("미처리", root_response.text)
             self.assertNotIn("folder-glyph", root_response.text)
             self.assertEqual(response.status_code, 200)
             self.assertNotIn('name="source_rels"', response.text)
@@ -301,7 +323,7 @@ class WebAppTests(unittest.TestCase):
                     f"/settings/prompt-categories/{category.id}/archive",
                     follow_redirects=False,
                 )
-                dashboard = client.get("/")
+                dashboard = client.get("/media")
                 restored = client.post(
                     f"/settings/prompt-categories/{category.id}/restore",
                     follow_redirects=False,
@@ -421,7 +443,7 @@ class WebAppTests(unittest.TestCase):
             self.assertEqual(dashboard.status_code, 200)
             self.assertIn('class="recent-job-list"', dashboard.text)
             self.assertNotIn("<table", dashboard.text)
-            self.assertIn("전체 작업", dashboard.text)
+            self.assertIn("최근 작업", dashboard.text)
             self.assertIn("전사 중", dashboard.text)
             self.assertIn("확인 필요", dashboard.text)
             self.assertIn("전사 청크", dashboard.text)
@@ -458,7 +480,7 @@ class WebAppTests(unittest.TestCase):
             )
 
             with TestClient(create_app(settings)) as client:
-                before = client.get("/")
+                before = client.get("/media")
                 saved = client.post(
                     "/settings",
                     data={
@@ -468,7 +490,7 @@ class WebAppTests(unittest.TestCase):
                     },
                     follow_redirects=False,
                 )
-                after = client.get("/")
+                after = client.get("/media")
                 health = client.get("/healthz").json()
 
             self.assertIn("전사·번역 서버를 설정", before.text)
@@ -504,7 +526,7 @@ class WebAppTests(unittest.TestCase):
                 jobs = client.get("/api/jobs").json()
 
             self.assertEqual(response.status_code, 303)
-            self.assertEqual(response.headers["location"], "/?queued=2")
+            self.assertEqual(response.headers["location"], "/media?queued=2")
             self.assertEqual(
                 {job["source_rel"] for job in jobs},
                 {"one.mkv", "two.mp4"},
@@ -585,7 +607,7 @@ class WebAppTests(unittest.TestCase):
             self.assertEqual(response.status_code, 303)
             self.assertEqual(
                 response.headers["location"],
-                "/?queued=1&skipped=3",
+                "/media?queued=1&skipped=3",
             )
             created = next(
                 job
@@ -667,7 +689,7 @@ class WebAppTests(unittest.TestCase):
                     blocked_stage="translation",
                 )
                 add_job("completed-job", "completed.mkv", "completed")
-                response = client.get("/")
+                response = client.get("/media")
 
             self.assertEqual(response.status_code, 200)
             expected_stages = {
@@ -984,12 +1006,12 @@ class WebAppTests(unittest.TestCase):
                 )
                 service.store.update(failed.id, status="failed", error="bad")
 
-                page = client.get("/")
+                page = client.get("/media")
 
             self.assertIn("미처리", page.text)
             self.assertIn("번역 중", page.text)
             self.assertIn("자막 생성 완료", page.text)
-            self.assertIn("확인 필요", page.text)
+            self.assertIn("실패", page.text)
             self.assertIn('href="/jobs/running-job"', page.text)
             self.assertIn('href="/jobs/done-job"', page.text)
             self.assertIn('href="/jobs/failed-job"', page.text)
@@ -1181,17 +1203,17 @@ class WebAppTests(unittest.TestCase):
             self.assertEqual(single_pause.status_code, 303)
             self.assertEqual(
                 single_pause.headers["location"],
-                "/?folder=series&translation_pause_requested=1",
+                "/media?folder=series&translation_pause_requested=1",
             )
             self.assertEqual(bulk_pause.status_code, 303)
             self.assertEqual(
                 bulk_pause.headers["location"],
-                "/?folder=series&translations_paused=2",
+                "/media?folder=series&translations_paused=2",
             )
             self.assertEqual(bulk_stop.status_code, 303)
             self.assertEqual(
                 bulk_stop.headers["location"],
-                "/?folder=series&jobs_stopped=3",
+                "/media?folder=series&jobs_stopped=3",
             )
             self.assertEqual(single.status, "translation_paused")
             self.assertEqual(queued.status, "blocked")
@@ -1261,7 +1283,7 @@ class WebAppTests(unittest.TestCase):
             self.assertEqual(response.status_code, 303)
             self.assertEqual(
                 response.headers["location"],
-                "/?folder=series&jobs_retried=2",
+                "/media?folder=series&jobs_retried=2",
             )
             self.assertIn("중단·실패 작업 2개를 재시도했습니다.", notice.text)
             self.assertIn("중단 작업 일괄 재시도 (0)", refreshed.text)
@@ -1304,7 +1326,7 @@ class WebAppTests(unittest.TestCase):
             self.assertIn("completed-14.mp4", second.text)
             self.assertIn("jobs_page=2", first.text)
 
-    def test_dashboard_exposes_three_pipeline_buttons_and_queues_transcription(
+    def test_media_page_exposes_three_pipeline_buttons_and_queues_transcription(
         self,
     ) -> None:
         with TemporaryDirectory() as directory:
@@ -1317,7 +1339,7 @@ class WebAppTests(unittest.TestCase):
             ) as client:
                 service = client.app.state.orchestrator
                 service.stop()
-                dashboard = client.get("/")
+                dashboard = client.get("/media")
                 response = client.post(
                     "/jobs",
                     data={
@@ -1349,7 +1371,7 @@ class WebAppTests(unittest.TestCase):
             self.assertLess(advanced_end, prompt_position)
             self.assertLess(prompt_position, button_position)
             self.assertEqual(response.status_code, 303)
-            self.assertEqual(response.headers["location"], "/?queued=1")
+            self.assertEqual(response.headers["location"], "/media?queued=1")
             self.assertEqual(jobs[0].operation, "transcribe")
             self.assertNotIn("translation_prompt", jobs[0].options)
 

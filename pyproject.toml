@@ -12,8 +12,7 @@ dependencies = []
 
 [project.scripts]
 stt-transcribe = "stt_to_subtitle.cli:main"
-stt-api = "stt_to_subtitle.macos_api:main"
-stt-macos-api = "stt_to_subtitle.macos_api:main"
+stt-api = "stt_to_subtitle.stt_api:main"
 stt-web = "stt_to_subtitle.web_app:main"
 
 [tool.setuptools.packages.find]

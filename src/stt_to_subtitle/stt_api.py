@@ -89,7 +89,7 @@ def _env_boolean(name: str, default: bool = False) -> bool:
 
 
 @dataclass(frozen=True)
-class MacOSAPISettings:
+class STTAPISettings:
     state_dir: Path
     api_token: str
     hf_token: str
@@ -110,11 +110,11 @@ class MacOSAPISettings:
     debug_artifacts_dir: Path | None = None
 
     @classmethod
-    def from_env(cls) -> MacOSAPISettings:
+    def from_env(cls) -> STTAPISettings:
         threads_value = os.environ.get("STT_THREADS", "").strip()
         return cls(
             state_dir=Path(
-                os.environ.get("STT_STATE_DIR", "./var/macos-stt")
+                os.environ.get("STT_STATE_DIR", "./var/stt")
             ).expanduser(),
             api_token=os.environ.get("STT_API_TOKEN", ""),
             hf_token=os.environ.get("HF_TOKEN", ""),
@@ -232,7 +232,7 @@ def _device_unavailable_reason(torch: Any, device: str) -> str | None:
     return None
 
 
-def _whisperx_unavailable_reason(settings: MacOSAPISettings) -> str | None:
+def _whisperx_unavailable_reason(settings: STTAPISettings) -> str | None:
     if settings.device == "mps" or settings.diarization_device == "mps":
         return "WhisperX backend supports only cpu or CUDA devices"
     if not settings.whisperx_python.is_file():
@@ -243,7 +243,7 @@ def _whisperx_unavailable_reason(settings: MacOSAPISettings) -> str | None:
     return None
 
 
-def _parse_options(raw_options: str, settings: MacOSAPISettings) -> dict[str, Any]:
+def _parse_options(raw_options: str, settings: STTAPISettings) -> dict[str, Any]:
     try:
         decoded = json.loads(raw_options)
     except json.JSONDecodeError as error:
@@ -390,7 +390,7 @@ def _git_commit() -> str:
 
 
 def _runtime_trace(
-    settings: MacOSAPISettings,
+    settings: STTAPISettings,
     *,
     backend: str,
     elapsed_seconds: float | None = None,
@@ -412,7 +412,7 @@ def _runtime_trace(
 class TranscriptionService:
     """Own the persistent queue and the single lazy model instance."""
 
-    def __init__(self, settings: MacOSAPISettings) -> None:
+    def __init__(self, settings: STTAPISettings) -> None:
         settings.validate()
         self.settings = settings
         self.settings.state_dir.mkdir(parents=True, exist_ok=True)
@@ -427,7 +427,7 @@ class TranscriptionService:
         self._pipeline: SpeechPipeline | None = None
         self._worker = threading.Thread(
             target=self._worker_loop,
-            name="macos-stt-worker",
+            name="stt-api-worker",
             daemon=True,
         )
         self._started_at = time.time()
@@ -1230,11 +1230,11 @@ class TranscriptionService:
 
 
 def create_app(
-    settings: MacOSAPISettings | None = None,
+    settings: STTAPISettings | None = None,
 ) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        service = TranscriptionService(settings or MacOSAPISettings.from_env())
+        service = TranscriptionService(settings or STTAPISettings.from_env())
         app.state.transcription_service = service
         service.start()
         try:
@@ -1394,7 +1394,7 @@ def main() -> None:
         os.environ.get("LOG_LEVEL", "INFO").upper(),
     )
     uvicorn.run(
-        "stt_to_subtitle.macos_api:app",
+        "stt_to_subtitle.stt_api:app",
         host=os.environ.get("STT_HOST", "0.0.0.0"),
         port=int(os.environ.get("STT_PORT", "8100")),
         workers=1,

@@ -1,5 +1,6 @@
 .git
 .github
+.claude
 .idea
 .venv
 .env
@@ -13,5 +14,6 @@ media
 output
 var
 model-cache
+gpu-observability
 tests
 AGENTS.md

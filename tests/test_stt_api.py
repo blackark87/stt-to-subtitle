@@ -9,8 +9,8 @@ import wave
 
 from fastapi.testclient import TestClient
 
-from stt_to_subtitle.macos_api import (
-    MacOSAPISettings,
+from stt_to_subtitle.stt_api import (
+    STTAPISettings,
     TranscriptionService,
     _device_unavailable_reason,
     _parse_options,
@@ -20,9 +20,9 @@ from stt_to_subtitle.macos_api import (
 from stt_to_subtitle.transcription_store import TranscriptionJob
 
 
-class MacOSAPIHelpersTests(unittest.TestCase):
+class STTAPIHelpersTests(unittest.TestCase):
     def test_parses_client_options_but_keeps_server_batch_size(self) -> None:
-        settings = MacOSAPISettings(
+        settings = STTAPISettings(
             state_dir=Path("/tmp/not-used"),
             api_token="api-token",
             hf_token="hf-token",
@@ -41,7 +41,7 @@ class MacOSAPIHelpersTests(unittest.TestCase):
         self.assertEqual(options["backend"], "kotoba")
 
     def test_accepts_request_level_whisperx_backend_case_insensitively(self) -> None:
-        settings = MacOSAPISettings(
+        settings = STTAPISettings(
             state_dir=Path("/tmp/not-used"),
             api_token="",
             hf_token="hf-token",
@@ -57,7 +57,7 @@ class MacOSAPIHelpersTests(unittest.TestCase):
         self.assertEqual(options["repetition_policy"], "flag")
 
     def test_accepts_hybrid_backend_with_independent_chunk_defaults(self) -> None:
-        settings = MacOSAPISettings(
+        settings = STTAPISettings(
             state_dir=Path("/tmp/not-used"),
             api_token="",
             hf_token="hf-token",
@@ -81,7 +81,7 @@ class MacOSAPIHelpersTests(unittest.TestCase):
     def test_hybrid_reject_policy_is_invalid_because_rescue_needs_flags(
         self,
     ) -> None:
-        settings = MacOSAPISettings(
+        settings = STTAPISettings(
             state_dir=Path("/tmp/not-used"),
             api_token="",
             hf_token="hf-token",
@@ -99,7 +99,7 @@ class MacOSAPIHelpersTests(unittest.TestCase):
     def test_accepts_configurable_whisperx_segmentation_and_reject_policy(
         self,
     ) -> None:
-        settings = MacOSAPISettings(
+        settings = STTAPISettings(
             state_dir=Path("/tmp/not-used"),
             api_token="",
             hf_token="hf-token",
@@ -127,7 +127,7 @@ class MacOSAPIHelpersTests(unittest.TestCase):
         self.assertEqual(options["repetition_min_count"], 12)
 
     def test_short_span_policy_is_observation_only(self) -> None:
-        settings = MacOSAPISettings(
+        settings = STTAPISettings(
             state_dir=Path("/tmp/not-used"),
             api_token="",
             hf_token="hf-token",
@@ -137,7 +137,7 @@ class MacOSAPIHelpersTests(unittest.TestCase):
             _parse_options('{"short_span_policy":"drop"}', settings)
 
     def test_rejects_unknown_transcription_backend(self) -> None:
-        settings = MacOSAPISettings(
+        settings = STTAPISettings(
             state_dir=Path("/tmp/not-used"),
             api_token="",
             hf_token="hf-token",
@@ -150,7 +150,7 @@ class MacOSAPIHelpersTests(unittest.TestCase):
             _parse_options('{"backend": "other"}', settings)
 
     def test_whisperx_backend_requires_vad(self) -> None:
-        settings = MacOSAPISettings(
+        settings = STTAPISettings(
             state_dir=Path("/tmp/not-used"),
             api_token="",
             hf_token="hf-token",
@@ -166,7 +166,7 @@ class MacOSAPIHelpersTests(unittest.TestCase):
             )
 
     def test_defaults_to_sixty_seconds_and_accepts_disabled_filter(self) -> None:
-        settings = MacOSAPISettings(
+        settings = STTAPISettings(
             state_dir=Path("/tmp/not-used"),
             api_token="",
             hf_token="hf-token",
@@ -192,7 +192,7 @@ class MacOSAPIHelpersTests(unittest.TestCase):
             _validate_wav(path)
 
     def test_chunk_progress_interval_accepts_only_10_or_100(self) -> None:
-        settings = MacOSAPISettings(
+        settings = STTAPISettings(
             state_dir=Path("/tmp/not-used"),
             api_token="",
             hf_token="hf-token",
@@ -206,7 +206,7 @@ class MacOSAPIHelpersTests(unittest.TestCase):
             settings.validate()
 
     def test_noise_filter_trigger_level_must_be_positive(self) -> None:
-        settings = MacOSAPISettings(
+        settings = STTAPISettings(
             state_dir=Path("/tmp/not-used"),
             api_token="",
             hf_token="hf-token",
@@ -220,7 +220,7 @@ class MacOSAPIHelpersTests(unittest.TestCase):
             settings.validate()
 
     def test_accepts_cuda_devices_with_optional_indexes(self) -> None:
-        settings = MacOSAPISettings(
+        settings = STTAPISettings(
             state_dir=Path("/tmp/not-used"),
             api_token="",
             hf_token="hf-token",
@@ -231,7 +231,7 @@ class MacOSAPIHelpersTests(unittest.TestCase):
         settings.validate()
 
     def test_rejects_unsupported_device(self) -> None:
-        settings = MacOSAPISettings(
+        settings = STTAPISettings(
             state_dir=Path("/tmp/not-used"),
             api_token="",
             hf_token="hf-token",
@@ -273,7 +273,7 @@ class MacOSAPIHelpersTests(unittest.TestCase):
             root = Path(directory)
             whisperx_python = root / "python"
             whisperx_python.write_text("placeholder", encoding="utf-8")
-            settings = MacOSAPISettings(
+            settings = STTAPISettings(
                 state_dir=root / "state",
                 api_token="",
                 hf_token="secret-hf-token",
@@ -319,7 +319,7 @@ class MacOSAPIHelpersTests(unittest.TestCase):
 
             with patch.object(service, "_release_pipeline") as release:
                 with patch(
-                    "stt_to_subtitle.macos_api.subprocess.run",
+                    "stt_to_subtitle.stt_api.subprocess.run",
                     side_effect=fake_run,
                 ) as run:
                     result = service._run_whisperx_worker(job)
@@ -340,7 +340,7 @@ class MacOSAPIHelpersTests(unittest.TestCase):
 
             with patch.object(service, "_release_pipeline") as release:
                 with patch(
-                    "stt_to_subtitle.macos_api.subprocess.run",
+                    "stt_to_subtitle.stt_api.subprocess.run",
                     side_effect=fake_run,
                 ) as run:
                     service._run_whisperx_worker(
@@ -369,7 +369,7 @@ class MacOSAPIHelpersTests(unittest.TestCase):
                 wav_file.setsampwidth(2)
                 wav_file.setframerate(16000)
                 wav_file.writeframes(b"\x00\x00" * 16000)
-            settings = MacOSAPISettings(
+            settings = STTAPISettings(
                 state_dir=state_dir,
                 api_token="",
                 hf_token="hf-token",
@@ -430,7 +430,7 @@ class MacOSAPIHelpersTests(unittest.TestCase):
                     return_value=primary_result,
                 ) as run_whisperx:
                     with patch(
-                        "stt_to_subtitle.macos_api.run_pipeline",
+                        "stt_to_subtitle.stt_api.run_pipeline",
                         return_value=fallback_result,
                     ) as run_kotoba:
                         service._run_job("hybrid-job")
@@ -498,7 +498,7 @@ class MacOSAPIHelpersTests(unittest.TestCase):
                 wav_file.setframerate(16000)
                 wav_file.writeframes(b"\x00\x00" * 16000)
             service = TranscriptionService(
-                MacOSAPISettings(
+                STTAPISettings(
                     state_dir=state_dir,
                     api_token="",
                     hf_token="hf-token",
@@ -548,7 +548,7 @@ class MacOSAPIHelpersTests(unittest.TestCase):
 
             with patch.object(service, "_get_pipeline", return_value=Mock()):
                 with patch(
-                    "stt_to_subtitle.macos_api.run_pipeline",
+                    "stt_to_subtitle.stt_api.run_pipeline",
                     return_value=result,
                 ):
                     service._run_job("job-id")
@@ -575,10 +575,10 @@ class MacOSAPIHelpersTests(unittest.TestCase):
             )
 
 
-class MacOSAPIRouteTests(unittest.TestCase):
+class STTAPIRouteTests(unittest.TestCase):
     def test_health_is_public_and_job_status_requires_bearer_token(self) -> None:
         with TemporaryDirectory() as directory:
-            settings = MacOSAPISettings(
+            settings = STTAPISettings(
                 state_dir=Path(directory),
                 api_token="api-token",
                 hf_token="hf-token",
@@ -593,7 +593,7 @@ class MacOSAPIRouteTests(unittest.TestCase):
 
     def test_blank_api_token_disables_bearer_authentication(self) -> None:
         with TemporaryDirectory() as directory:
-            settings = MacOSAPISettings(
+            settings = STTAPISettings(
                 state_dir=Path(directory),
                 api_token="",
                 hf_token="hf-token",
@@ -612,7 +612,7 @@ class MacOSAPIRouteTests(unittest.TestCase):
                 wav_file.setsampwidth(2)
                 wav_file.setframerate(16000)
                 wav_file.writeframes(b"\x00\x00" * 100)
-            settings = MacOSAPISettings(
+            settings = STTAPISettings(
                 state_dir=root / "state",
                 api_token="",
                 hf_token="hf-token",

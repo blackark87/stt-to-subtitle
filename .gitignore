@@ -61,7 +61,7 @@ tmp/
 .env
 .env.*
 !.env.compose.example
-!.env.macos.example
+!.env.stt.example
 var/
 local.properties
 .settings/
@@ -1090,6 +1090,7 @@ FodyWeavers.xsd
 
 !README.md
 !MEMORY.md
+!IMPLEMENTATION_SUMMARY.md
 !LICENSE
 
 # !Makefile
@@ -1196,7 +1197,7 @@ override.tf.json
 .terraformrc
 terraform.rc
 
-### macOS template
+### Desktop OS metadata template
 # General
 .DS_Store
 .AppleDouble
@@ -1336,7 +1337,7 @@ tags
 !/requirements-whisperx-cuda.txt
 !/requirements-test.txt
 !/.env.compose.example
-!/.env.macos.example
+!/.env.stt.example
 !/.github/
 !/.github/**
 !/scripts/

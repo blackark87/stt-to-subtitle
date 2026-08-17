@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{% block title %}STT to Subtitle{% endblock %}</title>
+    <link rel="stylesheet" href="{{ url_for('static', path='/app.css') }}">
+    <script defer src="{{ url_for('static', path='/poll.js') }}"></script>
+    {% block head %}{% endblock %}
+  </head>
+  <body>
+    {% import "_icons.html" as icons %}
+    <header class="topbar">
+      <a href="/" class="brand">
+        <span class="brand-mark" aria-hidden="true">{{ icons.captions(16) }}</span>
+        STT to Subtitle
+      </a>
+      <div class="topbar-actions">
+        {% if not request.app.state.authentication_enabled or request.session.get("authenticated") %}
+          <a href="/settings" class="button secondary">{{ icons.settings(16) }}서버 설정</a>
+        {% endif %}
+        {% if request.app.state.authentication_enabled and request.session.get("authenticated") %}
+          <form method="post" action="/logout">
+            <input type="hidden" name="csrf_token" value="{{ request.session.get('csrf_token') }}">
+            <button type="submit" class="secondary">{{ icons.log_out(16) }}로그아웃</button>
+          </form>
+        {% endif %}
+      </div>
+    </header>
+    <main class="container">
+      {% block content %}{% endblock %}
+    </main>
+  </body>
+</html>

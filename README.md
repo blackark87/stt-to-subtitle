@@ -45,9 +45,9 @@ HTTP 서버는 Kotoba 환경에서 실행하고 WhisperX 요청만 격리된 Pyt
 - Pyannote 모델 이용 조건을 승인한 Hugging Face read 토큰
 - 일본어→한국어 모델을 제공하는 OpenAI 호환 API
 
-별도의 CUDA Toolkit이나 호스트 Python 환경은 필요하지 않습니다. macOS의
-Docker 가상 머신은 Metal/MPS 장치를 PyTorch 컨테이너에 전달하지 않으므로
-Mac MPS 전사는 아래의 네이티브 실행 경로를 사용합니다.
+별도의 CUDA Toolkit이나 호스트 Python 환경은 필요하지 않습니다. Apple
+Silicon의 Docker 가상 머신은 Metal/MPS 장치를 PyTorch 컨테이너에 전달하지
+않으므로 MPS 전사는 아래의 호스트 실행 경로를 사용합니다.
 
 ## 처음 실행
 
@@ -119,6 +119,10 @@ curl https://stt.example.com/healthz
 웹 상태 디렉터리의 `jobs.sqlite3`에 저장되며 컨테이너를 다시 만들어도
 유지됩니다.
 
+웹 화면은 역할별로 분리됩니다. `/`는 상태 요약과 최근 작업만 보여 주는
+대시보드이고, `/media`는 파일 탐색과 신규 작업 등록, `/jobs`는 상태별 작업
+목록입니다. 모든 화면에서 사이드 메뉴로 각 영역을 직접 이동할 수 있습니다.
+
 ## 환경 설정
 
 ### 공통 및 웹
@@ -137,6 +141,7 @@ curl https://stt.example.com/healthz
 | `WEB_ADMIN_PASSWORD` | 빈 값 | 웹 로그인 비밀번호 |
 | `WEB_SESSION_SECRET` | 빈 값 | 로그인 사용 시 필요한 32자 이상 세션 키 |
 | `WEB_SECURE_COOKIE` | `true` | HTTPS에서만 세션 쿠키 전송 |
+| `GPU_DASHBOARD_URL` | 빈 값 | 독립 Grafana GPU 대시보드로 이동할 외부 URL |
 
 `WEB_ADMIN_PASSWORD`를 설정하면 `WEB_SESSION_SECRET`도 반드시 32자
 이상으로 설정해야 합니다. 다음과 같이 생성할 수 있습니다.
@@ -167,6 +172,15 @@ python3 -c 'import secrets; print(secrets.token_urlsafe(48))'
 `STT_DEBUG_ARTIFACTS=true`는 단계별 JSON에 민감한 전사문을 저장할 수
 있으므로 기본적으로 꺼져 있습니다. 토큰은 이미지, 로그, 결과 메타데이터에
 저장하지 않습니다.
+
+## GPU 관측 사이드 프로젝트
+
+`gpu-observability/`는 메인 Compose와 분리된 독립 프로젝트입니다. NVIDIA
+DCGM Exporter, Prometheus와 Grafana를 함께 실행하며 GPU 사용률, 메모리,
+온도, 전력과 XID 오류를 보여 주는 대시보드를 자동 구성합니다. 실행 방법과
+분리 배포 조건은 `gpu-observability/README.md`를 참고하십시오. Grafana URL을
+`GPU_DASHBOARD_URL`에 지정하면 메인 대시보드에는 외부 모니터링 링크만
+표시되며 두 프로젝트의 프로세스와 저장소는 결합되지 않습니다.
 
 ## 전사 백엔드
 
@@ -225,23 +239,23 @@ JSON·번역 체크포인트부터 이어집니다.
 산출물을 계속 사용할 수 있습니다. 데이터베이스 스키마와 파일명은 변경하지
 않습니다.
 
-## macOS MPS 전사 API
+## 호스트 STT API (Apple Silicon MPS 예시)
 
-Apple Silicon에서는 전사 API를 macOS 호스트 프로세스로 실행할 수 있습니다.
+Apple Silicon에서는 전사 API를 호스트 프로세스로 실행할 수 있습니다.
 이 경로는 CUDA Compose 배포와 별개이며 Metal/MPS를 사용하는 경우에만
 필요합니다.
 
 ```bash
 brew install python@3.11 ffmpeg libsndfile portaudio
-cp .env.macos.example .env.macos
-# .env.macos의 HF_TOKEN을 설정
-./scripts/run-macos-stt.sh
+cp .env.stt.example .env.stt
+# .env.stt의 HF_TOKEN을 설정
+./scripts/run-stt-api.sh
 ```
 
 독립 실행 폴더가 필요하면 다음 도구를 사용합니다.
 
 ```bash
-python3 scripts/create_macos_runtime.py /path/to/runtime
+python3 scripts/create_stt_runtime.py /path/to/runtime
 cd /path/to/runtime
 ./setup.sh
 ./run.sh

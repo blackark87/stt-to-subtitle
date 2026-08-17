@@ -6,7 +6,7 @@ Application code lives in `src/stt_to_subtitle/`. `audio.py` builds and runs FFm
 
 ## Architecture & Data Flow
 
-Maintain explicit boundaries between audio extraction, speech transcription, transcript normalization, translation, and subtitle rendering. The Compose project runs the web orchestrator and CUDA transcription API as separate containers; the STT image isolates Kotoba and WhisperX in separate Python environments. The Mac transcription API runs natively with Whisper on MPS and Pyannote on CPU. Correct model-relative timestamps at the transcript-normalization boundary; do not defer known model timestamp defects to translation. Subtitle rendering must preserve real cross-speaker overlap, replace overlapping lines from the same speaker, and emit both compatible SRT and styled ASS without changing translation IDs. Provider or model integrations should not leak credentials into output metadata.
+Maintain explicit boundaries between audio extraction, speech transcription, transcript normalization, translation, and subtitle rendering. The Compose project runs the web orchestrator and CUDA transcription API as separate containers; the STT image isolates Kotoba and WhisperX in separate Python environments. The host STT API can run with Whisper on MPS and Pyannote on CPU. Correct model-relative timestamps at the transcript-normalization boundary; do not defer known model timestamp defects to translation. Subtitle rendering must preserve real cross-speaker overlap, replace overlapping lines from the same speaker, and emit both compatible SRT and styled ASS without changing translation IDs. Provider or model integrations should not leak credentials into output metadata.
 
 ## Build, Test, and Development Commands
 

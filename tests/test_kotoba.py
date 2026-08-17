@@ -600,7 +600,7 @@ class TranscribeTests(unittest.TestCase):
             trust_remote_code=True,
         )
         speech_pipeline.assert_called_once_with(
-            "/output/sample.wav",
+            str(Path("/output/sample.wav")),
             chunk_length_s=60,
             add_punctuation=False,
             num_speakers=2,

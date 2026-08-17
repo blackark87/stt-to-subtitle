@@ -187,6 +187,7 @@ class WebSettings:
     lm_base_url: str
     lm_token: str
     lm_model: str
+    gpu_dashboard_url: str = ""
     secure_cookie: bool = False
     maximum_listed_files: int = 5000
     stt_poll_interval: float = 5.0
@@ -218,6 +219,10 @@ class WebSettings:
                 "OPENAI_COMPATIBLE_MODEL",
                 "LM_STUDIO_MODEL",
             ).strip(),
+            gpu_dashboard_url=os.environ.get(
+                "GPU_DASHBOARD_URL",
+                "",
+            ).strip().rstrip("/"),
             secure_cookie=_env_bool("WEB_SECURE_COOKIE"),
             maximum_listed_files=int(
                 os.environ.get("WEB_MAXIMUM_LISTED_FILES", "5000")
@@ -244,6 +249,11 @@ class WebSettings:
             raise ValueError("WEB_MAXIMUM_LISTED_FILES must be positive")
         if self.stt_poll_interval <= 0:
             raise ValueError("STT_POLL_INTERVAL_SECONDS must be positive")
+        if self.gpu_dashboard_url:
+            normalize_server_url(
+                self.gpu_dashboard_url,
+                "GPU_DASHBOARD_URL",
+            )
         if (
             self.translation_batch_segments < 1
             or self.translation_batch_characters < 1

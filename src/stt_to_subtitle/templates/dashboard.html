@@ -1,25 +1,16 @@
 {% extends "base.html" %}
 {% import "_icons.html" as icons %}
-{% block title %}작업 대시보드 · STT to Subtitle{% endblock %}
-{% block head %}
-  <script defer src="{{ url_for('static', path='/media-picker.js') }}"></script>
-  <script defer src="{{ url_for('static', path='/folder-browser.js') }}"></script>
-{% endblock %}
+{% block title %}대시보드 · STT to Subtitle{% endblock %}
 {% block content %}
-  <div
-    class="folder-loading-overlay"
-    data-folder-loading
-    aria-live="polite"
-    aria-busy="true"
-    hidden
-  >
-    <div class="folder-loading-panel">
-      <span class="loading-spinner" aria-hidden="true"></span>
-      <strong>폴더 내용을 불러오는 중...</strong>
+  <div class="page-heading workspace-heading">
+    <div>
+      <p class="page-kicker">OVERVIEW</p>
+      <h1>대시보드</h1>
+      <p class="muted">파이프라인 상태와 최근 작업을 한눈에 확인합니다.</p>
     </div>
+    <a class="button" href="/media">{{ icons.folder(16) }}새 작업 만들기</a>
   </div>
-  <h1>자막 작업</h1>
-  <p class="muted">전사, 기존 전사 번역, 전체 자막 생성 중 필요한 처리 범위를 선택합니다.</p>
+
   {% if not remote_servers.configured %}
     <p class="alert">
       작업을 시작하려면 먼저 <a href="/settings">전사·번역 서버를 설정</a>하세요.
@@ -32,214 +23,67 @@
     {% include "_job_stats.html" %}
   </div>
 
-  <section class="card">
-    <h2>새 작업</h2>
-    <form method="post" action="/jobs" class="grid-form">
-      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-      <input type="hidden" name="return_folder" value="{{ current_folder }}">
-      <fieldset class="media-picker wide">
-        <legend>미디어 탐색</legend>
-        <nav class="breadcrumbs" aria-label="미디어 폴더 경로">
-          {% for breadcrumb in breadcrumbs %}
-            {% if loop.last %}
-              <span aria-current="page">{{ breadcrumb.name }}</span>
-            {% else %}
-              <a data-folder-link href="/?folder={{ breadcrumb.path|urlencode }}">{{ breadcrumb.name }}</a>
-              <span class="breadcrumb-separator" aria-hidden="true">/</span>
-            {% endif %}
-          {% endfor %}
-        </nav>
-        {% set selectable_files = files|selectattr("selectable")|list %}
-        {% if selectable_files or folders %}
-          <div class="media-toolbar">
-            <span>
-              <strong data-selection-count>0</strong>개 선택
-              <small class="media-selection-help">폴더 작업은 선택한 처리 단계가 이미 완료된 파일을 자동 제외합니다.</small>
-            </span>
-            <span class="media-toolbar-actions">
-              <button type="button" class="secondary compact" data-select-all>전체 선택</button>
-              <button type="button" class="secondary compact" data-clear-selection>선택 해제</button>
-            </span>
-          </div>
-        {% endif %}
-        {% if folders or files %}
-          <div class="media-board">
-          {% for folder in folders %}
-            <article class="folder-card media-card is-selectable">
-              <label class="folder-select">
-                <input
-                  class="media-card-checkbox"
-                  name="folder_rels"
-                  type="checkbox"
-                  value="{{ folder.path }}"
-                  aria-label="{{ folder.name }} 폴더 전체 선택"
-                >
-                <span>하위 미완료 작업 선택</span>
-              </label>
-              <a data-folder-link href="/?folder={{ folder.path|urlencode }}">
-                <span class="folder-visual folder-icon" aria-hidden="true">
-                  {{ icons.folder(40) }}
-                </span>
-                <span class="folder-card-content">
-                  <strong class="folder-name">{{ folder.name }}</strong>
-                  <span class="folder-summary">폴더 열기</span>
-                </span>
-              </a>
-            </article>
-          {% endfor %}
-          {% for file in files %}
-            {% if file.selectable %}
-              <label class="media-card video-card is-selectable">
-                <input
-                  class="media-card-checkbox"
-                  name="source_rels"
-                  type="checkbox"
-                  value="{{ file.path }}"
-                  aria-label="{{ file.name }} 선택"
-                >
-            {% elif file.job_id %}
-              <a class="media-card video-card is-linked" href="/jobs/{{ file.job_id }}" aria-label="{{ file.name }} 작업 상세 보기">
-            {% else %}
-              <article class="media-card video-card">
-            {% endif %}
-                {% if file.has_nfo %}
-                  <span class="poster-frame">
-                    {% if file.poster_path %}
-                      <img
-                        src="{{ url_for('media_poster', poster_path=file.poster_path) }}"
-                        alt="{{ file.title }} 포스터"
-                        loading="lazy"
-                      >
-                    {% else %}
-                      <span class="poster-placeholder" aria-hidden="true">포스터 없음</span>
-                    {% endif %}
-                  </span>
-                  <span class="media-card-content">
-                    <span class="metadata-label">NFO</span>
-                    <strong class="media-title">{{ file.title }}</strong>
-                    <span class="media-filename" title="{{ file.name }}">{{ file.name }}</span>
-                    <span class="media-size">{{ file.size|filesize }}</span>
-                    <span class="media-duration">재생시간 {{ file.duration_seconds|duration }}</span>
-                    <span
-                      class="subtitle-state is-{{ file.subtitle_state }}"
-                      data-processing-stage="{{ file.processing_status }}"
-                    >
-                      {{ file.processing_label }}
-                    </span>
-                  </span>
-                {% else %}
-                  <span class="video-placeholder" aria-hidden="true">
-                    <span class="video-play">{{ icons.play(20) }}</span>
-                  </span>
-                  <span class="media-card-content">
-                    <strong class="media-title">{{ file.name }}</strong>
-                    <span class="media-size">{{ file.size|filesize }}</span>
-                    <span class="media-duration">재생시간 {{ file.duration_seconds|duration }}</span>
-                    <span
-                      class="subtitle-state is-{{ file.subtitle_state }}"
-                      data-processing-stage="{{ file.processing_status }}"
-                    >
-                      {{ file.processing_label }}
-                    </span>
-                  </span>
-                {% endif %}
-            {% if file.selectable %}
-              </label>
-            {% elif file.job_id %}
-              </a>
-            {% else %}
-              </article>
-            {% endif %}
-          {% endfor %}
-          </div>
-        {% else %}
-          <p class="empty-state">이 폴더에 하위 폴더나 지원 미디어 파일이 없습니다.</p>
-        {% endif %}
-      </fieldset>
-
-      <h3 class="form-section-title wide">처리 설정</h3>
-      <label class="wide">전사 엔진
-        <select name="backend">
-          <option value="hybrid" selected>하이브리드 (WhisperX + Kotoba 보정)</option>
-          <option value="whisperx">WhisperX</option>
-          <option value="kotoba">Kotoba</option>
-        </select>
-        <span class="field-help">전사와 전체 작업에 적용됩니다. 하이브리드는 WhisperX 30초·Kotoba 15초 결과를 비교해 이상 구간을 보정합니다.</span>
-      </label>
-      <details class="advanced-options wide">
-        <summary>
-          <strong>고급 옵션</strong>
-          <span class="muted">오디오 구간 · 화자 수 · 필터 (기본값 그대로 진행 가능)</span>
-        </summary>
-        <div class="advanced-options-grid grid-form">
-          <label>오디오 스트림
-            <input name="audio_stream" type="number" min="0" value="0" required>
-          </label>
-          <label>시작(초)
-            <input name="start_seconds" type="number" min="0" step="0.1" value="0" required>
-          </label>
-          <label>길이(초)
-            <input name="duration_seconds" type="number" min="0" step="0.1" placeholder="비우거나 0 = 끝까지">
-          </label>
-          <label>단독 엔진 청크(초)
-            <input name="chunk_length_seconds" type="number" min="1" value="60" required>
-            <span class="field-help">Kotoba 또는 WhisperX 단독 선택 시 적용됩니다.</span>
-          </label>
-          <label>하이브리드 Kotoba 청크(초)
-            <input name="hybrid_kotoba_chunk_length_seconds" type="number" min="1" value="15" required>
-          </label>
-          <label>하이브리드 WhisperX 청크(초)
-            <input name="hybrid_whisperx_chunk_length_seconds" type="number" min="1" value="30" required>
-          </label>
-          <label>화자 수
-            <input name="num_speakers" type="number" min="1" placeholder="자동">
-          </label>
-          <label>최소 화자
-            <input name="min_speakers" type="number" min="1" placeholder="자동">
-          </label>
-          <label>최대 화자
-            <input name="max_speakers" type="number" min="1" placeholder="자동">
-          </label>
-          <div class="option-checks wide">
-            <label class="check"><input name="add_punctuation" type="checkbox"><span>일본어 구두점 모델 사용</span></label>
-            <label class="check">
-              <input name="noise_filter" type="hidden" value="false">
-              <input name="noise_filter" type="checkbox" value="true" checked>
-              <span>소음 오인식 필터 사용</span>
-            </label>
-            <label class="check"><input name="force_overwrite" type="checkbox"><span>기존 <code>.ko.srt/.ko.ass</code> 강제 덮어쓰기</span></label>
-          </div>
-        </div>
-      </details>
-      <label class="wide">번역 프롬프트 카테고리
-        <select name="prompt_category_id" data-prompt-category>
-          <option value="">전체·번역 작업을 시작하려면 선택하세요</option>
-          {% for category in prompt_categories %}
-            <option value="{{ category.id }}">{{ category.name }}</option>
-          {% endfor %}
-        </select>
-        <span class="field-help">번역과 전체 작업에만 필요합니다. 작업 등록 시 현재 프롬프트가 복사되어 이후 설정 변경의 영향을 받지 않습니다.</span>
-      </label>
-      <div class="wide submit-row">
-        <button type="submit" name="operation" value="transcribe" class="secondary" data-batch-submit data-requires-servers data-server-configured="{{ 'true' if remote_servers.configured else 'false' }}" disabled>전사</button>
-        <button type="submit" name="operation" value="translate" class="secondary" data-batch-submit data-requires-servers data-server-configured="{{ 'true' if remote_servers.configured else 'false' }}" disabled>번역</button>
-        <button type="submit" name="operation" value="full" data-batch-submit data-requires-servers data-server-configured="{{ 'true' if remote_servers.configured else 'false' }}" disabled>전체</button>
+  <div class="dashboard-grid">
+    <section class="card dashboard-action-card">
+      <span class="dashboard-card-icon" aria-hidden="true">{{ icons.folder(22) }}</span>
+      <div>
+        <p class="page-kicker">NEW JOB</p>
+        <h2>미디어에서 시작</h2>
+        <p class="muted">파일 또는 폴더를 선택하고 전사·번역 범위를 지정합니다.</p>
       </div>
-      <p class="wide action-help muted">전사: 오디오 추출 → 전사 · 번역: 기존 전사 → 번역 → 자막 · 전체: 오디오 추출 → 전사 → 번역 → 자막</p>
-    </form>
-  </section>
+      <a class="button secondary" href="/media">미디어 열기{{ icons.chevron_right(16) }}</a>
+    </section>
 
-  <section class="card recent-jobs-card">
+    <section class="card service-card">
+      <div class="section-heading compact-heading">
+        <div>
+          <p class="page-kicker">SERVICES</p>
+          <h2>서비스 연결</h2>
+        </div>
+        <a href="/settings">설정</a>
+      </div>
+      <dl class="service-status-list">
+        <div>
+          <dt>전사 API</dt>
+          <dd class="connection-state{% if remote_servers.stt_base_url %} is-ready{% endif %}">
+            {{ "설정됨" if remote_servers.stt_base_url else "미설정" }}
+          </dd>
+        </div>
+        <div>
+          <dt>번역 API</dt>
+          <dd class="connection-state{% if remote_servers.lm_base_url and remote_servers.lm_model %} is-ready{% endif %}">
+            {{ "설정됨" if remote_servers.lm_base_url and remote_servers.lm_model else "미설정" }}
+          </dd>
+        </div>
+      </dl>
+      {% if gpu_dashboard_url %}
+        <a class="service-monitor-link" href="{{ gpu_dashboard_url }}" target="_blank" rel="noreferrer">
+          GPU 모니터링 열기{{ icons.chevron_right(15) }}
+        </a>
+      {% else %}
+        <p class="service-card-note">GPU 관측 프로젝트를 연결하려면 <code>GPU_DASHBOARD_URL</code>을 설정하세요.</p>
+      {% endif %}
+    </section>
+  </div>
+
+  <section class="card recent-jobs-card dashboard-jobs-card">
     <div class="section-heading">
       <div>
+        <p class="page-kicker">RECENT ACTIVITY</p>
         <h2>최근 작업</h2>
-        <p class="muted">상태와 관계없이 생성 시각 최신순으로 20개씩 표시합니다.</p>
+        <p class="muted">가장 최근에 갱신된 작업을 확인합니다.</p>
       </div>
+      <a class="button secondary" href="/jobs">전체 작업 보기{{ icons.chevron_right(16) }}</a>
     </div>
     <div
-      data-update-url="/jobs-fragment?jobs_page={{ jobs_page }}&amp;folder={{ current_folder|urlencode }}"
+      data-update-url="/jobs-fragment?jobs_page={{ jobs_page }}&amp;compact=true"
       aria-live="off"
     >
+      {% set job_list_title = "최근 작업" %}
+      {% set job_list_description = "최신순, 페이지당 20개" %}
+      {% set show_bulk_actions = false %}
+      {% set translatable_job_ids = [] %}
+      {% set translatable_job_count = 0 %}
       {% include "_jobs_table.html" %}
     </div>
   </section>

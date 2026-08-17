@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export a self-contained macOS STT runtime outside the Git worktree."""
+"""Export a self-contained STT API runtime outside the Git worktree."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import argparse
 from pathlib import Path
 import shutil
 
-RUNTIME_MARKER = "stt-to-subtitle macos runtime v1\n"
+RUNTIME_MARKER = "stt-to-subtitle stt runtime v1\n"
 
 
 def _copy_runtime_files(repository_root: Path, target: Path) -> None:
@@ -19,17 +19,17 @@ def _copy_runtime_files(repository_root: Path, target: Path) -> None:
         repository_root / "requirements-kotoba.txt": (
             target / "requirements-kotoba.txt"
         ),
-        repository_root / ".env.macos.example": target / ".env.example",
-        repository_root / "scripts" / "run-macos-stt.sh": (
-            target / "scripts" / "run-macos-stt.sh"
+        repository_root / ".env.stt.example": target / ".env.example",
+        repository_root / "scripts" / "run-stt-api.sh": (
+            target / "scripts" / "run-stt-api.sh"
         ),
-        repository_root / "scripts" / "macos-runtime" / "setup.sh": (
+        repository_root / "scripts" / "stt-runtime" / "setup.sh": (
             target / "setup.sh"
         ),
-        repository_root / "scripts" / "macos-runtime" / "run.sh": (
+        repository_root / "scripts" / "stt-runtime" / "run.sh": (
             target / "run.sh"
         ),
-        repository_root / "scripts" / "macos-runtime" / "README.md": (
+        repository_root / "scripts" / "stt-runtime" / "README.md": (
             target / "README.md"
         ),
     }
@@ -46,7 +46,7 @@ def _copy_runtime_files(repository_root: Path, target: Path) -> None:
         target_package,
         ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
     )
-    (target / ".stt-macos-runtime").write_text(
+    (target / ".stt-runtime").write_text(
         RUNTIME_MARKER,
         encoding="utf-8",
     )
@@ -66,11 +66,11 @@ def create_runtime(
     if resolved_target == root or root in resolved_target.parents:
         raise ValueError("runtime target must be outside the Git repository")
 
-    marker = resolved_target / ".stt-macos-runtime"
+    marker = resolved_target / ".stt-runtime"
     if update:
         if not resolved_target.is_dir() or not marker.is_file():
             raise ValueError(
-                "--update requires an existing exported macOS runtime"
+                "--update requires an existing exported STT runtime"
             )
         if marker.read_text(encoding="utf-8") != RUNTIME_MARKER:
             raise ValueError("runtime marker is invalid or unsupported")
@@ -89,7 +89,7 @@ def create_runtime(
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Copy the macOS STT application into a runtime directory "
+            "Copy the STT API application into a runtime directory "
             "outside the Git worktree."
         )
     )
@@ -103,7 +103,7 @@ def main() -> None:
         action="store_true",
         help=(
             "refresh application files in an exported runtime while "
-            "preserving .env, .venv-macos, and var"
+            "preserving .env, .venv-stt, and var"
         ),
     )
     arguments = parser.parse_args()
@@ -114,7 +114,7 @@ def main() -> None:
         parser.error(str(error))
 
     action = "Updated" if arguments.update else "Created"
-    print(f"{action} macOS STT runtime: {target}")
+    print(f"{action} STT API runtime: {target}")
     print(f"Next: cd {target} && ./setup.sh")
 
 

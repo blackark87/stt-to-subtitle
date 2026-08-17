@@ -270,7 +270,17 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             for key, value in {"folder": folder, **values}.items()
             if value not in (None, "")
         }
+        if folder:
+            return f"/media?{urlencode(query)}"
         return f"/?{urlencode(query)}" if query else "/"
+
+    def media_location(folder: str = "", **values: object) -> str:
+        query = {
+            key: value
+            for key, value in {"folder": folder, **values}.items()
+            if value not in (None, "")
+        }
+        return f"/media?{urlencode(query)}" if query else "/media"
 
     def job_action_location(
         job_id: str,
@@ -463,8 +473,27 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         *,
         error: str | None = None,
         notice: str | None = None,
-        folder: str = "",
         jobs_page: int = 1,
+    ) -> dict[str, Any]:
+        service = orchestrator(request)
+        return {
+            "request": request,
+            **job_list_context(service, jobs_page=jobs_page),
+            "job_stats": job_stats(service),
+            "csrf_token": request.session.get("csrf_token", ""),
+            "error": error,
+            "notice": notice,
+            "remote_servers": service.remote_servers_view(),
+            "gpu_dashboard_url": configured_settings.gpu_dashboard_url,
+            "prompt_categories": service.active_prompt_categories(),
+        }
+
+    def media_context(
+        request: Request,
+        *,
+        error: str | None = None,
+        notice: str | None = None,
+        folder: str = "",
     ) -> dict[str, Any]:
         service = orchestrator(request)
         browser = service.library.browse(folder)
@@ -532,12 +561,6 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
 
         return {
             "request": request,
-            **job_list_context(
-                service,
-                jobs_page=jobs_page,
-                folder=folder,
-            ),
-            "job_stats": job_stats(service),
             "csrf_token": request.session.get("csrf_token", ""),
             "error": error,
             "notice": notice,
@@ -614,6 +637,11 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
     ) -> Any:
         if not is_authenticated(request):
             return login_redirect()
+        if folder:
+            return RedirectResponse(
+                media_location(folder),
+                status_code=status.HTTP_303_SEE_OTHER,
+            )
         notice = None
         if queued is not None and queued > 0:
             notice = f"작업 {queued}개를 등록했습니다."
@@ -636,7 +664,6 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             context = dashboard_context(
                 request,
                 notice=notice,
-                folder=folder,
                 jobs_page=(
                     completed_page
                     if completed_page is not None and jobs_page == 1
@@ -650,6 +677,55 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         return TEMPLATES.TemplateResponse(
             request,
             "dashboard.html",
+            context,
+            status_code=response_status,
+        )
+
+    @app.get("/media", response_class=HTMLResponse)
+    def media_page(
+        request: Request,
+        queued: int | None = None,
+        skipped: int | None = None,
+        translation_pause_requested: int | None = None,
+        translations_paused: int | None = None,
+        jobs_stopped: int | None = None,
+        jobs_retried: int | None = None,
+        translations_queued: int | None = None,
+        folder: str = "",
+    ) -> Any:
+        if not is_authenticated(request):
+            return login_redirect()
+        notice = None
+        if queued is not None and queued > 0:
+            notice = f"작업 {queued}개를 등록했습니다."
+            if skipped:
+                notice += f" 기존 작업·자막 {skipped}개는 제외했습니다."
+        elif translation_pause_requested is not None:
+            notice = "번역 중단 요청을 반영했습니다."
+        elif translations_paused is not None:
+            notice = f"번역 작업 {translations_paused}개에 중단을 요청했습니다."
+        elif jobs_stopped is not None:
+            notice = f"진행 중인 작업 {jobs_stopped}개에 중단을 요청했습니다."
+        elif jobs_retried is not None:
+            notice = f"중단·실패 작업 {jobs_retried}개를 재시도했습니다."
+        elif translations_queued is not None:
+            notice = (
+                f"선택한 전사 작업 {translations_queued}개를 번역으로 "
+                "전환했습니다."
+            )
+        try:
+            context = media_context(
+                request,
+                notice=notice,
+                folder=folder,
+            )
+            response_status = status.HTTP_200_OK
+        except ValueError as error:
+            context = media_context(request, error=str(error))
+            response_status = status.HTTP_400_BAD_REQUEST
+        return TEMPLATES.TemplateResponse(
+            request,
+            "media.html",
             context,
             status_code=response_status,
         )
@@ -950,6 +1026,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         completed_page: int | None = None,
         folder: str = "",
         status_group: str | None = None,
+        compact: bool = False,
     ) -> Any:
         if not is_authenticated(request):
             raise HTTPException(status_code=401, detail="authentication required")
@@ -963,6 +1040,16 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                 status_group=status_group,
                 folder=folder,
             )
+            if compact:
+                context.update(
+                    {
+                        "job_list_title": "최근 작업",
+                        "job_list_description": "최신순, 페이지당 20개",
+                        "show_bulk_actions": False,
+                        "translatable_job_ids": set(),
+                        "translatable_job_count": 0,
+                    }
+                )
         except ValueError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
         return TEMPLATES.TemplateResponse(
@@ -1088,16 +1175,16 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             )
         except (FileExistsError, OSError, ValueError) as error:
             try:
-                context = dashboard_context(
+                context = media_context(
                     request,
                     error=str(error),
                     folder=return_folder,
                 )
             except ValueError:
-                context = dashboard_context(request, error=str(error))
+                context = media_context(request, error=str(error))
             return TEMPLATES.TemplateResponse(
                 request,
-                "dashboard.html",
+                "media.html",
                 context,
                 status_code=status.HTTP_400_BAD_REQUEST,
             )
@@ -1107,7 +1194,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         if return_folder:
             query["folder"] = return_folder
         return RedirectResponse(
-            f"/?{urlencode(query)}",
+            f"/media?{urlencode(query)}",
             status_code=status.HTTP_303_SEE_OTHER,
         )
 
@@ -1474,7 +1561,6 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                 context = dashboard_context(
                     request,
                     error=str(error),
-                    folder=return_folder,
                     jobs_page=return_jobs_page,
                 )
             except ValueError:

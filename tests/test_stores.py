@@ -94,6 +94,7 @@ class TranscriptionStoreTests(unittest.TestCase):
                     """,
                     (now, now),
                 )
+            connection.close()
 
             job = TranscriptionStore(database_path).get("job-1")
 
@@ -410,6 +411,7 @@ class JobStoreTests(unittest.TestCase):
                     """,
                     (now, now),
                 )
+            connection.close()
 
             job = JobStore(database_path).get("job-1")
 

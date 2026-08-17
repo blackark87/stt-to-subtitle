@@ -20,7 +20,7 @@ class BuildFfmpegCommandTests(unittest.TestCase):
         self.assertIn("0:a:1", command)
         self.assertIn("16000", command)
         self.assertIn("pcm_s16le", command)
-        self.assertEqual(command[-1], "/output/movie.wav")
+        self.assertEqual(command[-1], str(Path("/output/movie.wav")))
         self.assertEqual(command[command.index("-ss") + 1], "30.5")
         self.assertEqual(command[command.index("-t") + 1], "120.0")
 
