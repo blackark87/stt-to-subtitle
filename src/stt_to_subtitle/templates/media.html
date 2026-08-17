@@ -39,7 +39,6 @@
     <div class="section-heading">
       <div>
         <h2>파일 선택</h2>
-        <p class="muted">폴더를 이동하거나 여러 파일을 한 번에 선택할 수 있습니다.</p>
       </div>
     </div>
     <form
@@ -156,7 +155,7 @@
                   {% endif %}
                   <span class="media-card-content">
                     <span class="metadata-label multipart-badge">MULTIPART · {{ file.part_count }}</span>
-                    <strong class="media-title">{{ file.title }}</strong>
+                    <strong class="media-title" title="{{ file.title }}">{{ file.title }}</strong>
                     {% if file.name != file.title %}
                       <span class="media-filename" title="{{ file.paths|join(', ') }}">{{ file.name }}</span>
                     {% endif %}
@@ -184,7 +183,7 @@
                   </span>
                   <span class="media-card-content">
                     <span class="metadata-label">NFO</span>
-                    <strong class="media-title">{{ file.title }}</strong>
+                    <strong class="media-title" title="{{ file.title }}">{{ file.title }}</strong>
                     <span class="media-filename" title="{{ file.name }}">{{ file.name }}</span>
                     {% if search_query %}<span class="media-path" title="{{ file.path }}">{{ file.path }}</span>{% endif %}
                     <span class="media-size">{{ file.size|filesize }}</span>
@@ -201,7 +200,8 @@
                     <span class="video-play">{{ icons.play(20) }}</span>
                   </span>
                   <span class="media-card-content">
-                    <strong class="media-title">{{ file.name }}</strong>
+                    <span class="metadata-label is-empty" aria-hidden="true">&nbsp;</span>
+                    <strong class="media-title" title="{{ file.name }}">{{ file.name }}</strong>
                     {% if search_query %}<span class="media-path" title="{{ file.path }}">{{ file.path }}</span>{% endif %}
                     <span class="media-size">{{ file.size|filesize }}</span>
                     <span class="media-duration">재생시간 {{ file.duration_seconds|duration }}</span>
@@ -234,19 +234,25 @@
       </fieldset>
 
       <h3 class="form-section-title wide">처리 설정</h3>
-      <label class="wide">전사 엔진
-        <select name="backend">
-          <option value="hybrid" selected>하이브리드 (WhisperX + Kotoba 보정)</option>
-          <option value="whisperx">WhisperX</option>
-          <option value="kotoba">Kotoba</option>
-        </select>
-        <span class="field-help">전사와 전체 작업에 적용됩니다. 하이브리드는 WhisperX 30초·Kotoba 15초 결과를 비교해 이상 구간을 보정합니다.</span>
-      </label>
+      <div class="wide processing-choices">
+        <label>전사 엔진
+          <select name="backend">
+            <option value="hybrid" selected>하이브리드 (WhisperX + Kotoba 보정)</option>
+            <option value="whisperx">WhisperX</option>
+            <option value="kotoba">Kotoba</option>
+          </select>
+        </label>
+        <label>번역 프롬프트 카테고리
+          <select name="prompt_category_id" data-prompt-category>
+            <option value="">전체·번역 작업을 시작하려면 선택하세요</option>
+            {% for category in prompt_categories %}
+              <option value="{{ category.id }}">{{ category.name }}</option>
+            {% endfor %}
+          </select>
+        </label>
+      </div>
       <details class="advanced-options wide">
-        <summary>
-          <strong>고급 옵션</strong>
-          <span class="muted">오디오 구간 · 화자 수 · 필터 (기본값 그대로 진행 가능)</span>
-        </summary>
+        <summary><strong>고급 옵션</strong></summary>
         <div class="advanced-options-grid grid-form">
           <label>오디오 스트림
             <input name="audio_stream" type="number" min="0" value="0" required>
@@ -259,7 +265,6 @@
           </label>
           <label>단독 엔진 청크(초)
             <input name="chunk_length_seconds" type="number" min="1" value="60" required>
-            <span class="field-help">Kotoba 또는 WhisperX 단독 선택 시 적용됩니다.</span>
           </label>
           <label>하이브리드 Kotoba 청크(초)
             <input name="hybrid_kotoba_chunk_length_seconds" type="number" min="1" value="15" required>
@@ -287,22 +292,12 @@
           </div>
         </div>
       </details>
-      <label class="wide">번역 프롬프트 카테고리
-        <select name="prompt_category_id" data-prompt-category>
-          <option value="">전체·번역 작업을 시작하려면 선택하세요</option>
-          {% for category in prompt_categories %}
-            <option value="{{ category.id }}">{{ category.name }}</option>
-          {% endfor %}
-        </select>
-        <span class="field-help">번역과 전체 작업에만 필요합니다. 작업 등록 시 현재 프롬프트가 복사되어 이후 설정 변경의 영향을 받지 않습니다.</span>
-      </label>
       <div class="wide submit-row">
-        <button type="submit" name="operation" value="transcribe" class="secondary" data-batch-submit data-requires-servers data-server-configured="{{ 'true' if remote_servers.configured else 'false' }}" disabled>전사</button>
+        <button type="submit" name="operation" value="transcribe" class="secondary" data-batch-submit data-requires-servers data-server-configured="{{ 'true' if remote_servers.configured else 'false' }}" title="오디오 추출 → 전사" disabled>전사</button>
         <button type="submit" name="operation" value="compare" class="secondary" data-batch-submit data-requires-servers data-server-configured="{{ 'true' if remote_servers.configured else 'false' }}" title="선택 파일마다 하이브리드·WhisperX·Kotoba 전사 작업을 생성합니다" disabled>전사 비교</button>
-        <button type="submit" name="operation" value="translate" class="secondary" data-batch-submit data-requires-servers data-server-configured="{{ 'true' if remote_servers.configured else 'false' }}" disabled>번역</button>
-        <button type="submit" name="operation" value="full" data-batch-submit data-requires-servers data-server-configured="{{ 'true' if remote_servers.configured else 'false' }}" disabled>전체</button>
+        <button type="submit" name="operation" value="translate" class="secondary" data-batch-submit data-requires-servers data-server-configured="{{ 'true' if remote_servers.configured else 'false' }}" title="기존 전사 → 번역 → 자막" disabled>번역</button>
+        <button type="submit" name="operation" value="full" data-batch-submit data-requires-servers data-server-configured="{{ 'true' if remote_servers.configured else 'false' }}" title="오디오 추출 → 전사 → 번역 → 자막" disabled>전체</button>
       </div>
-      <p class="wide action-help muted">전사: 오디오 추출 → 전사 · 전사 비교: 세 엔진을 각각 실행해 결과 비교 · 번역: 기존 전사 → 번역 → 자막 · 전체: 오디오 추출 → 전사 → 번역 → 자막</p>
     </form>
   </section>
 

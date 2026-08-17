@@ -345,6 +345,9 @@ button:disabled, .button:disabled { opacity: .5; cursor: not-allowed; box-shadow
 }
 .media-card {
   position: relative;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
   min-width: 0;
   padding: 12px;
   border: 1px solid var(--line);
@@ -409,31 +412,42 @@ button:disabled, .button:disabled { opacity: .5; cursor: not-allowed; box-shadow
   box-shadow: 0 6px 18px color-mix(in srgb, #000 22%, transparent);
   font-size: 1.2rem;
 }
-.media-card-content { display: grid; min-width: 0; gap: 4px; margin-top: 10px; }
+.media-card-content { display: flex; flex-direction: column; flex: 1; min-width: 0; gap: 4px; margin-top: 10px; }
 .metadata-label { width: max-content; border-radius: 4px; padding: 1px 5px; background: color-mix(in srgb, var(--accent) 12%, transparent); color: var(--accent); font-size: .72rem; font-weight: 750; }
-.media-title { min-width: 0; font-size: .96rem; line-height: 1.4; overflow-wrap: anywhere; }
+.media-title {
+  display: -webkit-box;
+  min-width: 0;
+  max-width: 100%;
+  min-height: 2.8em;
+  overflow: hidden;
+  font-size: .96rem;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
 .media-filename { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .media-filename, .media-path, .media-size, .media-duration { color: var(--muted); font-size: .78rem; font-weight: 400; }
 .media-path { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.subtitle-state { width: max-content; margin-top: 5px; border-radius: 999px; padding: 2px 8px; font-size: .77rem; font-weight: 750; }
+.subtitle-state { width: max-content; max-width: 100%; margin-top: auto; border-radius: 999px; padding: 2px 8px; font-size: .77rem; font-weight: 750; white-space: nowrap; }
 .subtitle-state::before { content: ""; display: inline-block; width: 6px; height: 6px; margin-right: 6px; border-radius: 50%; background: currentColor; vertical-align: .08em; }
 .subtitle-state.is-completed { background: color-mix(in srgb, var(--success) 16%, var(--card)); color: var(--success); }
 .subtitle-state.is-progress { background: color-mix(in srgb, var(--accent) 14%, var(--card)); color: var(--accent); }
 .subtitle-state.is-running { background: color-mix(in srgb, var(--accent) 16%, var(--card)); color: var(--accent); }
 .subtitle-state.is-attention { background: color-mix(in srgb, var(--danger) 14%, var(--card)); color: var(--danger); }
 .subtitle-state.is-pending { background: color-mix(in srgb, var(--line) 60%, transparent); color: var(--muted); }
-.multipart-badge { display: inline-flex; align-items: center; justify-content: center; width: 100%; height: 24px; box-sizing: border-box; border-radius: 6px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.multipart-badge { white-space: nowrap; font-variant-numeric: tabular-nums; }
+.metadata-label.is-empty { visibility: hidden; }
 .empty-state { margin: 0; padding: 24px; border: 1px dashed var(--line); border-radius: 8px; color: var(--muted); text-align: center; }
 .form-section-title { margin: 8px 0 0; padding-top: 18px; border-top: 1px solid var(--line); font-size: 1rem; }
+.processing-choices { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr)); align-items: end; gap: 14px; }
 .advanced-options { border: 1px solid var(--line); border-radius: var(--radius-control); padding: 12px 14px; background: var(--surface-sunken); }
 .advanced-options[open] { padding-bottom: 16px; }
 .advanced-options summary { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; cursor: pointer; font-weight: 650; list-style: revert; }
-.advanced-options summary .muted { font-weight: 400; font-size: .84rem; }
 .advanced-options-grid { margin-top: 16px; }
 .option-checks { display: flex; align-items: flex-start; gap: 12px 28px; flex-wrap: wrap; }
 .submit-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
 .submit-row .muted { font-size: .88rem; }
-.action-help { margin: -4px 0 0; font-size: .86rem; }
 .field-help { color: var(--muted); font-size: .82rem; font-weight: 400; }
 .comparison-guidance { margin: 0 0 18px; border: 1px solid color-mix(in srgb, var(--accent) 26%, var(--line)); border-radius: var(--radius-control); padding: 12px 14px; background: color-mix(in srgb, var(--accent) 8%, var(--card)); color: var(--muted); }
 .comparison-progress { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 18px; }

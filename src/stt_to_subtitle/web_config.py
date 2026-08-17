@@ -734,10 +734,14 @@ class MediaLibrary:
         return duration
 
     def _find_nfo(self, source_path: Path) -> Path | None:
-        for candidate in (
-            source_path.with_suffix(".nfo"),
-            source_path.parent / "movie.nfo",
-        ):
+        candidates = [source_path.with_suffix(".nfo")]
+        multipart = MULTIPART_STEM_PATTERN.fullmatch(source_path.stem)
+        if multipart is not None:
+            candidates.append(
+                source_path.with_name(f"{multipart.group('base')}.nfo")
+            )
+        candidates.append(source_path.parent / "movie.nfo")
+        for candidate in candidates:
             if candidate.is_file() and not candidate.is_symlink():
                 return candidate
         return None
