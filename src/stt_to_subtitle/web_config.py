@@ -72,6 +72,14 @@ def _multipart_part_sort_key(value: str) -> tuple[tuple[int, object], ...]:
     )
 
 
+def _nfo_actor_name(element: "ElementTree.Element") -> str:
+    """Return an actor name from either a nested <name> or the element text."""
+    for child in element:
+        if child.tag.rsplit("}", 1)[-1].lower() == "name":
+            return (child.text or "").strip()
+    return (element.text or "").strip()
+
+
 def group_multipart_media(
     media_files: Sequence[dict[str, object]],
 ) -> list[dict[str, object]]:
@@ -156,6 +164,13 @@ def group_multipart_media(
                 ),
                 "has_nfo": any(bool(item.get("has_nfo")) for item in members),
                 "poster_path": poster_path,
+                "actors": list(
+                    dict.fromkeys(
+                        name
+                        for item in members
+                        for name in (item.get("actors") or ())
+                    )
+                ),
                 "multipart": True,
                 "part_count": len(members),
             }
@@ -663,8 +678,9 @@ class MediaLibrary:
         nfo_path = self._find_nfo(path)
         title: str | None = None
         poster_path: str | None = None
+        actors: list[str] = []
         if nfo_path is not None:
-            title, poster_references = self._read_nfo(nfo_path)
+            title, poster_references, actors = self._read_nfo(nfo_path)
             poster = self._find_poster(path, nfo_path, poster_references)
             if poster is not None:
                 poster_path = poster.relative_to(self.root).as_posix()
@@ -677,12 +693,13 @@ class MediaLibrary:
             "has_nfo": nfo_path is not None,
             "title": title or path.stem,
             "poster_path": poster_path,
+            "actors": actors,
         }
 
     def _media_title(self, path: Path) -> str:
         nfo_path = self._find_nfo(path)
         if nfo_path is not None:
-            title, _ = self._read_nfo(nfo_path)
+            title, _, _ = self._read_nfo(nfo_path)
             if title:
                 return title
         return path.stem
@@ -746,18 +763,27 @@ class MediaLibrary:
                 return candidate
         return None
 
-    def _read_nfo(self, nfo_path: Path) -> tuple[str | None, list[str]]:
+    def _read_nfo(
+        self,
+        nfo_path: Path,
+    ) -> tuple[str | None, list[str], list[str]]:
         try:
             if nfo_path.stat().st_size > MAX_NFO_BYTES:
-                return None, []
+                return None, [], []
             root = ElementTree.parse(nfo_path).getroot()
         except (ElementTree.ParseError, OSError):
-            return None, []
+            return None, [], []
 
         title: str | None = None
         poster_references: list[str] = []
+        actors: list[str] = []
         for element in root.iter():
             tag = element.tag.rsplit("}", 1)[-1].lower()
+            if tag == "actor":
+                name = _nfo_actor_name(element)
+                if name and name not in actors:
+                    actors.append(name)
+                continue
             value = (element.text or "").strip()
             if not value:
                 continue
@@ -770,7 +796,7 @@ class MediaLibrary:
                 and element.attrib.get("aspect", "").strip().lower() == "poster"
             ):
                 poster_references.append(value)
-        return title, poster_references
+        return title, poster_references, actors
 
     def _find_poster(
         self,
