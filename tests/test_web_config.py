@@ -103,6 +103,62 @@ class MediaLibraryTests(unittest.TestCase):
             )
             self.assertTrue(season_view["files"][0]["has_subtitle"])
 
+    def test_nfo_actor_names_are_exposed_for_media_entries(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "nested.mkv").write_bytes(b"media")
+            (root / "nested.nfo").write_text(
+                "<movie><title>제목</title>"
+                "<actor><name>미야시타 레나</name><role>본인</role></actor>"
+                "<actor><name>사토 아이</name></actor>"
+                "<actor><name>미야시타 레나</name></actor>"
+                "</movie>",
+                encoding="utf-8",
+            )
+            (root / "plain.mkv").write_bytes(b"media")
+            (root / "plain.nfo").write_text(
+                "<movie><title>제목</title><actor>모리 히나코</actor></movie>",
+                encoding="utf-8",
+            )
+            (root / "none.mkv").write_bytes(b"media")
+
+            files = {
+                item["name"]: item
+                for item in MediaLibrary(root).browse()["files"]
+            }
+
+            self.assertEqual(
+                files["nested.mkv"]["actors"],
+                ["미야시타 레나", "사토 아이"],
+            )
+            self.assertEqual(files["plain.mkv"]["actors"], ["모리 히나코"])
+            self.assertEqual(files["none.mkv"]["actors"], [])
+
+    def test_multipart_group_merges_actor_names_without_duplicates(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            show = root / "show"
+            show.mkdir()
+            for part, actor in ((1, "사토 아이"), (2, "모리 히나코")):
+                (show / f"movie-pt{part}.mkv").write_bytes(b"media")
+                (show / f"movie-pt{part}.nfo").write_text(
+                    "<movie><title>같은 제목</title>"
+                    "<actor><name>미야시타 레나</name></actor>"
+                    f"<actor><name>{actor}</name></actor>"
+                    "</movie>",
+                    encoding="utf-8",
+                )
+
+            view = MediaLibrary(root).browse("show")
+            grouped = group_multipart_media(view["files"])[0]
+
+            self.assertEqual(
+                grouped["actors"],
+                ["미야시타 레나", "사토 아이", "모리 히나코"],
+            )
+
     def test_multipart_parts_inherit_the_group_level_nfo(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
