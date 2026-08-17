@@ -41,8 +41,9 @@
   promptCategory?.addEventListener("change", update);
 
   picker.querySelector("[data-select-all]")?.addEventListener("click", () => {
+    // 이미 자막이 있는 항목은 담지 않는다. 다시 번역하려면 직접 고른다.
     for (const checkbox of checkboxes) {
-      checkbox.checked = true;
+      checkbox.checked = checkbox.hasAttribute("data-auto-select");
     }
     update();
   });

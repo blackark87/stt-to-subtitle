@@ -69,8 +69,7 @@
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <input type="hidden" name="return_folder" value="{{ current_folder }}">
       <input type="hidden" name="return_query" value="{{ search_query }}">
-      <fieldset class="media-picker wide">
-        <legend>미디어 탐색</legend>
+      <fieldset class="media-picker wide" aria-label="미디어 탐색">
         <nav class="breadcrumbs" aria-label="미디어 폴더 경로">
           {% for breadcrumb in breadcrumbs %}
             {% if loop.last %}
@@ -89,8 +88,8 @@
         {% set selectable_files = files|selectattr("selectable")|list %}
         {% if selectable_files or folders %}
           <div class="media-toolbar">
-            <span>
-              <strong data-selection-count>0</strong>개 선택
+            <span class="media-selection-summary">
+              <span><strong data-selection-count>0</strong>개 선택</span>
               <small class="media-selection-help">폴더 작업은 선택한 처리 단계가 이미 완료된 파일을 자동 제외합니다.</small>
             </span>
             <span class="media-toolbar-actions">
@@ -133,6 +132,7 @@
                   type="checkbox"
                   value="{% if file.multipart %}{{ file.paths|tojson|forceescape }}{% else %}{{ file.path }}{% endif %}"
                   aria-label="{{ file.title if file.multipart else file.name }}{% if file.multipart %} {{ file.part_count }}파트{% endif %} 선택"
+                  {% if file.auto_selectable %}data-auto-select{% endif %}
                 >
             {% elif file.job_id %}
               <a class="media-card video-card is-linked" href="/jobs/{{ file.job_id }}" aria-label="{{ file.name }} 작업 상세 보기">
@@ -162,12 +162,18 @@
                     {% if search_query %}<span class="media-path" title="{{ file.actors|join(', ') if file.actors else file.path }}">{{ file.actors|actor_label }}</span>{% endif %}
                     <span class="media-size">{{ file.size|filesize }}</span>
                     <span class="media-duration">총 재생시간 {{ file.duration_seconds|duration }}</span>
-                    <span
-                      class="subtitle-state multipart-badge is-{{ file.subtitle_state }}"
-                      data-processing-stage="{{ file.processing_status }}"
-                    >
-                      {{ file.processing_label }}
-                    </span>
+                    {% if file.selectable and file.job_id %}
+                      <a
+                        class="subtitle-state multipart-badge is-{{ file.subtitle_state }}"
+                        data-processing-stage="{{ file.processing_status }}"
+                        href="/jobs/{{ file.job_id }}"
+                      >{{ file.processing_label }}</a>
+                    {% else %}
+                      <span
+                        class="subtitle-state multipart-badge is-{{ file.subtitle_state }}"
+                        data-processing-stage="{{ file.processing_status }}"
+                      >{{ file.processing_label }}</span>
+                    {% endif %}
                   </span>
                 {% elif file.has_nfo %}
                   <span class="poster-frame">
@@ -188,12 +194,18 @@
                     {% if search_query %}<span class="media-path" title="{{ file.actors|join(', ') if file.actors else file.path }}">{{ file.actors|actor_label }}</span>{% endif %}
                     <span class="media-size">{{ file.size|filesize }}</span>
                     <span class="media-duration">재생시간 {{ file.duration_seconds|duration }}</span>
-                    <span
-                      class="subtitle-state is-{{ file.subtitle_state }}"
-                      data-processing-stage="{{ file.processing_status }}"
-                    >
-                      {{ file.processing_label }}
-                    </span>
+                    {% if file.selectable and file.job_id %}
+                      <a
+                        class="subtitle-state is-{{ file.subtitle_state }}"
+                        data-processing-stage="{{ file.processing_status }}"
+                        href="/jobs/{{ file.job_id }}"
+                      >{{ file.processing_label }}</a>
+                    {% else %}
+                      <span
+                        class="subtitle-state is-{{ file.subtitle_state }}"
+                        data-processing-stage="{{ file.processing_status }}"
+                      >{{ file.processing_label }}</span>
+                    {% endif %}
                   </span>
                 {% else %}
                   <span class="video-placeholder" aria-hidden="true">
@@ -205,12 +217,18 @@
                     {% if search_query %}<span class="media-path" title="{{ file.actors|join(', ') if file.actors else file.path }}">{{ file.actors|actor_label }}</span>{% endif %}
                     <span class="media-size">{{ file.size|filesize }}</span>
                     <span class="media-duration">재생시간 {{ file.duration_seconds|duration }}</span>
-                    <span
-                      class="subtitle-state is-{{ file.subtitle_state }}"
-                      data-processing-stage="{{ file.processing_status }}"
-                    >
-                      {{ file.processing_label }}
-                    </span>
+                    {% if file.selectable and file.job_id %}
+                      <a
+                        class="subtitle-state is-{{ file.subtitle_state }}"
+                        data-processing-stage="{{ file.processing_status }}"
+                        href="/jobs/{{ file.job_id }}"
+                      >{{ file.processing_label }}</a>
+                    {% else %}
+                      <span
+                        class="subtitle-state is-{{ file.subtitle_state }}"
+                        data-processing-stage="{{ file.processing_status }}"
+                      >{{ file.processing_label }}</span>
+                    {% endif %}
                   </span>
                 {% endif %}
             {% if file.selectable %}

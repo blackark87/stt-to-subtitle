@@ -32,6 +32,7 @@ MEDIA_EXTENSIONS = {
 POSTER_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 MAX_NFO_BYTES = 2 * 1024 * 1024
 IGNORED_DIRECTORY_NAMES = {
+    ".actors",
     ".ds_store",
     ".snapshot",
     ".snapshots",
@@ -40,6 +41,7 @@ IGNORED_DIRECTORY_NAMES = {
     "@recycle",
     "@sharesnap",
     "@tmp",
+    "extrafanart",
 }
 IGNORED_FILE_NAMES = {
     ".ds_store",

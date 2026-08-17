@@ -435,7 +435,8 @@ class WebAppTests(unittest.TestCase):
             self.assertIn("미처리", root_response.text)
             self.assertNotIn("folder-glyph", root_response.text)
             self.assertEqual(response.status_code, 200)
-            self.assertNotIn('name="source_rels"', response.text)
+            self.assertIn('name="source_rels"', response.text)
+            self.assertNotIn("data-auto-select", response.text)
             self.assertIn('name="return_folder" value="show"', response.text)
             self.assertIn("첫 번째 에피소드", response.text)
             self.assertIn("한국어 자막 있음", response.text)
@@ -1041,7 +1042,7 @@ class WebAppTests(unittest.TestCase):
             for stage, label in expected_stages.items():
                 self.assertRegex(
                     response.text,
-                    rf'data-processing-stage="{stage}"\s*>\s*{label}',
+                    rf'data-processing-stage="{stage}"[^>]*>\s*{label}',
                 )
             self.assertIn("하위 미완료 작업 선택", response.text)
             self.assertIn("이미 완료된 파일을 자동 제외", response.text)
@@ -1353,7 +1354,17 @@ class WebAppTests(unittest.TestCase):
             self.assertIn('href="/jobs/done-job"', page.text)
             self.assertIn('href="/jobs/failed-job"', page.text)
             self.assertIn('value="pending.mp4"', page.text)
-            self.assertNotIn('value="done.mp4"', page.text)
+            # 완료된 항목도 다시 번역하려면 개별 선택이 되어야 한다.
+            self.assertIn('value="done.mp4"', page.text)
+            # 다만 '전체 선택'에는 담기지 않는다.
+            self.assertRegex(
+                page.text,
+                r'value="pending\.mp4"[^>]*\s+data-auto-select',
+            )
+            self.assertNotRegex(
+                page.text,
+                r'value="done\.mp4"[^>]*\s+data-auto-select',
+            )
 
     def test_deletes_legacy_audio_and_missing_remote_job_records(
         self,
