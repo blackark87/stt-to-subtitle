@@ -1,0 +1,38 @@
+<nav class="job-status-filter job-stage-filter" aria-label="작업 단계 필터">
+  <a
+    class="button{% if not selected_status_group and not selected_stage_filter %} is-filter-active{% else %} secondary{% endif %}"
+    href="/jobs"
+    {% if not selected_status_group and not selected_stage_filter %}aria-current="page"{% endif %}
+  >전체</a>
+  {% for stage in job_stage_filters %}
+    <div class="job-stage-filter-group">
+      <a
+        class="button{% if stage.key == selected_stage_filter %} is-filter-active{% elif stage.key == selected_stage_group %} is-filter-group-active{% else %} secondary{% endif %}"
+        href="/jobs?stage_filter={{ stage.key }}"
+        {% if stage.key == selected_stage_filter %}aria-current="page"{% endif %}
+      >
+        <span>{{ stage.label }}</span>
+        <span
+          class="job-stage-filter-count"
+          aria-label="{{ job_stage_counts[stage.key] }}건"
+        >{{ job_stage_counts[stage.key] }}</span>
+      </a>
+      {% if stage.children %}
+        <div class="job-stage-filter-children" aria-label="{{ stage.label }} 세부 상태">
+          {% for child in stage.children %}
+            <a
+              class="button{% if child.key == selected_stage_filter %} is-filter-active{% else %} secondary{% endif %}"
+              href="/jobs?stage_filter={{ child.key }}"
+              {% if child.key == selected_stage_filter %}aria-current="page"{% endif %}
+            >{{ child.label }}</a>
+          {% endfor %}
+        </div>
+      {% endif %}
+    </div>
+  {% endfor %}
+  <a
+    class="button{% if selected_status_group == 'attention' %} is-filter-active{% else %} secondary{% endif %}"
+    href="/jobs?status_group=attention"
+    {% if selected_status_group == 'attention' %}aria-current="page"{% endif %}
+  >확인 필요</a>
+</nav>

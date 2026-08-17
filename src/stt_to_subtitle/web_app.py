@@ -92,6 +92,61 @@ JOB_STATUS_GROUP_LABELS = {
     "waiting": "대기",
     "completed": "완료",
 }
+JOB_STAGE_FILTERS = {
+    "extraction": {"queued", "extracting", "audio_completed"},
+    "transcription": {
+        "audio_ready",
+        "transcription_running",
+        "transcription_completed",
+    },
+    "transcription_waiting": {"audio_ready"},
+    "transcription_running": {"transcription_running"},
+    "transcription_completed": {"transcription_completed"},
+    "translation": {
+        "transcribed",
+        "translation_running",
+        "translation_paused",
+        "translated",
+    },
+    "translation_waiting": {"transcribed"},
+    "translation_running": {"translation_running"},
+    "translation_completed": {"translated"},
+    "completed": {"rendering", "completed"},
+}
+JOB_STAGE_FILTER_LABELS = {
+    "extraction": "추출",
+    "transcription": "전사",
+    "transcription_waiting": "전사 · 대기",
+    "transcription_running": "전사 · 진행 중",
+    "transcription_completed": "전사 · 완료",
+    "translation": "번역",
+    "translation_waiting": "번역 · 대기",
+    "translation_running": "번역 · 진행 중",
+    "translation_completed": "번역 · 완료",
+    "completed": "완료",
+}
+JOB_STAGE_FILTER_NAV = (
+    {"key": "extraction", "label": "추출", "children": ()},
+    {
+        "key": "transcription",
+        "label": "전사",
+        "children": (
+            {"key": "transcription_waiting", "label": "대기"},
+            {"key": "transcription_running", "label": "진행 중"},
+            {"key": "transcription_completed", "label": "완료"},
+        ),
+    },
+    {
+        "key": "translation",
+        "label": "번역",
+        "children": (
+            {"key": "translation_waiting", "label": "대기"},
+            {"key": "translation_running", "label": "진행 중"},
+            {"key": "translation_completed", "label": "완료"},
+        ),
+    },
+    {"key": "completed", "label": "완료", "children": ()},
+)
 JOB_STATUS_LABELS = {
     "queued": "대기 중",
     "extracting": "오디오 추출 중",
@@ -532,8 +587,27 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         return_folder: str,
         return_status_group: str,
         return_jobs_page: int,
+        return_stage_filter: str = "",
         **values: object,
     ) -> str:
+        if return_status_group and return_stage_filter:
+            raise ValueError(
+                "작업 상태와 단계 필터를 동시에 사용할 수 없습니다."
+            )
+        if (
+            return_status_group
+            and return_status_group not in JOB_STATUS_GROUPS
+        ):
+            raise ValueError("지원하지 않는 작업 상태 필터입니다.")
+        if return_stage_filter and return_stage_filter not in JOB_STAGE_FILTERS:
+            raise ValueError("지원하지 않는 작업 단계 필터입니다.")
+        if return_stage_filter:
+            query = {
+                "stage_filter": return_stage_filter,
+                "jobs_page": max(1, return_jobs_page),
+                **values,
+            }
+            return f"/jobs?{urlencode(query)}"
         if return_status_group:
             query = {
                 "status_group": return_status_group,
@@ -561,22 +635,63 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             for group, statuses in JOB_STATUS_GROUPS.items()
         }
 
+    def validate_job_list_filters(
+        *,
+        status_group: str | None,
+        stage_filter: str | None,
+    ) -> None:
+        if status_group is not None and status_group not in JOB_STATUS_GROUPS:
+            raise ValueError("지원하지 않는 작업 상태 필터입니다.")
+        if stage_filter is not None and stage_filter not in JOB_STAGE_FILTERS:
+            raise ValueError("지원하지 않는 작업 단계 필터입니다.")
+        if status_group is not None and stage_filter is not None:
+            raise ValueError("작업 상태와 단계 필터를 동시에 사용할 수 없습니다.")
+
+    def job_stage_filter_context(
+        service: SubtitleOrchestrator,
+        *,
+        status_group: str | None,
+        stage_filter: str | None,
+    ) -> dict[str, Any]:
+        validate_job_list_filters(
+            status_group=status_group,
+            stage_filter=stage_filter,
+        )
+        return {
+            "job_stage_filters": JOB_STAGE_FILTER_NAV,
+            "job_stage_counts": {
+                stage["key"]: service.store.count_jobs(
+                    statuses=JOB_STAGE_FILTERS[stage["key"]]
+                )
+                for stage in JOB_STAGE_FILTER_NAV
+            },
+            "selected_status_group": status_group,
+            "selected_stage_filter": stage_filter,
+            "selected_stage_group": (
+                stage_filter.split("_", 1)[0] if stage_filter else None
+            ),
+        }
+
     def job_list_context(
         service: SubtitleOrchestrator,
         *,
         jobs_page: int,
         status_group: str | None = None,
+        stage_filter: str | None = None,
         folder: str = "",
         limit: int = RECENT_JOB_LIMIT,
         paginated: bool = True,
     ) -> dict[str, Any]:
-        if status_group is not None and status_group not in JOB_STATUS_GROUPS:
-            raise ValueError("지원하지 않는 작업 상태 필터입니다.")
-        statuses = (
-            JOB_STATUS_GROUPS[status_group]
-            if status_group is not None
-            else None
+        validate_job_list_filters(
+            status_group=status_group,
+            stage_filter=stage_filter,
         )
+        if stage_filter is not None:
+            statuses = JOB_STAGE_FILTERS[stage_filter]
+        elif status_group is not None:
+            statuses = JOB_STATUS_GROUPS[status_group]
+        else:
+            statuses = None
         jobs_page = max(1, jobs_page) if paginated else 1
         job_count = service.store.count_jobs(statuses=statuses)
         jobs_offset = (jobs_page - 1) * limit
@@ -600,15 +715,22 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             if folder:
                 return media_location(folder, jobs_page=page)
             query = {"jobs_page": page}
-            if status_group is not None:
+            if stage_filter is not None:
+                query = {"stage_filter": stage_filter, **query}
+            elif status_group is not None:
                 query = {"status_group": status_group, **query}
             return "/jobs?" + urlencode(query)
 
         label = (
-            JOB_STATUS_GROUP_LABELS[status_group]
-            if status_group is not None
-            else "전체"
+            JOB_STAGE_FILTER_LABELS[stage_filter]
+            if stage_filter is not None
+            else (
+                JOB_STATUS_GROUP_LABELS[status_group]
+                if status_group is not None
+                else "전체"
+            )
         )
+        filtered = status_group is not None or stage_filter is not None
         return {
             "recent_jobs": recent_jobs,
             "translatable_job_ids": translatable_job_ids,
@@ -636,20 +758,24 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             "job_count": job_count,
             "job_list_title": f"{label} 작업",
             "job_list_description": (
-                f"{label} 상태만 최신순으로, 페이지당 {limit}개씩 표시합니다."
-                if status_group is not None
+                f"{label} 단계만 최신순으로, 페이지당 {limit}개씩 표시합니다."
+                if filtered
                 else (
                     f"최신순, 페이지당 {limit}개 · "
                     "중단 요청은 안전한 지점에서 반영됩니다."
                 )
             ),
             "job_list_empty_message": (
-                f"{label} 상태의 작업이 없습니다."
-                if status_group is not None
+                f"{label} 단계의 작업이 없습니다."
+                if filtered
                 else "등록된 작업이 없습니다."
             ),
-            "show_bulk_actions": status_group is None,
+            "show_bulk_actions": not filtered,
             "selected_status_group": status_group,
+            "selected_stage_filter": stage_filter,
+            "selected_stage_group": (
+                stage_filter.split("_", 1)[0] if stage_filter else None
+            ),
             "current_folder": folder,
         }
 
@@ -1468,6 +1594,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
     def jobs_page(
         request: Request,
         status_group: str = "",
+        stage_filter: str = "",
         jobs_page: int = 1,
         translations_queued: int | None = None,
     ) -> Any:
@@ -1480,6 +1607,12 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                     orchestrator(request),
                     jobs_page=jobs_page,
                     status_group=status_group or None,
+                    stage_filter=stage_filter or None,
+                ),
+                **job_stage_filter_context(
+                    orchestrator(request),
+                    status_group=status_group or None,
+                    stage_filter=stage_filter or None,
                 ),
                 "status_groups": JOB_STATUS_GROUP_LABELS,
                 "csrf_token": request.session.get("csrf_token", ""),
@@ -1497,6 +1630,31 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         except ValueError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
         return TEMPLATES.TemplateResponse(request, "jobs.html", context)
+
+    @app.get("/job-stage-filters-fragment", response_class=HTMLResponse)
+    def job_stage_filters_fragment(
+        request: Request,
+        status_group: str = "",
+        stage_filter: str = "",
+    ) -> Any:
+        if not is_authenticated(request):
+            raise HTTPException(
+                status_code=401,
+                detail="authentication required",
+            )
+        try:
+            context = job_stage_filter_context(
+                orchestrator(request),
+                status_group=status_group or None,
+                stage_filter=stage_filter or None,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        return TEMPLATES.TemplateResponse(
+            request,
+            "_job_stage_filters.html",
+            {"request": request, **context},
+        )
 
     @app.get("/comparisons", response_class=HTMLResponse)
     def transcription_comparison_history_page(
@@ -1779,6 +1937,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         completed_page: int | None = None,
         folder: str = "",
         status_group: str | None = None,
+        stage_filter: str | None = None,
         compact: bool = False,
     ) -> Any:
         if not is_authenticated(request):
@@ -1791,6 +1950,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                 service,
                 jobs_page=1 if compact else jobs_page,
                 status_group=status_group or None,
+                stage_filter=stage_filter or None,
                 folder=folder,
                 limit=DASHBOARD_JOB_LIMIT if compact else RECENT_JOB_LIMIT,
                 paginated=not compact,
@@ -2423,9 +2583,24 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         )
 
     @app.get("/jobs/{job_id}", response_class=HTMLResponse)
-    def job_page(request: Request, job_id: str) -> Any:
+    def job_page(
+        request: Request,
+        job_id: str,
+        return_status_group: str = "",
+        return_stage_filter: str = "",
+        return_jobs_page: int = 1,
+    ) -> Any:
         if not is_authenticated(request):
             return login_redirect()
+        try:
+            job_return_url = job_list_action_location(
+                return_folder="",
+                return_status_group=return_status_group,
+                return_stage_filter=return_stage_filter,
+                return_jobs_page=return_jobs_page,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
         service = orchestrator(request)
         job = service.store.get(job_id)
         if job is None:
@@ -2435,6 +2610,10 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             "job.html",
             {
                 "job": job,
+                "job_return_url": job_return_url,
+                "return_status_group": return_status_group,
+                "return_stage_filter": return_stage_filter,
+                "return_jobs_page": max(1, return_jobs_page),
                 "events": [
                     event
                     for event in service.store.events(job_id)
@@ -2459,9 +2638,24 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         )
 
     @app.get("/jobs/{job_id}/panel", response_class=HTMLResponse)
-    def job_panel(request: Request, job_id: str) -> Any:
+    def job_panel(
+        request: Request,
+        job_id: str,
+        return_status_group: str = "",
+        return_stage_filter: str = "",
+        return_jobs_page: int = 1,
+    ) -> Any:
         if not is_authenticated(request):
             raise HTTPException(status_code=401, detail="authentication required")
+        try:
+            job_list_action_location(
+                return_folder="",
+                return_status_group=return_status_group,
+                return_stage_filter=return_stage_filter,
+                return_jobs_page=return_jobs_page,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
         service = orchestrator(request)
         job = service.store.get(job_id)
         if job is None:
@@ -2471,6 +2665,9 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             "_job_panel.html",
             {
                 "job": job,
+                "return_status_group": return_status_group,
+                "return_stage_filter": return_stage_filter,
+                "return_jobs_page": max(1, return_jobs_page),
                 "events": [
                     event
                     for event in service.store.events(job_id)
@@ -2543,16 +2740,25 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         job_id: str,
         csrf_token: str = Form(""),
         return_folder: str | None = Form(None),
+        return_status_group: str = Form(""),
+        return_stage_filter: str = Form(""),
+        return_jobs_page: int = Form(1),
     ) -> Any:
         if not is_authenticated(request):
             return login_redirect()
         validate_csrf(request, csrf_token)
         try:
+            return_location = job_list_action_location(
+                return_folder=return_folder or "",
+                return_status_group=return_status_group,
+                return_stage_filter=return_stage_filter,
+                return_jobs_page=return_jobs_page,
+            )
             orchestrator(request).delete_job_record(job_id)
         except ValueError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
         return RedirectResponse(
-            dashboard_location(return_folder or ""),
+            return_location,
             status_code=status.HTTP_303_SEE_OTHER,
         )
 
@@ -2638,6 +2844,15 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                         if return_status_group in JOB_STATUS_GROUPS
                         else None
                     ),
+                ),
+                **job_stage_filter_context(
+                    service,
+                    status_group=(
+                        return_status_group
+                        if return_status_group in JOB_STATUS_GROUPS
+                        else None
+                    ),
+                    stage_filter=None,
                 ),
                 "status_groups": JOB_STATUS_GROUP_LABELS,
                 "csrf_token": request.session.get("csrf_token", ""),

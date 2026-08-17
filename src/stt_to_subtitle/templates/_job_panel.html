@@ -1,4 +1,5 @@
 {% import "_icons.html" as icons %}
+{% set pipeline = job|job_progress %}
 <section
   class="card job-overview-card"
   {% if job.status in ["audio_completed", "transcription_completed", "completed", "translation_paused", "blocked", "failed"] %}data-update-stop{% endif %}
@@ -20,6 +21,60 @@
       </time>
     </p>
   </div>
+  <div
+    class="job-progress-overview"
+    title="파이프라인 단계를 같은 비중으로 계산한 진행률이며 남은 시간 추정치는 아닙니다."
+  >
+    <div class="job-progress-heading">
+      <span>전체 진행률</span>
+      <strong>{{ pipeline.percent }}%</strong>
+      {% if pipeline.complete %}
+        <span class="job-progress-current">모든 단계 완료</span>
+      {% elif pipeline.current %}
+        <span class="job-progress-current">
+          현재 {{ pipeline.current.label }} · {{ pipeline.current.state_label }}
+          {% if pipeline.current.total %}
+            · {{ pipeline.current.completed }}/{% if pipeline.current.total_is_estimate %}약 {% endif %}{{ pipeline.current.total }} 청크
+          {% endif %}
+        </span>
+      {% endif %}
+    </div>
+    <progress
+      value="{{ pipeline.percent }}"
+      max="100"
+      aria-label="전체 진행률 {{ pipeline.percent }}%"
+    ></progress>
+  </div>
+  <ol class="job-stage-strip job-detail-stage-strip" aria-label="단계별 진행 상황">
+    {% for stage in pipeline.stages %}
+      <li
+        class="job-stage is-{{ stage.state }}"
+        {% if stage.state == 'failed' and job.error %}title="error: {{ job.error }}"{% endif %}
+      >
+        <span class="job-stage-icon" aria-hidden="true">
+          {%- if stage.state == 'done' %}{{ icons.check(13) }}
+          {%- elif stage.state == 'running' %}{{ icons.activity(13) }}
+          {%- elif stage.state == 'failed' %}{{ icons.alert_triangle(13) }}
+          {%- elif stage.state == 'paused' %}{{ icons.pause(13) }}
+          {%- else %}{{ icons.clock(13) }}{% endif -%}
+        </span>
+        <span class="job-stage-label">{{ stage.label }}</span>
+        {% if stage.key == 'render' and stage.state == 'done' %}
+          <span class="job-stage-count" aria-hidden="true"></span>
+        {% elif stage.total %}
+          <span class="job-stage-count">{{ stage.completed }}/{% if stage.total_is_estimate %}≈{% endif %}{{ stage.total }}</span>
+        {% else %}
+          <span class="job-stage-count">{{ stage.state_label }}</span>
+        {% endif %}
+        <progress
+          class="job-stage-progress"
+          value="{{ stage.percent }}"
+          max="100"
+          aria-label="{{ stage.label }} 진행률 {{ stage.percent }}%"
+        ></progress>
+      </li>
+    {% endfor %}
+  </ol>
   <dl class="details">
     <dt>작업 ID</dt><dd><code>{{ job.id }}</code></dd>
     <dt>생성 시각</dt>
@@ -99,6 +154,9 @@
         data-confirm-message="{% if job.status == 'audio_completed' %}완료된 오디오 추출 기록을 삭제하시겠습니까? 원본 영상과 생성된 WAV는 삭제하지 않습니다.{% else %}이 작업 기록을 삭제하시겠습니까? 원본 영상과 생성·중간 파일은 삭제하지 않습니다.{% endif %}"
       >
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="return_status_group" value="{{ return_status_group or '' }}">
+        <input type="hidden" name="return_stage_filter" value="{{ return_stage_filter or '' }}">
+        <input type="hidden" name="return_jobs_page" value="{{ return_jobs_page or 1 }}">
         <button type="submit" class="danger">{{ icons.trash(16) }}{% if job.status == 'audio_completed' %}기록 삭제{% else %}작업 삭제{% endif %}</button>
       </form>
     {% endif %}

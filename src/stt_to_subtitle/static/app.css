@@ -205,6 +205,23 @@ a { color: var(--accent); }
 .media-workspace-card { margin-top: 0; }
 .job-status-filter { display: flex; gap: 8px; margin: 0 0 20px; flex-wrap: wrap; }
 .job-status-filter .is-filter-active { box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 35%, transparent); }
+.job-stage-filter { align-items: flex-start; }
+.job-stage-filter-group { display: grid; gap: 6px; }
+.job-stage-filter .is-filter-group-active { border-color: var(--accent); background: var(--accent-subtle); }
+.job-stage-filter-count {
+  display: inline-grid;
+  place-items: center;
+  min-width: 1.6em;
+  min-height: 1.6em;
+  padding: 0 .38em;
+  border-radius: 999px;
+  background: color-mix(in srgb, currentColor 12%, transparent);
+  font-size: .76em;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+.job-stage-filter-children { display: flex; gap: 4px; padding-left: 8px; border-left: 2px solid var(--line); }
+.job-stage-filter-children .button { padding: 5px 8px; font-size: .76rem; }
 .result-preview { border-color: var(--line-strong); }
 h1 { font-size: 1.75rem; font-weight: 700; line-height: 1.25; letter-spacing: -0.01em; }
 h2 { font-size: 1.25rem; font-weight: 700; line-height: 1.35; }
@@ -795,6 +812,7 @@ th, td { border-bottom: 1px solid var(--line); padding: 10px 8px; text-align: le
 .job-stage.is-waiting { color: var(--muted); border-style: dashed; }
 .job-stage.is-pending { color: var(--muted); border-style: dashed; background: transparent; opacity: .62; }
 .job-stage.is-pending .job-stage-label { color: var(--muted); font-weight: 650; }
+.job-detail-stage-strip { margin: 8px 0 18px; }
 .job-progress-note { margin: -1px 0 0; color: var(--muted); font-size: .68rem; line-height: 1.4; }
 .status.has-detail { cursor: help; text-decoration: underline dotted currentColor; text-underline-offset: 3px; }
 .recent-job-actions { display: flex; align-items: flex-start; justify-content: flex-end; gap: 7px; flex-wrap: wrap; }

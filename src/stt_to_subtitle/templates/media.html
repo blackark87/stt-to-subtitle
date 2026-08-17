@@ -90,7 +90,7 @@
           <div class="media-toolbar">
             <span class="media-selection-summary">
               <span><strong data-selection-count>0</strong>개 선택</span>
-              <small class="media-selection-help">폴더 작업은 선택한 처리 단계가 이미 완료된 파일을 자동 제외합니다.</small>
+              <small class="media-selection-help">폴더를 선택하면 하위 폴더까지 포함하며, 선택한 처리 단계가 이미 완료된 파일을 자동 제외합니다.</small>
             </span>
             <span class="media-toolbar-actions">
               <button type="button" class="secondary compact" data-select-all>전체 선택</button>
@@ -108,9 +108,10 @@
                   name="folder_rels"
                   type="checkbox"
                   value="{{ folder.path }}"
+                  data-auto-select
                   aria-label="{{ folder.name }} 폴더 전체 선택"
                 >
-                <span>하위 미완료 작업 선택</span>
+                <span>폴더 전체 선택</span>
               </label>
               <a data-folder-link href="/media?folder={{ folder.path|urlencode }}">
                 <span class="folder-visual folder-icon" aria-hidden="true">

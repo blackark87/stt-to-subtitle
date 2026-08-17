@@ -328,6 +328,138 @@ class WebAppTests(unittest.TestCase):
             )
             self.assertEqual(invalid_page.status_code, 400)
 
+    def test_job_list_uses_two_level_pipeline_stage_filters(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            with TestClient(create_app(self.settings(root, media_root))) as client:
+                service = client.app.state.orchestrator
+                service.stop()
+                for job_id, status in (
+                    ("extracting", "extracting"),
+                    ("transcription-waiting", "audio_ready"),
+                    ("transcription-running", "transcription_running"),
+                    ("transcription-completed", "transcription_completed"),
+                    ("translation-waiting", "transcribed"),
+                    ("translation-running", "translation_running"),
+                    ("translation-completed", "translated"),
+                    ("rendering", "rendering"),
+                    ("completed", "completed"),
+                ):
+                    job = service.store.create(
+                        job_id=job_id,
+                        source_rel=f"{job_id}.mkv",
+                        force_overwrite=False,
+                        options={},
+                    )
+                    service.store.update(job.id, status=status)
+
+                page = client.get("/jobs")
+                transcription = client.get(
+                    "/jobs?stage_filter=transcription"
+                )
+                transcription_waiting = client.get(
+                    "/jobs?stage_filter=transcription_waiting"
+                )
+                translation_completed = client.get(
+                    "/jobs?stage_filter=translation_completed"
+                )
+                completed = client.get("/jobs?stage_filter=completed")
+                invalid = client.get("/jobs?stage_filter=unknown")
+                stage_counts = client.get(
+                    "/job-stage-filters-fragment"
+                    "?stage_filter=transcription"
+                )
+                service.store.update("extracting", status="audio_ready")
+                refreshed_stage_counts = client.get(
+                    "/job-stage-filters-fragment"
+                    "?stage_filter=transcription"
+                )
+
+            self.assertEqual(page.status_code, 200)
+            for stage_filter, label in (
+                ("extraction", "추출"),
+                ("transcription", "전사"),
+                ("translation", "번역"),
+                ("completed", "완료"),
+            ):
+                self.assertIn(
+                    f'href="/jobs?stage_filter={stage_filter}"',
+                    page.text,
+                )
+                self.assertIn(f"<span>{label}</span>", page.text)
+            for stage_filter in (
+                "transcription_waiting",
+                "transcription_running",
+                "transcription_completed",
+                "translation_waiting",
+                "translation_running",
+                "translation_completed",
+            ):
+                self.assertIn(
+                    f'href="/jobs?stage_filter={stage_filter}"',
+                    page.text,
+                )
+            self.assertEqual(page.text.count("job-stage-filter-children"), 2)
+            self.assertEqual(page.text.count("job-stage-filter-count"), 4)
+            self.assertIn(
+                'data-update-url="/job-stage-filters-fragment?',
+                page.text,
+            )
+            for stage_filter, label, count in (
+                ("extraction", "추출", 1),
+                ("transcription", "전사", 3),
+                ("translation", "번역", 3),
+                ("completed", "완료", 2),
+            ):
+                self.assertRegex(
+                    stage_counts.text,
+                    rf'href="/jobs\?stage_filter={stage_filter}"[^>]*>'
+                    rf'\s*<span>{label}</span>\s*'
+                    rf'<span class="job-stage-filter-count" '
+                    rf'aria-label="{count}건">{count}</span>',
+                )
+            self.assertRegex(
+                refreshed_stage_counts.text,
+                r'href="/jobs\?stage_filter=extraction"[^>]*>\s*'
+                r'<span>추출</span>\s*<span '
+                r'class="job-stage-filter-count" aria-label="0건">0</span>',
+            )
+            self.assertRegex(
+                refreshed_stage_counts.text,
+                r'href="/jobs\?stage_filter=transcription"[^>]*>\s*'
+                r'<span>전사</span>\s*<span '
+                r'class="job-stage-filter-count" aria-label="4건">4</span>',
+            )
+            self.assertIn("transcription-waiting.mkv", transcription.text)
+            self.assertIn("transcription-running.mkv", transcription.text)
+            self.assertIn("transcription-completed.mkv", transcription.text)
+            self.assertNotIn("translation-waiting.mkv", transcription.text)
+            self.assertIn(
+                "transcription-waiting.mkv",
+                transcription_waiting.text,
+            )
+            self.assertNotIn(
+                "transcription-running.mkv",
+                transcription_waiting.text,
+            )
+            self.assertIn(
+                "translation-completed.mkv",
+                translation_completed.text,
+            )
+            self.assertNotIn(
+                "translation-running.mkv",
+                translation_completed.text,
+            )
+            self.assertIn("rendering.mkv", completed.text)
+            self.assertIn("completed.mkv", completed.text)
+            self.assertIn(
+                "stage_filter=completed&amp;jobs_page=1",
+                completed.text,
+            )
+            self.assertEqual(invalid.status_code, 400)
+
     def test_primary_pages_separate_overview_media_and_job_history(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -431,6 +563,13 @@ class WebAppTests(unittest.TestCase):
             self.assertEqual(root_response.status_code, 200)
             self.assertIn('class="folder-card media-card', root_response.text)
             self.assertIn("data-folder-link", root_response.text)
+            self.assertRegex(
+                root_response.text,
+                r'name="folder_rels"\s+type="checkbox"\s+'
+                r'value="show"\s+data-auto-select',
+            )
+            self.assertIn("폴더 전체 선택", root_response.text)
+            self.assertIn("하위 폴더까지 포함", root_response.text)
             self.assertIn("data-folder-loading", root_response.text)
             self.assertIn("data-media-loading", root_response.text)
             self.assertIn("data-media-search", root_response.text)
@@ -1114,7 +1253,12 @@ class WebAppTests(unittest.TestCase):
                     response.text,
                     rf'data-processing-stage="{stage}"[^>]*>\s*{label}',
                 )
-            self.assertIn("하위 미완료 작업 선택", response.text)
+            self.assertIn("폴더 전체 선택", response.text)
+            self.assertRegex(
+                response.text,
+                r'name="folder_rels"\s+type="checkbox"\s+'
+                r'value="nested"\s+data-auto-select',
+            )
             self.assertIn("이미 완료된 파일을 자동 제외", response.text)
 
     def test_completed_job_streams_video_range_and_webvtt(self) -> None:
@@ -1345,6 +1489,12 @@ class WebAppTests(unittest.TestCase):
             self.assertIn("20", page.text)
             self.assertIn("21 전체", page.text)
             self.assertIn("1 남음", page.text)
+            self.assertIn('class="job-stage-strip job-detail-stage-strip"', page.text)
+            for stage_label in ("추출", "전사", "번역", "완료"):
+                self.assertIn(
+                    f'<span class="job-stage-label">{stage_label}</span>',
+                    page.text,
+                )
             self.assertIn("한국어 결과 JSON 편집", page.text)
             self.assertEqual(editor.status_code, 200)
             self.assertIn("movie_result_ko.json", editor.text)
@@ -1499,6 +1649,18 @@ class WebAppTests(unittest.TestCase):
                     force_overwrite=False,
                     options={},
                 )
+                invalid_return = service.store.create(
+                    job_id="invalid-return-job",
+                    source_rel=source.name,
+                    force_overwrite=False,
+                    options={},
+                )
+                service.store.update(
+                    invalid_return.id,
+                    status="blocked",
+                    blocked_stage="translation",
+                    error="translation failed",
+                )
                 audio = service.store.create(
                     job_id="audio-job",
                     source_rel=audio_source.name,
@@ -1521,7 +1683,13 @@ class WebAppTests(unittest.TestCase):
                 artifact.write_bytes(b"audio")
 
                 dashboard = client.get("/jobs-fragment")
-                detail = client.get(f"/jobs/{missing.id}")
+                attention_page = client.get(
+                    "/jobs?status_group=attention&jobs_page=1"
+                )
+                detail = client.get(
+                    f"/jobs/{missing.id}?return_status_group=attention"
+                    "&return_jobs_page=2"
+                )
                 audio_detail = client.get(f"/jobs/{audio.id}")
                 rejected = client.post(
                     f"/jobs/{active.id}/delete",
@@ -1529,22 +1697,44 @@ class WebAppTests(unittest.TestCase):
                 )
                 blocked_deleted = client.post(
                     f"/jobs/{other.id}/delete",
+                    data={
+                        "return_status_group": "attention",
+                        "return_jobs_page": "1",
+                    },
                     follow_redirects=False,
                 )
                 failed_deleted = client.post(
                     f"/jobs/{failed.id}/delete",
+                    data={
+                        "return_status_group": "attention",
+                        "return_jobs_page": "1",
+                    },
                     follow_redirects=False,
                 )
                 deleted = client.post(
                     f"/jobs/{missing.id}/delete",
+                    data={
+                        "return_status_group": "attention",
+                        "return_jobs_page": "2",
+                    },
                     follow_redirects=False,
                 )
                 audio_deleted = client.post(
                     f"/jobs/{audio.id}/delete",
+                    data={
+                        "return_stage_filter": "extraction",
+                        "return_jobs_page": "3",
+                    },
+                    follow_redirects=False,
+                )
+                invalid_return_rejected = client.post(
+                    f"/jobs/{invalid_return.id}/delete",
+                    data={"return_status_group": "unknown"},
                     follow_redirects=False,
                 )
 
                 self.assertIsNotNone(service.store.get(active.id))
+                self.assertIsNotNone(service.store.get(invalid_return.id))
                 self.assertIsNone(service.store.get(other.id))
                 self.assertIsNone(service.store.get(failed.id))
                 self.assertIsNone(service.store.get(missing.id))
@@ -1571,6 +1761,22 @@ class WebAppTests(unittest.TestCase):
                 detail.text,
             )
             self.assertIn(
+                'href="/jobs?status_group=attention&amp;jobs_page=2"',
+                detail.text,
+            )
+            self.assertIn(
+                'name="return_status_group" value="attention"',
+                detail.text,
+            )
+            self.assertIn(
+                'name="return_jobs_page" value="2"',
+                detail.text,
+            )
+            self.assertIn(
+                'name="return_status_group" value="attention"',
+                attention_page.text,
+            )
+            self.assertIn(
                 f'action="/jobs/{audio.id}/delete"',
                 dashboard.text,
             )
@@ -1580,7 +1786,23 @@ class WebAppTests(unittest.TestCase):
             self.assertEqual(failed_deleted.status_code, 303)
             self.assertEqual(deleted.status_code, 303)
             self.assertEqual(audio_deleted.status_code, 303)
-            self.assertEqual(deleted.headers["location"], "/")
+            self.assertEqual(invalid_return_rejected.status_code, 400)
+            self.assertEqual(
+                blocked_deleted.headers["location"],
+                "/jobs?status_group=attention&jobs_page=1",
+            )
+            self.assertEqual(
+                failed_deleted.headers["location"],
+                "/jobs?status_group=attention&jobs_page=1",
+            )
+            self.assertEqual(
+                deleted.headers["location"],
+                "/jobs?status_group=attention&jobs_page=2",
+            )
+            self.assertEqual(
+                audio_deleted.headers["location"],
+                "/jobs?stage_filter=extraction&jobs_page=3",
+            )
             self.assertTrue(source.is_file())
             self.assertTrue(artifact.is_file())
             self.assertTrue(audio_source.is_file())

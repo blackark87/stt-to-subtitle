@@ -110,7 +110,7 @@
       {% endif %}
     </div>
     <div class="recent-job-actions">
-      <a class="button secondary compact" href="/jobs/{{ job.id }}">상세 보기</a>
+      <a class="button secondary compact" href="/jobs/{{ job.id }}{% if selected_status_group or selected_stage_filter or jobs_page > 1 %}?return_status_group={{ selected_status_group or '' }}&amp;return_stage_filter={{ selected_stage_filter or '' }}&amp;return_jobs_page={{ jobs_page }}{% endif %}">상세 보기</a>
       {% if job.can_pause_translation and job.status in ["transcribed", "translation_running"] %}
         <form method="post" action="/jobs/{{ job.id }}/pause-translation">
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
@@ -140,6 +140,9 @@
         <form method="post" action="/jobs/{{ job.id }}/delete" data-confirm-message="{% if job.status == 'audio_completed' %}완료된 오디오 추출 기록을 삭제하시겠습니까? 원본 영상과 생성된 WAV는 삭제하지 않습니다.{% else %}이 작업 기록을 삭제하시겠습니까? 원본 영상과 생성·중간 파일은 삭제하지 않습니다.{% endif %}">
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
           <input type="hidden" name="return_folder" value="{{ current_folder }}">
+          <input type="hidden" name="return_status_group" value="{{ selected_status_group or '' }}">
+          <input type="hidden" name="return_stage_filter" value="{{ selected_stage_filter or '' }}">
+          <input type="hidden" name="return_jobs_page" value="{{ jobs_page }}">
           <button type="submit" class="danger compact">{{ icons.trash(14) }}{% if job.status == 'audio_completed' %}기록 삭제{% else %}작업 삭제{% endif %}</button>
         </form>
       {% endif %}
@@ -210,6 +213,6 @@
       </nav>
     {% endif %}
   {% else %}
-    <div class="recent-jobs-empty"><strong>{{ job_list_empty_message|default("등록된 작업이 없습니다.") }}</strong><span>{% if selected_status_group %}다른 상태 필터를 선택해 보세요.{% else %}미디어나 폴더를 선택해 새 작업을 등록하세요.{% endif %}</span></div>
+    <div class="recent-jobs-empty"><strong>{{ job_list_empty_message|default("등록된 작업이 없습니다.") }}</strong><span>{% if selected_status_group or selected_stage_filter %}다른 단계 필터를 선택해 보세요.{% else %}미디어나 폴더를 선택해 새 작업을 등록하세요.{% endif %}</span></div>
   {% endif %}
 </section>
