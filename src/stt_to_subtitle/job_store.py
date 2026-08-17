@@ -83,6 +83,7 @@ class PipelineJob:
     error: str | None
     chunks_created: int
     chunks_completed: int
+    chunks_total_estimate: int
     chunk_progress_every: int
     translation_chunks_total: int
     translation_chunks_completed: int
@@ -94,6 +95,18 @@ class PipelineJob:
     @property
     def chunks_in_progress(self) -> int:
         return max(0, self.chunks_created - self.chunks_completed)
+
+    @property
+    def transcription_chunks_total(self) -> int:
+        return max(self.chunks_created, self.chunks_total_estimate)
+
+    @property
+    def transcription_total_is_estimated(self) -> bool:
+        return self.chunks_total_estimate > self.chunks_created
+
+    @property
+    def transcription_chunks_remaining(self) -> int:
+        return max(0, self.transcription_chunks_total - self.chunks_completed)
 
     @property
     def translation_chunks_in_progress(self) -> int:
@@ -171,6 +184,7 @@ class JobStore:
         "error",
         "chunks_created",
         "chunks_completed",
+        "chunks_total_estimate",
         "chunk_progress_every",
         "translation_chunks_total",
         "translation_chunks_completed",
@@ -227,6 +241,7 @@ class JobStore:
                     error TEXT,
                     chunks_created INTEGER NOT NULL DEFAULT 0,
                     chunks_completed INTEGER NOT NULL DEFAULT 0,
+                    chunks_total_estimate INTEGER NOT NULL DEFAULT 0,
                     chunk_progress_every INTEGER NOT NULL DEFAULT 10,
                     translation_chunks_total INTEGER NOT NULL DEFAULT 0,
                     translation_chunks_completed INTEGER NOT NULL DEFAULT 0,
@@ -284,6 +299,10 @@ class JobStore:
                 "chunks_completed": (
                     "ALTER TABLE jobs ADD COLUMN "
                     "chunks_completed INTEGER NOT NULL DEFAULT 0"
+                ),
+                "chunks_total_estimate": (
+                    "ALTER TABLE jobs ADD COLUMN "
+                    "chunks_total_estimate INTEGER NOT NULL DEFAULT 0"
                 ),
                 "chunk_progress_every": (
                     "ALTER TABLE jobs ADD COLUMN "
@@ -594,6 +613,7 @@ class JobStore:
             error=str(row["error"]) if row["error"] else None,
             chunks_created=int(row["chunks_created"]),
             chunks_completed=int(row["chunks_completed"]),
+            chunks_total_estimate=int(row["chunks_total_estimate"]),
             chunk_progress_every=int(row["chunk_progress_every"]),
             translation_chunks_total=int(row["translation_chunks_total"]),
             translation_chunks_completed=int(

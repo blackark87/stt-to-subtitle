@@ -23,39 +23,38 @@
     {% include "_job_stats.html" %}
   </div>
 
-  <section class="card service-card">
-    <div class="section-heading compact-heading">
-      <div>
-        <p class="page-kicker">SERVICES</p>
-        <h2>서비스 연결</h2>
-      </div>
-      <div class="service-card-links">
-        {% if gpu_dashboard_url %}
-          <a class="service-monitor-link" href="{{ gpu_dashboard_url }}" target="_blank" rel="noreferrer">
-            GPU 모니터링{{ icons.chevron_right(15) }}
-          </a>
-        {% endif %}
+  <div class="dashboard-status-grid">
+    <section class="card service-card">
+      <div class="section-heading compact-heading">
+        <div>
+          <p class="page-kicker">SERVICES</p>
+          <h2>서비스 연결</h2>
+        </div>
         <a class="service-monitor-link" href="/settings">서버 설정{{ icons.chevron_right(15) }}</a>
       </div>
+      <dl class="service-status-list">
+        <div>
+          <dt>전사 API</dt>
+          <dd class="connection-state{% if remote_servers.stt_base_url %} is-ready{% endif %}">
+            {{ "설정됨" if remote_servers.stt_base_url else "미설정" }}
+          </dd>
+        </div>
+        <div>
+          <dt>번역 API</dt>
+          <dd class="connection-state{% if remote_servers.lm_base_url and remote_servers.lm_model %} is-ready{% endif %}">
+            {{ "설정됨" if remote_servers.lm_base_url and remote_servers.lm_model else "미설정" }}
+          </dd>
+        </div>
+      </dl>
+    </section>
+    <div
+      data-gpu-update-url="/gpu-stats-fragment"
+      data-gpu-refresh-milliseconds="{{ gpu_refresh_milliseconds }}"
+      aria-live="polite"
+    >
+      {% include "_gpu_stats.html" %}
     </div>
-    <dl class="service-status-list">
-      <div>
-        <dt>전사 API</dt>
-        <dd class="connection-state{% if remote_servers.stt_base_url %} is-ready{% endif %}">
-          {{ "설정됨" if remote_servers.stt_base_url else "미설정" }}
-        </dd>
-      </div>
-      <div>
-        <dt>번역 API</dt>
-        <dd class="connection-state{% if remote_servers.lm_base_url and remote_servers.lm_model %} is-ready{% endif %}">
-          {{ "설정됨" if remote_servers.lm_base_url and remote_servers.lm_model else "미설정" }}
-        </dd>
-      </div>
-    </dl>
-    {% if not gpu_dashboard_url %}
-      <p class="service-card-note">GPU 관측 프로젝트를 연결하려면 <code>GPU_DASHBOARD_URL</code>을 설정하세요.</p>
-    {% endif %}
-  </section>
+  </div>
 
   <section class="card recent-jobs-card dashboard-jobs-card">
     <div class="section-heading">

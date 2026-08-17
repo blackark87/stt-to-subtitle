@@ -109,16 +109,28 @@ class OpenAICompatibleModelTests(unittest.TestCase):
 
 
 class STTAPIClientProgressTests(unittest.TestCase):
-    def test_stops_polling_when_requested(self) -> None:
-        running = Mock(status_code=200)
-        running.json.return_value = {"status": "running"}
-        client = STTAPIClient("http://stt.test", "", poll_interval=0.01)
-        client.request = Mock(return_value=running)
-        should_stop = Mock(side_effect=[False, True])
+    @staticmethod
+    def event_stream(*payloads: dict[str, object]) -> Mock:
+        response = Mock(status_code=200)
+        lines: list[str] = []
+        for payload in payloads:
+            lines.extend(
+                [
+                    "event: transcription",
+                    f"data: {json.dumps(payload)}",
+                    "",
+                ]
+            )
+        response.iter_lines.return_value = lines
+        return response
 
-        with patch(
-            "stt_to_subtitle.service_clients.time.sleep"
-        ), self.assertRaises(OperationStopped):
+    def test_stops_event_stream_when_requested(self) -> None:
+        running = self.event_stream({"status": "running"})
+        client = STTAPIClient("http://stt.test", "")
+        client.request = Mock(return_value=running)
+        should_stop = Mock(side_effect=[False, False, True])
+
+        with self.assertRaises(OperationStopped):
             client.transcribe(
                 Path("/not-read.wav"),
                 options={},
@@ -128,37 +140,41 @@ class STTAPIClientProgressTests(unittest.TestCase):
             )
 
         client.request.assert_called_once()
+        self.assertEqual(
+            client.request.call_args.args[1],
+            "http://stt.test/v1/transcriptions/remote-job/events",
+        )
 
-    def test_forwards_changed_chunk_progress_while_polling(self) -> None:
-        running = Mock(status_code=200)
-        running.json.return_value = {
-            "status": "running",
-            "chunk_progress": {
-                "created": 20,
-                "completed": 10,
-                "in_progress": 10,
+    def test_forwards_changed_chunk_progress_from_event_stream(self) -> None:
+        events = self.event_stream(
+            {
+                "status": "running",
+                "chunk_progress": {
+                    "created": 20,
+                    "completed": 10,
+                    "in_progress": 10,
+                },
             },
-        }
-        completed = Mock(status_code=200)
-        completed.json.return_value = {
-            "status": "completed",
-            "chunk_progress": {
-                "created": 23,
-                "completed": 23,
-                "in_progress": 0,
+            {
+                "status": "completed",
+                "chunk_progress": {
+                    "created": 23,
+                    "completed": 23,
+                    "in_progress": 0,
+                },
             },
-        }
+        )
         result = Mock(status_code=200)
         result.json.return_value = {
             "schema_version": 1,
             "job_id": "remote-job",
             "segments": [],
         }
-        client = STTAPIClient("http://stt.test", "", poll_interval=0.01)
-        client.request = Mock(side_effect=[running, completed, result])
+        client = STTAPIClient("http://stt.test", "")
+        client.request = Mock(side_effect=[events, result])
         progress = []
 
-        with patch("stt_to_subtitle.service_clients.time.sleep"):
+        with patch("stt_to_subtitle.service_clients.time.sleep") as sleep:
             client.transcribe(
                 Path("/not-read.wav"),
                 options={},
@@ -186,6 +202,9 @@ class STTAPIClientProgressTests(unittest.TestCase):
                 },
             ],
         )
+        self.assertEqual(client.request.call_count, 2)
+        self.assertTrue(client.request.call_args_list[0].kwargs["stream"])
+        sleep.assert_not_called()
 
 
 class TranslationResponseTests(unittest.TestCase):

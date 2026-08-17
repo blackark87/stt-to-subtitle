@@ -171,6 +171,34 @@ a { color: var(--accent); }
 .connection-state.is-ready { color: var(--success); }
 .service-monitor-link { display: inline-flex; align-items: center; gap: 4px; font-size: .84rem; font-weight: 700; text-decoration: none; }
 .service-card-note { margin: 15px 0 0; color: var(--muted); font-size: .76rem; }
+.dashboard-status-grid { display: grid; grid-template-columns: minmax(280px, .72fr) minmax(0, 1.28fr); gap: 16px; margin: 20px 0; align-items: stretch; }
+.dashboard-status-grid .card { height: 100%; margin: 0; }
+.gpu-monitoring-card h2, .gpu-device-card h3 { margin: 0; }
+.gpu-connection-state { display: inline-flex; align-items: center; gap: 7px; color: var(--muted); font-size: .78rem; font-weight: 750; }
+.gpu-connection-state > span { width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+.gpu-connection-state.is-ready { color: var(--success); }
+.gpu-connection-state.is-attention { color: var(--danger); }
+.gpu-empty-state { min-height: 128px; display: flex; align-items: center; gap: 14px; border: 1px dashed var(--line-strong); border-radius: var(--radius-control); padding: 18px; background: var(--surface-sunken); }
+.gpu-empty-state.is-attention { border-color: color-mix(in srgb, var(--danger) 45%, var(--line)); }
+.gpu-empty-state p { margin: 5px 0 0; color: var(--muted); font-size: .82rem; line-height: 1.5; }
+.gpu-empty-icon { display: grid; place-items: center; width: 40px; height: 40px; flex: none; border-radius: 50%; background: var(--accent-subtle); color: var(--accent); }
+.gpu-empty-state.is-attention .gpu-empty-icon { background: color-mix(in srgb, var(--danger) 14%, var(--card)); color: var(--danger); }
+.gpu-device-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; margin-top: 16px; }
+.gpu-device-card { min-width: 0; border: 1px solid var(--line); border-radius: var(--radius-control); padding: 14px; background: var(--surface-sunken); }
+.gpu-device-index { display: block; margin-bottom: 2px; color: var(--muted); font-size: .66rem; font-weight: 800; letter-spacing: .09em; }
+.gpu-device-card h3 { overflow: hidden; font-size: .94rem; text-overflow: ellipsis; white-space: nowrap; }
+.gpu-metric-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin-top: 12px; }
+.gpu-metric { min-width: 0; border-radius: var(--radius-sm); padding: 10px; background: var(--card); box-shadow: inset 0 0 0 1px var(--line); }
+.gpu-metric-wide { grid-column: span 2; }
+.gpu-metric-label { display: block; margin-bottom: 3px; color: var(--muted); font-size: .7rem; font-weight: 650; }
+.gpu-metric strong { display: block; font-size: 1.18rem; font-variant-numeric: tabular-nums; line-height: 1.2; }
+.gpu-metric strong small { margin-left: 2px; color: var(--muted); font-size: .65em; }
+.gpu-metric-detail { display: block; margin-top: 3px; overflow: hidden; color: var(--muted); font-size: .66rem; text-overflow: ellipsis; white-space: nowrap; }
+.gpu-metric-missing { color: var(--muted); }
+.gpu-metric progress { width: 100%; height: 5px; display: block; margin-top: 8px; overflow: hidden; border: 0; border-radius: 99px; background: var(--line); accent-color: var(--accent); }
+.gpu-metric progress::-webkit-progress-bar { border-radius: 99px; background: var(--line); }
+.gpu-metric progress::-webkit-progress-value { border-radius: 99px; background: var(--accent); }
+.gpu-metric progress::-moz-progress-bar { border-radius: 99px; background: var(--accent); }
 .dashboard-jobs-card { margin-top: 16px; }
 .dashboard-jobs-card > .section-heading { padding-bottom: 16px; border-bottom: 1px solid var(--line); }
 .dashboard-jobs-card .job-list-heading { display: none; }
@@ -635,7 +663,16 @@ th, td { border-bottom: 1px solid var(--line); padding: 10px 8px; text-align: le
 .recent-job-meta { display: flex; align-items: center; gap: 5px 12px; color: var(--muted); font-size: .77rem; flex-wrap: wrap; }
 .recent-job-meta time { font-variant-numeric: tabular-nums; }
 .recent-job-meta code { color: var(--muted); }
-.job-stage-strip { display: flex; align-items: stretch; gap: 6px; margin: 0; padding: 0; list-style: none; flex-wrap: wrap; }
+.job-progress-overview { display: grid; gap: 6px; border-radius: var(--radius-sm); padding: 9px 11px; background: var(--surface-sunken); box-shadow: inset 0 0 0 1px var(--line); }
+.job-progress-heading { display: flex; align-items: baseline; gap: 7px; min-width: 0; font-size: .73rem; }
+.job-progress-heading > span:first-child { color: var(--muted); font-weight: 700; }
+.job-progress-heading strong { color: var(--text); font-size: .9rem; font-variant-numeric: tabular-nums; }
+.job-progress-current { min-width: 0; overflow: hidden; color: var(--muted); text-overflow: ellipsis; white-space: nowrap; }
+.job-progress-overview > progress { width: 100%; height: 8px; overflow: hidden; border: 0; border-radius: 99px; background: var(--line); accent-color: var(--accent); }
+.job-progress-overview > progress::-webkit-progress-bar { border-radius: 99px; background: var(--line); }
+.job-progress-overview > progress::-webkit-progress-value { border-radius: 99px; background: linear-gradient(90deg, var(--accent), var(--success)); }
+.job-progress-overview > progress::-moz-progress-bar { border-radius: 99px; background: var(--accent); }
+.job-stage-strip { display: grid; grid-template-columns: repeat(auto-fit, minmax(116px, 1fr)); align-items: stretch; gap: 6px; margin: 0; padding: 0; list-style: none; }
 .job-stage {
   position: relative;
   display: grid;
@@ -646,24 +683,17 @@ th, td { border-bottom: 1px solid var(--line); padding: 10px 8px; text-align: le
   overflow: hidden;
   border: 1px solid var(--line);
   border-radius: var(--radius-sm);
-  padding: 6px 10px 7px;
+  padding: 7px 10px 8px;
   background: var(--surface-sunken);
   color: var(--muted);
-}
-.job-stage::after {
-  content: "";
-  position: absolute;
-  right: 0;
-  bottom: 0;
-  left: 0;
-  height: 2px;
-  width: var(--stage-percent, 0%);
-  background: currentColor;
-  opacity: .5;
 }
 .job-stage-icon { grid-row: 1 / 3; display: grid; place-items: center; width: 20px; height: 20px; border-radius: 50%; background: color-mix(in srgb, currentColor 16%, transparent); }
 .job-stage-label { color: var(--text); font-size: .76rem; font-weight: 700; line-height: 1.3; }
 .job-stage-count { font-size: .7rem; font-weight: 650; line-height: 1.3; font-variant-numeric: tabular-nums; }
+.job-stage-progress { grid-column: 1 / -1; width: 100%; height: 4px; margin-top: 3px; overflow: hidden; border: 0; border-radius: 99px; background: var(--line); accent-color: currentColor; }
+.job-stage-progress::-webkit-progress-bar { border-radius: 99px; background: var(--line); }
+.job-stage-progress::-webkit-progress-value { border-radius: 99px; background: currentColor; }
+.job-stage-progress::-moz-progress-bar { border-radius: 99px; background: currentColor; }
 .job-stage.is-done { color: var(--success); border-color: color-mix(in srgb, var(--success) 30%, var(--line)); }
 .job-stage.is-running { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); background: var(--accent-subtle); }
 .job-stage.is-failed { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 40%, var(--line)); background: color-mix(in srgb, var(--danger) 8%, var(--card)); }
@@ -671,6 +701,7 @@ th, td { border-bottom: 1px solid var(--line); padding: 10px 8px; text-align: le
 .job-stage.is-waiting { color: var(--muted); border-style: dashed; }
 .job-stage.is-pending { color: var(--muted); border-style: dashed; background: transparent; opacity: .62; }
 .job-stage.is-pending .job-stage-label { color: var(--muted); font-weight: 650; }
+.job-progress-note { margin: -1px 0 0; color: var(--muted); font-size: .68rem; line-height: 1.4; }
 .status.has-detail { cursor: help; text-decoration: underline dotted currentColor; text-underline-offset: 3px; }
 .recent-job-actions { display: flex; align-items: flex-start; justify-content: flex-end; gap: 7px; flex-wrap: wrap; }
 .recent-job-actions form { display: flex; align-items: stretch; gap: 7px; margin: 0; flex-wrap: wrap; }
@@ -793,6 +824,7 @@ code { overflow-wrap: anywhere; }
 @media (max-width: 1100px) {
   .app-shell { grid-template-columns: 210px minmax(0, 1fr); }
   .container { padding-right: 24px; padding-left: 24px; }
+  .dashboard-status-grid { grid-template-columns: 1fr; }
 }
 @media (max-width: 900px) {
   .stat-strip { grid-template-columns: repeat(2, 1fr); }
@@ -850,6 +882,9 @@ code { overflow-wrap: anywhere; }
   .stat-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
   .stat-tile { padding: 12px; column-gap: 10px; }
   .service-status-list { grid-template-columns: 1fr; }
+  .gpu-device-grid { grid-template-columns: 1fr; }
+  .gpu-metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .gpu-metric-wide { grid-column: span 2; }
   .media-board { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .media-toolbar { align-items: flex-start; }
   .model-picker { grid-template-columns: 1fr; }
@@ -860,6 +895,8 @@ code { overflow-wrap: anywhere; }
   .recent-job-item { grid-template-columns: 1fr; gap: 12px; }
   .recent-job-leading { display: flex; align-items: center; justify-content: flex-start; }
   .recent-job-heading { align-items: flex-start; }
+  .job-progress-heading { flex-wrap: wrap; }
+  .job-progress-current { flex-basis: 100%; white-space: normal; }
   .recent-job-actions { justify-content: flex-start; }
   .timeline-meta time { width: 100%; margin-left: 0; }
   .details { grid-template-columns: 1fr; gap: 3px; }

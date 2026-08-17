@@ -1328,6 +1328,7 @@ tags
 !/Dockerfile.stt-runtime
 !/Dockerfile.web
 !/compose.yaml
+!/compose.gpu-monitoring.yaml
 !/Makefile
 !/pyproject.toml
 !/requirements-api.txt

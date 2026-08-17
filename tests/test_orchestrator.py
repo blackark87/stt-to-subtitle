@@ -5,11 +5,34 @@ import unittest
 from unittest.mock import Mock, patch
 
 from stt_to_subtitle.web_config import WebSettings, RemoteServerSettings
-from stt_to_subtitle.orchestrator import SubtitleOrchestrator
+from stt_to_subtitle.orchestrator import (
+    SubtitleOrchestrator,
+    estimate_transcription_chunks,
+)
 from stt_to_subtitle.service_clients import TranslationPaused
 
 
 class SubtitleOrchestratorTests(unittest.TestCase):
+    def test_estimates_transcription_chunks_from_audio_duration(self) -> None:
+        self.assertEqual(
+            estimate_transcription_chunks(
+                121.0,
+                {"backend": "kotoba", "chunk_length_seconds": 60},
+            ),
+            3,
+        )
+        self.assertEqual(
+            estimate_transcription_chunks(
+                121.0,
+                {
+                    "backend": "hybrid",
+                    "chunk_length_seconds": 60,
+                    "hybrid_rescue": {"kotoba_chunk_length_seconds": 15},
+                },
+            ),
+            9,
+        )
+
     def make_orchestrator(
         self,
         root: Path,
@@ -243,6 +266,9 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                 with patch(
                     "stt_to_subtitle.orchestrator.extract_audio",
                     side_effect=fake_extract,
+                ), patch(
+                    "stt_to_subtitle.orchestrator.wav_duration_seconds",
+                    return_value=121.0,
                 ):
                     orchestrator._extract(job)
                 extracted = orchestrator.store.get(job.id)
@@ -271,6 +297,7 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                 orchestrator.stop()
 
             self.assertEqual(extracted.status, "audio_ready")
+            self.assertEqual(extracted.chunks_total_estimate, 3)
             self.assertEqual(completed.status, "transcription_completed")
             self.assertEqual(completed.operation, "transcribe")
             self.assertTrue(Path(completed.audio_path).is_file())

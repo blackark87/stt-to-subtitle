@@ -7,8 +7,8 @@ services:
     cap_add:
       - SYS_ADMIN
     gpus: all
-    ports:
-      - "${BIND_ADDRESS:-127.0.0.1}:${DCGM_EXPORTER_PORT:-9400}:9400"
+    expose:
+      - "9400"
     security_opt:
       - no-new-privileges:true
     networks:
@@ -24,8 +24,8 @@ services:
       - --storage.tsdb.path=/prometheus
       - --storage.tsdb.retention.time=30d
       - --web.enable-lifecycle
-    ports:
-      - "${BIND_ADDRESS:-127.0.0.1}:${PROMETHEUS_PORT:-9090}:9090"
+    expose:
+      - "9090"
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
@@ -41,8 +41,9 @@ services:
     depends_on:
       - prometheus
     environment:
-      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?GRAFANA_ADMIN_PASSWORD must be set}
+      GF_AUTH_BASIC_PASSWORD_POLICY: "true"
       GF_USERS_ALLOW_SIGN_UP: "false"
       GF_AUTH_ANONYMOUS_ENABLED: "false"
     ports:
@@ -62,4 +63,5 @@ volumes:
 
 networks:
   monitoring:
+    name: ${GPU_MONITORING_NETWORK:-gpu-monitoring}
     driver: bridge

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, fields, replace
 from datetime import datetime, timezone
@@ -23,7 +24,7 @@ import wave
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request
 from fastapi import UploadFile, status
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from .contracts import TRANSCRIPT_SCHEMA_VERSION, add_segment_ids
 from .files import write_json_atomic
@@ -74,6 +75,45 @@ DEFAULT_HYBRID_SEGMENTATION = {
     "max_chars": 36,
     "prefer_punctuation_boundary": True,
 }
+
+
+class TranscriptionChangeHook:
+    """Bridge transcription-store changes from worker threads to SSE clients."""
+
+    def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
+        self._loop = loop
+        self._versions: dict[str, int] = {}
+        self._changed: dict[str, asyncio.Event] = {}
+
+    def version(self, job_id: str) -> int:
+        return self._versions.get(job_id, 0)
+
+    def publish(self, job_id: str) -> None:
+        try:
+            self._loop.call_soon_threadsafe(self._mark_changed, job_id)
+        except RuntimeError:
+            return
+
+    def _mark_changed(self, job_id: str) -> None:
+        self._versions[job_id] = self.version(job_id) + 1
+        self._changed.setdefault(job_id, asyncio.Event()).set()
+
+    async def wait(
+        self,
+        job_id: str,
+        version: int,
+        timeout: float = 15.0,
+    ) -> int:
+        while self.version(job_id) == version:
+            changed = self._changed.setdefault(job_id, asyncio.Event())
+            changed.clear()
+            if self.version(job_id) != version:
+                break
+            try:
+                await asyncio.wait_for(changed.wait(), timeout=timeout)
+            except TimeoutError:
+                break
+        return self.version(job_id)
 
 
 def _env_boolean(name: str, default: bool = False) -> bool:
@@ -1235,11 +1275,15 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         service = TranscriptionService(settings or STTAPISettings.from_env())
+        change_hook = TranscriptionChangeHook(asyncio.get_running_loop())
+        service.store.set_change_hook(change_hook.publish)
         app.state.transcription_service = service
+        app.state.transcription_change_hook = change_hook
         service.start()
         try:
             yield
         finally:
+            service.store.set_change_hook(None)
             service.stop()
 
     app = FastAPI(
@@ -1334,6 +1378,9 @@ def create_app(
                 report_every=service.settings.chunk_progress_every,
             ),
             "status_url": str(request.url_for("get_transcription", job_id=job.id)),
+            "events_url": str(
+                request.url_for("get_transcription_events", job_id=job.id)
+            ),
             "result_url": str(
                 request.url_for("get_transcription_result", job_id=job.id)
             ),
@@ -1353,6 +1400,67 @@ def create_app(
             raise HTTPException(status_code=404, detail="job not found")
         return job.public_dict(
             report_every=service.settings.chunk_progress_every,
+        )
+
+    @app.get(
+        "/v1/transcriptions/{job_id}/events",
+        dependencies=[Depends(require_bearer)],
+        name="get_transcription_events",
+    )
+    def get_transcription_events(
+        request: Request,
+        job_id: str,
+        service: TranscriptionService = Depends(get_service),
+    ) -> StreamingResponse:
+        if service.store.get(job_id) is None:
+            raise HTTPException(status_code=404, detail="job not found")
+        change_hook: TranscriptionChangeHook = (
+            request.app.state.transcription_change_hook
+        )
+
+        async def stream() -> AsyncIterator[str]:
+            version = change_hook.version(job_id)
+            job = service.store.get(job_id)
+            if job is None:
+                return
+            payload = json.dumps(
+                job.public_dict(
+                    report_every=service.settings.chunk_progress_every,
+                ),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            yield f"id: {version}\nevent: transcription\ndata: {payload}\n\n"
+            while True:
+                if job.status in {"completed", "failed"}:
+                    return
+                updated_version = await change_hook.wait(job_id, version)
+                if updated_version == version:
+                    yield ": keep-alive\n\n"
+                    continue
+                version = updated_version
+                job = service.store.get(job_id)
+                if job is None:
+                    return
+                payload = json.dumps(
+                    job.public_dict(
+                        report_every=service.settings.chunk_progress_every,
+                    ),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                yield (
+                    f"id: {version}\nevent: transcription\n"
+                    f"data: {payload}\n\n"
+                )
+
+        return StreamingResponse(
+            stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "X-Accel-Buffering": "no",
+            },
         )
 
     @app.get(

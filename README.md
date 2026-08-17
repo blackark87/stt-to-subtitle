@@ -123,6 +123,12 @@ curl https://stt.example.com/healthz
 대시보드이고, `/media`는 파일 탐색과 신규 작업 등록, `/jobs`는 상태별 작업
 목록입니다. 모든 화면에서 사이드 메뉴로 각 영역을 직접 이동할 수 있습니다.
 
+전사 상태는 고정 간격으로 조회하지 않습니다. STT 저장소 변경 Hook이 작업별
+SSE 스트림으로 상태를 보내고, 웹 오케스트레이터의 변경 Hook이 다시 브라우저
+SSE에 전달합니다. 번역도 배치 저장 시 같은 경로로 즉시 반영됩니다. 오디오
+추출이 끝나면 WAV 헤더의 재생 시간과 모델 청크 길이로 전체 전사 청크를 먼저
+추정하며, 실제 생성 청크가 추정치를 넘으면 진행률의 전체 수를 자동 보정합니다.
+
 ## 환경 설정
 
 ### 공통 및 웹
@@ -141,7 +147,11 @@ curl https://stt.example.com/healthz
 | `WEB_ADMIN_PASSWORD` | 빈 값 | 웹 로그인 비밀번호 |
 | `WEB_SESSION_SECRET` | 빈 값 | 로그인 사용 시 필요한 32자 이상 세션 키 |
 | `WEB_SECURE_COOKIE` | `true` | HTTPS에서만 세션 쿠키 전송 |
-| `GPU_DASHBOARD_URL` | 빈 값 | 독립 Grafana GPU 대시보드로 이동할 외부 URL |
+| `GPU_PROMETHEUS_URL` | 빈 값 | STT 대시보드가 직접 조회할 Prometheus URL |
+| `GPU_PROMETHEUS_TOKEN` | 빈 값 | 외부 Prometheus 프록시가 요구할 때만 사용하는 Bearer 토큰 |
+| `GPU_METRICS_REFRESH_SECONDS` | `10` | STT 화면의 GPU 메트릭 갱신 및 서버 캐시 간격 |
+| `GPU_METRICS_TIMEOUT_SECONDS` | `3` | Prometheus 조회 제한 시간 |
+| `GPU_MONITORING_NETWORK` | `gpu-monitoring` | 두 Compose 프로젝트가 공유하는 내부 Docker 네트워크 |
 
 `WEB_ADMIN_PASSWORD`를 설정하면 `WEB_SESSION_SECRET`도 반드시 32자
 이상으로 설정해야 합니다. 다음과 같이 생성할 수 있습니다.
@@ -159,7 +169,7 @@ python3 -c 'import secrets; print(secrets.token_urlsafe(48))'
 | `STT_DEVICE` | `cuda` | `cuda` 또는 `cuda:<index>` |
 | `STT_DIARIZATION_DEVICE` | `cuda` | 화자 분리 장치, VRAM 절약 시 `cpu` |
 | `STT_BATCH_SIZE` | `1` | 모델 배치 크기 |
-| `STT_CHUNK_PROGRESS_EVERY` | `10` | 진행 보고 간격, `10` 또는 `100` |
+| `STT_CHUNK_PROGRESS_EVERY` | `10` | 청크 진행 로그 묶음 기준, `10` 또는 `100` (SSE 변경 알림은 매 변경 시 전송) |
 | `WHISPERX_MODEL` | `large-v3` | WhisperX 모델 |
 | `WHISPERX_LANGUAGE` | `ja` | WhisperX 언어 |
 | `WHISPERX_COMPUTE_TYPE` | `float16` | WhisperX 연산 형식 |
@@ -176,11 +186,25 @@ python3 -c 'import secrets; print(secrets.token_urlsafe(48))'
 ## GPU 관측 사이드 프로젝트
 
 `gpu-observability/`는 메인 Compose와 분리된 독립 프로젝트입니다. NVIDIA
-DCGM Exporter, Prometheus와 Grafana를 함께 실행하며 GPU 사용률, 메모리,
-온도, 전력과 XID 오류를 보여 주는 대시보드를 자동 구성합니다. 실행 방법과
-분리 배포 조건은 `gpu-observability/README.md`를 참고하십시오. Grafana URL을
-`GPU_DASHBOARD_URL`에 지정하면 메인 대시보드에는 외부 모니터링 링크만
-표시되며 두 프로젝트의 프로세스와 저장소는 결합되지 않습니다.
+DCGM Exporter, Prometheus와 Grafana를 함께 실행합니다. STT 웹은 Grafana로
+이동하지 않고 Prometheus의 현재 GPU 사용률, 메모리, 온도와 전력을 직접
+조회해 메인 대시보드에 표시합니다.
+
+관측 스택을 먼저 실행해 `gpu-monitoring` 네트워크를 만든 뒤, 메인 프로젝트에
+전용 Compose 오버레이를 함께 적용합니다.
+
+```bash
+docker compose \
+  -f compose.yaml \
+  -f compose.gpu-monitoring.yaml \
+  up -d --build web
+```
+
+이 구성에서는 기본 `GPU_PROMETHEUS_URL`이 `http://prometheus:9090`입니다.
+Prometheus와 DCGM Exporter는 호스트 포트를 공개하지 않으며 두 프로젝트는
+공유 내부 네트워크로만 통신합니다. `GPU_PROMETHEUS_TOKEN`은 별도 리버스
+프록시를 통해 Prometheus에 접속할 때만 필요합니다. 자세한 실행 및 Grafana
+계정 설명은 `gpu-observability/README.md`를 참고하십시오.
 
 ## 전사 백엔드
 

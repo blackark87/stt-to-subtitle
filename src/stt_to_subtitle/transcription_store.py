@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 import sqlite3
 import time
-from typing import Any, Iterator, Mapping
+from typing import Any, Callable, Iterator, Mapping
 
 from .time_display import format_kst_iso
 
@@ -51,8 +51,19 @@ class TranscriptionJob:
 class TranscriptionStore:
     def __init__(self, database_path: Path) -> None:
         self.database_path = database_path
+        self._change_hook: Callable[[str], None] | None = None
         database_path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
+
+    def set_change_hook(
+        self,
+        hook: Callable[[str], None] | None,
+    ) -> None:
+        self._change_hook = hook
+
+    def _notify_change(self, job_id: str) -> None:
+        if self._change_hook is not None:
+            self._change_hook(job_id)
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -198,6 +209,7 @@ class TranscriptionStore:
         job = self.get(job_id)
         if job is None:
             raise RuntimeError("created transcription job could not be read")
+        self._notify_change(job_id)
         return job
 
     def update(
@@ -209,7 +221,7 @@ class TranscriptionStore:
         error: str | None = None,
     ) -> None:
         with self._connect() as connection:
-            connection.execute(
+            result = connection.execute(
                 """
                 UPDATE transcription_jobs
                 SET status = ?, result_path = COALESCE(?, result_path),
@@ -224,10 +236,12 @@ class TranscriptionStore:
                     job_id,
                 ),
             )
+        if result.rowcount == 1:
+            self._notify_change(job_id)
 
     def requeue(self, job_id: str) -> None:
         with self._connect() as connection:
-            connection.execute(
+            result = connection.execute(
                 """
                 UPDATE transcription_jobs
                 SET status = 'queued', error = NULL,
@@ -238,6 +252,8 @@ class TranscriptionStore:
                 """,
                 (time.time(), job_id),
             )
+        if result.rowcount == 1:
+            self._notify_change(job_id)
 
     def update_chunk_progress(
         self,
@@ -249,7 +265,7 @@ class TranscriptionStore:
         if created < 0 or completed < 0 or completed > created:
             raise ValueError("invalid transcription chunk progress")
         with self._connect() as connection:
-            connection.execute(
+            result = connection.execute(
                 """
                 UPDATE transcription_jobs
                 SET chunks_created = ?, chunks_completed = ?, updated_at = ?
@@ -257,6 +273,8 @@ class TranscriptionStore:
                 """,
                 (created, completed, time.time(), job_id),
             )
+        if result.rowcount == 1:
+            self._notify_change(job_id)
 
     def fail_interrupted_jobs(self) -> int:
         with self._connect() as connection:

@@ -1,0 +1,11 @@
+services:
+  web:
+    environment:
+      GPU_PROMETHEUS_URL: ${GPU_PROMETHEUS_URL:-http://prometheus:9090}
+    networks:
+      - gpu-monitoring
+
+networks:
+  gpu-monitoring:
+    name: ${GPU_MONITORING_NETWORK:-gpu-monitoring}
+    external: true

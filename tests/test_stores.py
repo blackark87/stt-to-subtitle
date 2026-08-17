@@ -9,6 +9,25 @@ from stt_to_subtitle.transcription_store import TranscriptionStore
 
 
 class TranscriptionStoreTests(unittest.TestCase):
+    def test_calls_change_hook_after_transcription_mutations(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = TranscriptionStore(Path(directory) / "jobs.sqlite3")
+            changed_job_ids: list[str] = []
+            store.set_change_hook(changed_job_ids.append)
+
+            store.create(
+                job_id="job-1",
+                idempotency_key="key-1",
+                audio_path=Path(directory) / "audio.wav",
+                audio_sha256="abc",
+                options={},
+            )
+            store.update("job-1", status="running")
+            store.update_chunk_progress("job-1", created=2, completed=1)
+            store.requeue("job-1")
+
+            self.assertEqual(changed_job_ids, ["job-1"] * 4)
+
     def test_marks_running_jobs_failed_after_restart(self) -> None:
         with TemporaryDirectory() as directory:
             store = TranscriptionStore(Path(directory) / "jobs.sqlite3")
@@ -367,6 +386,7 @@ class JobStoreTests(unittest.TestCase):
                 "job-1",
                 chunks_created=21,
                 chunks_completed=20,
+                chunks_total_estimate=24,
                 chunk_progress_every=10,
             )
 
@@ -374,6 +394,10 @@ class JobStoreTests(unittest.TestCase):
             self.assertEqual(job.chunks_created, 21)
             self.assertEqual(job.chunks_completed, 20)
             self.assertEqual(job.chunks_in_progress, 1)
+            self.assertEqual(job.chunks_total_estimate, 24)
+            self.assertEqual(job.transcription_chunks_total, 24)
+            self.assertTrue(job.transcription_total_is_estimated)
+            self.assertEqual(job.transcription_chunks_remaining, 4)
             self.assertEqual(job.chunk_progress_every, 10)
 
     def test_adds_progress_columns_to_an_existing_web_database(self) -> None:
@@ -417,6 +441,7 @@ class JobStoreTests(unittest.TestCase):
 
             self.assertEqual(job.chunks_created, 0)
             self.assertEqual(job.chunks_completed, 0)
+            self.assertEqual(job.chunks_total_estimate, 0)
             self.assertEqual(job.chunk_progress_every, 10)
             self.assertEqual(job.operation, "full")
             self.assertEqual(job.translation_chunks_total, 0)

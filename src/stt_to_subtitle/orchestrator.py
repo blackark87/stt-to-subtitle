@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 import json
 import logging
+import math
 from pathlib import Path
 import threading
 from typing import Any, Callable, Mapping, Sequence
@@ -68,6 +69,47 @@ TRANSLATION_PROMPT_OPTION = "translation_prompt"
 TRANSLATION_REVIEW_ROUNDS = 2
 SUPPORTED_OPERATIONS = {"extract", "transcribe", "translate", "full"}
 TRANSLATION_OPERATIONS = {"translate", "full"}
+
+
+def wav_duration_seconds(path: Path) -> float | None:
+    """Read the exact duration represented by an extracted PCM WAV header."""
+    try:
+        with wave.open(str(path), "rb") as wav_file:
+            frame_rate = wav_file.getframerate()
+            if frame_rate <= 0:
+                return None
+            return round(wav_file.getnframes() / frame_rate, 3)
+    except (EOFError, OSError, wave.Error, ZeroDivisionError):
+        return None
+
+
+def estimate_transcription_chunks(
+    duration_seconds: float | None,
+    options: Mapping[str, Any],
+) -> int:
+    """Estimate model chunks from extracted audio duration and backend options."""
+    if duration_seconds is None or duration_seconds <= 0:
+        return 0
+    raw_chunk_length: object = options.get(
+        "chunk_length_seconds",
+        DEFAULT_CHUNK_LENGTH_SECONDS,
+    )
+    if str(options.get("backend", "kotoba")) == "hybrid":
+        hybrid_options = options.get("hybrid_rescue")
+        if isinstance(hybrid_options, Mapping):
+            raw_chunk_length = hybrid_options.get(
+                "kotoba_chunk_length_seconds",
+                raw_chunk_length,
+            )
+    try:
+        chunk_length = float(raw_chunk_length)
+    except (TypeError, ValueError):
+        return 0
+    if chunk_length <= 0:
+        return 0
+    return max(1, math.ceil(duration_seconds / chunk_length))
+
+
 SUPPORTED_STT_BACKENDS = {"kotoba", "whisperx", "hybrid"}
 HYBRID_SUBTITLE_SEGMENTATION_DEFAULTS = {
     "max_gap_sec": 0.8,
@@ -226,7 +268,6 @@ class SubtitleOrchestrator:
         stt_client = STTAPIClient(
             normalized.stt_base_url,
             normalized.stt_token,
-            poll_interval=self.settings.stt_poll_interval,
         )
         lm_client = OpenAICompatibleClient(
             normalized.lm_base_url,
@@ -424,6 +465,14 @@ class SubtitleOrchestrator:
                     ):
                         if key in reusable_audio.options:
                             resumed_options[key] = reusable_audio.options[key]
+                chunk_estimate = (
+                    estimate_transcription_chunks(
+                        wav_duration_seconds(Path(reusable_audio.audio_path)),
+                        resumed_options,
+                    )
+                    if audio_available and reusable_audio.audio_path
+                    else 0
+                )
                 self.store.update(
                     reusable_audio.id,
                     status="audio_ready" if audio_available else "queued",
@@ -445,6 +494,7 @@ class SubtitleOrchestrator:
                     error=None,
                     chunks_created=0,
                     chunks_completed=0,
+                    chunks_total_estimate=chunk_estimate,
                     translation_chunks_total=0,
                     translation_chunks_completed=0,
                     translation_pause_requested=0,
@@ -849,6 +899,17 @@ class SubtitleOrchestrator:
                     "chunks_created": 0,
                     "chunks_completed": 0,
                 }
+            )
+        if (
+            target_status == "audio_ready"
+            and job.audio_path
+            and Path(job.audio_path).is_file()
+        ):
+            retry_fields["chunks_total_estimate"] = (
+                estimate_transcription_chunks(
+                    wav_duration_seconds(Path(job.audio_path)),
+                    job.options,
+                )
             )
         self.store.update(job.id, **retry_fields)
         self.store.add_event(
@@ -1372,6 +1433,11 @@ class SubtitleOrchestrator:
         )
         extract_audio(source, audio_path, options)
         digest = sha256_file(audio_path)
+        audio_duration = wav_duration_seconds(audio_path)
+        chunk_estimate = estimate_transcription_chunks(
+            audio_duration,
+            job.options,
+        )
         next_status = (
             "audio_completed" if job.operation == "extract" else "audio_ready"
         )
@@ -1380,11 +1446,19 @@ class SubtitleOrchestrator:
             status=next_status,
             audio_path=str(audio_path),
             audio_sha256=digest,
+            chunks_total_estimate=chunk_estimate,
+        )
+        progress_detail = (
+            f"; {audio_duration:.1f}s; approximately {chunk_estimate} "
+            "transcription chunk(s)"
+            if audio_duration is not None and chunk_estimate
+            else ""
         )
         self.store.add_event(
             job.id,
             "info",
-            f"audio extraction completed ({audio_path.stat().st_size} bytes)",
+            "audio extraction completed "
+            f"({audio_path.stat().st_size} bytes{progress_detail})",
         )
 
     def _transcribe(self, job: PipelineJob) -> None:
@@ -1410,14 +1484,7 @@ class SubtitleOrchestrator:
         ):
             if key in job.options:
                 options[key] = job.options[key]
-        try:
-            with wave.open(job.audio_path, "rb") as wav_file:
-                audio_duration: float | None = round(
-                    wav_file.getnframes() / wav_file.getframerate(),
-                    3,
-                )
-        except (EOFError, wave.Error, ZeroDivisionError):
-            audio_duration = None
+        audio_duration = wav_duration_seconds(Path(job.audio_path))
         source_start = float(job.options["start_seconds"])
         source_end = (
             round(source_start + audio_duration, 3)
@@ -1545,10 +1612,18 @@ class SubtitleOrchestrator:
             next_status = "translation_paused"
         else:
             next_status = "transcribed"
+        final_chunk_total = (
+            max(current.chunks_created, current.chunks_total_estimate)
+            if current is not None
+            else 0
+        )
         self.store.update(
             job.id,
             status=next_status,
             transcript_path=str(transcript_path),
+            chunks_created=final_chunk_total,
+            chunks_completed=final_chunk_total,
+            chunks_total_estimate=final_chunk_total,
         )
         self.store.add_event(
             job.id,

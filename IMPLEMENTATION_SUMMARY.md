@@ -2,7 +2,7 @@
 
 - 작업일: 2026-08-17
 - 대상 프로젝트: `stt-to-subtitle`
-- 프로젝트 버전: `3.1.0`
+- 프로젝트 버전: `3.2.0`
 
 ## 1. 작업 목적
 
@@ -19,7 +19,11 @@
 - 메인 대시보드는 작업 현황, 서비스 연결 상태, 최근 작업만 보여주는 개요 화면으로 단순화했다.
 - 미디어 탐색과 새 작업 생성은 `/media`로 이동했다.
 - GPU 관측 스택을 `gpu-observability/` 아래 독립 Compose 프로젝트로 추가했다.
-- 메인 웹 앱은 `GPU_DASHBOARD_URL`로 외부 Grafana 링크만 노출하므로 관측 스택과 직접 결합되지 않는다.
+- 메인 웹 앱은 Prometheus의 DCGM 메트릭을 읽어 GPU 상태를 STT 대시보드 안에 직접 표시한다.
+- STT API와 웹 오케스트레이터 사이의 5초 상태 폴링을 제거하고, STT 저장소 변경 Hook → 작업별 SSE → 웹 저장소 변경 Hook → 브라우저 SSE로 이어지는 이벤트 경로를 적용했다.
+- 작업 목록은 전체 파이프라인과 전사·번역 청크 진행률을 단계 그래프와 진행 바로 표시한다.
+
+전체 진행률은 작업에 포함된 파이프라인 단계를 같은 비중으로 계산한 단계 진척도이며 예상 남은 시간은 아니다. 전사 전체 청크는 FFmpeg가 생성한 WAV 헤더의 재생 시간과 모델 청크 길이로 먼저 추정하고, 실제 생성 수가 추정치를 넘으면 자동으로 보정한다.
 - Windows 테스트에서 드러난 SQLite 연결 수명과 경로 표현 문제를 함께 보완했다.
 
 ## 3. STT 명칭 중립화
@@ -98,21 +102,22 @@ ASGI 모듈 경로도 `stt_to_subtitle.stt_api:app`으로 변경했다.
 - `src/stt_to_subtitle/templates/jobs.html`: 작업 이력 화면
 - `src/stt_to_subtitle/static/app.css`: 사이드바, 카드, 반응형 레이아웃
 - `src/stt_to_subtitle/web_app.py`: 대시보드·미디어 컨텍스트와 라우트 분리
-- `src/stt_to_subtitle/web_config.py`: GPU 대시보드 URL 설정 및 검증
+- `src/stt_to_subtitle/gpu_monitoring.py`: Prometheus GPU 메트릭 조회·정규화·캐시
+- `src/stt_to_subtitle/web_config.py`: Prometheus URL, 선택적 토큰과 갱신 설정 검증
 
 ## 5. GPU 관측 사이드 프로젝트
 
 ### 5.1 분리 원칙
 
-`gpu-observability/`는 메인 Compose 프로젝트와 별도의 프로젝트 이름, 네트워크, 데이터 볼륨을 사용한다. 향후 이 디렉터리만 별도 저장소로 옮겨도 동작하도록 메인 애플리케이션 소스에 의존하지 않는다.
+`gpu-observability/`는 메인 Compose 프로젝트와 별도의 프로젝트 이름과 데이터 볼륨을 사용한다. 향후 이 디렉터리만 별도 저장소로 옮길 수 있으며, STT 웹과는 이름이 고정된 내부 Docker 네트워크만 공유한다.
 
-메인 Docker 빌드 컨텍스트에서도 제외했으며, 메인 앱과의 연결은 선택적인 URL 링크뿐이다.
+메인 Docker 빌드 컨텍스트에서도 제외했다. Grafana 페이지를 삽입하거나 외부로 이동하지 않고, STT 웹이 Prometheus HTTP API의 현재 DCGM 메트릭만 조회한다.
 
 ```dotenv
-GPU_DASHBOARD_URL=http://127.0.0.1:3000/d/gpu-overview
+GPU_PROMETHEUS_URL=http://prometheus:9090
 ```
 
-빈 값이면 메인 대시보드에 설정 안내만 표시한다. URL은 HTTP 또는 HTTPS만 허용한다.
+빈 값이면 메인 대시보드에 설정 안내만 표시한다. URL은 HTTP 또는 HTTPS만 허용하며 선택적 Bearer 토큰은 화면이나 로그에 노출하지 않는다.
 
 ### 5.2 포함 구성
 
@@ -122,7 +127,7 @@ GPU_DASHBOARD_URL=http://127.0.0.1:3000/d/gpu-overview
 | Prometheus | `prom/prometheus:v3.13.1` | 메트릭 수집과 30일 보존, 경보 평가 |
 | Grafana | `grafana/grafana:13.1.0` | 자동 프로비저닝된 GPU 대시보드 제공 |
 
-기본 포트는 보안을 위해 `127.0.0.1`에만 바인딩한다. Grafana 익명 접근과 사용자 가입은 비활성화했다.
+Prometheus와 DCGM Exporter는 호스트에 포트를 게시하지 않는다. Grafana만 기본적으로 `127.0.0.1`에 바인딩하며 익명 접근과 사용자 가입은 비활성화했다.
 
 ### 5.3 대시보드와 경보
 
@@ -148,7 +153,7 @@ Prometheus 경보 규칙은 다음 상태를 감지한다.
 3. Linux 호스트에 NVIDIA 드라이버, Docker, NVIDIA Container Toolkit을 설치한다.
 4. `docker compose config`로 구성을 검증한다.
 5. `docker compose up -d`로 실행한다.
-6. 메인 앱의 `GPU_DASHBOARD_URL`에 Grafana 대시보드 주소를 지정한다.
+6. 메인 앱을 `compose.gpu-monitoring.yaml` 오버레이와 함께 실행한다.
 
 자세한 실행 절차는 `gpu-observability/README.md`에 정리되어 있다.
 
@@ -168,7 +173,10 @@ Prometheus 경보 규칙은 다음 상태를 감지한다.
 
 | 검증 | 결과 |
 | --- | --- |
-| 전체 `unittest` 제품군 | 212개 통과, 1개 건너뜀 |
+| GPU 조회·설정·대시보드 집중 테스트 | 7개 통과 |
+| 작업 시퀀스·진행률 UI 집중 테스트 | 10개 통과 |
+| STT SSE·청크 추정·DB 마이그레이션 집중 테스트 | 23개 통과 |
+| 전체 `unittest` 제품군 | 230개 중 228개 통과, 1개 건너뜀, 1개 실패 (`pyproject.toml`은 `3.2.0`이나 기존 릴리스 테스트가 `3.1.0`을 기대) |
 | Python 소스 컴파일 | 통과 |
 | `git diff --check` | 통과 |
 | 메인 `compose.yaml` 구성 렌더링 | 통과 |

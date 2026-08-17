@@ -1,0 +1,76 @@
+{% import "_icons.html" as icons %}
+<section class="card gpu-monitoring-card">
+  <div class="section-heading compact-heading">
+    <div>
+      <p class="page-kicker">GPU TELEMETRY</p>
+      <h2>GPU 상태</h2>
+    </div>
+    {% if gpu_snapshot.available %}
+      <span class="gpu-connection-state is-ready"><span aria-hidden="true"></span>수집 중</span>
+    {% elif gpu_snapshot.configured %}
+      <span class="gpu-connection-state is-attention"><span aria-hidden="true"></span>확인 필요</span>
+    {% else %}
+      <span class="gpu-connection-state"><span aria-hidden="true"></span>미연결</span>
+    {% endif %}
+  </div>
+
+  {% if not gpu_snapshot.configured %}
+    <div class="gpu-empty-state">
+      <span class="gpu-empty-icon" aria-hidden="true">{{ icons.activity(20) }}</span>
+      <div>
+        <strong>Prometheus 연결이 설정되지 않았습니다.</strong>
+        <p><code>GPU_PROMETHEUS_URL</code>을 설정하면 이 화면에서 GPU 상태를 직접 확인할 수 있습니다.</p>
+      </div>
+    </div>
+  {% elif not gpu_snapshot.available %}
+    <div class="gpu-empty-state is-attention">
+      <span class="gpu-empty-icon" aria-hidden="true">{{ icons.alert_triangle(20) }}</span>
+      <div>
+        <strong>GPU 메트릭을 불러오지 못했습니다.</strong>
+        <p>{{ gpu_snapshot.error }}</p>
+      </div>
+    </div>
+  {% else %}
+    <div class="gpu-device-grid">
+      {% for device in gpu_snapshot.devices %}
+        <article class="gpu-device-card">
+          <header>
+            <div>
+              <span class="gpu-device-index">GPU {{ device.index if device.index else loop.index0 }}</span>
+              <h3>{{ device.display_name }}</h3>
+            </div>
+          </header>
+          <div class="gpu-metric-grid">
+            <div class="gpu-metric gpu-metric-wide">
+              <span class="gpu-metric-label">사용률</span>
+              {% if device.utilization_percent is not none %}
+                <strong>{{ "%.0f"|format(device.utilization_percent) }}<small>%</small></strong>
+                <progress max="100" value="{{ device.utilization_percent }}" aria-label="GPU {{ device.index }} 사용률"></progress>
+              {% else %}
+                <strong class="gpu-metric-missing">—</strong>
+              {% endif %}
+            </div>
+            <div class="gpu-metric gpu-metric-wide">
+              <span class="gpu-metric-label">메모리</span>
+              {% if device.memory_percent is not none %}
+                <strong>{{ "%.0f"|format(device.memory_percent) }}<small>%</small></strong>
+                <span class="gpu-metric-detail">{{ "%.1f"|format(device.memory_used_gib) }} / {{ "%.1f"|format(device.memory_total_gib) }} GiB</span>
+                <progress max="100" value="{{ device.memory_percent }}" aria-label="GPU {{ device.index }} 메모리 사용률"></progress>
+              {% else %}
+                <strong class="gpu-metric-missing">—</strong>
+              {% endif %}
+            </div>
+            <div class="gpu-metric">
+              <span class="gpu-metric-label">온도</span>
+              <strong>{% if device.temperature_celsius is not none %}{{ "%.0f"|format(device.temperature_celsius) }}<small>°C</small>{% else %}<span class="gpu-metric-missing">—</span>{% endif %}</strong>
+            </div>
+            <div class="gpu-metric">
+              <span class="gpu-metric-label">전력</span>
+              <strong>{% if device.power_watts is not none %}{{ "%.0f"|format(device.power_watts) }}<small>W</small>{% else %}<span class="gpu-metric-missing">—</span>{% endif %}</strong>
+            </div>
+          </div>
+        </article>
+      {% endfor %}
+    </div>
+  {% endif %}
+</section>

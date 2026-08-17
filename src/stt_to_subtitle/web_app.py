@@ -29,6 +29,7 @@ from starlette.middleware.sessions import SessionMiddleware
 
 from .artifacts import artifact_filename
 from .contracts import validate_transcript, validate_translation_items
+from .gpu_monitoring import PrometheusGpuMonitor
 from .job_store import RETRYABLE_STATUSES, RUNNING_STATUSES, SUCCESS_STATUSES
 from .media_preview import (
     guess_media_type,
@@ -158,8 +159,11 @@ STAGE_STATE_LABELS = {
 def job_stage_view(job: Any) -> list[dict[str, Any]]:
     """작업이 거치는 모든 파이프라인 단계와 각 단계의 상태를 돌려준다."""
     stages = OPERATION_STAGES.get(str(job.operation), STAGE_SEQUENCE)
+    chunks_created = int(job.chunks_created)
+    chunks_total_estimate = int(getattr(job, "chunks_total_estimate", 0))
+    transcription_total = max(chunks_created, chunks_total_estimate)
     chunk_counts = {
-        "transcription": (job.chunks_completed, job.chunks_created),
+        "transcription": (job.chunks_completed, transcription_total),
         "translation": (
             job.translation_chunks_completed,
             job.translation_chunks_total,
@@ -197,6 +201,13 @@ def job_stage_view(job: Any) -> list[dict[str, Any]]:
         else:
             state = "done"
         completed, total = chunk_counts.get(stage, (0, 0))
+        percent = (
+            round(completed * 100 / total)
+            if total
+            else (100 if state == "done" else 0)
+        )
+        if state != "done":
+            percent = min(99, percent)
         view.append(
             {
                 "key": stage,
@@ -205,14 +216,42 @@ def job_stage_view(job: Any) -> list[dict[str, Any]]:
                 "state_label": STAGE_STATE_LABELS[state],
                 "completed": completed,
                 "total": total,
-                "percent": (
-                    round(completed * 100 / total)
-                    if total
-                    else (100 if state == "done" else 0)
+                "total_is_estimate": (
+                    stage == "transcription"
+                    and chunks_total_estimate > chunks_created
                 ),
+                "percent": percent,
             }
         )
     return view
+
+
+def job_progress_view(job: Any) -> dict[str, Any]:
+    """작업 목록에 표시할 전체 파이프라인 진행 상태를 계산한다."""
+    stages = job_stage_view(job)
+    percent = (
+        int(sum(stage["percent"] for stage in stages) / len(stages) + 0.5)
+        if stages
+        else 0
+    )
+    current = next(
+        (
+            stage
+            for stage in stages
+            if stage["state"] in {"running", "failed", "paused", "waiting"}
+        ),
+        stages[-1] if stages else None,
+    )
+    return {
+        "stages": stages,
+        "percent": percent,
+        "current": current,
+        "complete": bool(stages) and all(
+            stage["state"] == "done" for stage in stages
+        ),
+    }
+
+
 EVENT_LEVEL_LABELS = {
     "info": "정보",
     "warning": "주의",
@@ -236,6 +275,7 @@ TEMPLATES.env.filters["job_stage"] = lambda value: JOB_STAGE_LABELS.get(
     str(value),
 )
 TEMPLATES.env.filters["job_stages"] = job_stage_view
+TEMPLATES.env.filters["job_progress"] = job_progress_view
 TEMPLATES.env.filters["event_level"] = lambda value: EVENT_LEVEL_LABELS.get(
     str(value),
     str(value),
@@ -298,6 +338,12 @@ class JobChangeHook:
 def create_app(settings: WebSettings | None = None) -> FastAPI:
     configured_settings = settings or WebSettings.from_env()
     authentication_enabled = bool(configured_settings.admin_password.strip())
+    gpu_monitor = PrometheusGpuMonitor(
+        configured_settings.gpu_prometheus_url,
+        bearer_token=configured_settings.gpu_prometheus_token,
+        timeout_seconds=configured_settings.gpu_metrics_timeout_seconds,
+        cache_seconds=configured_settings.gpu_metrics_refresh_seconds,
+    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -321,6 +367,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         redoc_url=None,
     )
     app.state.authentication_enabled = authentication_enabled
+    app.state.gpu_monitor = gpu_monitor
 
     @app.middleware("http")
     async def allow_same_origin_webxr(
@@ -603,7 +650,10 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             "error": error,
             "notice": notice,
             "remote_servers": service.remote_servers_view(),
-            "gpu_dashboard_url": configured_settings.gpu_dashboard_url,
+            "gpu_snapshot": request.app.state.gpu_monitor.snapshot(),
+            "gpu_refresh_milliseconds": int(
+                configured_settings.gpu_metrics_refresh_seconds * 1000
+            ),
             "prompt_categories": service.active_prompt_categories(),
         }
 
@@ -1187,6 +1237,19 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             request,
             "_job_stats.html",
             {"job_stats": job_stats(orchestrator(request))},
+        )
+
+    @app.get("/gpu-stats-fragment", response_class=HTMLResponse)
+    def gpu_stats_fragment(request: Request) -> Any:
+        if not is_authenticated(request):
+            raise HTTPException(
+                status_code=401,
+                detail="authentication required",
+            )
+        return TEMPLATES.TemplateResponse(
+            request,
+            "_gpu_stats.html",
+            {"gpu_snapshot": request.app.state.gpu_monitor.snapshot()},
         )
 
     @app.get("/jobs/events")

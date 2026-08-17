@@ -5,7 +5,7 @@ from pathlib import Path
 import os
 from tempfile import TemporaryDirectory
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 WEB_TESTS_AVAILABLE = all(
     find_spec(module) is not None
@@ -15,6 +15,7 @@ if WEB_TESTS_AVAILABLE:
     from fastapi.testclient import TestClient
 
 from stt_to_subtitle.web_config import WebSettings
+from stt_to_subtitle.gpu_monitoring import GpuDevice, GpuSnapshot
 
 if WEB_TESTS_AVAILABLE:
     from stt_to_subtitle.web_app import JobChangeHook, create_app, main
@@ -42,6 +43,7 @@ class _StageJob:
         self.blocked_stage = None
         self.chunks_created = 0
         self.chunks_completed = 0
+        self.chunks_total_estimate = 0
         self.translation_chunks_total = 0
         self.translation_chunks_completed = 0
         for key, value in values.items():
@@ -109,6 +111,67 @@ class JobStageViewTests(unittest.TestCase):
         self.assertEqual(transcription["percent"], 25)
         self.assertEqual(transcription["completed"], 3)
         self.assertEqual(transcription["total"], 12)
+
+    def test_pipeline_progress_combines_stage_and_chunk_progress(self) -> None:
+        from stt_to_subtitle.web_app import job_progress_view
+
+        progress = job_progress_view(
+            _StageJob(
+                status="transcription_running",
+                chunks_created=12,
+                chunks_completed=7,
+            )
+        )
+
+        self.assertEqual(progress["percent"], 40)
+        self.assertEqual(progress["current"]["label"], "전사")
+        self.assertFalse(progress["complete"])
+
+    def test_estimated_transcription_total_is_used_until_actual_count_exceeds_it(
+        self,
+    ) -> None:
+        from stt_to_subtitle.web_app import job_stage_view
+
+        estimated = job_stage_view(
+            _StageJob(
+                status="transcription_running",
+                chunks_created=3,
+                chunks_completed=2,
+                chunks_total_estimate=10,
+            )
+        )[1]
+        corrected = job_stage_view(
+            _StageJob(
+                status="transcription_running",
+                chunks_created=12,
+                chunks_completed=8,
+                chunks_total_estimate=10,
+            )
+        )[1]
+
+        self.assertEqual(estimated["total"], 10)
+        self.assertTrue(estimated["total_is_estimate"])
+        self.assertEqual(corrected["total"], 12)
+        self.assertFalse(corrected["total_is_estimate"])
+
+    def test_running_stage_never_reports_one_hundred_percent(self) -> None:
+        from stt_to_subtitle.web_app import job_progress_view
+
+        progress = job_progress_view(
+            _StageJob(
+                status="translation_running",
+                translation_chunks_total=4,
+                translation_chunks_completed=4,
+            )
+        )
+
+        translation = next(
+            stage
+            for stage in progress["stages"]
+            if stage["key"] == "translation"
+        )
+        self.assertEqual(translation["percent"], 99)
+        self.assertLess(progress["percent"], 100)
 
     def test_completed_job_reports_every_stage_done(self) -> None:
         self.assertEqual(
@@ -255,6 +318,47 @@ class WebAppTests(unittest.TestCase):
                 "grid-template-columns: repeat(4, minmax(0, 1fr))",
                 stylesheet.text,
             )
+
+    def test_dashboard_renders_live_gpu_metrics_without_leaving_stt(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            snapshot = GpuSnapshot(
+                configured=True,
+                available=True,
+                devices=(
+                    GpuDevice(
+                        id="GPU-test",
+                        index="0",
+                        model_name="NVIDIA Test GPU",
+                        hostname="test-host",
+                        utilization_percent=73,
+                        memory_used_mib=8192,
+                        memory_total_mib=16384,
+                        temperature_celsius=67,
+                        power_watts=214.5,
+                    ),
+                ),
+            )
+
+            with TestClient(create_app(self.settings(root, media_root))) as client:
+                client.app.state.gpu_monitor = Mock(
+                    snapshot=Mock(return_value=snapshot)
+                )
+                dashboard = client.get("/")
+                fragment = client.get("/gpu-stats-fragment")
+                script = client.get("/static/gpu-monitoring.js")
+
+            self.assertEqual(dashboard.status_code, 200)
+            self.assertEqual(fragment.status_code, 200)
+            self.assertIn('data-gpu-update-url="/gpu-stats-fragment"', dashboard.text)
+            self.assertIn("NVIDIA Test GPU", dashboard.text)
+            self.assertIn("73", dashboard.text)
+            self.assertIn("8.0 / 16.0 GiB", dashboard.text)
+            self.assertNotIn("GPU_DASHBOARD_URL", dashboard.text)
+            self.assertNotIn("grafana", dashboard.text.lower())
+            self.assertIn("window.setTimeout", script.text)
 
     def test_media_page_renders_media_cards_and_local_poster(self) -> None:
         with TemporaryDirectory() as directory:
@@ -535,6 +639,7 @@ class WebAppTests(unittest.TestCase):
                     status="transcription_running",
                     chunks_created=12,
                     chunks_completed=7,
+                    chunks_total_estimate=15,
                 )
 
                 dashboard = client.get("/")
@@ -547,7 +652,10 @@ class WebAppTests(unittest.TestCase):
             self.assertIn("전사 중", dashboard.text)
             self.assertIn("확인 필요", dashboard.text)
             self.assertIn('class="job-stage-strip"', dashboard.text)
-            self.assertIn(">7/12<", dashboard.text)
+            self.assertIn('class="job-progress-overview"', dashboard.text)
+            self.assertIn("전체 진행률", dashboard.text)
+            self.assertIn("추출된 WAV 재생 시간", dashboard.text)
+            self.assertIn(">7/≈15<", dashboard.text)
             self.assertIn("movie.mkv", dashboard.text)
             self.assertIn("show", dashboard.text)
 
@@ -1033,8 +1141,8 @@ class WebAppTests(unittest.TestCase):
                 )
 
             self.assertIn("20", page.text)
-            self.assertIn("21 생성", page.text)
-            self.assertIn("1 진행·대기", page.text)
+            self.assertIn("21 전체", page.text)
+            self.assertIn("1 남음", page.text)
             self.assertIn("한국어 결과 JSON 편집", page.text)
             self.assertEqual(editor.status_code, 200)
             self.assertIn("movie_result_ko.json", editor.text)

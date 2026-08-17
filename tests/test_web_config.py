@@ -382,21 +382,29 @@ class WebSettingsTests(unittest.TestCase):
         self.assertEqual(settings.lm_token, "legacy-token")
         self.assertEqual(settings.lm_model, "legacy-model")
 
-    def test_reads_and_validates_gpu_dashboard_url(self) -> None:
+    def test_reads_and_validates_gpu_prometheus_settings(self) -> None:
         with patch.dict(
             os.environ,
-            {"GPU_DASHBOARD_URL": "https://grafana.test/d/gpu-overview/"},
+            {
+                "GPU_PROMETHEUS_URL": "https://prometheus.test/",
+                "GPU_PROMETHEUS_TOKEN": "metric-token",
+                "GPU_METRICS_REFRESH_SECONDS": "15",
+                "GPU_METRICS_TIMEOUT_SECONDS": "2.5",
+            },
             clear=True,
         ):
             settings = WebSettings.from_env()
 
         settings.validate()
         self.assertEqual(
-            settings.gpu_dashboard_url,
-            "https://grafana.test/d/gpu-overview",
+            settings.gpu_prometheus_url,
+            "https://prometheus.test",
         )
+        self.assertEqual(settings.gpu_prometheus_token, "metric-token")
+        self.assertEqual(settings.gpu_metrics_refresh_seconds, 15.0)
+        self.assertEqual(settings.gpu_metrics_timeout_seconds, 2.5)
 
-    def test_rejects_non_http_gpu_dashboard_url(self) -> None:
+    def test_rejects_non_http_gpu_prometheus_url(self) -> None:
         settings = WebSettings(
             state_dir=Path("/state"),
             media_root=Path("/media"),
@@ -407,10 +415,10 @@ class WebSettingsTests(unittest.TestCase):
             lm_base_url="",
             lm_token="",
             lm_model="",
-            gpu_dashboard_url="javascript:alert(1)",
+            gpu_prometheus_url="javascript:alert(1)",
         )
 
-        with self.assertRaisesRegex(ValueError, "GPU_DASHBOARD_URL"):
+        with self.assertRaisesRegex(ValueError, "GPU_PROMETHEUS_URL"):
             settings.validate()
 
     def test_allows_server_configuration_after_startup(self) -> None:

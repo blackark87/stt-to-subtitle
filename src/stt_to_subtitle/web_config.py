@@ -187,10 +187,12 @@ class WebSettings:
     lm_base_url: str
     lm_token: str
     lm_model: str
-    gpu_dashboard_url: str = ""
+    gpu_prometheus_url: str = ""
+    gpu_prometheus_token: str = ""
+    gpu_metrics_refresh_seconds: float = 10.0
+    gpu_metrics_timeout_seconds: float = 3.0
     secure_cookie: bool = False
     maximum_listed_files: int = 5000
-    stt_poll_interval: float = 5.0
     translation_batch_segments: int = 30
     translation_batch_characters: int = 6000
 
@@ -219,16 +221,23 @@ class WebSettings:
                 "OPENAI_COMPATIBLE_MODEL",
                 "LM_STUDIO_MODEL",
             ).strip(),
-            gpu_dashboard_url=os.environ.get(
-                "GPU_DASHBOARD_URL",
+            gpu_prometheus_url=os.environ.get(
+                "GPU_PROMETHEUS_URL",
                 "",
             ).strip().rstrip("/"),
+            gpu_prometheus_token=os.environ.get(
+                "GPU_PROMETHEUS_TOKEN",
+                "",
+            ),
+            gpu_metrics_refresh_seconds=float(
+                os.environ.get("GPU_METRICS_REFRESH_SECONDS", "10")
+            ),
+            gpu_metrics_timeout_seconds=float(
+                os.environ.get("GPU_METRICS_TIMEOUT_SECONDS", "3")
+            ),
             secure_cookie=_env_bool("WEB_SECURE_COOKIE"),
             maximum_listed_files=int(
                 os.environ.get("WEB_MAXIMUM_LISTED_FILES", "5000")
-            ),
-            stt_poll_interval=float(
-                os.environ.get("STT_POLL_INTERVAL_SECONDS", "5")
             ),
             translation_batch_segments=int(
                 os.environ.get("TRANSLATION_BATCH_SEGMENTS", "30")
@@ -247,13 +256,15 @@ class WebSettings:
             raise ValueError("WEB_SESSION_SECRET must be at least 32 characters")
         if self.maximum_listed_files < 1:
             raise ValueError("WEB_MAXIMUM_LISTED_FILES must be positive")
-        if self.stt_poll_interval <= 0:
-            raise ValueError("STT_POLL_INTERVAL_SECONDS must be positive")
-        if self.gpu_dashboard_url:
+        if self.gpu_prometheus_url:
             normalize_server_url(
-                self.gpu_dashboard_url,
-                "GPU_DASHBOARD_URL",
+                self.gpu_prometheus_url,
+                "GPU_PROMETHEUS_URL",
             )
+        if self.gpu_metrics_refresh_seconds <= 0:
+            raise ValueError("GPU_METRICS_REFRESH_SECONDS must be positive")
+        if self.gpu_metrics_timeout_seconds <= 0:
+            raise ValueError("GPU_METRICS_TIMEOUT_SECONDS must be positive")
         if (
             self.translation_batch_segments < 1
             or self.translation_batch_characters < 1

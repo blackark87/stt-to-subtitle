@@ -249,16 +249,16 @@
     </div>
     <span class="history-count">{{ events|length }}개 기록</span>
   </div>
-  {% if job.chunks_created or job.translation_chunks_total %}
+  {% if job.transcription_chunks_total or job.translation_chunks_total %}
     <div class="history-progress-grid">
-      {% if job.chunks_created %}
+      {% if job.transcription_chunks_total %}
         <div class="history-progress-item">
           <strong>전사 청크</strong>
-          <progress value="{{ job.chunks_completed }}" max="{{ job.chunks_created }}" aria-label="전사 청크 진행률"></progress>
+          <progress value="{{ job.chunks_completed }}" max="{{ job.transcription_chunks_total }}" aria-label="전사 청크 진행률"></progress>
           <span class="chunk-progress">
             <strong>{{ job.chunks_completed }}</strong> 완료
-            <span>/ {{ job.chunks_created }} 생성</span>
-            <span>/ {{ job.chunks_in_progress }} 진행·대기</span>
+            <span>/ {% if job.transcription_total_is_estimated %}약 {% endif %}{{ job.transcription_chunks_total }} 전체</span>
+            <span>/ {{ job.transcription_chunks_remaining }} 남음</span>
           </span>
         </div>
       {% endif %}

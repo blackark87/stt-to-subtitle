@@ -1,5 +1,6 @@
 {% import "_icons.html" as icons %}
 {% macro job_item(job) %}
+  {% set pipeline = job|job_progress %}
   {% set is_running = job.status in ['extracting', 'transcription_running', 'translation_running', 'rendering'] %}
   {% set is_attention = job.status in ['blocked', 'failed'] %}
   {% set is_completed = job.status in ['audio_completed', 'transcription_completed', 'completed'] %}
@@ -50,11 +51,34 @@
           <span>프롬프트 {{ job.prompt_category_name }}</span>
         {% endif %}
       </div>
+      <div
+        class="job-progress-overview"
+        title="파이프라인 단계를 같은 비중으로 계산한 진행률이며 남은 시간 추정치는 아닙니다."
+      >
+        <div class="job-progress-heading">
+          <span>전체 진행률</span>
+          <strong>{{ pipeline.percent }}%</strong>
+          {% if pipeline.complete %}
+            <span class="job-progress-current">모든 단계 완료</span>
+          {% elif pipeline.current %}
+            <span class="job-progress-current">
+              현재 {{ pipeline.current.label }} · {{ pipeline.current.state_label }}
+              {% if pipeline.current.total %}
+                · {{ pipeline.current.completed }}/{% if pipeline.current.total_is_estimate %}약 {% endif %}{{ pipeline.current.total }} 청크
+              {% endif %}
+            </span>
+          {% endif %}
+        </div>
+        <progress
+          value="{{ pipeline.percent }}"
+          max="100"
+          aria-label="{{ job.source_rel|filename }} 전체 진행률 {{ pipeline.percent }}%"
+        ></progress>
+      </div>
       <ol class="job-stage-strip" aria-label="{{ job.source_rel|filename }} 단계별 진행 상황">
-        {% for stage in job|job_stages %}
+        {% for stage in pipeline.stages %}
           <li
             class="job-stage is-{{ stage.state }}"
-            style="--stage-percent: {{ stage.percent }}%"
             {% if stage.state == 'failed' and job.error %}title="error: {{ job.error }}"{% endif %}
           >
             <span class="job-stage-icon" aria-hidden="true">
@@ -66,13 +90,22 @@
             </span>
             <span class="job-stage-label">{{ stage.label }}</span>
             {% if stage.total %}
-              <span class="job-stage-count">{{ stage.completed }}/{{ stage.total }}</span>
+              <span class="job-stage-count">{{ stage.completed }}/{% if stage.total_is_estimate %}≈{% endif %}{{ stage.total }}</span>
             {% else %}
               <span class="job-stage-count">{{ stage.state_label }}</span>
             {% endif %}
+            <progress
+              class="job-stage-progress"
+              value="{{ stage.percent }}"
+              max="100"
+              aria-label="{{ stage.label }} 진행률 {{ stage.percent }}%"
+            ></progress>
           </li>
         {% endfor %}
       </ol>
+      {% if job.status == 'transcription_running' and job.chunks_total_estimate %}
+        <p class="job-progress-note">전사 전체 청크는 추출된 WAV 재생 시간과 모델 청크 길이로 추정하며, 실제 생성 수가 더 많으면 자동으로 보정합니다.</p>
+      {% endif %}
       {% if job.job_stop_requested %}
         <p class="muted">전체 작업 중단 요청됨 · 현재 단계를 안전하게 마치는 중</p>
       {% elif job.translation_pause_requested and job.status != "translation_paused" %}

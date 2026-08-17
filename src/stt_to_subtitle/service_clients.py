@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 import json
 import logging
 from pathlib import Path
@@ -104,7 +104,6 @@ class STTAPIClient(RetryingJSONClient):
         base_url: str,
         token: str,
         *,
-        poll_interval: float = 5.0,
         attempts: int = 3,
     ) -> None:
         super().__init__(
@@ -113,7 +112,6 @@ class STTAPIClient(RetryingJSONClient):
             attempts=attempts,
         )
         self.base_url = base_url.rstrip("/")
-        self.poll_interval = poll_interval
 
     def transcribe(
         self,
@@ -128,7 +126,6 @@ class STTAPIClient(RetryingJSONClient):
     ) -> dict[str, Any]:
         job_id = existing_job_id
         may_requeue_existing = existing_job_id is not None
-        last_progress: tuple[int, int, int, int, bool] | None = None
         while True:
             if should_stop is not None and should_stop():
                 raise OperationStopped("transcription stop requested")
@@ -141,23 +138,67 @@ class STTAPIClient(RetryingJSONClient):
                 if on_job_created is not None:
                     on_job_created(job_id)
 
-            response = self.request(
-                "GET",
-                f"{self.base_url}/v1/transcriptions/{job_id}",
-                headers=self.headers,
+            status_payload = self._wait_for_terminal_status(
+                job_id,
+                on_progress=on_progress,
+                should_stop=should_stop,
             )
-            if response.status_code != 200:
+            remote_status = str(status_payload["status"])
+            if remote_status == "completed":
+                break
+            if remote_status == "failed":
+                if may_requeue_existing:
+                    may_requeue_existing = False
+                    job_id = None
+                    continue
                 raise ExternalServiceError(
-                    "transcription status request failed: "
-                    f"HTTP {response.status_code}: {_safe_error(response)}"
+                    "transcription job failed: "
+                    f"{status_payload.get('error', 'unknown remote error')}"
                 )
+
+        if should_stop is not None and should_stop():
+            raise OperationStopped("transcription stop requested")
+        response = self.request(
+            "GET",
+            f"{self.base_url}/v1/transcriptions/{job_id}/result",
+            headers=self.headers,
+        )
+        if response.status_code != 200:
+            raise ExternalServiceError(
+                "transcription result request failed: "
+                f"HTTP {response.status_code}: {_safe_error(response)}"
+            )
+        try:
+            payload = response.json()
+        except ValueError as error:
+            raise ExternalServiceError(
+                "transcription API returned invalid result JSON"
+            ) from error
+        validate_transcript(payload)
+        return payload
+
+    def _wait_for_terminal_status(
+        self,
+        job_id: str,
+        *,
+        on_progress: Callable[[Mapping[str, Any]], None] | None,
+        should_stop: Callable[[], bool] | None,
+    ) -> Mapping[str, Any]:
+        last_progress: tuple[int, int, int, int, bool] | None = None
+        for status_payload in self._status_events(
+            job_id,
+            should_stop=should_stop,
+        ):
             try:
-                status_payload = response.json()
                 remote_status = str(status_payload["status"])
             except (KeyError, TypeError, ValueError) as error:
                 raise ExternalServiceError(
-                    "transcription API returned an invalid status response"
+                    "transcription API returned an invalid status event"
                 ) from error
+            if remote_status not in {"queued", "running", "completed", "failed"}:
+                raise ExternalServiceError(
+                    f"transcription job returned unknown status {remote_status}"
+                )
             progress = status_payload.get("chunk_progress")
             if on_progress is not None and isinstance(progress, Mapping):
                 try:
@@ -194,44 +235,86 @@ class STTAPIClient(RetryingJSONClient):
                             "final": current_progress[4],
                         }
                     )
-            if remote_status == "completed":
-                break
-            if remote_status == "failed":
-                if may_requeue_existing:
-                    may_requeue_existing = False
-                    job_id = None
-                    last_progress = None
-                    continue
-                raise ExternalServiceError(
-                    "transcription job failed: "
-                    f"{status_payload.get('error', 'unknown remote error')}"
-                )
-            if remote_status not in {"queued", "running"}:
-                raise ExternalServiceError(
-                    f"transcription job returned unknown status {remote_status}"
-                )
-            time.sleep(self.poll_interval)
-
-        if should_stop is not None and should_stop():
-            raise OperationStopped("transcription stop requested")
-        response = self.request(
-            "GET",
-            f"{self.base_url}/v1/transcriptions/{job_id}/result",
-            headers=self.headers,
+            if remote_status in {"completed", "failed"}:
+                return status_payload
+        raise ExternalServiceError(
+            "transcription event stream ended before a terminal status"
         )
-        if response.status_code != 200:
-            raise ExternalServiceError(
-                "transcription result request failed: "
-                f"HTTP {response.status_code}: {_safe_error(response)}"
+
+    def _status_events(
+        self,
+        job_id: str,
+        *,
+        should_stop: Callable[[], bool] | None,
+    ) -> Iterator[Mapping[str, Any]]:
+        last_error: BaseException | None = None
+        for attempt in range(1, self.attempts + 1):
+            if should_stop is not None and should_stop():
+                raise OperationStopped("transcription stop requested")
+            response = self.request(
+                "GET",
+                f"{self.base_url}/v1/transcriptions/{job_id}/events",
+                headers={**self.headers, "Accept": "text/event-stream"},
+                stream=True,
             )
-        try:
-            payload = response.json()
-        except ValueError as error:
-            raise ExternalServiceError(
-                "transcription API returned invalid result JSON"
-            ) from error
-        validate_transcript(payload)
-        return payload
+            if response.status_code != 200:
+                try:
+                    detail = _safe_error(response)
+                finally:
+                    response.close()
+                raise ExternalServiceError(
+                    "transcription status request failed: "
+                    f"HTTP {response.status_code}: {detail}"
+                )
+            data_lines: list[str] = []
+            try:
+                for raw_line in response.iter_lines(
+                    chunk_size=1,
+                    decode_unicode=True,
+                ):
+                    if should_stop is not None and should_stop():
+                        raise OperationStopped("transcription stop requested")
+                    line = (
+                        raw_line.decode("utf-8", errors="replace")
+                        if isinstance(raw_line, bytes)
+                        else str(raw_line)
+                    )
+                    if line.startswith("data:"):
+                        data_lines.append(line[5:].lstrip())
+                        continue
+                    if line or not data_lines:
+                        continue
+                    try:
+                        payload = json.loads("\n".join(data_lines))
+                    except (TypeError, ValueError, json.JSONDecodeError) as error:
+                        raise ExternalServiceError(
+                            "transcription API returned an invalid status event"
+                        ) from error
+                    data_lines.clear()
+                    if not isinstance(payload, Mapping):
+                        raise ExternalServiceError(
+                            "transcription status event must be an object"
+                        )
+                    yield payload
+                    if str(payload.get("status", "")) in {"completed", "failed"}:
+                        return
+            except requests.RequestException as error:
+                last_error = error
+            finally:
+                response.close()
+            if attempt < self.attempts:
+                delay = float(2 ** (attempt - 1))
+                LOGGER.warning(
+                    "transcription event stream disconnected; reconnecting "
+                    "in %.0fs (%d/%d)",
+                    delay,
+                    attempt,
+                    self.attempts,
+                )
+                time.sleep(delay)
+        raise ExternalServiceError(
+            "transcription event stream disconnected before completion"
+        ) from last_error
 
     def _submit(
         self,

@@ -1,3 +1,4 @@
+import asyncio
 import os
 import json
 from pathlib import Path
@@ -11,6 +12,7 @@ from fastapi.testclient import TestClient
 
 from stt_to_subtitle.stt_api import (
     STTAPISettings,
+    TranscriptionChangeHook,
     TranscriptionService,
     _device_unavailable_reason,
     _parse_options,
@@ -18,6 +20,18 @@ from stt_to_subtitle.stt_api import (
     create_app,
 )
 from stt_to_subtitle.transcription_store import TranscriptionJob
+
+
+class TranscriptionChangeHookTests(unittest.IsolatedAsyncioTestCase):
+    async def test_wakes_only_the_changed_transcription_job(self) -> None:
+        hook = TranscriptionChangeHook(asyncio.get_running_loop())
+        first_version = hook.version("job-1")
+
+        hook.publish("job-1")
+        updated = await hook.wait("job-1", first_version, timeout=0.1)
+
+        self.assertEqual(updated, first_version + 1)
+        self.assertEqual(hook.version("job-2"), 0)
 
 
 class STTAPIHelpersTests(unittest.TestCase):
@@ -576,6 +590,37 @@ class STTAPIHelpersTests(unittest.TestCase):
 
 
 class STTAPIRouteTests(unittest.TestCase):
+    def test_terminal_job_is_delivered_as_an_sse_status_event(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings = STTAPISettings(
+                state_dir=root,
+                api_token="api-token",
+                hf_token="hf-token",
+            )
+            with TestClient(create_app(settings)) as client:
+                service = client.app.state.transcription_service
+                service.store.create(
+                    job_id="job-1",
+                    idempotency_key="key-1",
+                    audio_path=root / "audio.wav",
+                    audio_sha256="abc",
+                    options={},
+                )
+                service.store.update("job-1", status="completed")
+
+                with client.stream(
+                    "GET",
+                    "/v1/transcriptions/job-1/events",
+                    headers={"Authorization": "Bearer api-token"},
+                ) as response:
+                    body = "".join(response.iter_text())
+
+            self.assertEqual(response.status_code, 200)
+            self.assertIn("event: transcription", body)
+            self.assertIn('"status":"completed"', body)
+            self.assertEqual(response.headers["x-accel-buffering"], "no")
+
     def test_health_is_public_and_job_status_requires_bearer_token(self) -> None:
         with TemporaryDirectory() as directory:
             settings = STTAPISettings(
