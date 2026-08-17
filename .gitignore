@@ -1091,6 +1091,7 @@ FodyWeavers.xsd
 !README.md
 !MEMORY.md
 !IMPLEMENTATION_SUMMARY.md
+!future_task.md
 !LICENSE
 
 # !Makefile

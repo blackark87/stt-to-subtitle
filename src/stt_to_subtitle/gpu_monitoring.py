@@ -15,11 +15,12 @@ import requests
 
 LOGGER = logging.getLogger(__name__)
 GPU_METRICS_QUERY = (
-    '{__name__=~"DCGM_FI_DEV_(GPU_UTIL|FB_USED|FB_TOTAL|GPU_TEMP|POWER_USAGE)"}'
+    '{__name__=~"DCGM_FI_DEV_(GPU_UTIL|FB_USED|FB_FREE|FB_TOTAL|GPU_TEMP|POWER_USAGE)"}'
 )
 METRIC_FIELDS = {
     "DCGM_FI_DEV_GPU_UTIL": "utilization_percent",
     "DCGM_FI_DEV_FB_USED": "memory_used_mib",
+    "DCGM_FI_DEV_FB_FREE": "_memory_free_mib",
     "DCGM_FI_DEV_FB_TOTAL": "memory_total_mib",
     "DCGM_FI_DEV_GPU_TEMP": "temperature_celsius",
     "DCGM_FI_DEV_POWER_USAGE": "power_watts",
@@ -204,7 +205,18 @@ def _normalize_devices(results: list[object]) -> tuple[GpuDevice, ...]:
         )
         device[field] = value
 
-    normalized = [GpuDevice(**device) for device in devices.values()]
+    normalized = []
+    for device in devices.values():
+        memory_free_mib = device.pop("_memory_free_mib", None)
+        if (
+            "memory_total_mib" not in device
+            and "memory_used_mib" in device
+            and memory_free_mib is not None
+        ):
+            device["memory_total_mib"] = (
+                device["memory_used_mib"] + memory_free_mib
+            )
+        normalized.append(GpuDevice(**device))
     normalized.sort(key=lambda device: _gpu_sort_key(device.index, device.id))
     return tuple(normalized)
 

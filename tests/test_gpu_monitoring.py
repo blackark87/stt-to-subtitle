@@ -122,6 +122,41 @@ class PrometheusGpuMonitorTests(unittest.TestCase):
         self.assertIs(first, second)
         session.get.assert_called_once()
 
+    def test_derives_total_memory_when_dcgm_exposes_free_memory(self) -> None:
+        response = Mock()
+        response.json.return_value = {
+            "status": "success",
+            "data": {
+                "resultType": "vector",
+                "result": [
+                    metric(
+                        "DCGM_FI_DEV_FB_USED",
+                        "3",
+                        gpu="0",
+                        UUID="GPU-one",
+                    ),
+                    metric(
+                        "DCGM_FI_DEV_FB_FREE",
+                        "997",
+                        gpu="0",
+                        UUID="GPU-one",
+                    ),
+                ],
+            },
+        }
+        session = Mock()
+        session.get.return_value = response
+
+        snapshot = PrometheusGpuMonitor(
+            "http://prometheus:9090",
+            session=session,
+        ).snapshot()
+
+        self.assertTrue(snapshot.available)
+        self.assertEqual(snapshot.devices[0].memory_used_mib, 3.0)
+        self.assertEqual(snapshot.devices[0].memory_total_mib, 1000.0)
+        self.assertEqual(snapshot.devices[0].memory_percent, 0.3)
+
     def test_reports_missing_dcgm_series(self) -> None:
         response = Mock()
         response.json.return_value = {
