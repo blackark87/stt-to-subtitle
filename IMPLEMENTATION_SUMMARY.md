@@ -116,7 +116,7 @@ GPU_DASHBOARD_URL=http://127.0.0.1:3000/d/gpu-overview
 
 | 구성 요소 | 기본 이미지 | 역할 |
 | --- | --- | --- |
-| NVIDIA DCGM Exporter | `nvcr.io/nvidia/k8s/dcgm-exporter:4.6.0-4.8.3-ubuntu22.04` | NVIDIA GPU 메트릭 노출 |
+| NVIDIA DCGM Exporter | `nvcr.io/nvidia/k8s/dcgm-exporter:4.6.0-4.8.3-distroless` | NVIDIA GPU 메트릭 노출 |
 | Prometheus | `prom/prometheus:v3.13.1` | 메트릭 수집과 30일 보존, 경보 평가 |
 | Grafana | `grafana/grafana:13.1.0` | 자동 프로비저닝된 GPU 대시보드 제공 |
 

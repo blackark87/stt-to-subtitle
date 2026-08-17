@@ -15,6 +15,9 @@ STT 애플리케이션과 독립적으로 배포하는 NVIDIA GPU 관측 프로�
 - Docker Engine, Compose 플러그인, NVIDIA Container Toolkit
 
 DCGM Exporter는 Linux에서만 지원됩니다. Apple Silicon MPS나 CPU 사용량은 이 프로젝트의 수집 범위에 포함되지 않습니다.
+Alpine 변형 대신 NVIDIA가 제공하는 경량 `4.6.0-4.8.3-distroless` 이미지를
+기본으로 사용합니다. Distroless 이미지에는 셸과 패키지 관리자가 없으므로
+컨테이너 내부 명령보다 로그와 `/metrics` 엔드포인트로 상태를 진단하십시오.
 
 ## 실행
 

@@ -2,7 +2,7 @@ name: gpu-observability
 
 services:
   dcgm-exporter:
-    image: ${DCGM_EXPORTER_IMAGE:-nvcr.io/nvidia/k8s/dcgm-exporter:4.6.0-4.8.3-ubuntu22.04}
+    image: ${DCGM_EXPORTER_IMAGE:-nvcr.io/nvidia/k8s/dcgm-exporter:4.6.0-4.8.3-distroless}
     restart: unless-stopped
     cap_add:
       - SYS_ADMIN
