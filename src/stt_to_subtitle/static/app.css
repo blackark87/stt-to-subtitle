@@ -440,6 +440,7 @@ button:disabled, .button:disabled { opacity: .5; cursor: not-allowed; box-shadow
 .metadata-label.is-empty { visibility: hidden; }
 .empty-state { margin: 0; padding: 24px; border: 1px dashed var(--line); border-radius: 8px; color: var(--muted); text-align: center; }
 .form-section-title { margin: 8px 0 0; padding-top: 18px; border-top: 1px solid var(--line); font-size: 1rem; }
+.processing-choices { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr)); align-items: end; gap: 14px; }
 .advanced-options { border: 1px solid var(--line); border-radius: var(--radius-control); padding: 12px 14px; background: var(--surface-sunken); }
 .advanced-options[open] { padding-bottom: 16px; }
 .advanced-options summary { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; cursor: pointer; font-weight: 650; list-style: revert; }

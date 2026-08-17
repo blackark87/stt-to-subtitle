@@ -234,13 +234,23 @@
       </fieldset>
 
       <h3 class="form-section-title wide">처리 설정</h3>
-      <label class="wide">전사 엔진
-        <select name="backend">
-          <option value="hybrid" selected>하이브리드 (WhisperX + Kotoba 보정)</option>
-          <option value="whisperx">WhisperX</option>
-          <option value="kotoba">Kotoba</option>
-        </select>
-      </label>
+      <div class="wide processing-choices">
+        <label>전사 엔진
+          <select name="backend">
+            <option value="hybrid" selected>하이브리드 (WhisperX + Kotoba 보정)</option>
+            <option value="whisperx">WhisperX</option>
+            <option value="kotoba">Kotoba</option>
+          </select>
+        </label>
+        <label>번역 프롬프트 카테고리
+          <select name="prompt_category_id" data-prompt-category>
+            <option value="">전체·번역 작업을 시작하려면 선택하세요</option>
+            {% for category in prompt_categories %}
+              <option value="{{ category.id }}">{{ category.name }}</option>
+            {% endfor %}
+          </select>
+        </label>
+      </div>
       <details class="advanced-options wide">
         <summary><strong>고급 옵션</strong></summary>
         <div class="advanced-options-grid grid-form">
@@ -282,14 +292,6 @@
           </div>
         </div>
       </details>
-      <label class="wide">번역 프롬프트 카테고리
-        <select name="prompt_category_id" data-prompt-category>
-          <option value="">전체·번역 작업을 시작하려면 선택하세요</option>
-          {% for category in prompt_categories %}
-            <option value="{{ category.id }}">{{ category.name }}</option>
-          {% endfor %}
-        </select>
-      </label>
       <div class="wide submit-row">
         <button type="submit" name="operation" value="transcribe" class="secondary" data-batch-submit data-requires-servers data-server-configured="{{ 'true' if remote_servers.configured else 'false' }}" title="오디오 추출 → 전사" disabled>전사</button>
         <button type="submit" name="operation" value="compare" class="secondary" data-batch-submit data-requires-servers data-server-configured="{{ 'true' if remote_servers.configured else 'false' }}" title="선택 파일마다 하이브리드·WhisperX·Kotoba 전사 작업을 생성합니다" disabled>전사 비교</button>

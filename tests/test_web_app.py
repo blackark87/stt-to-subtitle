@@ -1680,8 +1680,10 @@ class WebAppTests(unittest.TestCase):
             button_position = dashboard.text.index(
                 'name="operation" value="transcribe"'
             )
-            self.assertLess(advanced_end, prompt_position)
-            self.assertLess(prompt_position, button_position)
+            # 엔진·프롬프트 선택이 한 줄에 오고, 고급 옵션은 그 아래
+            # 전체 폭으로, 실행 버튼은 마지막에 온다.
+            self.assertLess(prompt_position, advanced_position)
+            self.assertLess(advanced_end, button_position)
             self.assertEqual(response.status_code, 303)
             self.assertEqual(response.headers["location"], "/media?queued=1")
             self.assertEqual(jobs[0].operation, "transcribe")
