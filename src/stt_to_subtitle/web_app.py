@@ -45,6 +45,8 @@ from .web_config import (
     normalize_server_url,
 )
 from .orchestrator import (
+    COMPARISON_AUDIO_SOURCE_JOB_ID_OPTION,
+    COMPARISON_PARENT_ID_OPTION,
     SubtitleOrchestrator,
     TRANSCRIPTION_COMPARISON_BACKENDS,
     TRANSLATION_OPERATIONS,
@@ -59,10 +61,18 @@ from .time_display import (
     format_kst_iso,
     format_kst_timestamp,
 )
+from .whisperx_worker import WHISPERX_MAX_CHUNK_LENGTH_SECONDS
+from .whisperjav_worker import (
+    DEFAULT_ANIME_MAX_GROUP_SECONDS,
+    DEFAULT_QWEN_MAX_GROUP_SECONDS,
+    MAX_MAX_GROUP_SECONDS,
+    MIN_MAX_GROUP_SECONDS,
+)
 
 LOGGER = logging.getLogger(__name__)
 PACKAGE_DIR = Path(__file__).parent
 RECENT_JOB_LIMIT = 20
+COMPARISON_HISTORY_LIMIT = 20
 DASHBOARD_JOB_LIMIT = 5
 WAITING_STATUSES = {
     "queued",
@@ -114,6 +124,7 @@ MEDIA_PROCESSING_LABELS = {
     "completed": "자막 생성 완료",
 }
 STT_BACKEND_LABELS = {
+    "whisperjav": "WhisperJAV",
     "hybrid": "하이브리드",
     "whisperx": "WhisperX",
     "kotoba": "Kotoba",
@@ -260,6 +271,32 @@ def job_progress_view(job: Any) -> dict[str, Any]:
         "complete": bool(stages) and all(
             stage["state"] == "done" for stage in stages
         ),
+    }
+
+
+def comparison_audio_stage(jobs: Sequence[Any]) -> dict[str, str]:
+    """여러 비교 작업의 오디오 준비 상태를 하나의 단계로 집계한다."""
+    audio_stages = [
+        stage
+        for job in jobs
+        for stage in job_stage_view(job)
+        if stage["key"] == "audio extraction"
+    ]
+    states = {str(stage["state"]) for stage in audio_stages}
+    if audio_stages and states == {"done"}:
+        state = "done"
+    elif "failed" in states:
+        state = "failed"
+    elif "running" in states or "done" in states:
+        state = "running"
+    elif "waiting" in states:
+        state = "waiting"
+    else:
+        state = "pending"
+    return {
+        "label": "오디오 추출",
+        "state": state,
+        "state_label": STAGE_STATE_LABELS[state],
     }
 
 
@@ -841,13 +878,10 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             **browser,
         }
 
-    def transcription_comparison_context(
-        request: Request,
+    def transcription_comparison_jobs(
+        service: SubtitleOrchestrator,
         comparison_id: str,
-        *,
-        skipped: int = 0,
-    ) -> dict[str, Any]:
-        service = orchestrator(request)
+    ) -> list[Any]:
         comparison_jobs = [
             job
             for job in service.store.list_jobs(limit=None)
@@ -858,19 +892,272 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                 status_code=404,
                 detail="transcription comparison not found",
             )
+        return comparison_jobs
+
+    def transcription_comparison_chunk_lengths(
+        comparison_jobs: Sequence[Any],
+    ) -> dict[str, int | float]:
+        chunk_lengths = {
+            "kotoba_chunk_length_seconds": 15,
+            "whisperx_chunk_length_seconds": 30,
+            "anime_max_group_duration_seconds": (
+                DEFAULT_ANIME_MAX_GROUP_SECONDS
+            ),
+            "qwen_max_group_duration_seconds": (
+                DEFAULT_QWEN_MAX_GROUP_SECONDS
+            ),
+        }
+        for job in comparison_jobs:
+            if str(job.options.get("backend", "")) == "hybrid":
+                rescue = job.options.get("hybrid_rescue", {})
+                if isinstance(rescue, Mapping):
+                    for key in chunk_lengths:
+                        try:
+                            chunk_lengths[key] = int(rescue[key])
+                        except (KeyError, TypeError, ValueError):
+                            pass
+        for job in comparison_jobs:
+            backend = str(job.options.get("backend", ""))
+            if backend in {"kotoba", "whisperx"}:
+                key = f"{backend}_chunk_length_seconds"
+                try:
+                    chunk_lengths[key] = int(
+                        job.options["chunk_length_seconds"]
+                    )
+                except (KeyError, TypeError, ValueError):
+                    pass
+            if backend == "whisperjav":
+                raw_whisperjav = job.options.get("whisperjav", {})
+                if isinstance(raw_whisperjav, Mapping):
+                    for key in (
+                        "anime_max_group_duration_seconds",
+                        "qwen_max_group_duration_seconds",
+                    ):
+                        try:
+                            chunk_lengths[key] = float(raw_whisperjav[key])
+                        except (KeyError, TypeError, ValueError):
+                            pass
+        return chunk_lengths
+
+    def transcription_comparison_backends(
+        comparison_jobs: Sequence[Any],
+    ) -> tuple[str, ...]:
+        for job in comparison_jobs:
+            configured = job.options.get("comparison_backends")
+            if isinstance(configured, list):
+                normalized = tuple(
+                    backend
+                    for backend in configured
+                    if backend in TRANSCRIPTION_COMPARISON_BACKENDS
+                )
+                if normalized:
+                    return normalized
+        present = {
+            str(job.options.get("backend", "")) for job in comparison_jobs
+        }
+        return tuple(
+            backend
+            for backend in TRANSCRIPTION_COMPARISON_BACKENDS
+            if backend in present
+        )
+
+    def transcription_comparison_rerun_options(
+        comparison_jobs: Sequence[Any],
+        *,
+        kotoba_chunk_length_seconds: int,
+        whisperx_chunk_length_seconds: int,
+        anime_max_group_duration_seconds: float,
+        qwen_max_group_duration_seconds: float,
+    ) -> dict[str, Any]:
+        template_job = next(
+            (
+                job
+                for job in comparison_jobs
+                if str(job.options.get("backend", "")) == "hybrid"
+            ),
+            comparison_jobs[0],
+        )
+        options = dict(template_job.options)
+        options.pop("comparison_id", None)
+        options.pop("comparison_schema_version", None)
+        options.pop("comparison_backends", None)
+        options.pop(COMPARISON_PARENT_ID_OPTION, None)
+        options.pop(COMPARISON_AUDIO_SOURCE_JOB_ID_OPTION, None)
+        options["backend"] = "hybrid"
+        raw_rescue = options.get("hybrid_rescue", {})
+        rescue = dict(raw_rescue) if isinstance(raw_rescue, Mapping) else {}
+        rescue.update(
+            {
+                "kotoba_chunk_length_seconds": (
+                    kotoba_chunk_length_seconds
+                ),
+                "whisperx_chunk_length_seconds": (
+                    whisperx_chunk_length_seconds
+                ),
+            }
+        )
+        options["hybrid_rescue"] = rescue
+        options["whisperjav"] = {
+            "anime_max_group_duration_seconds": (
+                anime_max_group_duration_seconds
+            ),
+            "qwen_max_group_duration_seconds": (
+                qwen_max_group_duration_seconds
+            ),
+        }
+        options["chunk_length_seconds"] = kotoba_chunk_length_seconds
+        return options
+
+    def transcription_comparison_jobs_by_id(
+        service: SubtitleOrchestrator,
+    ) -> dict[str, list[Any]]:
+        jobs_by_comparison: dict[str, list[Any]] = {}
+        for job in service.store.list_jobs(limit=None):
+            candidate_id = str(job.options.get("comparison_id", "")).strip()
+            if candidate_id:
+                jobs_by_comparison.setdefault(candidate_id, []).append(job)
+        return jobs_by_comparison
+
+    def transcription_comparison_source_key(
+        comparison_jobs: Sequence[Any],
+    ) -> tuple[str, ...]:
+        return tuple(
+            sorted(
+                {job.source_rel for job in comparison_jobs},
+                key=str.casefold,
+            )
+        )
+
+    def transcription_comparison_run_summary(
+        comparison_id: str,
+        comparison_jobs: Sequence[Any],
+    ) -> dict[str, Any]:
+        source_rels = transcription_comparison_source_key(comparison_jobs)
+        terminal_statuses = SUCCESS_STATUSES | RETRYABLE_STATUSES
+        completed_count = sum(
+            job.status in SUCCESS_STATUSES for job in comparison_jobs
+        )
+        attention_count = sum(
+            job.status in RETRYABLE_STATUSES for job in comparison_jobs
+        )
+        active_count = sum(
+            job.status in RUNNING_STATUSES for job in comparison_jobs
+        )
+        terminal_count = sum(
+            job.status in terminal_statuses for job in comparison_jobs
+        )
+        waiting_count = max(
+            0,
+            len(comparison_jobs) - terminal_count - active_count,
+        )
+        if attention_count:
+            status_group = "attention"
+            status_label = "확인 필요"
+            status_value = "failed"
+        elif active_count:
+            status_group = "running"
+            status_label = "진행 중"
+            status_value = "transcription_running"
+        elif terminal_count == len(comparison_jobs):
+            status_group = "completed"
+            status_label = "완료"
+            status_value = "transcription_completed"
+        else:
+            status_group = "waiting"
+            status_label = "대기 중"
+            status_value = "queued"
+        return {
+            "id": comparison_id,
+            "source_rels": list(source_rels),
+            "source_names": [
+                Path(source_rel).name for source_rel in source_rels
+            ],
+            "source_count": len(source_rels),
+            "job_count": len(comparison_jobs),
+            "completed_count": completed_count,
+            "attention_count": attention_count,
+            "active_count": active_count,
+            "waiting_count": waiting_count,
+            "terminal_count": terminal_count,
+            "progress_percent": round(
+                terminal_count * 100 / len(comparison_jobs)
+            ),
+            "status_group": status_group,
+            "status_label": status_label,
+            "status_value": status_value,
+            "created_at": min(job.created_at for job in comparison_jobs),
+            "updated_at": max(job.updated_at for job in comparison_jobs),
+            "chunks": transcription_comparison_chunk_lengths(comparison_jobs),
+        }
+
+    def transcription_comparison_records(
+        service: SubtitleOrchestrator,
+        comparison_id: str,
+        comparison_jobs: Sequence[Any],
+    ) -> list[dict[str, Any]]:
+        source_key = transcription_comparison_source_key(comparison_jobs)
+        records = [
+            transcription_comparison_run_summary(candidate_id, jobs)
+            for candidate_id, jobs in transcription_comparison_jobs_by_id(
+                service
+            ).items()
+            if transcription_comparison_source_key(jobs) == source_key
+        ]
+        for record in records:
+            record["current"] = record["id"] == comparison_id
+        records.sort(
+            key=lambda record: (record["created_at"], record["id"]),
+            reverse=True,
+        )
+        return records
+
+    def transcription_comparison_context(
+        request: Request,
+        comparison_id: str,
+        *,
+        skipped: int = 0,
+        notice: str | None = None,
+        error: str | None = None,
+        chunk_values: Mapping[str, object] | None = None,
+        selected_translation_job_ids: Sequence[str] = (),
+        translation_prompt_category_id: str = "",
+    ) -> dict[str, Any]:
+        service = orchestrator(request)
+        comparison_jobs = transcription_comparison_jobs(
+            service,
+            comparison_id,
+        )
+        selected_translation_ids = set(selected_translation_job_ids)
+        chunk_lengths: dict[str, object] = {
+            **transcription_comparison_chunk_lengths(comparison_jobs),
+            **(dict(chunk_values) if chunk_values is not None else {}),
+        }
+        comparison_backends = transcription_comparison_backends(
+            comparison_jobs
+        )
 
         jobs_by_source: dict[str, dict[str, Any]] = {}
         for job in comparison_jobs:
             backend = str(job.options.get("backend", ""))
-            if backend in TRANSCRIPTION_COMPARISON_BACKENDS:
+            if backend in comparison_backends:
                 jobs_by_source.setdefault(job.source_rel, {})[backend] = job
 
         sources: list[dict[str, Any]] = []
         for source_rel in sorted(jobs_by_source, key=str.casefold):
             jobs_by_backend = jobs_by_source[source_rel]
             engines: list[dict[str, Any]] = []
-            for backend in TRANSCRIPTION_COMPARISON_BACKENDS:
+            for backend in comparison_backends:
                 job = jobs_by_backend.get(backend)
+                transcription_stage = None
+                if job is not None:
+                    transcription_stage = next(
+                        (
+                            stage
+                            for stage in job_stage_view(job)
+                            if stage["key"] == "transcription"
+                        ),
+                        None,
+                    )
                 segments: list[dict[str, Any]] = []
                 transcript_error: str | None = None
                 if job is not None and job.transcript_path:
@@ -895,6 +1182,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                         "backend": backend,
                         "label": STT_BACKEND_LABELS[backend],
                         "job": job,
+                        "transcription_stage": transcription_stage,
                         "segments": segments,
                         "segment_count": len(segments),
                         "character_count": sum(
@@ -906,12 +1194,28 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                             else None
                         ),
                         "transcript_error": transcript_error,
+                        "translatable": bool(
+                            job is not None
+                            and job.can_start_translation
+                            and transcript_error is None
+                        ),
+                        "translation_selected": bool(
+                            job is not None
+                            and job.id in selected_translation_ids
+                        ),
                     }
                 )
+            translatable_engines = [
+                engine for engine in engines if engine["translatable"]
+            ]
             sources.append(
                 {
                     "source_rel": source_rel,
+                    "audio_stage": comparison_audio_stage(
+                        list(jobs_by_backend.values())
+                    ),
                     "engines": engines,
+                    "translatable_engines": translatable_engines,
                 }
             )
 
@@ -921,6 +1225,23 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             "comparison_id": comparison_id,
             "sources": sources,
             "jobs": comparison_jobs,
+            "csrf_token": request.session.get("csrf_token", ""),
+            "retriable_count": sum(
+                job.status in RETRYABLE_STATUSES for job in comparison_jobs
+            ),
+            "comparison_chunks": chunk_lengths,
+            "comparison_backends": comparison_backends,
+            "comparison_backend_labels": ", ".join(
+                STT_BACKEND_LABELS[backend]
+                for backend in comparison_backends
+            ),
+            "prompt_categories": service.active_prompt_categories(),
+            "translation_prompt_category_id": (
+                translation_prompt_category_id
+            ),
+            "translatable_source_count": sum(
+                bool(source["translatable_engines"]) for source in sources
+            ),
             "completed_count": sum(
                 job.status == "transcription_completed"
                 for job in comparison_jobs
@@ -929,6 +1250,75 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                 job.status in terminal_statuses for job in comparison_jobs
             ),
             "skipped": skipped,
+            "notice": notice,
+            "error": error,
+            "comparison_records": transcription_comparison_records(
+                service, comparison_id, comparison_jobs
+            ),
+        }
+
+    def transcription_comparison_history_context(
+        service: SubtitleOrchestrator,
+        *,
+        comparisons_page: int,
+    ) -> dict[str, Any]:
+        comparisons = [
+            transcription_comparison_run_summary(comparison_id, jobs)
+            for comparison_id, jobs in transcription_comparison_jobs_by_id(
+                service
+            ).items()
+        ]
+        grouped_comparisons: dict[tuple[str, ...], list[dict[str, Any]]] = {}
+        for comparison in comparisons:
+            source_key = tuple(comparison["source_rels"])
+            grouped_comparisons.setdefault(source_key, []).append(comparison)
+
+        comparison_groups: list[dict[str, Any]] = []
+        for source_rels, records in grouped_comparisons.items():
+            records.sort(
+                key=lambda record: (record["created_at"], record["id"]),
+                reverse=True,
+            )
+            comparison_groups.append(
+                {
+                    "source_rels": list(source_rels),
+                    "source_names": [
+                        Path(source_rel).name for source_rel in source_rels
+                    ],
+                    "source_count": len(source_rels),
+                    "record_count": len(records),
+                    "records": records,
+                    "created_at": min(
+                        record["created_at"] for record in records
+                    ),
+                    "updated_at": max(
+                        record["updated_at"] for record in records
+                    ),
+                }
+            )
+        comparison_groups.sort(
+            key=lambda group: (
+                group["updated_at"],
+                group["source_rels"],
+            ),
+            reverse=True,
+        )
+
+        comparisons_page = max(1, comparisons_page)
+        comparison_count = len(comparisons)
+        comparison_group_count = len(comparison_groups)
+        offset = (comparisons_page - 1) * COMPARISON_HISTORY_LIMIT
+        return {
+            "comparison_groups": comparison_groups[
+                offset : offset + COMPARISON_HISTORY_LIMIT
+            ],
+            "comparison_count": comparison_count,
+            "comparison_group_count": comparison_group_count,
+            "comparisons_page": comparisons_page,
+            "comparisons_has_previous": comparisons_page > 1,
+            "comparisons_has_next": (
+                offset + COMPARISON_HISTORY_LIMIT < comparison_group_count
+            ),
         }
 
     @app.get("/healthz")
@@ -1117,6 +1507,25 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         except ValueError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
         return TEMPLATES.TemplateResponse(request, "jobs.html", context)
+
+    @app.get("/comparisons", response_class=HTMLResponse)
+    def transcription_comparison_history_page(
+        request: Request,
+        comparisons_page: int = 1,
+    ) -> Any:
+        if not is_authenticated(request):
+            return login_redirect()
+        return TEMPLATES.TemplateResponse(
+            request,
+            "comparisons.html",
+            {
+                "request": request,
+                **transcription_comparison_history_context(
+                    orchestrator(request),
+                    comparisons_page=comparisons_page,
+                ),
+            },
+        )
 
     def settings_context(
         request: Request,
@@ -1421,6 +1830,25 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             },
         )
 
+    @app.get("/comparisons-fragment", response_class=HTMLResponse)
+    def transcription_comparison_history_fragment(
+        request: Request,
+        comparisons_page: int = 1,
+    ) -> Any:
+        if not is_authenticated(request):
+            raise HTTPException(
+                status_code=401,
+                detail="authentication required",
+            )
+        return TEMPLATES.TemplateResponse(
+            request,
+            "_comparison_history.html",
+            transcription_comparison_history_context(
+                orchestrator(request),
+                comparisons_page=comparisons_page,
+            ),
+        )
+
     @app.get("/job-stats-fragment", response_class=HTMLResponse)
     def job_stats_fragment(request: Request) -> Any:
         if not is_authenticated(request):
@@ -1483,13 +1911,14 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         return_query: str = Form(""),
         csrf_token: str = Form(""),
         force_overwrite: bool = Form(False),
-        backend: str = Form("kotoba"),
+        backend: str = Form("auto"),
         audio_stream: str = Form("0"),
         start_seconds: str = Form("0"),
         duration_seconds: str = Form(""),
-        chunk_length_seconds: str = Form("60"),
-        hybrid_kotoba_chunk_length_seconds: str = Form("15"),
-        hybrid_whisperx_chunk_length_seconds: str = Form("30"),
+        kotoba_chunk_length_seconds: str = Form("15"),
+        whisperx_chunk_length_seconds: str = Form("30"),
+        anime_max_group_duration_seconds: str = Form("2.0"),
+        qwen_max_group_duration_seconds: str = Form("3.0"),
         num_speakers: str = Form(""),
         min_speakers: str = Form(""),
         max_speakers: str = Form(""),
@@ -1501,25 +1930,40 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         if not is_authenticated(request):
             return login_redirect()
         validate_csrf(request, csrf_token)
+        normalized_backend = backend.strip().lower()
+        effective_prompt_category_id = prompt_category_id.strip()
+        if normalized_backend == "auto":
+            normalized_backend = "whisperjav"
+            if operation in {"translate", "full"}:
+                effective_prompt_category_id = "jav"
         options = {
-            "backend": backend,
+            "backend": normalized_backend,
             "audio_stream": audio_stream,
             "start_seconds": start_seconds,
             "duration_seconds": duration_seconds,
-            "chunk_length_seconds": chunk_length_seconds,
+            "chunk_length_seconds": (
+                whisperx_chunk_length_seconds
+                if normalized_backend == "whisperx"
+                else kotoba_chunk_length_seconds
+            ),
             "num_speakers": num_speakers,
             "min_speakers": min_speakers,
             "max_speakers": max_speakers,
             "add_punctuation": add_punctuation,
             "noise_filter": noise_filter[-1] if noise_filter else True,
         }
-        if backend.strip().lower() == "hybrid" or operation == "compare":
+        if normalized_backend == "hybrid" or operation == "compare":
             options["hybrid_rescue"] = {
-                "kotoba_chunk_length_seconds": (
-                    hybrid_kotoba_chunk_length_seconds
+                "kotoba_chunk_length_seconds": kotoba_chunk_length_seconds,
+                "whisperx_chunk_length_seconds": whisperx_chunk_length_seconds,
+            }
+        if normalized_backend == "whisperjav" or operation == "compare":
+            options["whisperjav"] = {
+                "anime_max_group_duration_seconds": (
+                    anime_max_group_duration_seconds
                 ),
-                "whisperx_chunk_length_seconds": (
-                    hybrid_whisperx_chunk_length_seconds
+                "qwen_max_group_duration_seconds": (
+                    qwen_max_group_duration_seconds
                 ),
             }
         try:
@@ -1530,17 +1974,14 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             ]
             if (
                 operation in {"translate", "full"}
-                and not prompt_category_id.strip()
+                and not effective_prompt_category_id
             ):
                 raise ValueError("번역 프롬프트 카테고리를 선택하세요.")
-            selection_operation = (
-                "transcribe" if operation == "compare" else operation
-            )
             selected_sources, skipped = service.expand_job_sources(
                 expanded_source_rels,
                 folder_rels or [],
                 force_overwrite=force_overwrite,
-                operation=selection_operation,
+                operation=operation,
             )
             comparison_id: str | None = None
             if operation == "compare":
@@ -1557,7 +1998,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                     options=options,
                     operation=operation,
                     prompt_category_id=(
-                        prompt_category_id
+                        effective_prompt_category_id
                         if operation in {"translate", "full"}
                         else None
                     ),
@@ -1735,13 +2176,37 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         request: Request,
         comparison_id: str,
         skipped: int = 0,
+        retried: int | None = None,
+        adjusted: int = 0,
+        rerun: bool = False,
+        reused_audio: int = 0,
     ) -> Any:
         if not is_authenticated(request):
             return login_redirect()
+        notice = None
+        if retried is not None:
+            notice = (
+                f"실패한 전사 작업 {max(0, retried)}개를 재시도했습니다."
+                if retried > 0
+                else "재시도할 실패 작업이 없습니다."
+            )
+            if adjusted > 0:
+                notice += (
+                    f" 기존 WhisperX 청크 {adjusted}개는 30초로 "
+                    "보정했습니다."
+                )
+        elif rerun:
+            notice = "변경한 분할 설정으로 새 전사 비교를 시작했습니다."
+            if reused_audio > 0:
+                notice += (
+                    f" 기존 추출 오디오 {reused_audio}개를 재사용하며 "
+                    "전사부터 실행합니다."
+                )
         context = transcription_comparison_context(
             request,
             comparison_id,
             skipped=max(0, skipped),
+            notice=notice,
         )
         return TEMPLATES.TemplateResponse(
             request,
@@ -1766,6 +2231,205 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             request,
             "_comparison_panel.html",
             transcription_comparison_context(request, comparison_id),
+        )
+
+    @app.post("/comparisons/{comparison_id}/retry")
+    def retry_transcription_comparison(
+        request: Request,
+        comparison_id: str,
+        csrf_token: str = Form(""),
+    ) -> Any:
+        if not is_authenticated(request):
+            return login_redirect()
+        validate_csrf(request, csrf_token)
+        service = orchestrator(request)
+        comparison_jobs = transcription_comparison_jobs(
+            service,
+            comparison_id,
+        )
+        retried_count = 0
+        adjusted_count = 0
+        for job in comparison_jobs:
+            if job.status not in RETRYABLE_STATUSES:
+                continue
+            retried = service.retry(job.id)
+            if retried.options != job.options:
+                adjusted_count += 1
+            retried_count += 1
+        query = {"retried": retried_count}
+        if adjusted_count:
+            query["adjusted"] = adjusted_count
+        return RedirectResponse(
+            f"/comparisons/{comparison_id}?{urlencode(query)}",
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+
+    @app.post(
+        "/comparisons/{comparison_id}/rerun",
+        response_class=HTMLResponse,
+    )
+    def rerun_transcription_comparison(
+        request: Request,
+        comparison_id: str,
+        csrf_token: str = Form(""),
+        kotoba_chunk_length_seconds: str = Form("15"),
+        whisperx_chunk_length_seconds: str = Form("30"),
+        anime_max_group_duration_seconds: str = Form("2.0"),
+        qwen_max_group_duration_seconds: str = Form("3.0"),
+    ) -> Any:
+        if not is_authenticated(request):
+            return login_redirect()
+        validate_csrf(request, csrf_token)
+        service = orchestrator(request)
+        comparison_jobs = transcription_comparison_jobs(
+            service,
+            comparison_id,
+        )
+
+        def positive_chunk_seconds(value: str, label: str) -> int:
+            try:
+                normalized = int(value)
+            except ValueError as error:
+                raise ValueError(
+                    f"{label} 청크는 정수로 입력하세요."
+                ) from error
+            if normalized < 1:
+                raise ValueError(f"{label} 청크는 1초 이상이어야 합니다.")
+            if (
+                label == "WhisperX"
+                and normalized > WHISPERX_MAX_CHUNK_LENGTH_SECONDS
+            ):
+                raise ValueError(
+                    "WhisperX 청크는 "
+                    f"{WHISPERX_MAX_CHUNK_LENGTH_SECONDS}초 이하여야 합니다."
+                )
+            return normalized
+
+        def bounded_group_seconds(value: str, label: str) -> float:
+            try:
+                normalized = float(value)
+            except ValueError as error:
+                raise ValueError(f"{label}은 숫자로 입력하세요.") from error
+            if not MIN_MAX_GROUP_SECONDS <= normalized <= MAX_MAX_GROUP_SECONDS:
+                raise ValueError(
+                    f"{label}: "
+                    f"{MIN_MAX_GROUP_SECONDS}초 이상 "
+                    f"{MAX_MAX_GROUP_SECONDS}초 이하여야 합니다."
+                )
+            return normalized
+
+        try:
+            kotoba_chunk = positive_chunk_seconds(
+                kotoba_chunk_length_seconds,
+                "Kotoba",
+            )
+            whisperx_chunk = positive_chunk_seconds(
+                whisperx_chunk_length_seconds,
+                "WhisperX",
+            )
+            anime_max_group = bounded_group_seconds(
+                anime_max_group_duration_seconds,
+                "WhisperJAV 1차 그룹 길이",
+            )
+            qwen_max_group = bounded_group_seconds(
+                qwen_max_group_duration_seconds,
+                "WhisperJAV 2차 그룹 길이",
+            )
+            options = transcription_comparison_rerun_options(
+                comparison_jobs,
+                kotoba_chunk_length_seconds=kotoba_chunk,
+                whisperx_chunk_length_seconds=whisperx_chunk,
+                anime_max_group_duration_seconds=anime_max_group,
+                qwen_max_group_duration_seconds=qwen_max_group,
+            )
+            source_rels = list(
+                dict.fromkeys(job.source_rel for job in comparison_jobs)
+            )
+            new_comparison_id, new_jobs = (
+                service.create_transcription_comparison(
+                    source_rels,
+                    options=options,
+                    reuse_audio_from=comparison_jobs,
+                    parent_comparison_id=comparison_id,
+                )
+            )
+        except (OSError, ValueError) as error:
+            return TEMPLATES.TemplateResponse(
+                request,
+                "comparison.html",
+                transcription_comparison_context(
+                    request,
+                    comparison_id,
+                    error=str(error),
+                    chunk_values={
+                        "kotoba_chunk_length_seconds": (
+                            kotoba_chunk_length_seconds
+                        ),
+                        "whisperx_chunk_length_seconds": (
+                            whisperx_chunk_length_seconds
+                        ),
+                        "anime_max_group_duration_seconds": (
+                            anime_max_group_duration_seconds
+                        ),
+                        "qwen_max_group_duration_seconds": (
+                            qwen_max_group_duration_seconds
+                        ),
+                    },
+                ),
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+        reused_audio_count = len(
+            {
+                job.source_rel
+                for job in new_jobs
+                if COMPARISON_AUDIO_SOURCE_JOB_ID_OPTION in job.options
+            }
+        )
+        return RedirectResponse(
+            f"/comparisons/{new_comparison_id}?"
+            f"{urlencode({'rerun': 'true', 'reused_audio': reused_audio_count})}",
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+
+    @app.post(
+        "/comparisons/{comparison_id}/translate",
+        response_class=HTMLResponse,
+    )
+    def translate_transcription_comparison_results(
+        request: Request,
+        comparison_id: str,
+        job_ids: list[str] | None = Form(None),
+        prompt_category_id: str = Form(""),
+        csrf_token: str = Form(""),
+    ) -> Any:
+        if not is_authenticated(request):
+            return login_redirect()
+        validate_csrf(request, csrf_token)
+        service = orchestrator(request)
+        try:
+            if not prompt_category_id.strip():
+                raise ValueError("번역 프롬프트 카테고리를 선택하세요.")
+            created = service.create_comparison_translation_jobs(
+                comparison_id,
+                job_ids or [],
+                prompt_category_id=prompt_category_id,
+            )
+        except (OSError, UnicodeError, ValueError) as error:
+            return TEMPLATES.TemplateResponse(
+                request,
+                "comparison.html",
+                transcription_comparison_context(
+                    request,
+                    comparison_id,
+                    error=str(error),
+                    selected_translation_job_ids=job_ids or [],
+                    translation_prompt_category_id=prompt_category_id,
+                ),
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+        return RedirectResponse(
+            f"/jobs?{urlencode({'translations_queued': len(created)})}",
+            status_code=status.HTTP_303_SEE_OTHER,
         )
 
     @app.get("/jobs/{job_id}", response_class=HTMLResponse)

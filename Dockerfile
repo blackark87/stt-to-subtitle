@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 ARG PYTHON_IMAGE=python:3.11.15-slim-bookworm@sha256:b18992999dbe963a45a8a4da40ac2b1975be1a776d939d098c647482bcad5cba
-ARG STT_RUNTIME_IMAGE=stt-to-subtitle-stt-runtime:py311-cuda-v1
+ARG STT_RUNTIME_IMAGE=stt-to-subtitle-stt-runtime:py311-cuda-v2
 
 FROM ${PYTHON_IMAGE} AS app-builder
 
@@ -27,6 +27,7 @@ ENV PYTHONUNBUFFERED=1 \
     TORCH_HOME=/var/cache/stt/torch \
     WHISPERX_CACHE_DIR=/var/cache/stt/whisperx \
     WHISPERX_PYTHON=/opt/venvs/whisperx/bin/python \
+    WHISPERJAV_PYTHON=/opt/venvs/whisperjav/bin/python \
     STT_STATE_DIR=/var/lib/stt \
     STT_DEVICE=cuda \
     STT_DIARIZATION_DEVICE=cuda
@@ -40,6 +41,8 @@ COPY --from=app-builder /wheel /tmp/stt-wheel
 RUN /opt/venvs/kotoba/bin/python -m pip install --no-cache-dir --no-deps \
         /tmp/stt-wheel/*.whl \
     && /opt/venvs/whisperx/bin/python -m pip install --no-cache-dir --no-deps \
+        /tmp/stt-wheel/*.whl \
+    && /opt/venvs/whisperjav/bin/python -m pip install --no-cache-dir --no-deps \
         /tmp/stt-wheel/*.whl \
     && rm -rf /tmp/stt-wheel
 

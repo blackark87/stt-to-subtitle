@@ -635,6 +635,10 @@ class JobStore:
         force_overwrite: bool,
         options: Mapping[str, Any],
         operation: str = "full",
+        status: str = "queued",
+        audio_path: str | None = None,
+        audio_sha256: str | None = None,
+        chunks_total_estimate: int = 0,
     ) -> PipelineJob:
         now = time.time()
         with self._connect() as connection:
@@ -642,21 +646,30 @@ class JobStore:
                 """
                 INSERT INTO jobs (
                     id, source_rel, status, force_overwrite, operation,
-                    options_json,
+                    options_json, audio_path, audio_sha256,
+                    chunks_total_estimate,
                     created_at, updated_at
-                ) VALUES (?, ?, 'queued', ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job_id,
                     source_rel,
+                    status,
                     int(force_overwrite),
                     operation,
                     json.dumps(dict(options), sort_keys=True),
+                    audio_path,
+                    audio_sha256,
+                    max(0, int(chunks_total_estimate)),
                     now,
                     now,
                 ),
             )
-        self.add_event(job_id, "info", "job queued")
+        self.add_event(
+            job_id,
+            "info",
+            "job queued" if status == "queued" else f"job created in {status}",
+        )
         job = self.get(job_id)
         if job is None:
             raise RuntimeError("created job could not be read")

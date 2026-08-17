@@ -33,6 +33,16 @@ class HybridRescueOptionsTests(unittest.TestCase):
                 {"hybrid_rescue": {"max_word_duration_sec": "nan"}}
             )
 
+    def test_rejects_whisperx_chunks_longer_than_native_window(self) -> None:
+        with self.assertRaisesRegex(ValueError, "must be at most 30"):
+            HybridRescueOptions.from_options(
+                {
+                    "hybrid_rescue": {
+                        "whisperx_chunk_length_seconds": 31,
+                    }
+                }
+            )
+
 
 class HybridDiagnosticsTests(unittest.TestCase):
     def setUp(self) -> None:

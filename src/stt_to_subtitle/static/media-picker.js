@@ -12,6 +12,26 @@
     document.querySelectorAll("[data-batch-submit]")
   );
   const promptCategory = document.querySelector("[data-prompt-category]");
+  const transcriptionBackend = document.querySelector(
+    "[data-transcription-backend]"
+  );
+
+  const syncAutomaticPreset = () => {
+    if (!promptCategory || !transcriptionBackend) {
+      return;
+    }
+    const automatic = transcriptionBackend.value === "auto";
+    const automaticPrompt = promptCategory.dataset.autoPromptCategory;
+    const automaticOption = Array.from(promptCategory.options).find(
+      (option) => option.value === automaticPrompt
+    );
+    if (automatic) {
+      promptCategory.value = automaticOption?.value || "";
+      promptCategory.disabled = true;
+    } else {
+      promptCategory.disabled = false;
+    }
+  };
 
   const update = () => {
     const selected = checkboxes.filter((checkbox) => checkbox.checked).length;
@@ -39,6 +59,10 @@
     checkbox.addEventListener("change", update);
   }
   promptCategory?.addEventListener("change", update);
+  transcriptionBackend?.addEventListener("change", () => {
+    syncAutomaticPreset();
+    update();
+  });
 
   picker.querySelector("[data-select-all]")?.addEventListener("click", () => {
     // 이미 자막이 있는 항목은 담지 않는다. 다시 번역하려면 직접 고른다.
@@ -57,5 +81,6 @@
       update();
     });
 
+  syncAutomaticPreset();
   update();
 })();

@@ -6,16 +6,143 @@
     <div>
       <p class="page-kicker">TRANSCRIPTION COMPARISON</p>
       <h1>전사 엔진 비교</h1>
-      <p class="muted">동일한 미디어를 하이브리드, WhisperX, Kotoba로 각각 전사한 결과입니다.</p>
+      <p class="muted">동일한 미디어를 다음 엔진으로 전사한 결과입니다: {{ comparison_backend_labels }}</p>
     </div>
-    <a href="/media" class="button secondary">{{ icons.chevron_left(16) }}미디어로</a>
+    <a href="/comparisons" class="button secondary">{{ icons.chevron_left(16) }}비교 이력</a>
   </div>
+  {% if error %}<p class="alert">{{ error }}</p>{% endif %}
+  {% if notice %}<p class="notice">{{ notice }}</p>{% endif %}
   {% if skipped %}
     <p class="notice">기존 진행 작업·완료 결과 {{ skipped }}개는 비교 대상에서 제외했습니다.</p>
   {% endif %}
+  <section class="card comparison-records-card">
+    <div class="section-heading compact-heading">
+      <div>
+        <h2>같은 미디어의 비교 기록</h2>
+        <p class="muted">같은 파일 세트로 실행한 비교를 분할 설정별 기록으로 표시합니다.</p>
+      </div>
+      <span class="history-count">{{ comparison_records|length }}건</span>
+    </div>
+    <div class="comparison-record-list">
+      {% for record in comparison_records %}
+        <article class="comparison-record-item comparison-record-{{ record.status_group }}{% if record.current %} is-current{% endif %}">
+          <div class="comparison-record-main">
+            <div class="comparison-record-heading">
+              {% if record.current %}
+                <strong>비교 #{{ record.id[:8] }}</strong>
+              {% else %}
+                <a href="/comparisons/{{ record.id }}">비교 #{{ record.id[:8] }}</a>
+              {% endif %}
+              <span class="status status-{{ record.status_value }}">{{ record.status_label }}</span>
+            </div>
+            <div class="comparison-record-meta">
+              <span>실행 <time datetime="{{ record.created_at|datetime_iso }}">{{ record.created_at|datetime }}</time></span>
+              <span>엔진 작업 {{ record.job_count }}개</span>
+            </div>
+            <div class="comparison-record-settings">
+              <span>Kotoba {{ record.chunks.kotoba_chunk_length_seconds }}초</span>
+              <span>WhisperX {{ record.chunks.whisperx_chunk_length_seconds }}초</span>
+              <span>WhisperJAV 1차 {{ record.chunks.anime_max_group_duration_seconds }}초</span>
+              <span>WhisperJAV 2차 {{ record.chunks.qwen_max_group_duration_seconds }}초</span>
+            </div>
+          </div>
+          <div class="comparison-record-actions">
+            {% if record.current %}
+              <span class="comparison-current-label">현재 기록</span>
+            {% else %}
+              <a class="button secondary compact" href="/comparisons/{{ record.id }}">결과 보기</a>
+            {% endif %}
+          </div>
+        </article>
+      {% endfor %}
+    </div>
+  </section>
   <p class="comparison-guidance">
     정답 전사문이 없으므로 자동으로 우열을 판정하지 않습니다. 누락·반복·화자 분리와 문장 자연스러움을 나란히 확인하세요.
   </p>
+  <section class="card comparison-actions-card">
+    <div class="section-heading">
+      <div>
+        <h2>다시 실행</h2>
+        <p class="muted">실패 작업만 이어서 재시도하거나, 엔진별 분할 설정을 바꿔 새 비교를 실행합니다.</p>
+      </div>
+    </div>
+    <div class="comparison-action-grid">
+      <div class="comparison-action-block">
+        <div>
+          <h3>실패 작업 재시도</h3>
+          <p>현재 비교에서 실패·중단된 엔진만 기존 설정으로 다시 실행합니다.</p>
+        </div>
+        <form method="post" action="/comparisons/{{ comparison_id }}/retry">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button type="submit" class="secondary"{% if not retriable_count %} disabled{% endif %}>
+            {{ icons.refresh(15) }}실패 작업 재시도 ({{ retriable_count }})
+          </button>
+        </form>
+      </div>
+      <div class="comparison-action-block">
+        <div>
+          <h3>분할 설정 변경 후 새 비교</h3>
+          <p>현재 결과와 추출 오디오는 보존하고, 같은 WAV로 전사만 다시 실행합니다.</p>
+        </div>
+        <form
+          method="post"
+          action="/comparisons/{{ comparison_id }}/rerun"
+          class="comparison-rerun-form"
+          data-confirm-message="현재 결과와 추출 오디오를 유지하고, 변경한 엔진별 분할 설정으로 전사만 다시 실행하시겠습니까?"
+        >
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <div class="comparison-chunk-fields">
+            <label>Kotoba 청크(초)
+              <input
+                name="kotoba_chunk_length_seconds"
+                type="number"
+                min="1"
+                max="30"
+                step="1"
+                value="{{ comparison_chunks.kotoba_chunk_length_seconds }}"
+                required
+              >
+            </label>
+            <label>WhisperX 청크(초)
+              <input
+                name="whisperx_chunk_length_seconds"
+                type="number"
+                min="1"
+                step="1"
+                value="{{ comparison_chunks.whisperx_chunk_length_seconds }}"
+                required
+              >
+            </label>
+            <label>WhisperJAV 1차 그룹(초)
+              <input
+                name="anime_max_group_duration_seconds"
+                type="number"
+                min="0.5"
+                max="30"
+                step="0.1"
+                value="{{ comparison_chunks.anime_max_group_duration_seconds }}"
+                required
+              >
+            </label>
+            <label>WhisperJAV 2차 그룹(초)
+              <input
+                name="qwen_max_group_duration_seconds"
+                type="number"
+                min="0.5"
+                max="30"
+                step="0.1"
+                value="{{ comparison_chunks.qwen_max_group_duration_seconds }}"
+                required
+              >
+            </label>
+          </div>
+          <p class="field-help">각 값은 해당 엔진을 사용하는 모든 비교 작업에 적용됩니다.</p>
+          <button type="submit">{{ icons.play(15) }}새 비교 실행</button>
+        </form>
+      </div>
+    </div>
+  </section>
   <div{% if not all_terminal %} data-update-url="/comparisons/{{ comparison_id }}/panel"{% endif %}>
     {% include "_comparison_panel.html" %}
   </div>

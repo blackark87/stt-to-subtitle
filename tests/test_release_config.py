@@ -20,12 +20,41 @@ class ReleaseConfigurationTests(unittest.TestCase):
         self.assertIn("dockerfile: Dockerfile.stt-runtime", compose)
         self.assertEqual(compose.count("context: ${WORKSPACE:-.}"), 3)
         self.assertIn("STT_RUNTIME_IMAGE:", compose)
-        self.assertIn("stt-to-subtitle-stt-runtime:py311-cuda-v1", compose)
+        self.assertIn("stt-to-subtitle-stt-runtime:py311-cuda-v2", compose)
         stt_dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
         runtime_dockerfile = (ROOT / "Dockerfile.stt-runtime").read_text(
             encoding="utf-8"
         )
         self.assertIn("FROM ${STT_RUNTIME_IMAGE} AS runtime", stt_dockerfile)
+        self.assertNotIn("AS whisperjav-builder", stt_dockerfile)
+        self.assertIn(
+            "FROM ${PYTHON_IMAGE} AS whisperjav-builder",
+            runtime_dockerfile,
+        )
+        self.assertIn(
+            "COPY --from=whisperjav-builder /opt/venvs/whisperjav",
+            runtime_dockerfile,
+        )
+        self.assertIn("--extra qwen", runtime_dockerfile)
+        self.assertNotIn("--extra cli", runtime_dockerfile)
+        self.assertIn("ten-vad==1.0.6.8", runtime_dockerfile)
+        self.assertIn("onnxruntime-gpu==1.23.2", runtime_dockerfile)
+        self.assertIn("libc++1", runtime_dockerfile)
+        self.assertIn("libc++abi1", runtime_dockerfile)
+        self.assertIn("from ten_vad import TenVad", runtime_dockerfile)
+        self.assertIn(
+            "uv pip install --python /opt/venvs/whisperjav/bin/python",
+            runtime_dockerfile,
+        )
+        self.assertIn("-m ensurepip --upgrade", runtime_dockerfile)
+        self.assertIn(
+            "/opt/venvs/whisperjav/bin/python -m pip",
+            stt_dockerfile,
+        )
+        self.assertIn(
+            "WHISPERJAV_PYTHON=/opt/venvs/whisperjav/bin/python",
+            stt_dockerfile,
+        )
         self.assertNotIn("requirements-kotoba.txt", stt_dockerfile)
         self.assertIn("requirements-kotoba.txt", runtime_dockerfile)
         self.assertIn("requirements-whisperx-cuda.txt", runtime_dockerfile)

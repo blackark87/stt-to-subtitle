@@ -254,17 +254,19 @@
       <h3 class="form-section-title wide">처리 설정</h3>
       <div class="wide processing-choices">
         <label>전사 엔진
-          <select name="backend">
-            <option value="hybrid" selected>하이브리드 (WhisperX + Kotoba 보정)</option>
+          <select name="backend" data-transcription-backend>
+            <option value="auto" selected>자동 (JAV 프롬프트 + WhisperJAV)</option>
+            <option value="whisperjav">WhisperJAV</option>
+            <option value="hybrid">하이브리드</option>
             <option value="whisperx">WhisperX</option>
             <option value="kotoba">Kotoba</option>
           </select>
         </label>
         <label>번역 프롬프트 카테고리
-          <select name="prompt_category_id" data-prompt-category>
+          <select name="prompt_category_id" data-prompt-category data-auto-prompt-category="jav" disabled>
             <option value="">전체·번역 작업을 시작하려면 선택하세요</option>
             {% for category in prompt_categories %}
-              <option value="{{ category.id }}">{{ category.name }}</option>
+              <option value="{{ category.id }}"{% if category.id == 'jav' %} selected{% endif %}>{{ category.name }}</option>
             {% endfor %}
           </select>
         </label>
@@ -281,14 +283,17 @@
           <label>길이(초)
             <input name="duration_seconds" type="number" min="0" step="0.1" placeholder="비우거나 0 = 끝까지">
           </label>
-          <label>단독 엔진 청크(초)
-            <input name="chunk_length_seconds" type="number" min="1" value="60" required>
+          <label>Kotoba 청크(초)
+            <input name="kotoba_chunk_length_seconds" type="number" min="1" value="15" required>
           </label>
-          <label>하이브리드 Kotoba 청크(초)
-            <input name="hybrid_kotoba_chunk_length_seconds" type="number" min="1" value="15" required>
+          <label>WhisperX 청크(초)
+            <input name="whisperx_chunk_length_seconds" type="number" min="1" max="30" value="30" required>
           </label>
-          <label>하이브리드 WhisperX 청크(초)
-            <input name="hybrid_whisperx_chunk_length_seconds" type="number" min="1" value="30" required>
+          <label>WhisperJAV 1차 그룹(초)
+            <input name="anime_max_group_duration_seconds" type="number" min="0.5" max="30" step="0.1" value="2.0" required>
+          </label>
+          <label>WhisperJAV 2차 그룹(초)
+            <input name="qwen_max_group_duration_seconds" type="number" min="0.5" max="30" step="0.1" value="3.0" required>
           </label>
           <label>화자 수
             <input name="num_speakers" type="number" min="1" placeholder="자동">
@@ -312,7 +317,7 @@
       </details>
       <div class="wide submit-row">
         <button type="submit" name="operation" value="transcribe" class="secondary" data-batch-submit data-requires-servers data-server-configured="{{ 'true' if remote_servers.configured else 'false' }}" title="오디오 추출 → 전사" disabled>전사</button>
-        <button type="submit" name="operation" value="compare" class="secondary" data-batch-submit data-requires-servers data-server-configured="{{ 'true' if remote_servers.configured else 'false' }}" title="선택 파일마다 하이브리드·WhisperX·Kotoba 전사 작업을 생성합니다" disabled>전사 비교</button>
+        <button type="submit" name="operation" value="compare" class="secondary" data-batch-submit data-requires-servers data-server-configured="{{ 'true' if remote_servers.configured else 'false' }}" title="선택 파일마다 WhisperJAV·하이브리드·WhisperX·Kotoba 전사 작업을 생성합니다" disabled>전사 비교</button>
         <button type="submit" name="operation" value="translate" class="secondary" data-batch-submit data-requires-servers data-server-configured="{{ 'true' if remote_servers.configured else 'false' }}" title="기존 전사 → 번역 → 자막" disabled>번역</button>
         <button type="submit" name="operation" value="full" data-batch-submit data-requires-servers data-server-configured="{{ 'true' if remote_servers.configured else 'false' }}" title="오디오 추출 → 전사 → 번역 → 자막" disabled>전체</button>
       </div>

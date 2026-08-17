@@ -33,6 +33,29 @@ RUN --mount=type=cache,id=stt-whisperx-pip,target=/root/.cache/pip \
     /opt/venvs/whisperx/bin/python -m pip install \
         -r requirements-whisperx-cuda.txt
 
+FROM ${PYTHON_IMAGE} AS whisperjav-builder
+
+ARG WHISPERJAV_COMMIT=a69a43244e14612ebd3a1eb417bdd0de6d494d0f
+
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    UV_PROJECT_ENVIRONMENT=/opt/venvs/whisperjav
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/* \
+    && python -m pip install --no-cache-dir uv==0.8.15
+
+WORKDIR /build/whisperjav
+RUN git clone https://github.com/meizhong986/WhisperJAV.git . \
+    && git checkout --detach "${WHISPERJAV_COMMIT}" \
+    && test "$(git rev-parse HEAD)" = "${WHISPERJAV_COMMIT}"
+RUN --mount=type=cache,id=stt-whisperjav-uv,target=/root/.cache/uv \
+    uv sync --frozen --no-dev --no-editable --extra qwen \
+    && uv pip install --python /opt/venvs/whisperjav/bin/python \
+        ten-vad==1.0.6.8 \
+        onnxruntime-gpu==1.23.2 \
+    && /opt/venvs/whisperjav/bin/python -m ensurepip --upgrade
+
 FROM ${PYTHON_IMAGE}
 
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
@@ -42,6 +65,8 @@ RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
         libgomp1 \
         libportaudio2 \
+        libc++1 \
+        libc++abi1 \
         ca-certificates \
         ffmpeg \
         libsndfile1 \
@@ -49,3 +74,7 @@ RUN apt-get update \
 
 COPY --from=kotoba-builder /opt/venvs/kotoba /opt/venvs/kotoba
 COPY --from=whisperx-builder /opt/venvs/whisperx /opt/venvs/whisperx
+COPY --from=whisperjav-builder /opt/venvs/whisperjav /opt/venvs/whisperjav
+
+RUN /opt/venvs/whisperjav/bin/python -c \
+    "from ten_vad import TenVad; vad = TenVad()"

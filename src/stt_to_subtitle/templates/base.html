@@ -27,8 +27,11 @@
             <a href="/media"{% if request.url.path.startswith('/media') %} class="is-active" aria-current="page"{% endif %}>
               {{ icons.folder(18) }}<span>미디어</span>
             </a>
-            <a href="/jobs"{% if request.url.path.startswith('/jobs') or request.url.path.startswith('/comparisons') %} class="is-active" aria-current="page"{% endif %}>
+            <a href="/jobs"{% if request.url.path.startswith('/jobs') %} class="is-active" aria-current="page"{% endif %}>
               {{ icons.activity(18) }}<span>작업 목록</span>
+            </a>
+            <a href="/comparisons"{% if request.url.path.startswith('/comparisons') %} class="is-active" aria-current="page"{% endif %}>
+              {{ icons.compare(18) }}<span>전사 비교</span>
             </a>
             <a href="/settings"{% if request.url.path.startswith('/settings') %} class="is-active" aria-current="page"{% endif %}>
               {{ icons.settings(18) }}<span>설정</span>

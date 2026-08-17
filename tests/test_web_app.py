@@ -442,18 +442,25 @@ class WebAppTests(unittest.TestCase):
             self.assertIn("한국어 자막 있음", response.text)
             self.assertIn("일본어 구두점 모델 사용", response.text)
             self.assertIn("소음 오인식 필터 사용", response.text)
-            self.assertIn('<select name="backend">', response.text)
             self.assertIn(
-                '<option value="hybrid" selected>', response.text
-            )
-            self.assertIn('name="chunk_length_seconds"', response.text)
-            self.assertIn(
-                'name="hybrid_kotoba_chunk_length_seconds"', response.text
+                '<select name="backend" data-transcription-backend>',
+                response.text,
             )
             self.assertIn(
-                'name="hybrid_whisperx_chunk_length_seconds"', response.text
+                '<option value="auto" selected>', response.text
             )
-            self.assertIn('value="60"', response.text)
+            self.assertNotIn('name="chunk_length_seconds"', response.text)
+            self.assertIn(
+                'name="kotoba_chunk_length_seconds"', response.text
+            )
+            self.assertIn(
+                'name="whisperx_chunk_length_seconds"', response.text
+            )
+            self.assertNotIn("단독 엔진 청크", response.text)
+            self.assertNotIn("하이브리드 Kotoba 청크", response.text)
+            self.assertNotIn("하이브리드 WhisperX 청크", response.text)
+            self.assertIn("Kotoba 청크(초)", response.text)
+            self.assertIn("WhisperX 청크(초)", response.text)
             self.assertIn(
                 'name="noise_filter" type="checkbox" value="true" checked',
                 response.text,
@@ -850,6 +857,58 @@ class WebAppTests(unittest.TestCase):
                 )
             )
 
+    def test_auto_backend_applies_jav_prompt_and_whisperjav_preset(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            (media_root / "jav.mp4").write_bytes(b"media")
+            (media_root / "variety.mp4").write_bytes(b"media")
+
+            with TestClient(
+                create_app(self.settings(root, media_root))
+            ) as client:
+                service = client.app.state.orchestrator
+                service.stop()
+                jav_response = client.post(
+                    "/jobs",
+                    data={
+                        "source_rels": "jav.mp4",
+                        "backend": "auto",
+                        "operation": "full",
+                    },
+                    follow_redirects=False,
+                )
+                variety_response = client.post(
+                    "/jobs",
+                    data={
+                        "source_rels": "variety.mp4",
+                        "backend": "hybrid",
+                        "prompt_category_id": "variety",
+                        "operation": "full",
+                    },
+                    follow_redirects=False,
+                )
+                jobs = {
+                    job.source_rel: job
+                    for job in service.store.list_jobs(limit=None)
+                }
+
+            self.assertEqual(jav_response.status_code, 303)
+            self.assertEqual(variety_response.status_code, 303)
+            self.assertEqual(jobs["jav.mp4"].options["backend"], "whisperjav")
+            self.assertEqual(jobs["variety.mp4"].options["backend"], "hybrid")
+            self.assertEqual(
+                jobs["jav.mp4"].options["translation_prompt"]["category_id"],
+                "jav",
+            )
+            self.assertEqual(
+                jobs["variety.mp4"].options["translation_prompt"][
+                    "category_id"
+                ],
+                "variety",
+            )
+
     def test_multipart_card_queues_each_physical_file_as_a_job(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -936,6 +995,7 @@ class WebAppTests(unittest.TestCase):
                     "/jobs",
                     data={
                         "folder_rels": "Shows",
+                        "backend": "hybrid",
                         "prompt_category_id": "variety",
                     },
                     follow_redirects=False,
@@ -961,7 +1021,7 @@ class WebAppTests(unittest.TestCase):
                 created.options["translation_prompt"]["review_rounds"],
                 2,
             )
-            self.assertEqual(created.options["backend"], "kotoba")
+            self.assertEqual(created.options["backend"], "hybrid")
 
     def test_media_cards_show_each_files_latest_processing_stage(self) -> None:
         with TemporaryDirectory() as directory:
@@ -1110,6 +1170,8 @@ class WebAppTests(unittest.TestCase):
             self.assertIn("data-vr-volume", page.text)
             self.assertIn("Space: 재생/일시정지", page.text)
             self.assertIn("vr180-player.js", page.text)
+            self.assertNotIn("전사·번역 결과를 화자별", page.text)
+            self.assertNotIn("지원하지 않는 MIME 형식", page.text)
             self.assertNotIn("<source", page.text)
             self.assertEqual(video.status_code, 206)
             self.assertEqual(video.content, b"2345")
@@ -1705,6 +1767,15 @@ class WebAppTests(unittest.TestCase):
             self.assertIn(">전사</button>", dashboard.text)
             self.assertIn(">번역</button>", dashboard.text)
             self.assertIn(">전체</button>", dashboard.text)
+            self.assertIn(
+                "자동 (JAV 프롬프트 + WhisperJAV)",
+                dashboard.text,
+            )
+            self.assertIn(
+                'data-auto-prompt-category="jav" disabled',
+                dashboard.text,
+            )
+            self.assertIn('value="jav" selected', dashboard.text)
             self.assertNotIn("오디오만 추출", dashboard.text)
             advanced_position = dashboard.text.index(
                 '<details class="advanced-options wide">'
@@ -1724,9 +1795,10 @@ class WebAppTests(unittest.TestCase):
             self.assertEqual(response.status_code, 303)
             self.assertEqual(response.headers["location"], "/media?queued=1")
             self.assertEqual(jobs[0].operation, "transcribe")
+            self.assertEqual(jobs[0].options["backend"], "whisperjav")
             self.assertNotIn("translation_prompt", jobs[0].options)
 
-    def test_transcription_comparison_queues_three_engines_and_renders_results(
+    def test_transcription_comparison_queues_four_engines_and_renders_results(
         self,
     ) -> None:
         with TemporaryDirectory() as directory:
@@ -1753,8 +1825,42 @@ class WebAppTests(unittest.TestCase):
                 waiting = client.get(
                     f"/comparisons/{comparison_id}"
                 )
-                for job in jobs:
+                service.store.update(
+                    jobs[0].id,
+                    status="failed",
+                    blocked_stage="transcription",
+                    error="transcription failed",
+                )
+                failed_comparison = client.get(
+                    f"/comparisons/{comparison_id}"
+                )
+                retry_response = client.post(
+                    f"/comparisons/{comparison_id}/retry",
+                    follow_redirects=False,
+                )
+                retry_notice = client.get(
+                    retry_response.headers["location"]
+                )
+                retried_job = service.store.get(jobs[0].id)
+                service.store.update(jobs[0].id, status="extracting")
+                extracting = client.get(
+                    f"/comparisons/{comparison_id}"
+                )
+                comparison_panel = client.get(
+                    f"/comparisons/{comparison_id}/panel"
+                )
+                partial_comparison = None
+                for index, job in enumerate(jobs):
                     backend = str(job.options["backend"])
+                    audio = (
+                        root
+                        / "state"
+                        / "jobs"
+                        / job.id
+                        / "audio.16k.wav"
+                    )
+                    audio.parent.mkdir(parents=True, exist_ok=True)
+                    audio.write_bytes(b"wave")
                     transcript = (
                         root
                         / "state"
@@ -1762,7 +1868,7 @@ class WebAppTests(unittest.TestCase):
                         / job.id
                         / "movie_translate.json"
                     )
-                    transcript.parent.mkdir(parents=True)
+                    transcript.parent.mkdir(parents=True, exist_ok=True)
                     transcript.write_text(
                         json.dumps(
                             {
@@ -1784,22 +1890,116 @@ class WebAppTests(unittest.TestCase):
                     service.store.update(
                         job.id,
                         status="transcription_completed",
+                        audio_path=str(audio),
+                        audio_sha256=f"audio-{job.id}",
                         transcript_path=str(transcript),
                     )
+                    if index == 0:
+                        partial_comparison = client.get(
+                            f"/comparisons/{comparison_id}"
+                        )
                 comparison = client.get(
                     f"/comparisons/{comparison_id}"
                 )
+                history = client.get("/comparisons")
+                history_fragment = client.get("/comparisons-fragment")
+                invalid_rerun = client.post(
+                    f"/comparisons/{comparison_id}/rerun",
+                    data={
+                        "kotoba_chunk_length_seconds": "0",
+                        "whisperx_chunk_length_seconds": "42",
+                    },
+                )
+                invalid_whisperx_rerun = client.post(
+                    f"/comparisons/{comparison_id}/rerun",
+                    data={
+                        "kotoba_chunk_length_seconds": "21",
+                        "whisperx_chunk_length_seconds": "31",
+                    },
+                )
+                invalid_whisperjav_rerun = client.post(
+                    f"/comparisons/{comparison_id}/rerun",
+                    data={
+                        "kotoba_chunk_length_seconds": "21",
+                        "whisperx_chunk_length_seconds": "24",
+                        "anime_max_group_duration_seconds": "0.1",
+                    },
+                )
+                rerun_response = client.post(
+                    f"/comparisons/{comparison_id}/rerun",
+                    data={
+                        "kotoba_chunk_length_seconds": "21",
+                        "whisperx_chunk_length_seconds": "24",
+                        "anime_max_group_duration_seconds": "2.7",
+                        "qwen_max_group_duration_seconds": "4.2",
+                    },
+                    follow_redirects=False,
+                )
+                new_comparison_id = rerun_response.headers[
+                    "location"
+                ].split("/")[2].split("?")[0]
+                rerun_notice = client.get(
+                    rerun_response.headers["location"]
+                )
+                rerun_jobs = [
+                    job
+                    for job in service.store.list_jobs(limit=None)
+                    if job.options.get("comparison_id")
+                    == new_comparison_id
+                ]
+                original_after_rerun = client.get(
+                    f"/comparisons/{comparison_id}"
+                )
+                history_after_rerun = client.get("/comparisons")
                 detail = client.get(f"/jobs/{jobs[0].id}")
+                selected_comparison_job = next(
+                    job
+                    for job in jobs
+                    if job.options.get("backend") == "hybrid"
+                )
+                missing_translation_selection = client.post(
+                    f"/comparisons/{comparison_id}/translate",
+                    data={"prompt_category_id": "jav"},
+                )
+                duplicate_translation_selection = client.post(
+                    f"/comparisons/{comparison_id}/translate",
+                    data={
+                        "job_ids": [jobs[0].id, jobs[1].id],
+                        "prompt_category_id": "jav",
+                    },
+                )
+                translation_response = client.post(
+                    f"/comparisons/{comparison_id}/translate",
+                    data={
+                        "job_ids": selected_comparison_job.id,
+                        "prompt_category_id": "jav",
+                    },
+                    follow_redirects=False,
+                )
+                translation_jobs = [
+                    job
+                    for job in service.store.list_jobs(limit=None)
+                    if isinstance(
+                        job.options.get("comparison_transcript_source"),
+                        dict,
+                    )
+                ]
+                preserved_comparison_job = service.store.get(
+                    selected_comparison_job.id
+                )
+                translation_notice = client.get(
+                    translation_response.headers["location"]
+                )
 
             self.assertEqual(queued.status_code, 303)
             self.assertEqual(
                 queued.headers["location"],
                 f"/comparisons/{comparison_id}",
             )
-            self.assertEqual(len(jobs), 3)
+            self.assertEqual(len(jobs), 4)
             self.assertEqual(
                 {job.options["backend"] for job in jobs},
-                {"hybrid", "whisperx", "kotoba"},
+                {"whisperjav", "hybrid", "whisperx", "kotoba"},
             )
             self.assertEqual(
                 {job.options["comparison_id"] for job in jobs},
@@ -1811,23 +2011,447 @@ class WebAppTests(unittest.TestCase):
             self.assertIn("hybrid_rescue", options_by_backend["hybrid"])
             self.assertNotIn("hybrid_rescue", options_by_backend["whisperx"])
             self.assertNotIn("hybrid_rescue", options_by_backend["kotoba"])
+            self.assertEqual(
+                options_by_backend["whisperjav"]["whisperjav"],
+                {
+                    "recipe": "whisperjav-domain-ensemble-v1",
+                    "anime_max_group_duration_seconds": 2.0,
+                    "qwen_max_group_duration_seconds": 3.0,
+                },
+            )
+            self.assertTrue(
+                all(
+                    job.options["comparison_schema_version"] == 2
+                    for job in jobs
+                )
+            )
+            self.assertEqual(
+                options_by_backend["hybrid"]["hybrid_rescue"],
+                {
+                    "window_padding_sec": 5.0,
+                    "max_word_duration_sec": 8.0,
+                    "short_segment_duration_sec": 0.2,
+                    "short_segment_cluster_window_sec": 5.0,
+                    "short_segment_cluster_count": 3,
+                    "speaker_debounce_sec": 0.1,
+                    "kotoba_chunk_length_seconds": 15,
+                    "whisperx_chunk_length_seconds": 30,
+                },
+            )
+            self.assertEqual(
+                options_by_backend["whisperx"]["chunk_length_seconds"],
+                30,
+            )
+            self.assertEqual(
+                options_by_backend["kotoba"]["chunk_length_seconds"],
+                15,
+            )
             self.assertTrue(all(job.operation == "transcribe" for job in jobs))
             self.assertIn(
                 f'data-update-url="/comparisons/{comparison_id}/panel"',
                 waiting.text,
             )
+            self.assertNotIn(
+                "data-comparison-translation-form",
+                waiting.text,
+            )
+            self.assertIn(
+                f'action="/comparisons/{comparison_id}/rerun"',
+                waiting.text,
+            )
+            self.assertIn(
+                'name="kotoba_chunk_length_seconds"',
+                waiting.text,
+            )
+            self.assertIn('value="15"', waiting.text)
+            self.assertIn(
+                'name="whisperx_chunk_length_seconds"',
+                waiting.text,
+            )
+            self.assertIn('max="30"', waiting.text)
+            self.assertIn('value="30"', waiting.text)
+            self.assertIn(
+                'name="anime_max_group_duration_seconds"', waiting.text
+            )
+            self.assertIn(
+                'name="qwen_max_group_duration_seconds"', waiting.text
+            )
+            self.assertEqual(waiting.text.count("오디오 추출"), 1)
+            self.assertEqual(waiting.text.count("전사 예정"), 4)
+            self.assertIn("실패 작업 재시도 (1)", failed_comparison.text)
+            self.assertEqual(retry_response.status_code, 303)
+            self.assertEqual(
+                retry_response.headers["location"],
+                f"/comparisons/{comparison_id}?retried=1",
+            )
+            self.assertIn(
+                "실패한 전사 작업 1개를 재시도했습니다.",
+                retry_notice.text,
+            )
+            self.assertEqual(retried_job.status, "queued")
+            self.assertIn(
+                "comparison-audio-stage is-running",
+                extracting.text,
+            )
+            self.assertEqual(extracting.text.count("오디오 추출"), 1)
+            self.assertNotIn("오디오 추출 중", extracting.text)
+            self.assertEqual(extracting.text.count("전사 예정"), 4)
+            self.assertEqual(comparison_panel.status_code, 200)
+            self.assertIn(
+                "comparison-audio-stage is-running",
+                comparison_panel.text,
+            )
+            self.assertIsNotNone(partial_comparison)
+            self.assertIn(
+                f'data-update-url="/comparisons/{comparison_id}/panel"',
+                partial_comparison.text,
+            )
+            self.assertIn(
+                f'action="/comparisons/{comparison_id}/translate"',
+                partial_comparison.text,
+            )
+            self.assertIn(
+                f'value="{jobs[0].id}"',
+                partial_comparison.text,
+            )
+            self.assertIn(
+                "완료된 결과 중 파일마다 사용할 엔진",
+                partial_comparison.text,
+            )
             self.assertEqual(comparison.status_code, 200)
-            self.assertIn("3 / 3개 전사 완료", comparison.text)
+            self.assertEqual(comparison.text.count("오디오 추출"), 1)
+            self.assertIn("4 / 4개 전사 완료", comparison.text)
+            self.assertIn("WhisperJAV", comparison.text)
             self.assertIn("하이브리드", comparison.text)
             self.assertIn("WhisperX", comparison.text)
             self.assertIn("Kotoba", comparison.text)
             self.assertIn("hybrid 전사 결과", comparison.text)
             self.assertIn("whisperx 전사 결과", comparison.text)
             self.assertIn("kotoba 전사 결과", comparison.text)
+            self.assertIn("whisperjav 전사 결과", comparison.text)
+            self.assertIn(
+                f'action="/comparisons/{comparison_id}/translate"',
+                comparison.text,
+            )
+            self.assertIn("선택한 전사 결과로 번역", comparison.text)
+            self.assertIn('name="prompt_category_id"', comparison.text)
+            for job in jobs:
+                self.assertIn(f'value="{job.id}"', comparison.text)
+            self.assertIn(
+                'href="/comparisons" class="is-active"',
+                comparison.text,
+            )
+            self.assertEqual(history.status_code, 200)
+            self.assertIn("전사 비교 이력", history.text)
+            self.assertIn(
+                'href="/comparisons" class="is-active"',
+                history.text,
+            )
+            self.assertNotIn(
+                'href="/jobs" class="is-active"',
+                history.text,
+            )
+            self.assertEqual(
+                history.text.count('class="comparison-history-item'),
+                1,
+            )
+            self.assertEqual(
+                history.text.count('class="comparison-record-item'),
+                1,
+            )
+            self.assertIn("movie.mp4", history.text)
+            self.assertIn("완료 4", history.text)
+            self.assertIn(
+                f'href="/comparisons/{comparison_id}"',
+                history.text,
+            )
+            self.assertEqual(history_fragment.status_code, 200)
+            self.assertEqual(
+                history_fragment.text.count(
+                    'class="comparison-history-item'
+                ),
+                1,
+            )
+            self.assertEqual(
+                history_fragment.text.count(
+                    'class="comparison-record-item'
+                ),
+                1,
+            )
+            self.assertEqual(invalid_rerun.status_code, 400)
+            self.assertIn(
+                "Kotoba 청크는 1초 이상이어야 합니다.",
+                invalid_rerun.text,
+            )
+            self.assertIn('value="0"', invalid_rerun.text)
+            self.assertEqual(invalid_whisperx_rerun.status_code, 400)
+            self.assertIn(
+                "WhisperX 청크는 30초 이하여야 합니다.",
+                invalid_whisperx_rerun.text,
+            )
+            self.assertEqual(invalid_whisperjav_rerun.status_code, 400)
+            self.assertIn(
+                "WhisperJAV 1차 그룹 길이: 0.5초 이상 30.0초 이하여야 합니다.",
+                invalid_whisperjav_rerun.text,
+            )
+            self.assertEqual(rerun_response.status_code, 303)
+            self.assertNotEqual(new_comparison_id, comparison_id)
+            self.assertEqual(len(rerun_jobs), 4)
+            self.assertTrue(
+                all(job.status == "audio_ready" for job in rerun_jobs)
+            )
+            self.assertEqual(
+                len({job.audio_path for job in rerun_jobs}),
+                1,
+            )
+            self.assertTrue(
+                all(
+                    job.options["comparison_parent_id"] == comparison_id
+                    for job in rerun_jobs
+                )
+            )
+            self.assertTrue(
+                all(
+                    "comparison_audio_source_job_id" in job.options
+                    for job in rerun_jobs
+                )
+            )
+            rerun_options = {
+                str(job.options["backend"]): job.options
+                for job in rerun_jobs
+            }
+            self.assertEqual(
+                rerun_options["hybrid"]["hybrid_rescue"][
+                    "kotoba_chunk_length_seconds"
+                ],
+                21,
+            )
+            self.assertEqual(
+                rerun_options["hybrid"]["hybrid_rescue"][
+                    "whisperx_chunk_length_seconds"
+                ],
+                24,
+            )
+            self.assertEqual(
+                rerun_options["kotoba"]["chunk_length_seconds"],
+                21,
+            )
+            self.assertEqual(
+                rerun_options["whisperx"]["chunk_length_seconds"],
+                24,
+            )
+            self.assertEqual(
+                rerun_options["whisperjav"]["whisperjav"][
+                    "anime_max_group_duration_seconds"
+                ],
+                2.7,
+            )
+            self.assertEqual(
+                rerun_options["whisperjav"]["whisperjav"][
+                    "qwen_max_group_duration_seconds"
+                ],
+                4.2,
+            )
+            self.assertIn(
+                "변경한 분할 설정으로 새 전사 비교를 시작했습니다.",
+                rerun_notice.text,
+            )
+            self.assertIn(
+                "기존 추출 오디오 1개를 재사용하며 전사부터 실행합니다.",
+                rerun_notice.text,
+            )
+            self.assertIn(
+                f'href="/comparisons/{comparison_id}"',
+                rerun_notice.text,
+            )
+            self.assertIn("같은 미디어의 비교 기록", rerun_notice.text)
+            self.assertIn("현재 기록", rerun_notice.text)
+            self.assertNotIn("이전 결과", rerun_notice.text)
+            self.assertIn(
+                f'href="/comparisons/{new_comparison_id}"',
+                original_after_rerun.text,
+            )
+            self.assertIn("같은 미디어의 비교 기록", original_after_rerun.text)
+            self.assertNotIn("후속 실행", original_after_rerun.text)
+            self.assertEqual(
+                history_after_rerun.text.count(
+                    'class="comparison-history-item'
+                ),
+                1,
+            )
+            self.assertEqual(
+                history_after_rerun.text.count(
+                    'class="comparison-record-item'
+                ),
+                2,
+            )
+            self.assertIn("비교 기록 2건", history_after_rerun.text)
+            self.assertNotIn("재실행 · 이전", history_after_rerun.text)
             self.assertIn(
                 f'/comparisons/{comparison_id}',
                 detail.text,
             )
+            self.assertEqual(translation_response.status_code, 303)
+            self.assertEqual(missing_translation_selection.status_code, 400)
+            self.assertIn(
+                "번역에 사용할 전사 결과를 하나 이상 선택하세요.",
+                missing_translation_selection.text,
+            )
+            self.assertEqual(duplicate_translation_selection.status_code, 400)
+            self.assertIn(
+                "파일마다 하나의 전사 결과만 선택하세요.",
+                duplicate_translation_selection.text,
+            )
+            self.assertEqual(
+                translation_response.headers["location"],
+                "/jobs?translations_queued=1",
+            )
+            self.assertEqual(len(translation_jobs), 1)
+            translated = translation_jobs[0]
+            self.assertEqual(translated.status, "transcribed")
+            self.assertEqual(translated.operation, "translate")
+            self.assertTrue(translated.force_overwrite)
+            self.assertEqual(
+                translated.options["translation_prompt"]["category_id"],
+                "jav",
+            )
+            self.assertNotIn("comparison_id", translated.options)
+            self.assertEqual(
+                translated.options["comparison_transcript_source"],
+                {
+                    "comparison_id": comparison_id,
+                    "job_id": selected_comparison_job.id,
+                    "backend": "hybrid",
+                },
+            )
+            self.assertEqual(
+                preserved_comparison_job.status,
+                "transcription_completed",
+            )
+            self.assertNotEqual(
+                translated.transcript_path,
+                selected_comparison_job.transcript_path,
+            )
+            self.assertEqual(
+                json.loads(
+                    Path(translated.transcript_path).read_text(encoding="utf-8")
+                )["job_id"],
+                selected_comparison_job.id,
+            )
+            self.assertIn(
+                "선택한 전사 작업 1개를 번역으로 전환했습니다.",
+                translation_notice.text,
+            )
+
+    def test_transcription_comparison_accepts_completed_subtitled_media(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            (media_root / "movie.mp4").write_bytes(b"media")
+            (media_root / "movie.ko.srt").write_text(
+                "existing subtitle",
+                encoding="utf-8",
+            )
+
+            with TestClient(
+                create_app(self.settings(root, media_root))
+            ) as client:
+                service = client.app.state.orchestrator
+                service.stop()
+                completed = service.store.create(
+                    job_id="completed",
+                    source_rel="movie.mp4",
+                    force_overwrite=False,
+                    options={},
+                    operation="full",
+                )
+                service.store.update(completed.id, status="completed")
+
+                queued = client.post(
+                    "/jobs",
+                    data={
+                        "source_rels": "movie.mp4",
+                        "operation": "compare",
+                    },
+                    follow_redirects=False,
+                )
+                jobs = service.store.list_jobs(limit=None)
+
+            comparison_jobs = [
+                job for job in jobs if job.options.get("comparison_id")
+            ]
+            comparison_id = str(
+                comparison_jobs[0].options["comparison_id"]
+            )
+            self.assertEqual(queued.status_code, 303)
+            self.assertEqual(
+                queued.headers["location"],
+                f"/comparisons/{comparison_id}",
+            )
+            self.assertEqual(len(comparison_jobs), 4)
+            self.assertTrue(
+                all(not job.force_overwrite for job in comparison_jobs)
+            )
+            self.assertEqual(
+                (media_root / "movie.ko.srt").read_text(encoding="utf-8"),
+                "existing subtitle",
+            )
+
+    def test_comparison_retry_repairs_legacy_whisperx_chunk(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            (media_root / "movie.mp4").write_bytes(b"media")
+
+            with TestClient(
+                create_app(self.settings(root, media_root))
+            ) as client:
+                service = client.app.state.orchestrator
+                service.stop()
+                legacy = service.store.create(
+                    job_id="legacy-comparison-whisperx",
+                    source_rel="movie.mp4",
+                    force_overwrite=False,
+                    options={
+                        "backend": "whisperx",
+                        "chunk_length_seconds": 60,
+                        "comparison_id": "legacy-comparison",
+                    },
+                    operation="transcribe",
+                )
+                service.store.update(
+                    legacy.id,
+                    status="blocked",
+                    blocked_stage="transcription",
+                    error="invalid input shape",
+                )
+
+                response = client.post(
+                    "/comparisons/legacy-comparison/retry",
+                    follow_redirects=False,
+                )
+                notice = client.get(response.headers["location"])
+                retried = service.store.get(legacy.id)
+
+            self.assertEqual(response.status_code, 303)
+            self.assertEqual(
+                response.headers["location"],
+                "/comparisons/legacy-comparison?retried=1&adjusted=1",
+            )
+            self.assertEqual(retried.options["chunk_length_seconds"], 30)
+            self.assertIn(
+                "기존 WhisperX 청크 1개는 30초로 보정했습니다.",
+                notice.text,
+            )
+            self.assertIn(
+                "동일한 미디어를 다음 엔진으로 전사한 결과입니다: WhisperX",
+                notice.text,
+            )
+            self.assertNotIn("<h3>WhisperJAV</h3>", notice.text)
 
     def test_job_list_selects_completed_transcripts_for_translation(self) -> None:
         with TemporaryDirectory() as directory:

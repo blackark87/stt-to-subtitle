@@ -10,6 +10,7 @@ from math import isfinite
 from typing import Any
 
 from .stt_quality import normalize_transcript, repetition_diagnostics
+from .whisperx_worker import WHISPERX_MAX_CHUNK_LENGTH_SECONDS
 
 HYBRID_POLICY_VERSION = "hybrid-rescue-v1"
 MIN_SPEAKER_MAPPING_CONFIDENCE = 0.5
@@ -69,7 +70,7 @@ class HybridRescueOptions:
             return value
 
         defaults = cls()
-        return cls(
+        options = cls(
             window_padding_sec=positive_float(
                 "window_padding_sec", defaults.window_padding_sec
             ),
@@ -101,6 +102,15 @@ class HybridRescueOptions:
                 defaults.whisperx_chunk_length_seconds,
             ),
         )
+        if (
+            options.whisperx_chunk_length_seconds
+            > WHISPERX_MAX_CHUNK_LENGTH_SECONDS
+        ):
+            raise ValueError(
+                "whisperx_chunk_length_seconds must be at most "
+                f"{WHISPERX_MAX_CHUNK_LENGTH_SECONDS}"
+            )
+        return options
 
 
 def _timestamp(value: Any) -> float | None:

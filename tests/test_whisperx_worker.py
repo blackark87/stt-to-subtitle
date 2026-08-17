@@ -3,12 +3,39 @@ import unittest
 from stt_to_subtitle.whisperx_worker import (
     WhisperXSegmentationOptions,
     extract_whisperx_words,
+    install_whisperx_sentence_splitter_fallback,
     normalize_whisperx_segments,
     rebuild_whisperx_segments,
 )
 
 
 class WhisperXWorkerTests(unittest.TestCase):
+    def test_uses_whole_segment_when_punkt_data_is_unavailable(self) -> None:
+        other_resource = object()
+
+        class AlignmentModule:
+            @staticmethod
+            def nltk_load(resource: str) -> object:
+                if resource.startswith("tokenizers/punkt_tab/"):
+                    raise LookupError("punkt_tab is unavailable")
+                return other_resource
+
+        install_whisperx_sentence_splitter_fallback(AlignmentModule)
+
+        tokenizer = AlignmentModule.nltk_load(
+            "tokenizers/punkt_tab/english.pickle"
+        )
+        text = "一文目です。二文目です。"
+
+        self.assertEqual(
+            list(tokenizer.span_tokenize(text)),
+            [(0, len(text))],
+        )
+        self.assertIs(
+            AlignmentModule.nltk_load("tokenizers/other/resource"),
+            other_resource,
+        )
+
     def test_normalizes_sorts_and_filters_aligned_segments(self) -> None:
         segments = normalize_whisperx_segments(
             [

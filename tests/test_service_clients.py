@@ -1,5 +1,8 @@
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 import json
+import threading
 import unittest
 from unittest.mock import Mock, patch
 
@@ -8,6 +11,7 @@ from stt_to_subtitle.service_clients import (
     LMStudioClient,
     OpenAICompatibleClient,
     OperationStopped,
+    RequestConcurrencyLimiter,
     RetryingJSONClient,
     STTAPIClient,
     TranslationPaused,
@@ -340,6 +344,213 @@ class TranslationResponseTests(unittest.TestCase):
             [[{"id": "segment-1", "text": "번역"}]],
         )
         self.assertEqual(client._translate_batch_with_recovery.call_count, 1)
+
+    def test_translates_one_file_batches_in_parallel_and_reorders_results(
+        self,
+    ) -> None:
+        client = OpenAICompatibleClient(
+            "http://translation.test/v1",
+            "",
+            "model",
+            max_segments=1,
+        )
+        all_started = threading.Event()
+        state_lock = threading.Lock()
+        active = 0
+        maximum_active = 0
+        started = 0
+
+        def translate_batch(batch, *_args):
+            nonlocal active, maximum_active, started
+            with state_lock:
+                active += 1
+                started += 1
+                maximum_active = max(maximum_active, active)
+                if started == 3:
+                    all_started.set()
+            if not all_started.wait(timeout=2):
+                raise AssertionError("three translation batches did not overlap")
+            try:
+                return [
+                    {
+                        "id": str(batch[0]["id"]),
+                        "text": f"번역-{batch[0]['id']}",
+                    }
+                ]
+            finally:
+                with state_lock:
+                    active -= 1
+
+        client._translate_batch_with_recovery = Mock(
+            side_effect=translate_batch
+        )
+        progress: list[tuple[int, int]] = []
+        checkpoints: list[list[dict[str, str]]] = []
+        segments = [
+            {"id": f"segment-{index}", "text": str(index)}
+            for index in range(1, 4)
+        ]
+
+        result = client.translate(
+            segments,
+            max_workers=3,
+            on_batch=checkpoints.append,
+            on_progress=lambda completed, total: progress.append(
+                (completed, total)
+            ),
+        )
+
+        self.assertEqual(maximum_active, 3)
+        self.assertEqual(
+            result,
+            [
+                {"id": f"segment-{index}", "text": f"번역-segment-{index}"}
+                for index in range(1, 4)
+            ],
+        )
+        self.assertEqual(progress[0], (0, 3))
+        self.assertEqual(progress[-1], (3, 3))
+        self.assertEqual(checkpoints[-1], result)
+
+    def test_parallel_translation_pauses_after_active_batches_checkpoint(
+        self,
+    ) -> None:
+        client = OpenAICompatibleClient(
+            "http://translation.test/v1",
+            "",
+            "model",
+            max_segments=1,
+        )
+        active_batches = threading.Barrier(2, timeout=2)
+
+        def translate_batch(batch, *_args):
+            active_batches.wait()
+            return [
+                {"id": str(batch[0]["id"]), "text": "번역"}
+            ]
+
+        client._translate_batch_with_recovery = Mock(
+            side_effect=translate_batch
+        )
+        checkpoints: list[list[dict[str, str]]] = []
+        progress: list[tuple[int, int]] = []
+
+        with self.assertRaises(TranslationPaused):
+            client.translate(
+                [
+                    {"id": "segment-1", "text": "一"},
+                    {"id": "segment-2", "text": "二"},
+                    {"id": "segment-3", "text": "三"},
+                ],
+                max_workers=2,
+                on_batch=checkpoints.append,
+                on_progress=lambda completed, total: progress.append(
+                    (completed, total)
+                ),
+                should_pause=lambda: True,
+            )
+
+        self.assertEqual(client._translate_batch_with_recovery.call_count, 2)
+        self.assertEqual(progress[0], (0, 3))
+        self.assertEqual(progress[-1], (2, 3))
+        self.assertEqual(len(checkpoints[-1]), 2)
+
+    def test_shares_request_limit_across_parallel_file_translations(
+        self,
+    ) -> None:
+        limiter = RequestConcurrencyLimiter(2)
+        clients = [
+            OpenAICompatibleClient(
+                "http://translation.test/v1",
+                "",
+                "model",
+                max_segments=1,
+                attempts=1,
+                request_limiter=limiter,
+            )
+            for _index in range(2)
+        ]
+        all_attempted = threading.Event()
+        release_requests = threading.Event()
+        state_lock = threading.Lock()
+        active = 0
+        maximum_active = 0
+        attempted = 0
+        original_slot = limiter.slot
+
+        @contextmanager
+        def tracked_slot():
+            nonlocal attempted
+            with state_lock:
+                attempted += 1
+                if attempted == 4:
+                    all_attempted.set()
+            with original_slot():
+                yield
+
+        limiter.slot = tracked_slot
+
+        def request(_method, _url, **kwargs):
+            nonlocal active, maximum_active
+            with state_lock:
+                active += 1
+                maximum_active = max(maximum_active, active)
+            if not release_requests.wait(timeout=2):
+                raise AssertionError("translation requests were not released")
+            try:
+                user_payload = json.loads(
+                    kwargs["json"]["messages"][1]["content"]
+                )
+                translations = [
+                    {"id": item["id"], "text": f"번역-{item['id']}"}
+                    for item in user_payload["target_segments"]
+                ]
+                response = Mock(status_code=200)
+                response.json.return_value = {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {"translations": translations},
+                                    ensure_ascii=False,
+                                )
+                            }
+                        }
+                    ]
+                }
+                return response
+            finally:
+                with state_lock:
+                    active -= 1
+
+        file_segments = [
+            [
+                {"id": f"file-{file_index}-segment-{segment_index}", "text": "원문"}
+                for segment_index in range(2)
+            ]
+            for file_index in range(2)
+        ]
+
+        with patch(
+            "stt_to_subtitle.service_clients.requests.Session.request",
+            side_effect=request,
+        ), ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [
+                executor.submit(
+                    client.translate,
+                    segments,
+                    max_workers=2,
+                )
+                for client, segments in zip(clients, file_segments)
+            ]
+            self.assertTrue(all_attempted.wait(timeout=2))
+            with state_lock:
+                self.assertEqual(active, 2)
+            release_requests.set()
+            results = [future.result() for future in futures]
+
+        self.assertEqual(maximum_active, 2)
+        self.assertEqual([len(result) for result in results], [2, 2])
 
     def test_reorders_an_exact_translation_id_set(self) -> None:
         normalized = normalize_translation_response(

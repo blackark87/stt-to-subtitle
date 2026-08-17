@@ -63,12 +63,14 @@ from .whisperx_worker import (
     DEFAULT_WHISPERX_COMPUTE_TYPE,
     DEFAULT_WHISPERX_LANGUAGE,
     DEFAULT_WHISPERX_MODEL,
+    WHISPERX_MAX_CHUNK_LENGTH_SECONDS,
     WhisperXSegmentationOptions,
     rebuild_whisperx_segments,
 )
+from .whisperjav_worker import WhisperJAVOptions
 
 LOGGER = logging.getLogger(__name__)
-STT_BACKENDS = {"hybrid", "kotoba", "whisperx"}
+STT_BACKENDS = {"hybrid", "kotoba", "whisperjav", "whisperx"}
 DEFAULT_HYBRID_SEGMENTATION = {
     "split_on_speaker_change": True,
     "max_gap_sec": 0.8,
@@ -143,6 +145,7 @@ class STTAPISettings:
     chunk_progress_every: int = 10
     noise_filter_trigger_level: float = DEFAULT_NOISE_FILTER_TRIGGER_LEVEL
     whisperx_python: Path = Path(".venv-whisperx/bin/python")
+    whisperjav_python: Path = Path(".venv-whisperjav/bin/python")
     whisperx_model: str = DEFAULT_WHISPERX_MODEL
     whisperx_language: str = DEFAULT_WHISPERX_LANGUAGE
     whisperx_compute_type: str = DEFAULT_WHISPERX_COMPUTE_TYPE
@@ -187,6 +190,12 @@ class STTAPISettings:
                 os.environ.get(
                     "WHISPERX_PYTHON",
                     ".venv-whisperx/bin/python",
+                )
+            ).expanduser(),
+            whisperjav_python=Path(
+                os.environ.get(
+                    "WHISPERJAV_PYTHON",
+                    ".venv-whisperjav/bin/python",
                 )
             ).expanduser(),
             whisperx_model=os.environ.get(
@@ -284,6 +293,35 @@ def _whisperx_unavailable_reason(settings: STTAPISettings) -> str | None:
     return None
 
 
+def _whisperjav_unavailable_reason(
+    settings: STTAPISettings,
+) -> str | None:
+    if settings.device == "mps" or settings.diarization_device == "mps":
+        return "WhisperJAV backend supports only cpu or CUDA devices"
+    if not settings.whisperjav_python.is_file():
+        return (
+            "WhisperJAV Python was not found: "
+            f"{settings.whisperjav_python}"
+        )
+    whisperx_reason = _whisperx_unavailable_reason(settings)
+    if whisperx_reason is not None:
+        return (
+            "WhisperJAV speaker assignment is unavailable: "
+            f"{whisperx_reason}"
+        )
+    return None
+
+
+def _venv_nvidia_library_paths(python: Path) -> list[str]:
+    return sorted(
+        str(path)
+        for path in (python.parent.parent / "lib").glob(
+            "python*/site-packages/nvidia/*/lib"
+        )
+        if path.is_dir()
+    )
+
+
 def _parse_options(raw_options: str, settings: STTAPISettings) -> dict[str, Any]:
     try:
         decoded = json.loads(raw_options)
@@ -305,6 +343,7 @@ def _parse_options(raw_options: str, settings: STTAPISettings) -> dict[str, Any]
         "repetition_policy",
         "repetition_min_count",
         "hybrid_rescue",
+        "whisperjav",
     }
     unknown = set(decoded) - allowed
     if unknown:
@@ -312,23 +351,30 @@ def _parse_options(raw_options: str, settings: STTAPISettings) -> dict[str, Any]
     backend = str(decoded.get("backend", "kotoba")).strip().lower()
     if backend not in STT_BACKENDS:
         raise ValueError(
-            "backend must be 'kotoba', 'whisperx', or 'hybrid'"
+            "backend must be 'kotoba', 'whisperx', 'hybrid', or "
+            "'whisperjav'"
         )
     noise_filter = decoded.get("noise_filter", True)
     if not isinstance(noise_filter, bool):
         raise ValueError("noise_filter must be a JSON boolean")
-    if backend in {"hybrid", "whisperx"} and not noise_filter:
+    if backend in {"hybrid", "whisperjav", "whisperx"} and not noise_filter:
         if backend == "whisperx":
             raise ValueError(
                 "WhisperX backend requires noise_filter=true for VAD"
             )
-        raise ValueError("hybrid backend requires noise_filter=true for VAD")
+        raise ValueError(
+            f"{backend} backend requires noise_filter=true for VAD"
+        )
     options = TranscriptionOptions(
         batch_size=settings.batch_size,
         chunk_length_seconds=int(
             decoded.get(
                 "chunk_length_seconds",
-                DEFAULT_CHUNK_LENGTH_SECONDS,
+                (
+                    WHISPERX_MAX_CHUNK_LENGTH_SECONDS
+                    if backend == "whisperx"
+                    else DEFAULT_CHUNK_LENGTH_SECONDS
+                ),
             )
         ),
         num_speakers=(
@@ -353,6 +399,15 @@ def _parse_options(raw_options: str, settings: STTAPISettings) -> dict[str, Any]
         threads=settings.threads,
     )
     options.validate()
+    if (
+        backend == "whisperx"
+        and options.chunk_length_seconds
+        > WHISPERX_MAX_CHUNK_LENGTH_SECONDS
+    ):
+        raise ValueError(
+            "WhisperX chunk_length_seconds must be at most "
+            f"{WHISPERX_MAX_CHUNK_LENGTH_SECONDS}"
+        )
     parsed = {"backend": backend, **asdict(options)}
     if backend in {"hybrid", "whisperx"}:
         if backend == "whisperx" and "hybrid_rescue" in decoded:
@@ -389,6 +444,28 @@ def _parse_options(raw_options: str, settings: STTAPISettings) -> dict[str, Any]
             parsed["chunk_length_seconds"] = (
                 hybrid.kotoba_chunk_length_seconds
             )
+    elif backend == "whisperjav":
+        forbidden = {
+            "repetition_policy",
+            "repetition_min_count",
+            "hybrid_rescue",
+        } & set(decoded)
+        if forbidden:
+            raise ValueError(
+                "unsupported WhisperJAV quality options: "
+                f"{sorted(forbidden)}"
+            )
+        segmentation_input = dict(decoded)
+        if "subtitle_segmentation" not in segmentation_input:
+            segmentation_input["subtitle_segmentation"] = (
+                DEFAULT_HYBRID_SEGMENTATION
+            )
+        parsed["subtitle_segmentation"] = asdict(
+            WhisperXSegmentationOptions.from_options(segmentation_input)
+        )
+        parsed["whisperjav"] = asdict(
+            WhisperJAVOptions.from_options(decoded)
+        )
     elif any(
         key in decoded
         for key in (
@@ -396,6 +473,7 @@ def _parse_options(raw_options: str, settings: STTAPISettings) -> dict[str, Any]
             "repetition_policy",
             "repetition_min_count",
             "hybrid_rescue",
+            "whisperjav",
         )
     ):
         raise ValueError(
@@ -501,6 +579,7 @@ class TranscriptionService:
             "backends": {
                 "hybrid": {"status": "ready"},
                 "kotoba": {"status": "ready"},
+                "whisperjav": {"status": "ready"},
                 "whisperx": {"status": "ready"},
             },
         }
@@ -536,6 +615,12 @@ class TranscriptionService:
                     "status": "unavailable",
                     "reason": whisperx_reason,
                 }
+        whisperjav_reason = _whisperjav_unavailable_reason(self.settings)
+        if whisperjav_reason is not None:
+            detail["backends"]["whisperjav"] = {
+                "status": "unavailable",
+                "reason": whisperjav_reason,
+            }
         detail["status"] = "ready"
         return True, detail
 
@@ -544,6 +629,8 @@ class TranscriptionService:
             return None
         if backend in {"hybrid", "whisperx"}:
             return _whisperx_unavailable_reason(self.settings)
+        if backend == "whisperjav":
+            return _whisperjav_unavailable_reason(self.settings)
         return f"unsupported transcription backend: {backend}"
 
     async def submit(
@@ -562,7 +649,7 @@ class TranscriptionService:
             if existing.status == "failed":
                 if not Path(existing.audio_path).is_file():
                     raise ValueError("saved upload for the failed job is unavailable")
-                self.store.requeue(existing.id)
+                self.store.requeue(existing.id, options=options)
                 self._queue.put(existing.id)
                 requeued = self.store.get(existing.id)
                 if requeued is None:
@@ -709,6 +796,113 @@ class TranscriptionService:
         finally:
             worker_result.unlink(missing_ok=True)
 
+    def _run_whisperjav_worker(
+        self,
+        job: TranscriptionJob,
+    ) -> Mapping[str, Any]:
+        reason = self.backend_unavailable_reason("whisperjav")
+        if reason is not None:
+            raise RuntimeError(reason)
+        self._release_pipeline()
+        ensemble_result = self.result_dir / f".{job.id}.whisperjav.json"
+        speaker_result = self.result_dir / f".{job.id}.speakers.json"
+        ensemble_result.unlink(missing_ok=True)
+        speaker_result.unlink(missing_ok=True)
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "HF_TOKEN": self.settings.hf_token,
+                "STT_DEVICE": self.settings.device,
+                "STT_DIARIZATION_DEVICE": self.settings.diarization_device,
+                "WHISPERX_CACHE_DIR": str(self.settings.whisperx_cache_dir),
+                "PYTHONIOENCODING": "utf-8",
+            }
+        )
+        whisperjav_environment = environment.copy()
+        nvidia_library_paths = _venv_nvidia_library_paths(
+            self.settings.whisperjav_python
+        )
+        if nvidia_library_paths:
+            existing_library_path = environment.get("LD_LIBRARY_PATH", "")
+            whisperjav_environment["LD_LIBRARY_PATH"] = ":".join(
+                [
+                    *nvidia_library_paths,
+                    *(
+                        [existing_library_path]
+                        if existing_library_path
+                        else []
+                    ),
+                ]
+            )
+        whisperjav_command = [
+            str(self.settings.whisperjav_python),
+            "-m",
+            "stt_to_subtitle.whisperjav_worker",
+            "--audio",
+            job.audio_path,
+            "--output",
+            str(ensemble_result),
+            "--options",
+            json.dumps(job.options, sort_keys=True),
+        ]
+        speaker_command = [
+            str(self.settings.whisperx_python),
+            "-m",
+            "stt_to_subtitle.speaker_worker",
+            "--audio",
+            job.audio_path,
+            "--input",
+            str(ensemble_result),
+            "--output",
+            str(speaker_result),
+            "--options",
+            json.dumps(job.options, sort_keys=True),
+        ]
+        if self.settings.debug_artifacts:
+            artifact_dir = self.settings.artifacts_dir / job.id
+            whisperjav_command.extend(
+                ["--debug-dir", str(artifact_dir / "whisperjav")]
+            )
+            speaker_command.extend(
+                ["--debug-dir", str(artifact_dir / "pyannote")]
+            )
+        try:
+            for label, command, worker_environment in (
+                ("WhisperJAV", whisperjav_command, whisperjav_environment),
+                (
+                    "WhisperJAV speaker assignment",
+                    speaker_command,
+                    environment,
+                ),
+            ):
+                completed = subprocess.run(
+                    command,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    env=worker_environment,
+                )
+                if completed.returncode != 0:
+                    detail = (completed.stderr or completed.stdout).strip()
+                    raise RuntimeError(
+                        f"{label} worker failed"
+                        + (f": {detail[-2000:]}" if detail else "")
+                    )
+            try:
+                payload = json.loads(speaker_result.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as error:
+                raise RuntimeError(
+                    "WhisperJAV worker returned an invalid result"
+                ) from error
+            if not isinstance(payload, Mapping):
+                raise RuntimeError("WhisperJAV worker result must be an object")
+            return payload
+        finally:
+            ensemble_result.unlink(missing_ok=True)
+            speaker_result.unlink(missing_ok=True)
+
     def _worker_loop(self) -> None:
         while True:
             job_id = self._queue.get()
@@ -740,7 +934,7 @@ class TranscriptionService:
                 backend in {"hybrid", "kotoba"}
                 and self._pipeline is not None
             )
-            stt_call_count = 2 if backend == "hybrid" else 1
+            stt_call_count = 2 if backend in {"hybrid", "whisperjav"} else 1
             artifact_dir = (
                 self.settings.artifacts_dir / job.id
                 if self.settings.debug_artifacts
@@ -762,8 +956,16 @@ class TranscriptionService:
                 "provider": backend,
                 "options": job.options,
                 "option_semantics": {
-                    "chunk_length_seconds": "model_internal",
+                    "chunk_length_seconds": (
+                        "not_applicable"
+                        if backend == "whisperjav"
+                        else "model_internal"
+                    ),
                     "stt_call_count": stt_call_count,
+                    "alignment_call_count": (
+                        1 if backend == "whisperjav" else 0
+                    ),
+                    "diarization_call_count": 1,
                 },
             }
             LOGGER.info(
@@ -795,7 +997,39 @@ class TranscriptionService:
             options = TranscriptionOptions(**option_values)
             words: list[dict[str, Any]] = []
             backend_quality: dict[str, Any] = {}
-            if backend == "whisperx":
+            if backend == "whisperjav":
+                backend_result = self._run_whisperjav_worker(job)
+                raw_segments = backend_result.get("segments")
+                if not isinstance(raw_segments, list):
+                    raise RuntimeError(
+                        "WhisperJAV worker result has no segments list"
+                    )
+                segments = add_segment_ids(raw_segments)
+                model = backend_result.get("model")
+                timing = backend_result.get("timing")
+                runtime = backend_result.get("runtime")
+                noise_filter = backend_result.get("noise_filter")
+                raw_words = backend_result.get("words", [])
+                if isinstance(raw_words, list):
+                    words = raw_words
+                raw_quality = backend_result.get("quality", {})
+                if isinstance(raw_quality, Mapping):
+                    backend_quality = dict(raw_quality)
+                if not isinstance(model, Mapping):
+                    raise RuntimeError("WhisperJAV worker result has no model")
+                if not isinstance(timing, Mapping):
+                    raise RuntimeError("WhisperJAV worker result has no timing")
+                if not isinstance(runtime, Mapping):
+                    raise RuntimeError("WhisperJAV worker result has no runtime")
+                if not isinstance(noise_filter, Mapping):
+                    raise RuntimeError(
+                        "WhisperJAV worker result has no noise_filter"
+                    )
+                runtime = {
+                    **runtime,
+                    "elapsed_seconds": round(time.monotonic() - started, 3),
+                }
+            elif backend == "whisperx":
                 backend_result = self._run_whisperx_worker(job)
                 raw_segments = backend_result.get("segments")
                 if not isinstance(raw_segments, list):

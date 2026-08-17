@@ -20,6 +20,7 @@ WHISPERX_PACKAGE_VERSION = "3.8.6"
 DEFAULT_WHISPERX_MODEL = "large-v3"
 DEFAULT_WHISPERX_LANGUAGE = "ja"
 DEFAULT_WHISPERX_COMPUTE_TYPE = "float16"
+WHISPERX_MAX_CHUNK_LENGTH_SECONDS = 30
 WHISPERX_TIMESTAMP_POSTPROCESSOR = "whisperx-forced-alignment"
 
 
@@ -84,6 +85,38 @@ class WhisperXSegmentationOptions:
                 "prefer_punctuation_boundary", True
             ),
         )
+
+
+class _WholeSegmentSentenceTokenizer:
+    """Keep alignment offline when WhisperX's optional Punkt data is absent."""
+
+    @staticmethod
+    def span_tokenize(text: str) -> list[tuple[int, int]]:
+        return [(0, len(text))] if text else []
+
+
+def install_whisperx_sentence_splitter_fallback(
+    alignment_module: Any,
+) -> None:
+    """Avoid WhisperX attempting a runtime NLTK data download."""
+    original_loader = alignment_module.nltk_load
+    fallback_tokenizer = _WholeSegmentSentenceTokenizer()
+    punkt_unavailable = False
+
+    def load_with_fallback(resource: str) -> Any:
+        nonlocal punkt_unavailable
+        is_punkt = str(resource).startswith("tokenizers/punkt_tab/")
+        if is_punkt and punkt_unavailable:
+            return fallback_tokenizer
+        try:
+            return original_loader(resource)
+        except LookupError:
+            if is_punkt:
+                punkt_unavailable = True
+                return fallback_tokenizer
+            raise
+
+    alignment_module.nltk_load = load_with_fallback
 
 
 def _timestamp(value: Any) -> float | None:
@@ -374,7 +407,10 @@ def run_whisperx(
 ) -> dict[str, Any]:
     """Run WhisperX ASR, Japanese alignment, and speaker diarization."""
     import whisperx
+    from whisperx import alignment as whisperx_alignment
     from whisperx.diarize import DiarizationPipeline
+
+    install_whisperx_sentence_splitter_fallback(whisperx_alignment)
 
     installed_version = version("whisperx")
     if installed_version != WHISPERX_PACKAGE_VERSION:

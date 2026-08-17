@@ -40,6 +40,7 @@ from .service_clients import (
     ExternalServiceError,
     OpenAICompatibleClient,
     OperationStopped,
+    RequestConcurrencyLimiter,
     STTAPIClient,
     TranslationPaused,
 )
@@ -48,7 +49,15 @@ from .translation_prompt import (
     KOREAN_JAV_SYSTEM_PROMPT,
     KOREAN_TRANSLATION_REVIEW_PROMPT,
 )
-from .whisperx_worker import WhisperXSegmentationOptions
+from .whisperx_worker import (
+    WHISPERX_MAX_CHUNK_LENGTH_SECONDS,
+    WhisperXSegmentationOptions,
+)
+from .whisperjav_worker import (
+    DEFAULT_ANIME_MAX_GROUP_SECONDS,
+    DEFAULT_QWEN_MAX_GROUP_SECONDS,
+    WhisperJAVOptions,
+)
 
 LOGGER = logging.getLogger(__name__)
 MAX_EDITABLE_JSON_BYTES = 20 * 1024 * 1024
@@ -69,8 +78,17 @@ TRANSLATION_PROMPT_OPTION = "translation_prompt"
 TRANSLATION_REVIEW_ROUNDS = 2
 SUPPORTED_OPERATIONS = {"extract", "transcribe", "translate", "full"}
 TRANSLATION_OPERATIONS = {"translate", "full"}
-TRANSCRIPTION_COMPARISON_BACKENDS = ("hybrid", "whisperx", "kotoba")
+TRANSCRIPTION_COMPARISON_BACKENDS = (
+    "whisperjav",
+    "hybrid",
+    "whisperx",
+    "kotoba",
+)
+TRANSCRIPTION_COMPARISON_SCHEMA_VERSION = 2
 MAX_TRANSCRIPTION_COMPARISON_SOURCES = 20
+MAX_CONCURRENT_TRANSLATION_JOBS = 8
+COMPARISON_PARENT_ID_OPTION = "comparison_parent_id"
+COMPARISON_AUDIO_SOURCE_JOB_ID_OPTION = "comparison_audio_source_job_id"
 
 
 def wav_duration_seconds(path: Path) -> float | None:
@@ -103,6 +121,31 @@ def estimate_transcription_chunks(
                 "kotoba_chunk_length_seconds",
                 raw_chunk_length,
             )
+    elif str(options.get("backend", "kotoba")) == "whisperjav":
+        whisperjav_options = options.get("whisperjav")
+        if isinstance(whisperjav_options, Mapping):
+            try:
+                pass1 = float(
+                    whisperjav_options.get(
+                        "anime_max_group_duration_seconds",
+                        DEFAULT_ANIME_MAX_GROUP_SECONDS,
+                    )
+                )
+                pass2 = float(
+                    whisperjav_options.get(
+                        "qwen_max_group_duration_seconds",
+                        DEFAULT_QWEN_MAX_GROUP_SECONDS,
+                    )
+                )
+            except (TypeError, ValueError):
+                return 0
+            if pass1 <= 0 or pass2 <= 0:
+                return 0
+            return max(
+                2,
+                math.ceil(duration_seconds / pass1)
+                + math.ceil(duration_seconds / pass2),
+            )
     try:
         chunk_length = float(raw_chunk_length)
     except (TypeError, ValueError):
@@ -112,7 +155,22 @@ def estimate_transcription_chunks(
     return max(1, math.ceil(duration_seconds / chunk_length))
 
 
-SUPPORTED_STT_BACKENDS = {"kotoba", "whisperx", "hybrid"}
+def _audio_extraction_signature(
+    options: Mapping[str, Any],
+) -> tuple[int, float, float | None]:
+    """Return the normalized fields that determine the extracted WAV."""
+    raw_duration = options.get("duration_seconds")
+    duration = (
+        float(raw_duration) if raw_duration not in (None, "", 0, 0.0) else None
+    )
+    return (
+        int(options.get("audio_stream", 0)),
+        float(options.get("start_seconds", 0.0)),
+        duration,
+    )
+
+
+SUPPORTED_STT_BACKENDS = {"kotoba", "whisperx", "hybrid", "whisperjav"}
 HYBRID_SUBTITLE_SEGMENTATION_DEFAULTS = {
     "max_gap_sec": 0.8,
     "max_duration_sec": 8.0,
@@ -169,6 +227,9 @@ class SubtitleOrchestrator:
             if saved_servers is not None
             else settings.remote_servers()
         )
+        self._translation_request_limiter = RequestConcurrencyLimiter(
+            initial_servers.translation_workers
+        )
         self._remote_runtime: tuple[
             STTAPIClient | None,
             OpenAICompatibleClient | None,
@@ -194,7 +255,7 @@ class SubtitleOrchestrator:
             thread_name_prefix="pipeline-stt",
         )
         self._translation_executor = ThreadPoolExecutor(
-            max_workers=8,
+            max_workers=MAX_CONCURRENT_TRANSLATION_JOBS,
             thread_name_prefix="pipeline-translation",
         )
 
@@ -277,6 +338,7 @@ class SubtitleOrchestrator:
             normalized.lm_model,
             max_segments=self.settings.translation_batch_segments,
             max_characters=self.settings.translation_batch_characters,
+            request_limiter=self._translation_request_limiter,
         )
         if persist:
             self.store.save_remote_server_settings(
@@ -287,6 +349,9 @@ class SubtitleOrchestrator:
                 lm_model=normalized.lm_model,
                 translation_workers=normalized.translation_workers,
             )
+        self._translation_request_limiter.set_limit(
+            normalized.translation_workers
+        )
         self._remote_runtime = (stt_client, lm_client, normalized)
         return normalized
 
@@ -350,6 +415,12 @@ class SubtitleOrchestrator:
             latest = latest_jobs.get(source_rel)
             if latest is not None and latest.status not in SUCCESS_STATUSES:
                 skipped += 1
+                continue
+            # A comparison is an explicitly repeatable, transcription-only
+            # operation. Completed jobs and rendered subtitles do not collide
+            # with its per-job artifacts, so they must not filter the source.
+            if operation == "compare":
+                selected.append(source_rel)
                 continue
             has_subtitle = any(
                 path.exists()
@@ -571,6 +642,8 @@ class SubtitleOrchestrator:
         source_rels: Sequence[str],
         *,
         options: Mapping[str, Any],
+        reuse_audio_from: Sequence[PipelineJob] = (),
+        parent_comparison_id: str | None = None,
     ) -> tuple[str, list[PipelineJob]]:
         """Queue one transcription-only job per engine and source."""
         if not self.remote_servers_configured:
@@ -588,12 +661,26 @@ class SubtitleOrchestrator:
         for source_rel in unique_source_rels:
             self.library.resolve_file(source_rel)
 
+        comparison_chunks = HybridRescueOptions.from_options(options)
         normalized_by_backend: dict[str, dict[str, Any]] = {}
         for backend in TRANSCRIPTION_COMPARISON_BACKENDS:
             backend_options = dict(options)
             backend_options["backend"] = backend
+            if backend == "kotoba":
+                backend_options["chunk_length_seconds"] = (
+                    comparison_chunks.kotoba_chunk_length_seconds
+                )
+            elif backend == "whisperx":
+                backend_options["chunk_length_seconds"] = (
+                    comparison_chunks.whisperx_chunk_length_seconds
+                )
             if backend != "hybrid":
                 backend_options.pop("hybrid_rescue", None)
+            if backend != "whisperjav":
+                backend_options.pop("whisperjav", None)
+            if backend == "whisperjav":
+                for key in ("repetition_policy", "repetition_min_count"):
+                    backend_options.pop(key, None)
             if backend == "kotoba":
                 for key in (
                     "subtitle_segmentation",
@@ -605,21 +692,87 @@ class SubtitleOrchestrator:
                 backend_options
             )
 
+        desired_audio_signature = _audio_extraction_signature(
+            normalized_by_backend[TRANSCRIPTION_COMPARISON_BACKENDS[0]]
+        )
+        reusable_audio_by_source: dict[str, PipelineJob] = {}
+        for candidate in sorted(
+            reuse_audio_from,
+            key=lambda job: (job.updated_at, job.created_at),
+            reverse=True,
+        ):
+            if candidate.source_rel in reusable_audio_by_source:
+                continue
+            if candidate.source_rel not in unique_source_rels:
+                continue
+            if _audio_extraction_signature(
+                candidate.options
+            ) != desired_audio_signature:
+                continue
+            if not candidate.audio_path or not Path(candidate.audio_path).is_file():
+                continue
+            reusable_audio_by_source[candidate.source_rel] = candidate
+
         comparison_id = uuid4().hex
+        normalized_parent_id = str(parent_comparison_id or "").strip()
+        duration_by_audio_path: dict[str, float | None] = {}
         jobs: list[PipelineJob] = []
         for source_rel in unique_source_rels:
+            reusable_audio = reusable_audio_by_source.get(source_rel)
             for backend in TRANSCRIPTION_COMPARISON_BACKENDS:
                 persisted_options = dict(normalized_by_backend[backend])
                 persisted_options["comparison_id"] = comparison_id
-                jobs.append(
-                    self.store.create(
-                        job_id=uuid4().hex,
-                        source_rel=source_rel,
-                        force_overwrite=False,
-                        options=persisted_options,
-                        operation="transcribe",
-                    )
+                persisted_options["comparison_schema_version"] = (
+                    TRANSCRIPTION_COMPARISON_SCHEMA_VERSION
                 )
+                persisted_options["comparison_backends"] = list(
+                    TRANSCRIPTION_COMPARISON_BACKENDS
+                )
+                if normalized_parent_id:
+                    persisted_options[COMPARISON_PARENT_ID_OPTION] = (
+                        normalized_parent_id
+                    )
+                if reusable_audio is not None:
+                    persisted_options[COMPARISON_AUDIO_SOURCE_JOB_ID_OPTION] = (
+                        reusable_audio.id
+                    )
+                    audio_path = str(reusable_audio.audio_path)
+                    if audio_path not in duration_by_audio_path:
+                        duration_by_audio_path[audio_path] = wav_duration_seconds(
+                            Path(audio_path)
+                        )
+                    chunk_estimate = estimate_transcription_chunks(
+                        duration_by_audio_path[audio_path],
+                        persisted_options,
+                    )
+                else:
+                    audio_path = None
+                    chunk_estimate = 0
+                created = self.store.create(
+                    job_id=uuid4().hex,
+                    source_rel=source_rel,
+                    force_overwrite=False,
+                    options=persisted_options,
+                    operation="transcribe",
+                    status=(
+                        "audio_ready" if reusable_audio is not None else "queued"
+                    ),
+                    audio_path=audio_path,
+                    audio_sha256=(
+                        reusable_audio.audio_sha256
+                        if reusable_audio is not None
+                        else None
+                    ),
+                    chunks_total_estimate=chunk_estimate,
+                )
+                if reusable_audio is not None:
+                    self.store.add_event(
+                        created.id,
+                        "info",
+                        "comparison rerun requested; reusing extracted audio "
+                        f"from job {reusable_audio.id}",
+                    )
+                jobs.append(created)
         return comparison_id, jobs
 
     def create_selected_translation_jobs(
@@ -717,6 +870,132 @@ class SubtitleOrchestrator:
             transitioned_jobs.append(refreshed)
         return transitioned_jobs
 
+    def create_comparison_translation_jobs(
+        self,
+        comparison_id: str,
+        job_ids: Sequence[str],
+        *,
+        prompt_category_id: str,
+    ) -> list[PipelineJob]:
+        """Create translation jobs from selected comparison transcripts."""
+        if not self.remote_servers_configured:
+            raise ValueError(
+                "먼저 서버 설정에서 전사 서버와 번역 서버를 저장하세요."
+            )
+        normalized_comparison_id = comparison_id.strip()
+        selected_ids = list(
+            dict.fromkeys(
+                job_id.strip() for job_id in job_ids if job_id.strip()
+            )
+        )
+        if not selected_ids:
+            raise ValueError("번역에 사용할 전사 결과를 하나 이상 선택하세요.")
+        if len(selected_ids) > self.settings.maximum_listed_files:
+            raise ValueError("한 번에 등록할 수 있는 파일 수를 초과했습니다.")
+
+        prompt_snapshot = self._prompt_snapshot(prompt_category_id)
+        selected_transcripts: list[tuple[PipelineJob, dict[str, Any]]] = []
+        selected_sources: set[str] = set()
+        for job_id in selected_ids:
+            job = self.store.get(job_id)
+            if job is None or str(
+                job.options.get("comparison_id", "")
+            ).strip() != normalized_comparison_id:
+                raise ValueError("선택한 전사 비교 결과를 찾을 수 없습니다.")
+            if job.source_rel in selected_sources:
+                raise ValueError(
+                    f"{job.source_rel}: 파일마다 하나의 전사 결과만 "
+                    "선택하세요."
+                )
+            if not job.can_start_translation:
+                raise ValueError(
+                    f"{job.source_rel}: 완료된 전사 결과만 번역할 수 "
+                    "있습니다."
+                )
+            self.library.resolve_file(job.source_rel)
+            transcript_path = Path(job.transcript_path or "")
+            try:
+                payload = json.loads(
+                    transcript_path.read_text(encoding="utf-8")
+                )
+                if not isinstance(payload, Mapping):
+                    raise ValueError(
+                        "transcript JSON document must be an object"
+                    )
+                validate_transcript(payload)
+            except (
+                OSError,
+                UnicodeError,
+                ValueError,
+                json.JSONDecodeError,
+            ) as error:
+                raise ValueError(
+                    f"{job.source_rel}: 번역에 사용할 유효한 전사 결과가 "
+                    "없습니다."
+                ) from error
+            normalized_payload = dict(payload)
+            normalized_payload.setdefault(
+                "job_id",
+                job.stt_job_id or job.id,
+            )
+            selected_sources.add(job.source_rel)
+            selected_transcripts.append((job, normalized_payload))
+
+        created_jobs: list[PipelineJob] = []
+        comparison_option_keys = {
+            "comparison_id",
+            "comparison_schema_version",
+            "comparison_backends",
+            COMPARISON_PARENT_ID_OPTION,
+            COMPARISON_AUDIO_SOURCE_JOB_ID_OPTION,
+        }
+        for reusable, transcript_payload in selected_transcripts:
+            options = {
+                key: value
+                for key, value in reusable.options.items()
+                if key not in comparison_option_keys
+            }
+            options[TRANSLATION_PROMPT_OPTION] = dict(prompt_snapshot)
+            options["comparison_transcript_source"] = {
+                "comparison_id": normalized_comparison_id,
+                "job_id": reusable.id,
+                "backend": str(reusable.options.get("backend", "")),
+            }
+            created = self.store.create(
+                job_id=uuid4().hex,
+                source_rel=reusable.source_rel,
+                force_overwrite=True,
+                options=options,
+                operation="translate",
+            )
+            transcript_path = artifact_path(
+                self.settings.state_dir,
+                created.id,
+                created.source_rel,
+                "transcript",
+            )
+            write_json_atomic(transcript_path, transcript_payload)
+            self.store.update(
+                created.id,
+                status="transcribed",
+                audio_path=reusable.audio_path,
+                audio_sha256=reusable.audio_sha256,
+                transcript_path=str(transcript_path),
+            )
+            self.store.add_event(
+                created.id,
+                "info",
+                "translation requested from comparison transcript "
+                f"{reusable.id}",
+            )
+            refreshed = self.store.get(created.id)
+            if refreshed is None:
+                raise RuntimeError(
+                    "comparison translation job could not be read"
+                )
+            created_jobs.append(refreshed)
+        return created_jobs
+
     def _reusable_transcript(
         self,
         source_rel: str,
@@ -768,7 +1047,11 @@ class SubtitleOrchestrator:
             chunk_length_seconds=int(
                 options.get(
                     "chunk_length_seconds",
-                    DEFAULT_CHUNK_LENGTH_SECONDS,
+                    (
+                        WHISPERX_MAX_CHUNK_LENGTH_SECONDS
+                        if backend == "whisperx"
+                        else DEFAULT_CHUNK_LENGTH_SECONDS
+                    ),
                 )
             ),
             num_speakers=(
@@ -791,7 +1074,19 @@ class SubtitleOrchestrator:
         )
         extraction.validate()
         transcription.validate()
-        if backend in {"hybrid", "whisperx"} and not transcription.noise_filter:
+        if (
+            backend == "whisperx"
+            and transcription.chunk_length_seconds
+            > WHISPERX_MAX_CHUNK_LENGTH_SECONDS
+        ):
+            raise ValueError(
+                "WhisperX chunk_length_seconds must be at most "
+                f"{WHISPERX_MAX_CHUNK_LENGTH_SECONDS}"
+            )
+        if (
+            backend in {"hybrid", "whisperjav", "whisperx"}
+            and not transcription.noise_filter
+        ):
             raise ValueError(
                 f"{backend} backend requires noise_filter=true for VAD"
             )
@@ -804,6 +1099,7 @@ class SubtitleOrchestrator:
                 "repetition_policy",
                 "repetition_min_count",
                 "hybrid_rescue",
+                "whisperjav",
             )
         ):
             raise ValueError(
@@ -829,6 +1125,8 @@ class SubtitleOrchestrator:
         ):
             raise ValueError("subtitle_segmentation must be an object")
         if backend == "hybrid":
+            if "whisperjav" in options:
+                raise ValueError("whisperjav options require backend='whisperjav'")
             segmentation = dict(HYBRID_SUBTITLE_SEGMENTATION_DEFAULTS)
             if isinstance(raw_segmentation, Mapping):
                 segmentation.update(raw_segmentation)
@@ -873,6 +1171,8 @@ class SubtitleOrchestrator:
                 }
             )
         elif backend == "whisperx":
+            if "whisperjav" in options:
+                raise ValueError("whisperjav options require backend='whisperjav'")
             if isinstance(raw_segmentation, Mapping):
                 normalized_options["subtitle_segmentation"] = asdict(
                     WhisperXSegmentationOptions.from_options(
@@ -893,6 +1193,30 @@ class SubtitleOrchestrator:
                 )
             normalized_options["repetition_policy"] = repetition_policy
             normalized_options["repetition_min_count"] = repetition_min_count
+        elif backend == "whisperjav":
+            forbidden = {
+                "repetition_policy",
+                "repetition_min_count",
+                "hybrid_rescue",
+            } & set(options)
+            if forbidden:
+                raise ValueError(
+                    "unsupported WhisperJAV quality options: "
+                    f"{sorted(forbidden)}"
+                )
+            segmentation = dict(HYBRID_SUBTITLE_SEGMENTATION_DEFAULTS)
+            if isinstance(raw_segmentation, Mapping):
+                segmentation.update(raw_segmentation)
+            normalized_options["subtitle_segmentation"] = asdict(
+                WhisperXSegmentationOptions.from_options(
+                    {"subtitle_segmentation": segmentation}
+                )
+            )
+            normalized_options["whisperjav"] = asdict(
+                WhisperJAVOptions.from_options(options)
+            )
+        elif "whisperjav" in options:
+            raise ValueError("whisperjav options require backend='whisperjav'")
         return normalized_options
 
     def retry(self, job_id: str) -> PipelineJob:
@@ -944,6 +1268,41 @@ class SubtitleOrchestrator:
         ):
             target_status = "audio_ready"
 
+        retry_options = dict(job.options)
+        chunk_adjusted = False
+        backend = str(retry_options.get("backend", ""))
+        if backend == "whisperx":
+            chunk_length = int(
+                retry_options.get(
+                    "chunk_length_seconds",
+                    WHISPERX_MAX_CHUNK_LENGTH_SECONDS,
+                )
+            )
+            if chunk_length > WHISPERX_MAX_CHUNK_LENGTH_SECONDS:
+                retry_options["chunk_length_seconds"] = (
+                    WHISPERX_MAX_CHUNK_LENGTH_SECONDS
+                )
+                chunk_adjusted = True
+        elif backend == "hybrid":
+            raw_rescue = retry_options.get("hybrid_rescue", {})
+            if isinstance(raw_rescue, Mapping):
+                rescue = dict(raw_rescue)
+                whisperx_chunk_length = int(
+                    rescue.get(
+                        "whisperx_chunk_length_seconds",
+                        WHISPERX_MAX_CHUNK_LENGTH_SECONDS,
+                    )
+                )
+                if (
+                    whisperx_chunk_length
+                    > WHISPERX_MAX_CHUNK_LENGTH_SECONDS
+                ):
+                    rescue["whisperx_chunk_length_seconds"] = (
+                        WHISPERX_MAX_CHUNK_LENGTH_SECONDS
+                    )
+                    retry_options["hybrid_rescue"] = rescue
+                    chunk_adjusted = True
+
         retry_fields: dict[str, Any] = {
             "status": target_status,
             "blocked_stage": None,
@@ -951,6 +1310,11 @@ class SubtitleOrchestrator:
             "translation_pause_requested": 0,
             "job_stop_requested": 0,
         }
+        if chunk_adjusted:
+            retry_fields["options_json"] = json.dumps(
+                retry_options,
+                sort_keys=True,
+            )
         if target_status in {"queued", "audio_ready"}:
             retry_fields.update(
                 {
@@ -966,10 +1330,16 @@ class SubtitleOrchestrator:
             retry_fields["chunks_total_estimate"] = (
                 estimate_transcription_chunks(
                     wav_duration_seconds(Path(job.audio_path)),
-                    job.options,
+                    retry_options,
                 )
             )
         self.store.update(job.id, **retry_fields)
+        if chunk_adjusted:
+            self.store.add_event(
+                job.id,
+                "info",
+                "legacy WhisperX chunk length reduced to 30 seconds for retry",
+            )
         self.store.add_event(
             job.id,
             "info",
@@ -1377,7 +1747,7 @@ class SubtitleOrchestrator:
     def _dispatch_translations(self) -> int:
         slots = max(
             0,
-            self.remote_servers.translation_workers
+            MAX_CONCURRENT_TRANSLATION_JOBS
             - len(self.store.ids_with_status("translation_running")),
         )
         dispatched = 0
@@ -1539,6 +1909,7 @@ class SubtitleOrchestrator:
             "repetition_policy",
             "repetition_min_count",
             "hybrid_rescue",
+            "whisperjav",
         ):
             if key in job.options:
                 options[key] = job.options[key]
@@ -1549,7 +1920,9 @@ class SubtitleOrchestrator:
             if audio_duration is not None
             else None
         )
-        stt_call_count = 2 if options["backend"] == "hybrid" else 1
+        stt_call_count = (
+            2 if options["backend"] in {"hybrid", "whisperjav"} else 1
+        )
         request_metadata = {
             "job_id": job.id,
             "request_id": f"pipeline-{job.id}",
@@ -1561,7 +1934,11 @@ class SubtitleOrchestrator:
             "provider": "remote_stt",
             "backend": options["backend"],
             "chunk_length_seconds": options["chunk_length_seconds"],
-            "chunk_length_semantics": "model_internal",
+            "chunk_length_semantics": (
+                "not_applicable"
+                if options["backend"] == "whisperjav"
+                else "model_internal"
+            ),
             "stt_call_count": stt_call_count,
         }
         if options["backend"] == "hybrid":
@@ -1573,6 +1950,12 @@ class SubtitleOrchestrator:
                     "whisperx_chunk_length_seconds"
                 ],
             }
+        elif options["backend"] == "whisperjav":
+            request_metadata["backend_group_durations"] = dict(
+                options["whisperjav"]
+            )
+            request_metadata["alignment_call_count"] = 1
+            request_metadata["diarization_call_count"] = 1
         LOGGER.info(
             "stt_request job_id=%s request_id=%s delivery_mode=single_wav "
             "audio_sha256=%s duration_sec=%s source_start_sec=%.3f "
@@ -1709,6 +2092,7 @@ class SubtitleOrchestrator:
             servers.lm_model,
             max_segments=self.settings.translation_batch_segments,
             max_characters=self.settings.translation_batch_characters,
+            request_limiter=self._translation_request_limiter,
         )
 
     def _translate(self, job: PipelineJob) -> None:
@@ -1823,6 +2207,7 @@ class SubtitleOrchestrator:
             on_progress=update_translation_progress,
             should_pause=should_pause,
             on_review_warning=review_warning,
+            max_workers=servers.translation_workers,
         )
         self._raise_if_job_stop_requested(job.id)
         write_json_atomic(

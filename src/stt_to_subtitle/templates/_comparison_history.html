@@ -1,0 +1,81 @@
+{% import "_icons.html" as icons %}
+<section class="comparison-history-section">
+  <div class="section-heading compact-heading">
+    <div>
+      <h2>미디어별 비교 기록</h2>
+      <p class="muted">같은 파일 세트의 비교 실행을 하나의 그룹 안에 최신순으로 표시합니다.</p>
+    </div>
+    <span class="history-count">{{ comparison_group_count }}개 그룹 · 실행 {{ comparison_count }}건</span>
+  </div>
+  {% if comparison_groups %}
+    <div class="comparison-history-list">
+      {% for group in comparison_groups %}
+        <article class="comparison-history-item">
+          <div class="comparison-history-group-heading">
+            <div class="recent-job-title-group">
+              <strong class="recent-job-title">
+                {{ group.source_names[0] }}{% if group.source_count > 1 %} 외 {{ group.source_count - 1 }}개{% endif %}
+              </strong>
+              <span class="recent-job-path" title="{{ group.source_rels|join(' · ') }}">
+                미디어 {{ group.source_count }}개 · 비교 기록 {{ group.record_count }}건
+              </span>
+            </div>
+            <span class="history-count">{{ group.record_count }}건</span>
+          </div>
+          <div class="comparison-record-list">
+            {% for record in group.records %}
+              <article class="comparison-record-item comparison-record-{{ record.status_group }}">
+                <div class="comparison-record-main">
+                  <div class="comparison-record-heading">
+                    <a href="/comparisons/{{ record.id }}">비교 #{{ record.id[:8] }}</a>
+                    <span class="status status-{{ record.status_value }}">{{ record.status_label }}</span>
+                  </div>
+                  <div class="comparison-record-meta">
+                    <span>실행 <time datetime="{{ record.created_at|datetime_iso }}">{{ record.created_at|datetime }}</time></span>
+                    <span>최근 갱신 <time datetime="{{ record.updated_at|datetime_iso }}">{{ record.updated_at|datetime }}</time></span>
+                    <span>엔진 작업 {{ record.job_count }}개</span>
+                  </div>
+                  <div class="comparison-record-settings">
+                    <span>Kotoba {{ record.chunks.kotoba_chunk_length_seconds }}초</span>
+                    <span>WhisperX {{ record.chunks.whisperx_chunk_length_seconds }}초</span>
+                    <span>WhisperJAV 1차 {{ record.chunks.anime_max_group_duration_seconds }}초</span>
+                    <span>WhisperJAV 2차 {{ record.chunks.qwen_max_group_duration_seconds }}초</span>
+                  </div>
+                  <div class="job-progress-overview">
+                    <div class="job-progress-heading comparison-history-progress-heading">
+                      <span>처리 현황</span>
+                      <strong>{{ record.terminal_count }}/{{ record.job_count }}</strong>
+                      <span class="job-progress-current">
+                        완료 {{ record.completed_count }}{% if record.attention_count %} · 확인 필요 {{ record.attention_count }}{% endif %}{% if record.active_count %} · 진행 {{ record.active_count }}{% endif %}{% if record.waiting_count %} · 대기 {{ record.waiting_count }}{% endif %}
+                      </span>
+                    </div>
+                    <progress
+                      value="{{ record.progress_percent }}"
+                      max="100"
+                      aria-label="전사 비교 #{{ record.id[:8] }} 처리율 {{ record.progress_percent }}%"
+                    ></progress>
+                  </div>
+                </div>
+                <div class="comparison-record-actions">
+                  <a class="button secondary compact" href="/comparisons/{{ record.id }}">결과 보기</a>
+                </div>
+              </article>
+            {% endfor %}
+          </div>
+        </article>
+      {% endfor %}
+    </div>
+    {% if comparisons_has_previous or comparisons_has_next %}
+      <nav class="pagination" aria-label="전사 비교 이력 페이지">
+        {% if comparisons_has_previous %}<a class="button secondary compact" href="/comparisons?comparisons_page={{ comparisons_page - 1 }}">{{ icons.chevron_left(14) }}이전</a>{% endif %}
+        <span>{{ comparisons_page }}페이지 · 총 {{ comparison_group_count }}개 그룹</span>
+        {% if comparisons_has_next %}<a class="button secondary compact" href="/comparisons?comparisons_page={{ comparisons_page + 1 }}">다음{{ icons.chevron_right(14) }}</a>{% endif %}
+      </nav>
+    {% endif %}
+  {% else %}
+    <div class="recent-jobs-empty">
+      <strong>전사 비교 이력이 없습니다.</strong>
+      <span>미디어에서 항목을 선택하고 전사 비교를 실행하세요.</span>
+    </div>
+  {% endif %}
+</section>

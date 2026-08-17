@@ -5,7 +5,7 @@ services:
     profiles:
       - build
     platform: linux/amd64
-    image: ${STT_RUNTIME_IMAGE:-stt-to-subtitle-stt-runtime:py311-cuda-v1}
+    image: ${STT_RUNTIME_IMAGE:-stt-to-subtitle-stt-runtime:py311-cuda-v2}
     build:
       context: ${WORKSPACE:-.}
       dockerfile: Dockerfile.stt-runtime
@@ -72,7 +72,7 @@ services:
       context: ${WORKSPACE:-.}
       dockerfile: Dockerfile
       args:
-        STT_RUNTIME_IMAGE: ${STT_RUNTIME_IMAGE:-stt-to-subtitle-stt-runtime:py311-cuda-v1}
+        STT_RUNTIME_IMAGE: ${STT_RUNTIME_IMAGE:-stt-to-subtitle-stt-runtime:py311-cuda-v2}
     user: "${PUID:-1000}:${PGID:-1000}"
     init: true
     restart: unless-stopped
@@ -95,6 +95,7 @@ services:
       PYANNOTE_CACHE: /var/cache/stt/pyannote
       TORCH_HOME: /var/cache/stt/torch
       WHISPERX_PYTHON: /opt/venvs/whisperx/bin/python
+      WHISPERJAV_PYTHON: /opt/venvs/whisperjav/bin/python
       WHISPERX_MODEL: ${WHISPERX_MODEL:-large-v3}
       WHISPERX_LANGUAGE: ${WHISPERX_LANGUAGE:-ja}
       WHISPERX_COMPUTE_TYPE: ${WHISPERX_COMPUTE_TYPE:-float16}

@@ -68,7 +68,7 @@ class TranscriptionStoreTests(unittest.TestCase):
                 idempotency_key="key-1",
                 audio_path=Path(directory) / "audio.wav",
                 audio_sha256="abc",
-                options={},
+                options={"chunk_length_seconds": 60},
             )
             store.update_chunk_progress(
                 "job-1",
@@ -76,12 +76,16 @@ class TranscriptionStoreTests(unittest.TestCase):
                 completed=90,
             )
 
-            store.requeue("job-1")
+            store.requeue(
+                "job-1",
+                options={"chunk_length_seconds": 30},
+            )
 
             job = store.get("job-1")
             self.assertEqual(job.chunks_created, 0)
             self.assertEqual(job.chunks_completed, 0)
             self.assertEqual(job.attempt, 2)
+            self.assertEqual(job.options["chunk_length_seconds"], 30)
 
     def test_adds_chunk_columns_to_an_existing_database(self) -> None:
         with TemporaryDirectory() as directory:

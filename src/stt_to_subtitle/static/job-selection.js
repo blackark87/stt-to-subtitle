@@ -1,6 +1,7 @@
 (() => {
   const selectedJobIds = new Set();
   const selectedPrompts = new Map();
+  const selectedComparisonJobs = new Map();
 
   const formsIn = (root) => {
     const forms = Array.from(
@@ -16,6 +17,24 @@
     document.querySelectorAll(
       `[data-translation-job-checkbox][form="${form.id}"]`,
     ),
+  );
+
+  const comparisonFormsIn = (root) => {
+    const forms = Array.from(
+      root.querySelectorAll?.("[data-comparison-translation-form]") || [],
+    );
+    if (root.matches?.("[data-comparison-translation-form]")) {
+      forms.unshift(root);
+    }
+    return forms;
+  };
+
+  const comparisonSelectsFor = (form) => Array.from(
+    form.querySelectorAll("[data-comparison-translation-source]"),
+  );
+
+  const comparisonSelectionKey = (form, select) => (
+    `${form.id}\u0000${select.dataset.comparisonTranslationSource}`
   );
 
   const syncForm = (form) => {
@@ -35,6 +54,39 @@
     }
   };
 
+  const syncComparisonForm = (form) => {
+    const selects = comparisonSelectsFor(form);
+    for (const select of selects) {
+      const key = comparisonSelectionKey(form, select);
+      const savedJobId = selectedComparisonJobs.get(key);
+      if (
+        savedJobId &&
+        Array.from(select.options).some((option) => option.value === savedJobId)
+      ) {
+        select.value = savedJobId;
+      } else if (savedJobId) {
+        selectedComparisonJobs.delete(key);
+      }
+    }
+    const prompt = form.querySelector("[data-comparison-translation-prompt]");
+    const savedPrompt = selectedPrompts.get(form.id);
+    if (
+      prompt &&
+      savedPrompt &&
+      Array.from(prompt.options).some((option) => option.value === savedPrompt)
+    ) {
+      prompt.value = savedPrompt;
+    }
+    const submit = form.querySelector("[data-translate-comparison]");
+    if (submit) {
+      submit.disabled = (
+        !selects.length ||
+        selects.some((select) => !select.value) ||
+        !prompt?.value
+      );
+    }
+  };
+
   const initialize = (root = document) => {
     for (const form of formsIn(root)) {
       const prompt = form.querySelector("[data-translation-prompt]");
@@ -47,6 +99,9 @@
         prompt.value = savedPrompt;
       }
       syncForm(form);
+    }
+    for (const form of comparisonFormsIn(root)) {
+      syncComparisonForm(form);
     }
   };
 
@@ -71,6 +126,37 @@
       if (form) {
         selectedPrompts.set(form.id, prompt.value);
         syncForm(form);
+      }
+      return;
+    }
+
+    const comparisonSelect = event.target.closest?.(
+      "[data-comparison-translation-source]",
+    );
+    if (comparisonSelect) {
+      const form = comparisonSelect.closest(
+        "[data-comparison-translation-form]",
+      );
+      if (form) {
+        selectedComparisonJobs.set(
+          comparisonSelectionKey(form, comparisonSelect),
+          comparisonSelect.value,
+        );
+        syncComparisonForm(form);
+      }
+      return;
+    }
+
+    const comparisonPrompt = event.target.closest?.(
+      "[data-comparison-translation-prompt]",
+    );
+    if (comparisonPrompt) {
+      const form = comparisonPrompt.closest(
+        "[data-comparison-translation-form]",
+      );
+      if (form) {
+        selectedPrompts.set(form.id, comparisonPrompt.value);
+        syncComparisonForm(form);
       }
     }
   });
