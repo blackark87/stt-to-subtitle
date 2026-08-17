@@ -112,11 +112,11 @@ def group_multipart_media(
         )
         paths = [str(item["path"]) for item in members]
         parent = Path(paths[0]).parent
-        pattern_name = f"{base}-pt*"
-        pattern_path = (
-            pattern_name
+        display_name = base
+        display_path = (
+            display_name
             if parent == Path(".")
-            else (parent / pattern_name).as_posix()
+            else (parent / display_name).as_posix()
         )
         durations = [item.get("duration_seconds") for item in members]
         duration = (
@@ -144,10 +144,10 @@ def group_multipart_media(
         )
         grouped.append(
             {
-                "path": pattern_path,
+                "path": display_path,
                 "paths": paths,
                 "parts": members,
-                "name": pattern_name,
+                "name": display_name,
                 "title": title,
                 "size": sum(int(item.get("size", 0)) for item in members),
                 "duration_seconds": duration,

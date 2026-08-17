@@ -9,13 +9,14 @@
   <div
     class="folder-loading-overlay"
     data-folder-loading
+    data-media-loading
     aria-live="polite"
-    aria-busy="true"
+    aria-busy="false"
     hidden
   >
     <div class="folder-loading-panel">
       <span class="loading-spinner" aria-hidden="true"></span>
-      <strong>폴더 내용을 불러오는 중...</strong>
+      <strong data-loading-message>폴더 내용을 불러오는 중...</strong>
     </div>
   </div>
   <div class="page-heading workspace-heading">
@@ -41,7 +42,13 @@
         <p class="muted">폴더를 이동하거나 여러 파일을 한 번에 선택할 수 있습니다.</p>
       </div>
     </div>
-    <form method="get" action="/media" class="media-search" role="search">
+    <form
+      method="get"
+      action="/media"
+      class="media-search"
+      role="search"
+      data-media-search
+    >
       {% if current_folder %}
         <input type="hidden" name="folder" value="{{ current_folder }}">
       {% endif %}
@@ -148,14 +155,16 @@
                     </span>
                   {% endif %}
                   <span class="media-card-content">
-                    <span class="metadata-label">MULTIPART · {{ file.part_count }}</span>
+                    <span class="metadata-label multipart-badge">MULTIPART · {{ file.part_count }}</span>
                     <strong class="media-title">{{ file.title }}</strong>
-                    <span class="media-filename" title="{{ file.paths|join(', ') }}">{{ file.name }}</span>
+                    {% if file.name != file.title %}
+                      <span class="media-filename" title="{{ file.paths|join(', ') }}">{{ file.name }}</span>
+                    {% endif %}
                     {% if search_query %}<span class="media-path" title="{{ file.path }}">{{ file.path }}</span>{% endif %}
                     <span class="media-size">{{ file.size|filesize }}</span>
                     <span class="media-duration">총 재생시간 {{ file.duration_seconds|duration }}</span>
                     <span
-                      class="subtitle-state is-{{ file.subtitle_state }}"
+                      class="subtitle-state multipart-badge is-{{ file.subtitle_state }}"
                       data-processing-stage="{{ file.processing_status }}"
                     >
                       {{ file.processing_label }}

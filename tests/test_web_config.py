@@ -154,7 +154,8 @@ class MediaLibraryTests(unittest.TestCase):
         self.assertEqual(len(grouped), 2)
         multipart = grouped[0]
         self.assertTrue(multipart["multipart"])
-        self.assertEqual(multipart["name"], "movie-pt*")
+        self.assertEqual(multipart["name"], "movie")
+        self.assertEqual(multipart["path"], "show/movie")
         self.assertEqual(multipart["title"], "movie")
         self.assertEqual(multipart["part_count"], 3)
         self.assertEqual(

@@ -396,6 +396,9 @@ class WebAppTests(unittest.TestCase):
             self.assertIn('class="folder-card media-card', root_response.text)
             self.assertIn("data-folder-link", root_response.text)
             self.assertIn("data-folder-loading", root_response.text)
+            self.assertIn("data-media-loading", root_response.text)
+            self.assertIn("data-media-search", root_response.text)
+            self.assertIn("data-loading-message", root_response.text)
             self.assertIn("folder-browser.js", root_response.text)
             self.assertIn("show", root_response.text)
             self.assertIn("plain.mp4", root_response.text)
@@ -850,8 +853,13 @@ class WebAppTests(unittest.TestCase):
 
             self.assertEqual(page.status_code, 200)
             self.assertIn("MULTIPART · 2", page.text)
+            self.assertIn("metadata-label multipart-badge", page.text)
+            self.assertIn("subtitle-state multipart-badge", page.text)
             self.assertIn('name="source_groups"', page.text)
-            self.assertIn("movie-pt*", page.text)
+            self.assertNotIn("movie-pt*", page.text)
+            self.assertIn(
+                '<strong class="media-title">movie</strong>', page.text
+            )
             self.assertEqual(response.status_code, 303)
             self.assertEqual(response.headers["location"], "/media?queued=2")
             self.assertEqual(
