@@ -145,6 +145,7 @@ class WebAppTests(unittest.TestCase):
                 dashboard = client.get("/")
                 media = client.get("/media")
                 jobs = client.get("/jobs")
+                stylesheet = client.get("/static/app.css")
 
             self.assertIn("파이프라인 상태와 최근 작업", dashboard.text)
             self.assertNotIn('class="media-board"', dashboard.text)
@@ -155,6 +156,12 @@ class WebAppTests(unittest.TestCase):
             self.assertNotIn("최근 작업", media.text)
             self.assertIn("상태별 작업", jobs.text)
             self.assertIn('href="/jobs" class="is-active"', jobs.text)
+            self.assertNotIn('class="topbar"', dashboard.text)
+            self.assertIn("position: fixed", stylesheet.text)
+            self.assertIn(
+                "grid-template-columns: repeat(4, minmax(0, 1fr))",
+                stylesheet.text,
+            )
 
     def test_media_page_renders_media_cards_and_local_poster(self) -> None:
         with TemporaryDirectory() as directory:
