@@ -448,7 +448,6 @@ button:disabled, .button:disabled { opacity: .5; cursor: not-allowed; box-shadow
 .option-checks { display: flex; align-items: flex-start; gap: 12px 28px; flex-wrap: wrap; }
 .submit-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
 .submit-row .muted { font-size: .88rem; }
-.action-help { margin: -4px 0 0; font-size: .86rem; }
 .field-help { color: var(--muted); font-size: .82rem; font-weight: 400; }
 .comparison-guidance { margin: 0 0 18px; border: 1px solid color-mix(in srgb, var(--accent) 26%, var(--line)); border-radius: var(--radius-control); padding: 12px 14px; background: color-mix(in srgb, var(--accent) 8%, var(--card)); color: var(--muted); }
 .comparison-progress { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 18px; }

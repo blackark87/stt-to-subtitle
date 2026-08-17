@@ -39,7 +39,6 @@
     <div class="section-heading">
       <div>
         <h2>파일 선택</h2>
-        <p class="muted">폴더를 이동하거나 여러 파일을 한 번에 선택할 수 있습니다.</p>
       </div>
     </div>
     <form
@@ -298,12 +297,11 @@
         <span class="field-help">번역과 전체 작업에만 필요합니다. 작업 등록 시 현재 프롬프트가 복사되어 이후 설정 변경의 영향을 받지 않습니다.</span>
       </label>
       <div class="wide submit-row">
-        <button type="submit" name="operation" value="transcribe" class="secondary" data-batch-submit data-requires-servers data-server-configured="{{ 'true' if remote_servers.configured else 'false' }}" disabled>전사</button>
+        <button type="submit" name="operation" value="transcribe" class="secondary" data-batch-submit data-requires-servers data-server-configured="{{ 'true' if remote_servers.configured else 'false' }}" title="오디오 추출 → 전사" disabled>전사</button>
         <button type="submit" name="operation" value="compare" class="secondary" data-batch-submit data-requires-servers data-server-configured="{{ 'true' if remote_servers.configured else 'false' }}" title="선택 파일마다 하이브리드·WhisperX·Kotoba 전사 작업을 생성합니다" disabled>전사 비교</button>
-        <button type="submit" name="operation" value="translate" class="secondary" data-batch-submit data-requires-servers data-server-configured="{{ 'true' if remote_servers.configured else 'false' }}" disabled>번역</button>
-        <button type="submit" name="operation" value="full" data-batch-submit data-requires-servers data-server-configured="{{ 'true' if remote_servers.configured else 'false' }}" disabled>전체</button>
+        <button type="submit" name="operation" value="translate" class="secondary" data-batch-submit data-requires-servers data-server-configured="{{ 'true' if remote_servers.configured else 'false' }}" title="기존 전사 → 번역 → 자막" disabled>번역</button>
+        <button type="submit" name="operation" value="full" data-batch-submit data-requires-servers data-server-configured="{{ 'true' if remote_servers.configured else 'false' }}" title="오디오 추출 → 전사 → 번역 → 자막" disabled>전체</button>
       </div>
-      <p class="wide action-help muted">전사: 오디오 추출 → 전사 · 전사 비교: 세 엔진을 각각 실행해 결과 비교 · 번역: 기존 전사 → 번역 → 자막 · 전체: 오디오 추출 → 전사 → 번역 → 자막</p>
     </form>
   </section>
 
