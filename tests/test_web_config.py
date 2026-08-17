@@ -103,6 +103,62 @@ class MediaLibraryTests(unittest.TestCase):
             )
             self.assertTrue(season_view["files"][0]["has_subtitle"])
 
+    def test_multipart_parts_inherit_the_group_level_nfo(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            show = root / "show"
+            show.mkdir()
+            for part in (1, 2):
+                (show / f"movie-pt{part}.mkv").write_bytes(b"media")
+            (show / "movie.nfo").write_text(
+                "<movie><title>그룹 제목</title></movie>",
+                encoding="utf-8",
+            )
+
+            view = MediaLibrary(root).browse("show")
+            grouped = group_multipart_media(view["files"])[0]
+
+            self.assertTrue(grouped["multipart"])
+            self.assertTrue(grouped["has_nfo"])
+            self.assertEqual(grouped["title"], "그룹 제목")
+
+    def test_part_level_nfo_takes_precedence_over_the_group_nfo(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            show = root / "show"
+            show.mkdir()
+            for part in (1, 2):
+                (show / f"movie-pt{part}.mkv").write_bytes(b"media")
+                (show / f"movie-pt{part}.nfo").write_text(
+                    "<movie><title>파트 제목</title></movie>",
+                    encoding="utf-8",
+                )
+            (show / "movie.nfo").write_text(
+                "<movie><title>그룹 제목</title></movie>",
+                encoding="utf-8",
+            )
+
+            view = MediaLibrary(root).browse("show")
+            grouped = group_multipart_media(view["files"])[0]
+
+            self.assertEqual(grouped["title"], "파트 제목")
+
+    def test_multipart_without_any_nfo_falls_back_to_the_base_stem(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            show = root / "show"
+            show.mkdir()
+            for part in (1, 2):
+                (show / f"movie-pt{part}.mkv").write_bytes(b"media")
+
+            view = MediaLibrary(root).browse("show")
+            grouped = group_multipart_media(view["files"])[0]
+
+            self.assertFalse(grouped["has_nfo"])
+            self.assertEqual(grouped["title"], "movie")
+
     def test_groups_multipart_files_by_sibling_prefix_in_natural_order(
         self,
     ) -> None:

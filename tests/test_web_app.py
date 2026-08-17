@@ -858,7 +858,8 @@ class WebAppTests(unittest.TestCase):
             self.assertIn('name="source_groups"', page.text)
             self.assertNotIn("movie-pt*", page.text)
             self.assertIn(
-                '<strong class="media-title">movie</strong>', page.text
+                '<strong class="media-title" title="movie">movie</strong>',
+                page.text,
             )
             self.assertEqual(response.status_code, 303)
             self.assertEqual(response.headers["location"], "/media?queued=2")

@@ -156,7 +156,7 @@
                   {% endif %}
                   <span class="media-card-content">
                     <span class="metadata-label multipart-badge">MULTIPART · {{ file.part_count }}</span>
-                    <strong class="media-title">{{ file.title }}</strong>
+                    <strong class="media-title" title="{{ file.title }}">{{ file.title }}</strong>
                     {% if file.name != file.title %}
                       <span class="media-filename" title="{{ file.paths|join(', ') }}">{{ file.name }}</span>
                     {% endif %}
@@ -184,7 +184,7 @@
                   </span>
                   <span class="media-card-content">
                     <span class="metadata-label">NFO</span>
-                    <strong class="media-title">{{ file.title }}</strong>
+                    <strong class="media-title" title="{{ file.title }}">{{ file.title }}</strong>
                     <span class="media-filename" title="{{ file.name }}">{{ file.name }}</span>
                     {% if search_query %}<span class="media-path" title="{{ file.path }}">{{ file.path }}</span>{% endif %}
                     <span class="media-size">{{ file.size|filesize }}</span>
@@ -201,7 +201,8 @@
                     <span class="video-play">{{ icons.play(20) }}</span>
                   </span>
                   <span class="media-card-content">
-                    <strong class="media-title">{{ file.name }}</strong>
+                    <span class="metadata-label is-empty" aria-hidden="true">&nbsp;</span>
+                    <strong class="media-title" title="{{ file.name }}">{{ file.name }}</strong>
                     {% if search_query %}<span class="media-path" title="{{ file.path }}">{{ file.path }}</span>{% endif %}
                     <span class="media-size">{{ file.size|filesize }}</span>
                     <span class="media-duration">재생시간 {{ file.duration_seconds|duration }}</span>
