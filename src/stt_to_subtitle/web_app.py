@@ -779,13 +779,18 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                 else ("subtitle_present" if media["has_subtitle"] else "pending")
             )
             media["job_id"] = linked_job.id if linked_job else None
-            media["selectable"] = (
-                not media["has_subtitle"]
-                and (
-                    latest is None
-                    or latest.status
-                    in {"audio_completed", "transcription_completed"}
-                )
+            # 진행 중이 아니면 개별 선택은 열어 둔다. 완료된 항목을 다시
+            # 번역하려면 직접 골라야 하기 때문이다.
+            media["selectable"] = latest is None or latest.status in {
+                "audio_completed",
+                "transcription_completed",
+                "completed",
+            }
+            # '전체 선택'은 아직 자막이 없는 항목만 담는다.
+            media["auto_selectable"] = not media["has_subtitle"] and (
+                latest is None
+                or latest.status
+                in {"audio_completed", "transcription_completed"}
             )
 
         browser["files"] = group_multipart_media(browser["files"])
@@ -820,6 +825,9 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             media["job_id"] = None
             media["selectable"] = any(
                 bool(part["selectable"]) for part in parts
+            )
+            media["auto_selectable"] = any(
+                bool(part["auto_selectable"]) for part in parts
             )
 
         return {

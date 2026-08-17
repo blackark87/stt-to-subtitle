@@ -366,6 +366,34 @@ class MediaLibraryTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "metadata"):
                 library.resolve_file("@eaDir/Visible/thumbnail.mp4")
 
+    def test_excludes_artwork_sidecar_directories(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            show = root / "show"
+            show.mkdir()
+            (show / "movie.mkv").write_bytes(b"media")
+            for name in ("ExtraFanart", ".actors"):
+                sidecar = show / name
+                sidecar.mkdir()
+                (sidecar / "art.mp4").write_bytes(b"artwork")
+
+            library = MediaLibrary(root)
+            view = library.browse("show")
+
+            self.assertEqual(view["folders"], [])
+            self.assertEqual(
+                [file["name"] for file in view["files"]],
+                ["movie.mkv"],
+            )
+            self.assertEqual(
+                library.list_media_recursive(["show"]),
+                ["show/movie.mkv"],
+            )
+            with self.assertRaisesRegex(ValueError, "metadata"):
+                library.browse("show/ExtraFanart")
+            with self.assertRaisesRegex(ValueError, "metadata"):
+                library.browse("show/.actors")
+
     def test_hides_trailer_mp4_files_from_listing(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
