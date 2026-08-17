@@ -123,17 +123,45 @@
               <label class="media-card video-card is-selectable">
                 <input
                   class="media-card-checkbox"
-                  name="source_rels"
+                  name="{% if file.multipart %}source_groups{% else %}source_rels{% endif %}"
                   type="checkbox"
-                  value="{{ file.path }}"
-                  aria-label="{{ file.name }} 선택"
+                  value="{% if file.multipart %}{{ file.paths|tojson|forceescape }}{% else %}{{ file.path }}{% endif %}"
+                  aria-label="{{ file.title if file.multipart else file.name }}{% if file.multipart %} {{ file.part_count }}파트{% endif %} 선택"
                 >
             {% elif file.job_id %}
               <a class="media-card video-card is-linked" href="/jobs/{{ file.job_id }}" aria-label="{{ file.name }} 작업 상세 보기">
             {% else %}
               <article class="media-card video-card">
             {% endif %}
-                {% if file.has_nfo %}
+                {% if file.multipart %}
+                  {% if file.poster_path %}
+                    <span class="poster-frame">
+                      <img
+                        src="{{ url_for('media_poster', poster_path=file.poster_path) }}"
+                        alt="{{ file.title }} 포스터"
+                        loading="lazy"
+                      >
+                    </span>
+                  {% else %}
+                    <span class="video-placeholder" aria-hidden="true">
+                      <span class="video-play">{{ icons.play(20) }}</span>
+                    </span>
+                  {% endif %}
+                  <span class="media-card-content">
+                    <span class="metadata-label">MULTIPART · {{ file.part_count }}</span>
+                    <strong class="media-title">{{ file.title }}</strong>
+                    <span class="media-filename" title="{{ file.paths|join(', ') }}">{{ file.name }}</span>
+                    {% if search_query %}<span class="media-path" title="{{ file.path }}">{{ file.path }}</span>{% endif %}
+                    <span class="media-size">{{ file.size|filesize }}</span>
+                    <span class="media-duration">총 재생시간 {{ file.duration_seconds|duration }}</span>
+                    <span
+                      class="subtitle-state is-{{ file.subtitle_state }}"
+                      data-processing-stage="{{ file.processing_status }}"
+                    >
+                      {{ file.processing_label }}
+                    </span>
+                  </span>
+                {% elif file.has_nfo %}
                   <span class="poster-frame">
                     {% if file.poster_path %}
                       <img
@@ -261,10 +289,11 @@
       </label>
       <div class="wide submit-row">
         <button type="submit" name="operation" value="transcribe" class="secondary" data-batch-submit data-requires-servers data-server-configured="{{ 'true' if remote_servers.configured else 'false' }}" disabled>전사</button>
+        <button type="submit" name="operation" value="compare" class="secondary" data-batch-submit data-requires-servers data-server-configured="{{ 'true' if remote_servers.configured else 'false' }}" title="선택 파일마다 하이브리드·WhisperX·Kotoba 전사 작업을 생성합니다" disabled>전사 비교</button>
         <button type="submit" name="operation" value="translate" class="secondary" data-batch-submit data-requires-servers data-server-configured="{{ 'true' if remote_servers.configured else 'false' }}" disabled>번역</button>
         <button type="submit" name="operation" value="full" data-batch-submit data-requires-servers data-server-configured="{{ 'true' if remote_servers.configured else 'false' }}" disabled>전체</button>
       </div>
-      <p class="wide action-help muted">전사: 오디오 추출 → 전사 · 번역: 기존 전사 → 번역 → 자막 · 전체: 오디오 추출 → 전사 → 번역 → 자막</p>
+      <p class="wide action-help muted">전사: 오디오 추출 → 전사 · 전사 비교: 세 엔진을 각각 실행해 결과 비교 · 번역: 기존 전사 → 번역 → 자막 · 전체: 오디오 추출 → 전사 → 번역 → 자막</p>
     </form>
   </section>
 

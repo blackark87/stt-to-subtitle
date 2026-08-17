@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import math
 import os
 from pathlib import Path
+import re
 import subprocess
 from urllib.parse import urlsplit
 from xml.etree import ElementTree
@@ -45,6 +46,10 @@ IGNORED_FILE_NAMES = {
     "desktop.ini",
     "thumbs.db",
 }
+MULTIPART_STEM_PATTERN = re.compile(
+    r"^(?P<base>.+)-pt(?P<part>.+)$",
+    re.IGNORECASE,
+)
 
 
 def _is_ignored_directory(name: str) -> bool:
@@ -57,6 +62,105 @@ def _is_ignored_file(name: str) -> bool:
 
 def _is_hidden_media_file(name: str) -> bool:
     return name.casefold().endswith("-trailer.mp4")
+
+
+def _multipart_part_sort_key(value: str) -> tuple[tuple[int, object], ...]:
+    return tuple(
+        (0, int(token)) if token.isdigit() else (1, token.casefold())
+        for token in re.split(r"(\d+)", value)
+        if token
+    )
+
+
+def group_multipart_media(
+    media_files: Sequence[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Collapse sibling ``*-pt*`` files into one display-only media item."""
+    identities: dict[int, tuple[tuple[str, str], str, str]] = {}
+    members_by_key: dict[tuple[str, str], list[dict[str, object]]] = {}
+    for media in media_files:
+        relative = Path(str(media.get("path", "")))
+        match = MULTIPART_STEM_PATTERN.fullmatch(relative.stem)
+        if match is None:
+            continue
+        base = match.group("base")
+        part = match.group("part")
+        parent = "" if relative.parent == Path(".") else relative.parent.as_posix()
+        key = (parent.casefold(), base.casefold())
+        identities[id(media)] = (key, base, part)
+        members_by_key.setdefault(key, []).append(media)
+
+    collapsed_keys = {
+        key for key, members in members_by_key.items() if len(members) > 1
+    }
+    emitted: set[tuple[str, str]] = set()
+    grouped: list[dict[str, object]] = []
+    for media in media_files:
+        identity = identities.get(id(media))
+        if identity is None or identity[0] not in collapsed_keys:
+            grouped.append(media)
+            continue
+        key, base, _part = identity
+        if key in emitted:
+            continue
+        emitted.add(key)
+        members = sorted(
+            members_by_key[key],
+            key=lambda item: _multipart_part_sort_key(
+                identities[id(item)][2]
+            ),
+        )
+        paths = [str(item["path"]) for item in members]
+        parent = Path(paths[0]).parent
+        pattern_name = f"{base}-pt*"
+        pattern_path = (
+            pattern_name
+            if parent == Path(".")
+            else (parent / pattern_name).as_posix()
+        )
+        durations = [item.get("duration_seconds") for item in members]
+        duration = (
+            sum(float(value) for value in durations)
+            if all(isinstance(value, (int, float)) for value in durations)
+            else None
+        )
+        common_nfo_titles = {
+            str(item.get("title", "")).casefold(): str(item.get("title", ""))
+            for item in members
+            if item.get("has_nfo") and str(item.get("title", "")).strip()
+        }
+        title = (
+            next(iter(common_nfo_titles.values()))
+            if len(common_nfo_titles) == 1
+            else base
+        )
+        poster_path = next(
+            (
+                str(item["poster_path"])
+                for item in members
+                if item.get("poster_path")
+            ),
+            None,
+        )
+        grouped.append(
+            {
+                "path": pattern_path,
+                "paths": paths,
+                "parts": members,
+                "name": pattern_name,
+                "title": title,
+                "size": sum(int(item.get("size", 0)) for item in members),
+                "duration_seconds": duration,
+                "has_subtitle": all(
+                    bool(item.get("has_subtitle")) for item in members
+                ),
+                "has_nfo": any(bool(item.get("has_nfo")) for item in members),
+                "poster_path": poster_path,
+                "multipart": True,
+                "part_count": len(members),
+            }
+        )
+    return grouped
 
 
 def probe_media_duration(path: Path) -> float | None:

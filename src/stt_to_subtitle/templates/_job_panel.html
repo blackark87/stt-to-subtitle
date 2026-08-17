@@ -29,6 +29,9 @@
       </time>
     </dd>
     <dt>작업 범위</dt><dd>{{ job.operation|job_operation }}</dd>
+    {% if job.options.backend %}
+      <dt>전사 엔진</dt><dd>{{ job.options.backend|stt_backend }}</dd>
+    {% endif %}
     {% if job.operation in ["translate", "full"] %}
       <dt>번역 프롬프트</dt><dd>{{ job.prompt_category_name }}</dd>
     {% endif %}
@@ -41,6 +44,9 @@
     {% if job.ass_path %}<dt>ASS</dt><dd>{{ job.ass_path }}</dd>{% endif %}
   </dl>
   <div class="actions">
+    {% if job.options.comparison_id %}
+      <a class="button secondary" href="/comparisons/{{ job.options.comparison_id }}">세 엔진 전사 비교</a>
+    {% endif %}
     {% set editable = job.status in ["transcription_completed", "completed", "blocked", "failed"] %}
     {% if job.transcript_path and editable %}
       <a class="button secondary" href="/jobs/{{ job.id }}/artifacts/transcript/edit" title="{{ artifact_names.transcript }}">{{ icons.pencil(16) }}일본어 전사 JSON 편집</a>

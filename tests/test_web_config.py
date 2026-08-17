@@ -6,6 +6,7 @@ import unittest
 from unittest.mock import patch
 
 from stt_to_subtitle.web_config import (
+    group_multipart_media,
     MediaLibrary,
     WebSettings,
     RemoteServerSettings,
@@ -101,6 +102,73 @@ class MediaLibraryTests(unittest.TestCase):
                 ["episode-01.mkv", "episode-02.mkv"],
             )
             self.assertTrue(season_view["files"][0]["has_subtitle"])
+
+    def test_groups_multipart_files_by_sibling_prefix_in_natural_order(
+        self,
+    ) -> None:
+        media_files = [
+            {
+                "path": "show/movie-pt10.mkv",
+                "name": "movie-pt10.mkv",
+                "title": "movie-pt10",
+                "size": 10,
+                "duration_seconds": 10.0,
+                "has_subtitle": False,
+                "has_nfo": False,
+                "poster_path": None,
+            },
+            {
+                "path": "show/movie-pt2.mp4",
+                "name": "movie-pt2.mp4",
+                "title": "movie-pt2",
+                "size": 2,
+                "duration_seconds": 2.0,
+                "has_subtitle": True,
+                "has_nfo": False,
+                "poster_path": None,
+            },
+            {
+                "path": "show/movie-pt1.mkv",
+                "name": "movie-pt1.mkv",
+                "title": "movie-pt1",
+                "size": 1,
+                "duration_seconds": 1.0,
+                "has_subtitle": True,
+                "has_nfo": False,
+                "poster_path": None,
+            },
+            {
+                "path": "other/movie-pt3.mkv",
+                "name": "movie-pt3.mkv",
+                "title": "movie-pt3",
+                "size": 3,
+                "duration_seconds": 3.0,
+                "has_subtitle": False,
+                "has_nfo": False,
+                "poster_path": None,
+            },
+        ]
+
+        grouped = group_multipart_media(media_files)
+
+        self.assertEqual(len(grouped), 2)
+        multipart = grouped[0]
+        self.assertTrue(multipart["multipart"])
+        self.assertEqual(multipart["name"], "movie-pt*")
+        self.assertEqual(multipart["title"], "movie")
+        self.assertEqual(multipart["part_count"], 3)
+        self.assertEqual(
+            multipart["paths"],
+            [
+                "show/movie-pt1.mkv",
+                "show/movie-pt2.mp4",
+                "show/movie-pt10.mkv",
+            ],
+        )
+        self.assertEqual(multipart["size"], 13)
+        self.assertEqual(multipart["duration_seconds"], 13.0)
+        self.assertFalse(multipart["has_subtitle"])
+        self.assertNotIn("multipart", grouped[1])
 
     def test_searches_display_titles_recursively_within_selected_folder(
         self,
