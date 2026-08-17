@@ -69,6 +69,8 @@ TRANSLATION_PROMPT_OPTION = "translation_prompt"
 TRANSLATION_REVIEW_ROUNDS = 2
 SUPPORTED_OPERATIONS = {"extract", "transcribe", "translate", "full"}
 TRANSLATION_OPERATIONS = {"translate", "full"}
+TRANSCRIPTION_COMPARISON_BACKENDS = ("hybrid", "whisperx", "kotoba")
+MAX_TRANSCRIPTION_COMPARISON_SOURCES = 20
 
 
 def wav_duration_seconds(path: Path) -> float | None:
@@ -563,6 +565,62 @@ class SubtitleOrchestrator:
                 )
             )
         return jobs
+
+    def create_transcription_comparison(
+        self,
+        source_rels: Sequence[str],
+        *,
+        options: Mapping[str, Any],
+    ) -> tuple[str, list[PipelineJob]]:
+        """Queue one transcription-only job per engine and source."""
+        if not self.remote_servers_configured:
+            raise ValueError(
+                "먼저 서버 설정에서 전사 서버와 번역 서버를 저장하세요."
+            )
+        unique_source_rels = list(dict.fromkeys(source_rels))
+        if not unique_source_rels:
+            raise ValueError("비교할 미디어 파일을 하나 이상 선택하세요.")
+        if len(unique_source_rels) > MAX_TRANSCRIPTION_COMPARISON_SOURCES:
+            raise ValueError(
+                "전사 비교는 한 번에 최대 "
+                f"{MAX_TRANSCRIPTION_COMPARISON_SOURCES}개 파일까지 가능합니다."
+            )
+        for source_rel in unique_source_rels:
+            self.library.resolve_file(source_rel)
+
+        normalized_by_backend: dict[str, dict[str, Any]] = {}
+        for backend in TRANSCRIPTION_COMPARISON_BACKENDS:
+            backend_options = dict(options)
+            backend_options["backend"] = backend
+            if backend != "hybrid":
+                backend_options.pop("hybrid_rescue", None)
+            if backend == "kotoba":
+                for key in (
+                    "subtitle_segmentation",
+                    "repetition_policy",
+                    "repetition_min_count",
+                ):
+                    backend_options.pop(key, None)
+            normalized_by_backend[backend] = self._normalize_options(
+                backend_options
+            )
+
+        comparison_id = uuid4().hex
+        jobs: list[PipelineJob] = []
+        for source_rel in unique_source_rels:
+            for backend in TRANSCRIPTION_COMPARISON_BACKENDS:
+                persisted_options = dict(normalized_by_backend[backend])
+                persisted_options["comparison_id"] = comparison_id
+                jobs.append(
+                    self.store.create(
+                        job_id=uuid4().hex,
+                        source_rel=source_rel,
+                        force_overwrite=False,
+                        options=persisted_options,
+                        operation="transcribe",
+                    )
+                )
+        return comparison_id, jobs
 
     def create_selected_translation_jobs(
         self,

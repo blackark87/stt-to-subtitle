@@ -6,6 +6,7 @@ import unittest
 from unittest.mock import patch
 
 from stt_to_subtitle.web_config import (
+    group_multipart_media,
     MediaLibrary,
     WebSettings,
     RemoteServerSettings,
@@ -101,6 +102,126 @@ class MediaLibraryTests(unittest.TestCase):
                 ["episode-01.mkv", "episode-02.mkv"],
             )
             self.assertTrue(season_view["files"][0]["has_subtitle"])
+
+    def test_groups_multipart_files_by_sibling_prefix_in_natural_order(
+        self,
+    ) -> None:
+        media_files = [
+            {
+                "path": "show/movie-pt10.mkv",
+                "name": "movie-pt10.mkv",
+                "title": "movie-pt10",
+                "size": 10,
+                "duration_seconds": 10.0,
+                "has_subtitle": False,
+                "has_nfo": False,
+                "poster_path": None,
+            },
+            {
+                "path": "show/movie-pt2.mp4",
+                "name": "movie-pt2.mp4",
+                "title": "movie-pt2",
+                "size": 2,
+                "duration_seconds": 2.0,
+                "has_subtitle": True,
+                "has_nfo": False,
+                "poster_path": None,
+            },
+            {
+                "path": "show/movie-pt1.mkv",
+                "name": "movie-pt1.mkv",
+                "title": "movie-pt1",
+                "size": 1,
+                "duration_seconds": 1.0,
+                "has_subtitle": True,
+                "has_nfo": False,
+                "poster_path": None,
+            },
+            {
+                "path": "other/movie-pt3.mkv",
+                "name": "movie-pt3.mkv",
+                "title": "movie-pt3",
+                "size": 3,
+                "duration_seconds": 3.0,
+                "has_subtitle": False,
+                "has_nfo": False,
+                "poster_path": None,
+            },
+        ]
+
+        grouped = group_multipart_media(media_files)
+
+        self.assertEqual(len(grouped), 2)
+        multipart = grouped[0]
+        self.assertTrue(multipart["multipart"])
+        self.assertEqual(multipart["name"], "movie")
+        self.assertEqual(multipart["path"], "show/movie")
+        self.assertEqual(multipart["title"], "movie")
+        self.assertEqual(multipart["part_count"], 3)
+        self.assertEqual(
+            multipart["paths"],
+            [
+                "show/movie-pt1.mkv",
+                "show/movie-pt2.mp4",
+                "show/movie-pt10.mkv",
+            ],
+        )
+        self.assertEqual(multipart["size"], 13)
+        self.assertEqual(multipart["duration_seconds"], 13.0)
+        self.assertFalse(multipart["has_subtitle"])
+        self.assertNotIn("multipart", grouped[1])
+
+    def test_searches_display_titles_recursively_within_selected_folder(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            season = root / "Series" / "Season 1"
+            season.mkdir(parents=True)
+            titled = season / "unrelated-name.mkv"
+            titled.write_bytes(b"media")
+            titled.with_suffix(".nfo").write_text(
+                "<episodedetails><title>첫 번째 에피소드</title></episodedetails>",
+                encoding="utf-8",
+            )
+            (season / "Second Episode.mp4").write_bytes(b"media")
+            (root / "Outside Match.mp4").write_bytes(b"media")
+
+            library = MediaLibrary(root)
+            nfo_results = library.search_by_title("첫 번째", "Series")
+            filename_results = library.search_by_title("second", "Series")
+            filename_only = library.search_by_title("unrelated", "Series")
+
+            self.assertEqual(nfo_results["folders"], [])
+            self.assertEqual(
+                [item["path"] for item in nfo_results["files"]],
+                ["Series/Season 1/unrelated-name.mkv"],
+            )
+            self.assertEqual(
+                [item["path"] for item in filename_results["files"]],
+                ["Series/Season 1/Second Episode.mp4"],
+            )
+            self.assertEqual(filename_only["files"], [])
+            self.assertEqual(nfo_results["current_folder"], "Series")
+
+    def test_title_search_describes_only_matching_media(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "match.mp4").write_bytes(b"media")
+            (root / "other.mp4").write_bytes(b"media")
+            probed_paths: list[Path] = []
+            library = MediaLibrary(
+                root,
+                duration_probe=lambda path: probed_paths.append(path) or 1.0,
+            )
+
+            results = library.search_by_title("match")
+
+            self.assertEqual(
+                [item["name"] for item in results["files"]],
+                ["match.mp4"],
+            )
+            self.assertEqual(probed_paths, [(root / "match.mp4").resolve()])
 
     def test_excludes_synology_and_desktop_metadata_entries(self) -> None:
         with TemporaryDirectory() as directory:

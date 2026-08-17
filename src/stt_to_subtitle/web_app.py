@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 import hmac
@@ -27,6 +27,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
 
+from . import __version__
 from .artifacts import artifact_filename
 from .contracts import validate_transcript, validate_translation_items
 from .gpu_monitoring import PrometheusGpuMonitor
@@ -38,11 +39,16 @@ from .media_preview import (
     srt_to_webvtt,
 )
 from .web_config import (
+    group_multipart_media,
     WebSettings,
     RemoteServerSettings,
     normalize_server_url,
 )
-from .orchestrator import SubtitleOrchestrator, TRANSLATION_OPERATIONS
+from .orchestrator import (
+    SubtitleOrchestrator,
+    TRANSCRIPTION_COMPARISON_BACKENDS,
+    TRANSLATION_OPERATIONS,
+)
 from .service_clients import (
     ExternalServiceError,
     list_openai_compatible_models,
@@ -106,6 +112,11 @@ MEDIA_PROCESSING_LABELS = {
     "translated": "번역 완료 · 자막 생성 대기",
     "rendering": "자막 생성 중",
     "completed": "자막 생성 완료",
+}
+STT_BACKEND_LABELS = {
+    "hybrid": "하이브리드",
+    "whisperx": "WhisperX",
+    "kotoba": "Kotoba",
 }
 JOB_OPERATION_LABELS = {
     "extract": "오디오 추출 (기존 작업)",
@@ -270,6 +281,9 @@ TEMPLATES.env.filters["job_status"] = lambda value: JOB_STATUS_LABELS.get(
 TEMPLATES.env.filters["job_operation"] = lambda value: (
     JOB_OPERATION_LABELS.get(str(value), str(value))
 )
+TEMPLATES.env.filters["stt_backend"] = lambda value: (
+    STT_BACKEND_LABELS.get(str(value), str(value))
+)
 TEMPLATES.env.filters["job_stage"] = lambda value: JOB_STAGE_LABELS.get(
     str(value),
     str(value),
@@ -301,6 +315,31 @@ def format_media_duration(value: object) -> str:
 
 
 TEMPLATES.env.filters["duration"] = format_media_duration
+
+
+def decode_source_groups(values: Sequence[str] | None) -> list[str]:
+    """Decode multipart card selections into their individual media paths."""
+    decoded: list[str] = []
+    for value in values or ():
+        try:
+            group = json.loads(value)
+        except json.JSONDecodeError as error:
+            raise ValueError(
+                "멀티파트 미디어 선택 정보가 올바르지 않습니다."
+            ) from error
+        if (
+            not isinstance(group, list)
+            or not group
+            or any(
+                not isinstance(path, str) or not path.strip()
+                for path in group
+            )
+        ):
+            raise ValueError(
+                "멀티파트 미디어 선택 정보가 올바르지 않습니다."
+            )
+        decoded.extend(path.strip() for path in group)
+    return decoded
 
 
 class JobChangeHook:
@@ -361,7 +400,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
 
     app = FastAPI(
         title="stt-to-subtitle orchestrator",
-        version="1.0.0",
+        version=__version__,
         lifespan=lifespan,
         docs_url=None,
         redoc_url=None,
@@ -663,9 +702,15 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         error: str | None = None,
         notice: str | None = None,
         folder: str = "",
+        query: str = "",
     ) -> dict[str, Any]:
         service = orchestrator(request)
-        browser = service.library.browse(folder)
+        normalized_query = query.strip()
+        browser = (
+            service.library.search_by_title(normalized_query, folder)
+            if normalized_query
+            else service.library.browse(folder)
+        )
         latest_jobs = service.store.latest_jobs_by_source()
         completed_subtitles = service.store.latest_completed_subtitle_jobs()
         for media in browser["files"]:
@@ -728,6 +773,40 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                 )
             )
 
+        browser["files"] = group_multipart_media(browser["files"])
+        for media in browser["files"]:
+            if not media.get("multipart"):
+                continue
+            parts = list(media["parts"])
+            states = {str(part["subtitle_state"]) for part in parts}
+            labels = {str(part["processing_label"]) for part in parts}
+            processing_statuses = {
+                str(part["processing_status"]) for part in parts
+            }
+            if len(states) == 1 and len(labels) == 1:
+                media["subtitle_state"] = next(iter(states))
+                media["processing_label"] = (
+                    f"{next(iter(labels))} · {len(parts)}파트"
+                )
+            elif "attention" in states:
+                media["subtitle_state"] = "attention"
+                media["processing_label"] = "일부 파트 확인 필요"
+            elif "running" in states:
+                media["subtitle_state"] = "running"
+                media["processing_label"] = "일부 파트 처리 중"
+            else:
+                media["subtitle_state"] = "progress"
+                media["processing_label"] = "파트별 처리 상태 다름"
+            media["processing_status"] = (
+                next(iter(processing_statuses))
+                if len(processing_statuses) == 1
+                else "multipart_mixed"
+            )
+            media["job_id"] = None
+            media["selectable"] = any(
+                bool(part["selectable"]) for part in parts
+            )
+
         return {
             "request": request,
             "csrf_token": request.session.get("csrf_token", ""),
@@ -735,7 +814,98 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             "notice": notice,
             "remote_servers": service.remote_servers_view(),
             "prompt_categories": service.active_prompt_categories(),
+            "search_query": normalized_query,
             **browser,
+        }
+
+    def transcription_comparison_context(
+        request: Request,
+        comparison_id: str,
+        *,
+        skipped: int = 0,
+    ) -> dict[str, Any]:
+        service = orchestrator(request)
+        comparison_jobs = [
+            job
+            for job in service.store.list_jobs(limit=None)
+            if str(job.options.get("comparison_id", "")) == comparison_id
+        ]
+        if not comparison_jobs:
+            raise HTTPException(
+                status_code=404,
+                detail="transcription comparison not found",
+            )
+
+        jobs_by_source: dict[str, dict[str, Any]] = {}
+        for job in comparison_jobs:
+            backend = str(job.options.get("backend", ""))
+            if backend in TRANSCRIPTION_COMPARISON_BACKENDS:
+                jobs_by_source.setdefault(job.source_rel, {})[backend] = job
+
+        sources: list[dict[str, Any]] = []
+        for source_rel in sorted(jobs_by_source, key=str.casefold):
+            jobs_by_backend = jobs_by_source[source_rel]
+            engines: list[dict[str, Any]] = []
+            for backend in TRANSCRIPTION_COMPARISON_BACKENDS:
+                job = jobs_by_backend.get(backend)
+                segments: list[dict[str, Any]] = []
+                transcript_error: str | None = None
+                if job is not None and job.transcript_path:
+                    try:
+                        payload = json.loads(
+                            Path(job.transcript_path).read_text(encoding="utf-8")
+                        )
+                        if not isinstance(payload, Mapping):
+                            raise ValueError(
+                                "transcript JSON document must be an object"
+                            )
+                        segments = validate_transcript(payload)
+                    except (
+                        OSError,
+                        UnicodeError,
+                        ValueError,
+                        json.JSONDecodeError,
+                    ):
+                        transcript_error = "전사 결과를 읽을 수 없습니다."
+                engines.append(
+                    {
+                        "backend": backend,
+                        "label": STT_BACKEND_LABELS[backend],
+                        "job": job,
+                        "segments": segments,
+                        "segment_count": len(segments),
+                        "character_count": sum(
+                            len(str(segment["text"])) for segment in segments
+                        ),
+                        "duration_seconds": (
+                            max(float(segment["end"]) for segment in segments)
+                            if segments
+                            else None
+                        ),
+                        "transcript_error": transcript_error,
+                    }
+                )
+            sources.append(
+                {
+                    "source_rel": source_rel,
+                    "engines": engines,
+                }
+            )
+
+        terminal_statuses = SUCCESS_STATUSES | RETRYABLE_STATUSES
+        return {
+            "request": request,
+            "comparison_id": comparison_id,
+            "sources": sources,
+            "jobs": comparison_jobs,
+            "completed_count": sum(
+                job.status == "transcription_completed"
+                for job in comparison_jobs
+            ),
+            "all_terminal": all(
+                job.status in terminal_statuses for job in comparison_jobs
+            ),
+            "skipped": skipped,
         }
 
     @app.get("/healthz")
@@ -851,6 +1021,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         jobs_retried: int | None = None,
         translations_queued: int | None = None,
         folder: str = "",
+        q: str = "",
     ) -> Any:
         if not is_authenticated(request):
             return login_redirect()
@@ -877,6 +1048,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                 request,
                 notice=notice,
                 folder=folder,
+                query=q,
             )
             response_status = status.HTTP_200_OK
         except ValueError as error:
@@ -1282,8 +1454,10 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
     def create_job(
         request: Request,
         source_rels: list[str] | None = Form(None),
+        source_groups: list[str] | None = Form(None),
         folder_rels: list[str] | None = Form(None),
         return_folder: str = Form(""),
+        return_query: str = Form(""),
         csrf_token: str = Form(""),
         force_overwrite: bool = Form(False),
         backend: str = Form("kotoba"),
@@ -1316,7 +1490,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             "add_punctuation": add_punctuation,
             "noise_filter": noise_filter[-1] if noise_filter else True,
         }
-        if backend.strip().lower() == "hybrid":
+        if backend.strip().lower() == "hybrid" or operation == "compare":
             options["hybrid_rescue"] = {
                 "kotoba_chunk_length_seconds": (
                     hybrid_kotoba_chunk_length_seconds
@@ -1327,34 +1501,51 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             }
         try:
             service = orchestrator(request)
+            expanded_source_rels = [
+                *(source_rels or []),
+                *decode_source_groups(source_groups),
+            ]
             if (
                 operation in {"translate", "full"}
                 and not prompt_category_id.strip()
             ):
                 raise ValueError("번역 프롬프트 카테고리를 선택하세요.")
+            selection_operation = (
+                "transcribe" if operation == "compare" else operation
+            )
             selected_sources, skipped = service.expand_job_sources(
-                source_rels or [],
+                expanded_source_rels,
                 folder_rels or [],
                 force_overwrite=force_overwrite,
-                operation=operation,
+                operation=selection_operation,
             )
-            jobs = service.create_jobs(
-                selected_sources,
-                force_overwrite=force_overwrite,
-                options=options,
-                operation=operation,
-                prompt_category_id=(
-                    prompt_category_id
-                    if operation in {"translate", "full"}
-                    else None
-                ),
-            )
+            comparison_id: str | None = None
+            if operation == "compare":
+                comparison_id, jobs = (
+                    service.create_transcription_comparison(
+                        selected_sources,
+                        options=options,
+                    )
+                )
+            else:
+                jobs = service.create_jobs(
+                    selected_sources,
+                    force_overwrite=force_overwrite,
+                    options=options,
+                    operation=operation,
+                    prompt_category_id=(
+                        prompt_category_id
+                        if operation in {"translate", "full"}
+                        else None
+                    ),
+                )
         except (FileExistsError, OSError, ValueError) as error:
             try:
                 context = media_context(
                     request,
                     error=str(error),
                     folder=return_folder,
+                    query=return_query,
                 )
             except ValueError:
                 context = media_context(request, error=str(error))
@@ -1364,11 +1555,20 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                 context,
                 status_code=status.HTTP_400_BAD_REQUEST,
             )
+        if comparison_id is not None:
+            query = {"skipped": skipped} if skipped else {}
+            suffix = f"?{urlencode(query)}" if query else ""
+            return RedirectResponse(
+                f"/comparisons/{comparison_id}{suffix}",
+                status_code=status.HTTP_303_SEE_OTHER,
+            )
         query = {"queued": len(jobs)}
         if skipped:
             query["skipped"] = skipped
         if return_folder:
             query["folder"] = return_folder
+        if return_query.strip():
+            query["q"] = return_query.strip()
         return RedirectResponse(
             f"/media?{urlencode(query)}",
             status_code=status.HTTP_303_SEE_OTHER,
@@ -1505,6 +1705,44 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             path_value,
             media_type=media_type,
             filename=f"{source_name}.ko.{subtitle_format}",
+        )
+
+    @app.get("/comparisons/{comparison_id}", response_class=HTMLResponse)
+    def transcription_comparison_page(
+        request: Request,
+        comparison_id: str,
+        skipped: int = 0,
+    ) -> Any:
+        if not is_authenticated(request):
+            return login_redirect()
+        context = transcription_comparison_context(
+            request,
+            comparison_id,
+            skipped=max(0, skipped),
+        )
+        return TEMPLATES.TemplateResponse(
+            request,
+            "comparison.html",
+            context,
+        )
+
+    @app.get(
+        "/comparisons/{comparison_id}/panel",
+        response_class=HTMLResponse,
+    )
+    def transcription_comparison_panel(
+        request: Request,
+        comparison_id: str,
+    ) -> Any:
+        if not is_authenticated(request):
+            raise HTTPException(
+                status_code=401,
+                detail="authentication required",
+            )
+        return TEMPLATES.TemplateResponse(
+            request,
+            "_comparison_panel.html",
+            transcription_comparison_context(request, comparison_id),
         )
 
     @app.get("/jobs/{job_id}", response_class=HTMLResponse)

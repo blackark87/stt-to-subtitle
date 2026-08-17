@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% import "_icons.html" as icons %}
+{% block title %}전사 비교 · STT to Subtitle{% endblock %}
+{% block content %}
+  <div class="page-heading workspace-heading">
+    <div>
+      <p class="page-kicker">TRANSCRIPTION COMPARISON</p>
+      <h1>전사 엔진 비교</h1>
+      <p class="muted">동일한 미디어를 하이브리드, WhisperX, Kotoba로 각각 전사한 결과입니다.</p>
+    </div>
+    <a href="/media" class="button secondary">{{ icons.chevron_left(16) }}미디어로</a>
+  </div>
+  {% if skipped %}
+    <p class="notice">기존 진행 작업·완료 결과 {{ skipped }}개는 비교 대상에서 제외했습니다.</p>
+  {% endif %}
+  <p class="comparison-guidance">
+    정답 전사문이 없으므로 자동으로 우열을 판정하지 않습니다. 누락·반복·화자 분리와 문장 자연스러움을 나란히 확인하세요.
+  </p>
+  <div{% if not all_terminal %} data-update-url="/comparisons/{{ comparison_id }}/panel"{% endif %}>
+    {% include "_comparison_panel.html" %}
+  </div>
+{% endblock %}

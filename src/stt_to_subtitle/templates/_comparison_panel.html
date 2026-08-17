@@ -1,0 +1,61 @@
+<div{% if all_terminal %} data-update-stop{% endif %}>
+  <div class="comparison-progress card">
+    <strong>{{ completed_count }} / {{ jobs|length }}개 전사 완료</strong>
+    {% if all_terminal %}
+      <span>비교 작업이 종료되었습니다.</span>
+    {% else %}
+      <span>작업 상태가 바뀌면 이 화면을 자동으로 갱신합니다.</span>
+    {% endif %}
+  </div>
+  {% for source in sources %}
+    <section class="card comparison-source">
+      <div class="section-heading">
+        <div>
+          <h2>{{ source.source_rel|filename }}</h2>
+          {% if source.source_rel|parent_path %}
+            <p class="muted">{{ source.source_rel|parent_path }}</p>
+          {% endif %}
+        </div>
+      </div>
+      <div class="comparison-grid">
+        {% for engine in source.engines %}
+          <article class="comparison-engine">
+            <header class="comparison-engine-heading">
+              <div>
+                <span class="metadata-label">{{ engine.backend }}</span>
+                <h3>{{ engine.label }}</h3>
+              </div>
+              {% if engine.job %}
+                <a href="/jobs/{{ engine.job.id }}" class="status status-{{ engine.job.status }}">{{ engine.job.status|job_status }}</a>
+              {% else %}
+                <span class="status status-failed">작업 없음</span>
+              {% endif %}
+            </header>
+            {% if engine.segments %}
+              <dl class="comparison-metrics">
+                <div><dt>구간</dt><dd>{{ engine.segment_count }}개</dd></div>
+                <div><dt>문자</dt><dd>{{ engine.character_count }}자</dd></div>
+                <div><dt>마지막 시각</dt><dd>{{ engine.duration_seconds|duration }}</dd></div>
+              </dl>
+              <ol class="comparison-transcript" aria-label="{{ engine.label }} 전사 내용">
+                {% for segment in engine.segments %}
+                  <li>
+                    <span class="comparison-timestamp">{{ "%.2f"|format(segment.start) }}–{{ "%.2f"|format(segment.end) }}</span>
+                    <span class="comparison-speaker">{{ segment.speaker }}</span>
+                    <p>{{ segment.text }}</p>
+                  </li>
+                {% endfor %}
+              </ol>
+            {% elif engine.transcript_error %}
+              <p class="alert">{{ engine.transcript_error }}</p>
+            {% elif engine.job and engine.job.status in ["blocked", "failed"] %}
+              <p class="alert">{{ engine.job.error or "전사 작업을 완료하지 못했습니다." }}</p>
+            {% else %}
+              <p class="empty-state">전사 결과를 기다리는 중입니다.</p>
+            {% endif %}
+          </article>
+        {% endfor %}
+      </div>
+    </section>
+  {% endfor %}
+</div>

@@ -10,6 +10,7 @@ import wave
 
 from fastapi.testclient import TestClient
 
+from stt_to_subtitle import __version__
 from stt_to_subtitle.stt_api import (
     STTAPISettings,
     TranscriptionChangeHook,
@@ -35,6 +36,17 @@ class TranscriptionChangeHookTests(unittest.IsolatedAsyncioTestCase):
 
 
 class STTAPIHelpersTests(unittest.TestCase):
+    def test_exposes_the_package_version(self) -> None:
+        app = create_app(
+            STTAPISettings(
+                state_dir=Path("/tmp/not-used"),
+                api_token="",
+                hf_token="",
+            )
+        )
+
+        self.assertEqual(app.version, __version__)
+
     def test_parses_client_options_but_keeps_server_batch_size(self) -> None:
         settings = STTAPISettings(
             state_dir=Path("/tmp/not-used"),

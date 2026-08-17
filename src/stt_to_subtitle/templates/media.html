@@ -9,13 +9,14 @@
   <div
     class="folder-loading-overlay"
     data-folder-loading
+    data-media-loading
     aria-live="polite"
-    aria-busy="true"
+    aria-busy="false"
     hidden
   >
     <div class="folder-loading-panel">
       <span class="loading-spinner" aria-hidden="true"></span>
-      <strong>폴더 내용을 불러오는 중...</strong>
+      <strong data-loading-message>폴더 내용을 불러오는 중...</strong>
     </div>
   </div>
   <div class="page-heading workspace-heading">
@@ -41,9 +42,34 @@
         <p class="muted">폴더를 이동하거나 여러 파일을 한 번에 선택할 수 있습니다.</p>
       </div>
     </div>
+    <form
+      method="get"
+      action="/media"
+      class="media-search"
+      role="search"
+      data-media-search
+    >
+      {% if current_folder %}
+        <input type="hidden" name="folder" value="{{ current_folder }}">
+      {% endif %}
+      <input
+        id="media-title-search"
+        name="q"
+        type="search"
+        value="{{ search_query }}"
+        maxlength="200"
+        placeholder="제목 검색"
+        aria-label="미디어 제목 검색"
+      >
+      <button type="submit" class="secondary">검색</button>
+      {% if search_query %}
+        <a class="button secondary" href="/media{% if current_folder %}?folder={{ current_folder|urlencode }}{% endif %}">검색 해제</a>
+      {% endif %}
+    </form>
     <form method="post" action="/jobs" class="grid-form">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <input type="hidden" name="return_folder" value="{{ current_folder }}">
+      <input type="hidden" name="return_query" value="{{ search_query }}">
       <fieldset class="media-picker wide">
         <legend>미디어 탐색</legend>
         <nav class="breadcrumbs" aria-label="미디어 폴더 경로">
@@ -56,6 +82,11 @@
             {% endif %}
           {% endfor %}
         </nav>
+        {% if search_query %}
+          <p class="media-search-summary">
+            <strong>“{{ search_query }}”</strong> 제목 검색 결과 {{ files|length }}개
+          </p>
+        {% endif %}
         {% set selectable_files = files|selectattr("selectable")|list %}
         {% if selectable_files or folders %}
           <div class="media-toolbar">
@@ -99,17 +130,47 @@
               <label class="media-card video-card is-selectable">
                 <input
                   class="media-card-checkbox"
-                  name="source_rels"
+                  name="{% if file.multipart %}source_groups{% else %}source_rels{% endif %}"
                   type="checkbox"
-                  value="{{ file.path }}"
-                  aria-label="{{ file.name }} 선택"
+                  value="{% if file.multipart %}{{ file.paths|tojson|forceescape }}{% else %}{{ file.path }}{% endif %}"
+                  aria-label="{{ file.title if file.multipart else file.name }}{% if file.multipart %} {{ file.part_count }}파트{% endif %} 선택"
                 >
             {% elif file.job_id %}
               <a class="media-card video-card is-linked" href="/jobs/{{ file.job_id }}" aria-label="{{ file.name }} 작업 상세 보기">
             {% else %}
               <article class="media-card video-card">
             {% endif %}
-                {% if file.has_nfo %}
+                {% if file.multipart %}
+                  {% if file.poster_path %}
+                    <span class="poster-frame">
+                      <img
+                        src="{{ url_for('media_poster', poster_path=file.poster_path) }}"
+                        alt="{{ file.title }} 포스터"
+                        loading="lazy"
+                      >
+                    </span>
+                  {% else %}
+                    <span class="video-placeholder" aria-hidden="true">
+                      <span class="video-play">{{ icons.play(20) }}</span>
+                    </span>
+                  {% endif %}
+                  <span class="media-card-content">
+                    <span class="metadata-label multipart-badge">MULTIPART · {{ file.part_count }}</span>
+                    <strong class="media-title">{{ file.title }}</strong>
+                    {% if file.name != file.title %}
+                      <span class="media-filename" title="{{ file.paths|join(', ') }}">{{ file.name }}</span>
+                    {% endif %}
+                    {% if search_query %}<span class="media-path" title="{{ file.path }}">{{ file.path }}</span>{% endif %}
+                    <span class="media-size">{{ file.size|filesize }}</span>
+                    <span class="media-duration">총 재생시간 {{ file.duration_seconds|duration }}</span>
+                    <span
+                      class="subtitle-state multipart-badge is-{{ file.subtitle_state }}"
+                      data-processing-stage="{{ file.processing_status }}"
+                    >
+                      {{ file.processing_label }}
+                    </span>
+                  </span>
+                {% elif file.has_nfo %}
                   <span class="poster-frame">
                     {% if file.poster_path %}
                       <img
@@ -125,6 +186,7 @@
                     <span class="metadata-label">NFO</span>
                     <strong class="media-title">{{ file.title }}</strong>
                     <span class="media-filename" title="{{ file.name }}">{{ file.name }}</span>
+                    {% if search_query %}<span class="media-path" title="{{ file.path }}">{{ file.path }}</span>{% endif %}
                     <span class="media-size">{{ file.size|filesize }}</span>
                     <span class="media-duration">재생시간 {{ file.duration_seconds|duration }}</span>
                     <span
@@ -140,6 +202,7 @@
                   </span>
                   <span class="media-card-content">
                     <strong class="media-title">{{ file.name }}</strong>
+                    {% if search_query %}<span class="media-path" title="{{ file.path }}">{{ file.path }}</span>{% endif %}
                     <span class="media-size">{{ file.size|filesize }}</span>
                     <span class="media-duration">재생시간 {{ file.duration_seconds|duration }}</span>
                     <span
@@ -160,7 +223,13 @@
           {% endfor %}
           </div>
         {% else %}
-          <p class="empty-state">이 폴더에 하위 폴더나 지원 미디어 파일이 없습니다.</p>
+          <p class="empty-state">
+            {% if search_query %}
+              이 범위에서 제목이 “{{ search_query }}”인 미디어를 찾지 못했습니다.
+            {% else %}
+              이 폴더에 하위 폴더나 지원 미디어 파일이 없습니다.
+            {% endif %}
+          </p>
         {% endif %}
       </fieldset>
 
@@ -229,10 +298,11 @@
       </label>
       <div class="wide submit-row">
         <button type="submit" name="operation" value="transcribe" class="secondary" data-batch-submit data-requires-servers data-server-configured="{{ 'true' if remote_servers.configured else 'false' }}" disabled>전사</button>
+        <button type="submit" name="operation" value="compare" class="secondary" data-batch-submit data-requires-servers data-server-configured="{{ 'true' if remote_servers.configured else 'false' }}" title="선택 파일마다 하이브리드·WhisperX·Kotoba 전사 작업을 생성합니다" disabled>전사 비교</button>
         <button type="submit" name="operation" value="translate" class="secondary" data-batch-submit data-requires-servers data-server-configured="{{ 'true' if remote_servers.configured else 'false' }}" disabled>번역</button>
         <button type="submit" name="operation" value="full" data-batch-submit data-requires-servers data-server-configured="{{ 'true' if remote_servers.configured else 'false' }}" disabled>전체</button>
       </div>
-      <p class="wide action-help muted">전사: 오디오 추출 → 전사 · 번역: 기존 전사 → 번역 → 자막 · 전체: 오디오 추출 → 전사 → 번역 → 자막</p>
+      <p class="wide action-help muted">전사: 오디오 추출 → 전사 · 전사 비교: 세 엔진을 각각 실행해 결과 비교 · 번역: 기존 전사 → 번역 → 자막 · 전체: 오디오 추출 → 전사 → 번역 → 자막</p>
     </form>
   </section>
 

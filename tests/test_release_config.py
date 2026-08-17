@@ -2,6 +2,8 @@ from pathlib import Path
 import tomllib
 import unittest
 
+from stt_to_subtitle import __version__
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -84,11 +86,12 @@ class ReleaseConfigurationTests(unittest.TestCase):
         self.assertTrue((ROOT / "requirements-kotoba.txt").is_file())
         self.assertFalse((ROOT / "requirements-cuda.txt").exists())
 
-    def test_project_version_is_3_1_0(self) -> None:
+    def test_project_and_package_versions_are_3_3_0(self) -> None:
         project = tomllib.loads(
             (ROOT / "pyproject.toml").read_text(encoding="utf-8")
         )
-        self.assertEqual(project["project"]["version"], "3.1.0")
+        self.assertEqual(project["project"]["version"], "3.3.0")
+        self.assertEqual(__version__, "3.3.0")
 
 
 if __name__ == "__main__":

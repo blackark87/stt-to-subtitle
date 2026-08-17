@@ -7,6 +7,8 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import Mock, patch
 
+from stt_to_subtitle import __version__
+
 WEB_TESTS_AVAILABLE = all(
     find_spec(module) is not None
     for module in ("itsdangerous", "jinja2", "multipart")
@@ -394,6 +396,9 @@ class WebAppTests(unittest.TestCase):
             self.assertIn('class="folder-card media-card', root_response.text)
             self.assertIn("data-folder-link", root_response.text)
             self.assertIn("data-folder-loading", root_response.text)
+            self.assertIn("data-media-loading", root_response.text)
+            self.assertIn("data-media-search", root_response.text)
+            self.assertIn("data-loading-message", root_response.text)
             self.assertIn("folder-browser.js", root_response.text)
             self.assertIn("show", root_response.text)
             self.assertIn("plain.mp4", root_response.text)
@@ -428,6 +433,59 @@ class WebAppTests(unittest.TestCase):
             )
             self.assertEqual(poster.status_code, 200)
             self.assertEqual(poster.content, b"poster-bytes")
+
+    def test_media_page_searches_nested_display_titles_and_preserves_query(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            show = media_root / "show"
+            show.mkdir(parents=True)
+            episode = show / "episode-01.mkv"
+            episode.write_bytes(b"media")
+            episode.with_suffix(".nfo").write_text(
+                "<episodedetails><title>첫 번째 에피소드</title></episodedetails>",
+                encoding="utf-8",
+            )
+            (show / "second.mkv").write_bytes(b"media")
+
+            with patch(
+                "stt_to_subtitle.orchestrator.probe_media_duration",
+                return_value=60.0,
+            ), TestClient(
+                create_app(self.settings(root, media_root))
+            ) as client:
+                client.app.state.orchestrator.stop()
+                response = client.get("/media?q=첫 번째")
+                queued = client.post(
+                    "/jobs",
+                    data={
+                        "source_rels": "show/episode-01.mkv",
+                        "return_query": "첫 번째",
+                        "operation": "transcribe",
+                    },
+                    follow_redirects=False,
+                )
+                app_version = client.app.version
+
+            self.assertEqual(response.status_code, 200)
+            self.assertIn('name="q"', response.text)
+            self.assertIn('value="첫 번째"', response.text)
+            self.assertIn("첫 번째 에피소드", response.text)
+            self.assertIn("show/episode-01.mkv", response.text)
+            self.assertNotIn("second.mkv", response.text)
+            self.assertIn(
+                'name="return_query" value="첫 번째"',
+                response.text,
+            )
+            self.assertIn("제목 검색 결과 1개", response.text)
+            self.assertEqual(app_version, __version__)
+            self.assertEqual(queued.status_code, 303)
+            self.assertEqual(
+                queued.headers["location"],
+                "/media?queued=1&q=%EC%B2%AB+%EB%B2%88%EC%A7%B8",
+            )
 
     def test_updates_remote_servers_from_settings_page(self) -> None:
         with TemporaryDirectory() as directory:
@@ -763,6 +821,50 @@ class WebAppTests(unittest.TestCase):
                     == "jav"
                     for job in jobs
                 )
+            )
+
+    def test_multipart_card_queues_each_physical_file_as_a_job(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            (media_root / "movie-pt1.mkv").write_bytes(b"part-one")
+            (media_root / "movie-pt2.mkv").write_bytes(b"part-two")
+
+            with patch(
+                "stt_to_subtitle.orchestrator.probe_media_duration",
+                return_value=60.0,
+            ), TestClient(
+                create_app(self.settings(root, media_root))
+            ) as client:
+                client.app.state.orchestrator.stop()
+                page = client.get("/media")
+                response = client.post(
+                    "/jobs",
+                    data={
+                        "source_groups": json.dumps(
+                            ["movie-pt1.mkv", "movie-pt2.mkv"]
+                        ),
+                        "operation": "transcribe",
+                    },
+                    follow_redirects=False,
+                )
+                jobs = client.get("/api/jobs").json()
+
+            self.assertEqual(page.status_code, 200)
+            self.assertIn("MULTIPART · 2", page.text)
+            self.assertIn("metadata-label multipart-badge", page.text)
+            self.assertIn("subtitle-state multipart-badge", page.text)
+            self.assertIn('name="source_groups"', page.text)
+            self.assertNotIn("movie-pt*", page.text)
+            self.assertIn(
+                '<strong class="media-title">movie</strong>', page.text
+            )
+            self.assertEqual(response.status_code, 303)
+            self.assertEqual(response.headers["location"], "/media?queued=2")
+            self.assertEqual(
+                {job["source_rel"] for job in jobs},
+                {"movie-pt1.mkv", "movie-pt2.mkv"},
             )
 
     def test_folder_submission_recurses_and_reports_skipped_files(self) -> None:
@@ -1534,7 +1636,7 @@ class WebAppTests(unittest.TestCase):
             self.assertIn("completed-14.mp4", second.text)
             self.assertIn("jobs_page=2", first.text)
 
-    def test_media_page_exposes_three_pipeline_buttons_and_queues_transcription(
+    def test_media_page_exposes_pipeline_buttons_and_queues_transcription(
         self,
     ) -> None:
         with TemporaryDirectory() as directory:
@@ -1559,6 +1661,7 @@ class WebAppTests(unittest.TestCase):
                 jobs = service.store.list_jobs()
 
             self.assertIn('name="operation" value="transcribe"', dashboard.text)
+            self.assertIn('name="operation" value="compare"', dashboard.text)
             self.assertIn('name="operation" value="translate"', dashboard.text)
             self.assertIn('name="operation" value="full"', dashboard.text)
             self.assertIn(">전사</button>", dashboard.text)
@@ -1582,6 +1685,109 @@ class WebAppTests(unittest.TestCase):
             self.assertEqual(response.headers["location"], "/media?queued=1")
             self.assertEqual(jobs[0].operation, "transcribe")
             self.assertNotIn("translation_prompt", jobs[0].options)
+
+    def test_transcription_comparison_queues_three_engines_and_renders_results(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            (media_root / "movie.mp4").write_bytes(b"media")
+
+            with TestClient(
+                create_app(self.settings(root, media_root))
+            ) as client:
+                service = client.app.state.orchestrator
+                service.stop()
+                queued = client.post(
+                    "/jobs",
+                    data={
+                        "source_rels": "movie.mp4",
+                        "operation": "compare",
+                    },
+                    follow_redirects=False,
+                )
+                jobs = service.store.list_jobs(limit=None)
+                comparison_id = str(jobs[0].options["comparison_id"])
+                waiting = client.get(
+                    f"/comparisons/{comparison_id}"
+                )
+                for job in jobs:
+                    backend = str(job.options["backend"])
+                    transcript = (
+                        root
+                        / "state"
+                        / "jobs"
+                        / job.id
+                        / "movie_translate.json"
+                    )
+                    transcript.parent.mkdir(parents=True)
+                    transcript.write_text(
+                        json.dumps(
+                            {
+                                "schema_version": 1,
+                                "segments": [
+                                    {
+                                        "id": "segment-000001",
+                                        "start": 0.0,
+                                        "end": 1.0,
+                                        "speaker": "SPEAKER_00",
+                                        "text": f"{backend} 전사 결과",
+                                    }
+                                ],
+                            },
+                            ensure_ascii=False,
+                        ),
+                        encoding="utf-8",
+                    )
+                    service.store.update(
+                        job.id,
+                        status="transcription_completed",
+                        transcript_path=str(transcript),
+                    )
+                comparison = client.get(
+                    f"/comparisons/{comparison_id}"
+                )
+                detail = client.get(f"/jobs/{jobs[0].id}")
+
+            self.assertEqual(queued.status_code, 303)
+            self.assertEqual(
+                queued.headers["location"],
+                f"/comparisons/{comparison_id}",
+            )
+            self.assertEqual(len(jobs), 3)
+            self.assertEqual(
+                {job.options["backend"] for job in jobs},
+                {"hybrid", "whisperx", "kotoba"},
+            )
+            self.assertEqual(
+                {job.options["comparison_id"] for job in jobs},
+                {comparison_id},
+            )
+            options_by_backend = {
+                str(job.options["backend"]): job.options for job in jobs
+            }
+            self.assertIn("hybrid_rescue", options_by_backend["hybrid"])
+            self.assertNotIn("hybrid_rescue", options_by_backend["whisperx"])
+            self.assertNotIn("hybrid_rescue", options_by_backend["kotoba"])
+            self.assertTrue(all(job.operation == "transcribe" for job in jobs))
+            self.assertIn(
+                f'data-update-url="/comparisons/{comparison_id}/panel"',
+                waiting.text,
+            )
+            self.assertEqual(comparison.status_code, 200)
+            self.assertIn("3 / 3개 전사 완료", comparison.text)
+            self.assertIn("하이브리드", comparison.text)
+            self.assertIn("WhisperX", comparison.text)
+            self.assertIn("Kotoba", comparison.text)
+            self.assertIn("hybrid 전사 결과", comparison.text)
+            self.assertIn("whisperx 전사 결과", comparison.text)
+            self.assertIn("kotoba 전사 결과", comparison.text)
+            self.assertIn(
+                f'/comparisons/{comparison_id}',
+                detail.text,
+            )
 
     def test_job_list_selects_completed_transcripts_for_translation(self) -> None:
         with TemporaryDirectory() as directory:
