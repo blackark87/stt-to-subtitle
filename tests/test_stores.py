@@ -103,6 +103,60 @@ class TranscriptionStoreTests(unittest.TestCase):
 
 
 class JobStoreTests(unittest.TestCase):
+    def test_lists_and_counts_jobs_by_status(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = JobStore(Path(directory) / "jobs.sqlite3")
+            queued = store.create(
+                job_id="queued-job",
+                source_rel="queued.mkv",
+                force_overwrite=False,
+                options={},
+            )
+            blocked = store.create(
+                job_id="blocked-job",
+                source_rel="blocked.mkv",
+                force_overwrite=False,
+                options={},
+            )
+            store.update(blocked.id, status="blocked")
+            completed = store.create(
+                job_id="completed-job",
+                source_rel="completed.mkv",
+                force_overwrite=False,
+                options={},
+            )
+            store.update(completed.id, status="completed")
+
+            attention = store.list_jobs(statuses={"blocked", "failed"})
+
+            self.assertEqual([job.id for job in attention], [blocked.id])
+            self.assertEqual(
+                store.count_jobs(statuses={"blocked", "failed"}),
+                1,
+            )
+            self.assertEqual(store.list_jobs(statuses=set()), [])
+            self.assertEqual(store.count_jobs(statuses=set()), 0)
+            self.assertEqual(store.count_jobs(), 3)
+            self.assertEqual(queued.status, "queued")
+
+    def test_calls_change_hook_after_job_mutations(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = JobStore(Path(directory) / "jobs.sqlite3")
+            changed_job_ids: list[str] = []
+            store.set_change_hook(changed_job_ids.append)
+
+            job = store.create(
+                job_id="job-1",
+                source_rel="movie.mkv",
+                force_overwrite=False,
+                options={},
+            )
+            store.update(job.id, status="blocked")
+            store.add_event(job.id, "warning", "stopped")
+            store.delete(job.id)
+
+            self.assertEqual(changed_job_ids, [job.id] * 4)
+
     def test_seeds_edits_and_archives_prompt_categories(self) -> None:
         with TemporaryDirectory() as directory:
             database_path = Path(directory) / "jobs.sqlite3"

@@ -44,6 +44,9 @@ COPY --from=web-dependencies /install /usr/local
 COPY --from=app-builder /wheel /tmp/stt-wheel
 RUN python -m pip install --no-cache-dir --no-deps /tmp/stt-wheel/*.whl \
     && rm -rf /tmp/stt-wheel
+RUN mkdir -p /var/lib/stt \
+    && chown -R app:app /var/lib/stt \
+    && rm -rf /data/stt-to-subtitle
 
 USER app
 WORKDIR /app

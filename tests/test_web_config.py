@@ -360,7 +360,7 @@ class WebSettingsTests(unittest.TestCase):
         self.assertEqual(settings.lm_model, "model")
         self.assertEqual(
             settings.state_dir,
-            Path("/data/stt-to-subtitle/web-state"),
+            Path("/var/lib/stt"),
         )
 
     def test_keeps_legacy_lm_studio_environment_fallback(self) -> None:

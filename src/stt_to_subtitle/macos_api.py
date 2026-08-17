@@ -616,6 +616,7 @@ class TranscriptionService:
                 "WHISPERX_LANGUAGE": self.settings.whisperx_language,
                 "WHISPERX_COMPUTE_TYPE": self.settings.whisperx_compute_type,
                 "WHISPERX_CACHE_DIR": str(self.settings.whisperx_cache_dir),
+                "PYTHONIOENCODING": "utf-8",
             }
         )
         command = [
@@ -645,6 +646,8 @@ class TranscriptionService:
                 check=False,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 env=environment,
             )
             if completed.returncode != 0:

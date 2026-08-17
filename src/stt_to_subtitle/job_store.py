@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 import sqlite3
 import time
-from typing import Any, Mapping
+from typing import Any, Callable, Collection, Mapping
 from uuid import uuid4
 
 from .translation_prompt import (
@@ -29,6 +29,7 @@ SUCCESS_STATUSES = {
     "transcription_completed",
     "completed",
 }
+RETRYABLE_STATUSES = {"blocked", "failed"}
 STOPPABLE_STATUSES = {
     "queued",
     "extracting",
@@ -117,12 +118,22 @@ class PipelineJob:
         return self.status in STOPPABLE_STATUSES and not self.job_stop_requested
 
     @property
+    def can_retry(self) -> bool:
+        return self.status in RETRYABLE_STATUSES
+
+    @property
     def can_pause_translation(self) -> bool:
         return (
             self.operation in {"translate", "full"}
             and self.status in TRANSLATION_PAUSABLE_STATUSES
             and not self.translation_pause_requested
             and not self.job_stop_requested
+        )
+
+    @property
+    def can_start_translation(self) -> bool:
+        return self.status == "transcription_completed" and bool(
+            self.transcript_path
         )
 
     @property
@@ -168,8 +179,19 @@ class JobStore:
 
     def __init__(self, database_path: Path) -> None:
         self.database_path = database_path
+        self._change_hook: Callable[[str], None] | None = None
         database_path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
+
+    def set_change_hook(
+        self,
+        hook: Callable[[str], None] | None,
+    ) -> None:
+        self._change_hook = hook
+
+    def _notify_change(self, job_id: str) -> None:
+        if self._change_hook is not None:
+            self._change_hook(job_id)
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.database_path, timeout=30)
@@ -627,24 +649,54 @@ class JobStore:
         limit: int | None = 100,
         *,
         offset: int = 0,
+        statuses: Collection[str] | None = None,
     ) -> list[PipelineJob]:
+        status_values = (
+            tuple(sorted(set(statuses))) if statuses is not None else None
+        )
+        if status_values == ():
+            return []
         with self._connect() as connection:
-            if limit is None:
+            if status_values is None and limit is None:
                 rows = connection.execute(
                     "SELECT * FROM jobs ORDER BY created_at DESC"
                 ).fetchall()
-            else:
+            elif status_values is None:
                 rows = connection.execute(
                     "SELECT * FROM jobs ORDER BY created_at DESC LIMIT ? OFFSET ?",
                     (limit, offset),
                 ).fetchall()
+            else:
+                placeholders = ", ".join("?" for _ in status_values)
+                limit_clause = "" if limit is None else " LIMIT ? OFFSET ?"
+                parameters: tuple[object, ...] = status_values
+                if limit is not None:
+                    parameters += (limit, offset)
+                rows = connection.execute(
+                    f"SELECT * FROM jobs WHERE status IN ({placeholders}) "
+                    f"ORDER BY created_at DESC{limit_clause}",
+                    parameters,
+                ).fetchall()
         return [job for row in rows if (job := self._from_row(row)) is not None]
 
-    def count_jobs(self) -> int:
+    def count_jobs(self, *, statuses: Collection[str] | None = None) -> int:
+        status_values = (
+            tuple(sorted(set(statuses))) if statuses is not None else None
+        )
+        if status_values == ():
+            return 0
         with self._connect() as connection:
-            row = connection.execute(
-                "SELECT COUNT(*) AS count FROM jobs"
-            ).fetchone()
+            if status_values is None:
+                row = connection.execute(
+                    "SELECT COUNT(*) AS count FROM jobs"
+                ).fetchone()
+            else:
+                placeholders = ", ".join("?" for _ in status_values)
+                row = connection.execute(
+                    f"SELECT COUNT(*) AS count FROM jobs "
+                    f"WHERE status IN ({placeholders})",
+                    status_values,
+                ).fetchone()
         return int(row["count"]) if row is not None else 0
 
     def list_open_jobs(self) -> list[PipelineJob]:
@@ -766,7 +818,10 @@ class JobStore:
                 f"{translation_condition}",
                 (running_status, time.time(), job_id, waiting_status),
             )
-        return result.rowcount == 1
+        claimed = result.rowcount == 1
+        if claimed:
+            self._notify_change(job_id)
+        return claimed
 
     def update(self, job_id: str, **fields: Any) -> None:
         if not fields:
@@ -779,10 +834,12 @@ class JobStore:
         assignments.append("updated_at = ?")
         values.extend([time.time(), job_id])
         with self._connect() as connection:
-            connection.execute(
+            result = connection.execute(
                 f"UPDATE jobs SET {', '.join(assignments)} WHERE id = ?",
                 values,
             )
+        if result.rowcount == 1:
+            self._notify_change(job_id)
 
     def update_if_status(
         self,
@@ -806,7 +863,10 @@ class JobStore:
                 f"WHERE id = ? AND status IN ({placeholders})",
                 values,
             )
-        return result.rowcount == 1
+        updated = result.rowcount == 1
+        if updated:
+            self._notify_change(job_id)
+        return updated
 
     def delete(self, job_id: str) -> bool:
         with self._connect() as connection:
@@ -818,7 +878,10 @@ class JobStore:
                 "DELETE FROM jobs WHERE id = ?",
                 (job_id,),
             )
-        return result.rowcount == 1
+        deleted = result.rowcount == 1
+        if deleted:
+            self._notify_change(job_id)
+        return deleted
 
     def add_event(self, job_id: str, level: str, message: str) -> None:
         with self._connect() as connection:
@@ -829,6 +892,7 @@ class JobStore:
                 """,
                 (job_id, level, message[:4000], time.time()),
             )
+        self._notify_change(job_id)
 
     def events(self, job_id: str, limit: int = 200) -> list[dict[str, Any]]:
         with self._connect() as connection:

@@ -77,7 +77,15 @@ test -w /data/stt-to-subtitle/stt-state
 test -w /data/stt-to-subtitle/model
 ```
 
-이미지를 로컬에서 빌드하고 두 서비스를 함께 실행합니다.
+고정 STT 실행 환경 이미지를 최초 한 번 빌드합니다. 이 이미지는 Python,
+CUDA 라이브러리, Kotoba, WhisperX 의존성만 포함하며 애플리케이션 소스와
+모델 가중치는 포함하지 않습니다.
+
+```bash
+./scripts/compose.sh --env-file .env.compose --profile build build stt-runtime
+```
+
+이후 애플리케이션 이미지를 빌드하고 두 서비스를 함께 실행합니다.
 
 ```bash
 ./scripts/compose.sh --env-file .env.compose config
@@ -90,8 +98,11 @@ test -w /data/stt-to-subtitle/model
 root 실행은 거부합니다. 따라서 `.env.compose`에 UID/GID를 설정할 필요가
 없고, 마운트 경로를 소유한 일반 사용자로 실행해야 합니다.
 
-STT 이미지는 두 ML 환경을 모두 설치하므로 최초 빌드 시간이 길고 이미지가
-클 수 있습니다. 모델 가중치는 이미지에 포함하지 않으며 최초 전사 요청 때
+`stt-runtime` 이미지는 두 ML 환경을 모두 설치하므로 최초 빌드 시간이 길고
+이미지가 클 수 있습니다. 일반 `build`는 이 고정 이미지를 재사용하고
+애플리케이션 코드만 설치합니다. 요구사항 파일이나 Python/CUDA 기반 환경을
+변경할 때만 `STT_RUNTIME_IMAGE` 태그를 올리고 `stt-runtime`을 다시
+빌드합니다. 모델 가중치는 이미지에 포함하지 않으며 최초 전사 요청 때
 `${MODEL_CACHE_PATH}`로 내려받습니다.
 
 상태를 확인합니다.
@@ -205,9 +216,9 @@ JSON·번역 체크포인트부터 이어집니다.
 마운트 용도는 다음과 같습니다.
 
 - `${MEDIA_PATH}:/media:rw`: 영상 조회 및 원본 옆 자막 저장
-- `${WEB_STATE_PATH}:/data/stt-to-subtitle/web-state:rw`: 작업 DB, WAV, 전사·번역 JSON
-- `${STT_STATE_PATH}:/data/stt-to-subtitle/stt-state:rw`: STT 작업 DB와 결과
-- `${MODEL_CACHE_PATH}:/data/stt-to-subtitle/model:rw`: 모델 캐시
+- `${WEB_STATE_PATH}:/var/lib/stt:rw`: 작업 DB, WAV, 전사·번역 JSON
+- `${STT_STATE_PATH}:/var/lib/stt:rw`: STT 작업 DB와 결과
+- `${MODEL_CACHE_PATH}:/var/cache/stt:rw`: 모델 캐시
 
 기존 배포의 `jobs.sqlite3`와 `jobs/` 디렉터리를 새
 `WEB_STATE_PATH`로 옮기거나 그 기존 경로를 직접 지정하면 작업 기록과
@@ -243,6 +254,14 @@ cd /path/to/runtime
 ```bash
 ./scripts/compose.sh --env-file .env.compose build
 ./scripts/compose.sh --env-file .env.compose up -d
+```
+
+소스 변경만으로는 `stt-runtime`을 다시 빌드하지 않습니다. ML 요구사항이나
+기반 런타임을 변경한 경우에만 새 `STT_RUNTIME_IMAGE` 태그를 지정하고 다음을
+실행합니다.
+
+```bash
+./scripts/compose.sh --env-file .env.compose --profile build build stt-runtime
 ```
 
 자주 사용하는 명령은 다음과 같습니다.

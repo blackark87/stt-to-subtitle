@@ -712,6 +712,66 @@ class SubtitleOrchestratorTests(unittest.TestCase):
             self.assertFalse(running_after_stop.job_stop_requested)
             self.assertEqual(paused_after_request.status, "translation_paused")
 
+    def test_retries_all_blocked_and_failed_jobs(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            orchestrator = self.make_orchestrator(root, media_root)
+            try:
+                blocked = orchestrator.store.create(
+                    job_id="blocked",
+                    source_rel="blocked.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                audio_path = root / "state" / "jobs" / blocked.id / "audio.wav"
+                audio_path.parent.mkdir(parents=True)
+                audio_path.write_bytes(b"audio")
+                orchestrator.store.update(
+                    blocked.id,
+                    status="blocked",
+                    audio_path=str(audio_path),
+                    blocked_stage="transcription",
+                    error="stopped",
+                    job_stop_requested=1,
+                )
+                failed = orchestrator.store.create(
+                    job_id="failed",
+                    source_rel="failed.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                orchestrator.store.update(
+                    failed.id,
+                    status="failed",
+                    blocked_stage="audio extraction",
+                    error="failed",
+                )
+                queued = orchestrator.store.create(
+                    job_id="queued",
+                    source_rel="queued.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+
+                retried_count = orchestrator.retry_all_jobs()
+                blocked = orchestrator.store.get(blocked.id)
+                failed = orchestrator.store.get(failed.id)
+                queued = orchestrator.store.get(queued.id)
+            finally:
+                orchestrator.stop()
+
+            self.assertEqual(retried_count, 2)
+            self.assertEqual(blocked.status, "audio_ready")
+            self.assertIsNone(blocked.blocked_stage)
+            self.assertIsNone(blocked.error)
+            self.assertFalse(blocked.job_stop_requested)
+            self.assertEqual(failed.status, "queued")
+            self.assertIsNone(failed.blocked_stage)
+            self.assertIsNone(failed.error)
+            self.assertEqual(queued.status, "queued")
+
     def test_creates_one_job_for_each_selected_media_file(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -736,6 +796,61 @@ class SubtitleOrchestratorTests(unittest.TestCase):
             self.assertTrue(
                 all(job.options["duration_seconds"] is None for job in jobs)
             )
+
+    def test_folder_expansion_skips_completed_requested_stage(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            folder = media_root / "season"
+            folder.mkdir(parents=True)
+            for name in (
+                "pending.mkv",
+                "audio-complete.mkv",
+                "transcribed.mkv",
+                "completed.mkv",
+            ):
+                (folder / name).write_bytes(b"media")
+            orchestrator = self.make_orchestrator(root, media_root)
+            try:
+                for job_id, source_rel, status in (
+                    (
+                        "audio-complete-job",
+                        "season/audio-complete.mkv",
+                        "audio_completed",
+                    ),
+                    (
+                        "transcribed-job",
+                        "season/transcribed.mkv",
+                        "transcription_completed",
+                    ),
+                    (
+                        "completed-job",
+                        "season/completed.mkv",
+                        "completed",
+                    ),
+                ):
+                    job = orchestrator.store.create(
+                        job_id=job_id,
+                        source_rel=source_rel,
+                        force_overwrite=False,
+                        options={},
+                    )
+                    orchestrator.store.update(job.id, status=status)
+
+                selected, skipped = orchestrator.expand_job_sources(
+                    [],
+                    ["season"],
+                    force_overwrite=False,
+                    operation="transcribe",
+                )
+            finally:
+                orchestrator.stop()
+
+            self.assertEqual(
+                set(selected),
+                {"season/audio-complete.mkv", "season/pending.mkv"},
+            )
+            self.assertEqual(skipped, 2)
 
     def test_batch_is_prevalidated_before_creating_any_job(self) -> None:
         with TemporaryDirectory() as directory:

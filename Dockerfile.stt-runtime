@@ -1,0 +1,51 @@
+# syntax=docker/dockerfile:1
+
+ARG PYTHON_IMAGE=python:3.11.15-slim-bookworm@sha256:b18992999dbe963a45a8a4da40ac2b1975be1a776d939d098c647482bcad5cba
+
+FROM ${PYTHON_IMAGE} AS kotoba-builder
+
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/* \
+    && python -m venv /opt/venvs/kotoba
+
+WORKDIR /build
+COPY requirements-kotoba.txt requirements-api.txt ./
+RUN --mount=type=cache,id=stt-kotoba-pip,target=/root/.cache/pip \
+    /opt/venvs/kotoba/bin/python -m pip install \
+        --extra-index-url https://download.pytorch.org/whl/cu121 \
+        -r requirements-kotoba.txt \
+        -r requirements-api.txt \
+    && /opt/venvs/kotoba/bin/python -m pip install --no-deps \
+        "git+https://github.com/huggingface/diarizers.git@f3c8ae500f55ad2b02b719fce1495ea2794ca9fe"
+
+FROM ${PYTHON_IMAGE} AS whisperx-builder
+
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1
+
+RUN python -m venv /opt/venvs/whisperx
+
+WORKDIR /build
+COPY requirements-whisperx-cuda.txt ./
+RUN --mount=type=cache,id=stt-whisperx-pip,target=/root/.cache/pip \
+    /opt/venvs/whisperx/bin/python -m pip install \
+        -r requirements-whisperx-cuda.txt
+
+FROM ${PYTHON_IMAGE}
+
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    LD_LIBRARY_PATH=/opt/venvs/whisperx/lib/python3.11/site-packages/nvidia/npp/lib
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends \
+        libgomp1 \
+        libportaudio2 \
+        ca-certificates \
+        ffmpeg \
+        libsndfile1 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=kotoba-builder /opt/venvs/kotoba /opt/venvs/kotoba
+COPY --from=whisperx-builder /opt/venvs/whisperx /opt/venvs/whisperx

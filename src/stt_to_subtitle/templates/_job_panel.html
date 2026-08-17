@@ -1,7 +1,7 @@
 {% import "_icons.html" as icons %}
 <section
   class="card job-overview-card"
-  {% if job.status in ["audio_completed", "transcription_completed", "completed", "translation_paused", "blocked", "failed"] %}data-poll-stop{% endif %}
+  {% if job.status in ["audio_completed", "transcription_completed", "completed", "translation_paused", "blocked", "failed"] %}data-update-stop{% endif %}
 >
   <div class="job-overview-heading">
     <div>

@@ -28,27 +28,8 @@
   {% if error %}<p class="alert">{{ error }}</p>{% endif %}
   {% if notice %}<p class="notice">{{ notice }}</p>{% endif %}
 
-  <div class="stat-strip">
-    <div class="stat-tile stat-running">
-      <span class="stat-icon">{{ icons.activity(18) }}</span>
-      <span class="stat-value">{{ job_stats.running }}</span>
-      <span class="stat-label">진행 중</span>
-    </div>
-    <div class="stat-tile stat-attention">
-      <span class="stat-icon">{{ icons.alert_triangle(18) }}</span>
-      <span class="stat-value">{{ job_stats.attention }}</span>
-      <span class="stat-label">확인 필요</span>
-    </div>
-    <div class="stat-tile stat-waiting">
-      <span class="stat-icon">{{ icons.clock(18) }}</span>
-      <span class="stat-value">{{ job_stats.waiting }}</span>
-      <span class="stat-label">대기</span>
-    </div>
-    <div class="stat-tile stat-completed">
-      <span class="stat-icon">{{ icons.check(18) }}</span>
-      <span class="stat-value">{{ job_stats.completed }}</span>
-      <span class="stat-label">완료</span>
-    </div>
+  <div data-update-url="/job-stats-fragment" aria-live="off">
+    {% include "_job_stats.html" %}
   </div>
 
   <section class="card">
@@ -71,7 +52,10 @@
         {% set selectable_files = files|selectattr("selectable")|list %}
         {% if selectable_files or folders %}
           <div class="media-toolbar">
-            <span><strong data-selection-count>0</strong>개 선택</span>
+            <span>
+              <strong data-selection-count>0</strong>개 선택
+              <small class="media-selection-help">폴더 작업은 선택한 처리 단계가 이미 완료된 파일을 자동 제외합니다.</small>
+            </span>
             <span class="media-toolbar-actions">
               <button type="button" class="secondary compact" data-select-all>전체 선택</button>
               <button type="button" class="secondary compact" data-clear-selection>선택 해제</button>
@@ -90,7 +74,7 @@
                   value="{{ folder.path }}"
                   aria-label="{{ folder.name }} 폴더 전체 선택"
                 >
-                <span>하위 전체 선택</span>
+                <span>하위 미완료 작업 선택</span>
               </label>
               <a data-folder-link href="/?folder={{ folder.path|urlencode }}">
                 <span class="folder-visual folder-icon" aria-hidden="true">
@@ -136,8 +120,11 @@
                     <span class="media-filename" title="{{ file.name }}">{{ file.name }}</span>
                     <span class="media-size">{{ file.size|filesize }}</span>
                     <span class="media-duration">재생시간 {{ file.duration_seconds|duration }}</span>
-                    <span class="subtitle-state is-{{ file.subtitle_state }}">
-                      {% if file.subtitle_state == "running" %}생성 중{% elif file.subtitle_state == "completed" %}생성 완료{% elif file.subtitle_state == "attention" %}확인 필요{% else %}대기{% endif %}
+                    <span
+                      class="subtitle-state is-{{ file.subtitle_state }}"
+                      data-processing-stage="{{ file.processing_status }}"
+                    >
+                      {{ file.processing_label }}
                     </span>
                   </span>
                 {% else %}
@@ -148,8 +135,11 @@
                     <strong class="media-title">{{ file.name }}</strong>
                     <span class="media-size">{{ file.size|filesize }}</span>
                     <span class="media-duration">재생시간 {{ file.duration_seconds|duration }}</span>
-                    <span class="subtitle-state is-{{ file.subtitle_state }}">
-                      {% if file.subtitle_state == "running" %}생성 중{% elif file.subtitle_state == "completed" %}생성 완료{% elif file.subtitle_state == "attention" %}확인 필요{% else %}대기{% endif %}
+                    <span
+                      class="subtitle-state is-{{ file.subtitle_state }}"
+                      data-processing-stage="{{ file.processing_status }}"
+                    >
+                      {{ file.processing_label }}
                     </span>
                   </span>
                 {% endif %}
@@ -245,14 +235,9 @@
         <h2>최근 작업</h2>
         <p class="muted">상태와 관계없이 생성 시각 최신순으로 20개씩 표시합니다.</p>
       </div>
-      <span class="polling-indicator">
-        <span aria-hidden="true"></span>
-        5초마다 갱신
-      </span>
     </div>
     <div
-      data-poll-url="/jobs-fragment?jobs_page={{ jobs_page }}&amp;folder={{ current_folder|urlencode }}"
-      data-poll-seconds="5"
+      data-update-url="/jobs-fragment?jobs_page={{ jobs_page }}&amp;folder={{ current_folder|urlencode }}"
       aria-live="off"
     >
       {% include "_jobs_table.html" %}

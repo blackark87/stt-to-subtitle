@@ -333,6 +333,9 @@ class MacOSAPIHelpersTests(unittest.TestCase):
                 os.environ.get("PYTHONPATH"),
             )
             self.assertEqual(environment["HF_TOKEN"], "secret-hf-token")
+            self.assertEqual(environment["PYTHONIOENCODING"], "utf-8")
+            self.assertEqual(run.call_args.kwargs["encoding"], "utf-8")
+            self.assertEqual(run.call_args.kwargs["errors"], "replace")
             self.assertEqual(result["model"]["id"], "large-v3")
 
             with patch.object(service, "_release_pipeline") as release:

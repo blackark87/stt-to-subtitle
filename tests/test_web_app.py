@@ -1,3 +1,4 @@
+import asyncio
 from importlib.util import find_spec
 import json
 from pathlib import Path
@@ -16,7 +17,22 @@ if WEB_TESTS_AVAILABLE:
 from stt_to_subtitle.web_config import WebSettings
 
 if WEB_TESTS_AVAILABLE:
-    from stt_to_subtitle.web_app import create_app, main
+    from stt_to_subtitle.web_app import JobChangeHook, create_app, main
+
+
+@unittest.skipUnless(
+    WEB_TESTS_AVAILABLE,
+    "web test dependencies are not installed",
+)
+class JobChangeHookTests(unittest.IsolatedAsyncioTestCase):
+    async def test_wakes_waiters_when_a_job_changes(self) -> None:
+        hook = JobChangeHook(asyncio.get_running_loop())
+        version = hook.version
+
+        hook.publish("job-1")
+        updated_version = await hook.wait(version, timeout=0.1)
+
+        self.assertEqual(updated_version, version + 1)
 
 
 @unittest.skipUnless(
@@ -36,6 +52,87 @@ class WebAppTests(unittest.TestCase):
             lm_token="",
             lm_model="model",
         )
+
+    def test_job_pages_use_change_events_instead_of_timed_polling(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+
+            with TestClient(create_app(self.settings(root, media_root))) as client:
+                service = client.app.state.orchestrator
+                service.stop()
+                job = service.store.create(
+                    job_id="active-job",
+                    source_rel="active.mp4",
+                    force_overwrite=False,
+                    options={},
+                )
+                dashboard = client.get("/")
+                detail = client.get(f"/jobs/{job.id}")
+                updates = client.get("/static/live-updates.js")
+                route_paths = {route.path for route in client.app.routes}
+
+            self.assertNotIn("변경 즉시 갱신", dashboard.text)
+            self.assertIn(
+                'data-update-url="/job-stats-fragment"',
+                dashboard.text,
+            )
+            self.assertIn('data-update-url="/jobs-fragment?', dashboard.text)
+            self.assertIn(
+                f'data-update-url="/jobs/{job.id}/panel"',
+                detail.text,
+            )
+            self.assertNotIn("data-poll", dashboard.text + detail.text)
+            self.assertNotIn("5초마다 갱신", dashboard.text)
+            self.assertIn("/jobs/events", route_paths)
+            self.assertIn("new window.EventSource", updates.text)
+            self.assertNotIn("setInterval", updates.text)
+
+    def test_status_tiles_link_to_filtered_job_pages(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            with TestClient(create_app(self.settings(root, media_root))) as client:
+                service = client.app.state.orchestrator
+                service.stop()
+                running = service.store.create(
+                    job_id="running-job",
+                    source_rel="running.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                service.store.update(
+                    running.id,
+                    status="transcription_running",
+                )
+                attention = service.store.create(
+                    job_id="attention-job",
+                    source_rel="attention.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                service.store.update(attention.id, status="blocked")
+
+                dashboard = client.get("/")
+                running_page = client.get("/jobs?status_group=running")
+                attention_page = client.get("/jobs?status_group=attention")
+                invalid_page = client.get("/jobs?status_group=unknown")
+
+            self.assertIn('href="/jobs?status_group=running"', dashboard.text)
+            self.assertIn('href="/jobs?status_group=attention"', dashboard.text)
+            self.assertIn('href="/jobs?status_group=waiting"', dashboard.text)
+            self.assertIn('href="/jobs?status_group=completed"', dashboard.text)
+            self.assertIn("running.mkv", running_page.text)
+            self.assertNotIn("attention.mkv", running_page.text)
+            self.assertIn("attention.mkv", attention_page.text)
+            self.assertNotIn("running.mkv", attention_page.text)
+            self.assertIn(
+                "data-update-url=\"/jobs-fragment?status_group=running",
+                running_page.text,
+            )
+            self.assertEqual(invalid_page.status_code, 400)
 
     def test_dashboard_renders_media_cards_and_local_poster(self) -> None:
         with TemporaryDirectory() as directory:
@@ -84,7 +181,7 @@ class WebAppTests(unittest.TestCase):
             self.assertNotIn('name="source_rels"', response.text)
             self.assertIn('name="return_folder" value="show"', response.text)
             self.assertIn("첫 번째 에피소드", response.text)
-            self.assertIn("생성 완료", response.text)
+            self.assertIn("한국어 자막 있음", response.text)
             self.assertIn("일본어 구두점 모델 사용", response.text)
             self.assertIn("소음 오인식 필터 사용", response.text)
             self.assertIn('<select name="backend">', response.text)
@@ -446,6 +543,7 @@ class WebAppTests(unittest.TestCase):
             nested.mkdir(parents=True)
             (nested / "pending.mkv").write_bytes(b"media")
             (nested / "running.mkv").write_bytes(b"media")
+            (nested / "completed.mkv").write_bytes(b"media")
             (nested / "subtitled.mkv").write_bytes(b"media")
             (nested / "subtitled.ko.srt").write_text(
                 "subtitle",
@@ -467,6 +565,13 @@ class WebAppTests(unittest.TestCase):
                     running.id,
                     status="transcription_running",
                 )
+                completed = service.store.create(
+                    job_id="completed-job",
+                    source_rel="Shows/Season 1/completed.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                service.store.update(completed.id, status="completed")
                 response = client.post(
                     "/jobs",
                     data={
@@ -480,10 +585,12 @@ class WebAppTests(unittest.TestCase):
             self.assertEqual(response.status_code, 303)
             self.assertEqual(
                 response.headers["location"],
-                "/?queued=1&skipped=2",
+                "/?queued=1&skipped=3",
             )
             created = next(
-                job for job in jobs if job.id != "running-job"
+                job
+                for job in jobs
+                if job.id not in {"running-job", "completed-job"}
             )
             self.assertEqual(
                 created.source_rel,
@@ -495,6 +602,90 @@ class WebAppTests(unittest.TestCase):
                 2,
             )
             self.assertEqual(created.options["backend"], "kotoba")
+
+    def test_media_cards_show_each_files_latest_processing_stage(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            (media_root / "nested").mkdir()
+            for name in (
+                "pending.mkv",
+                "audio.mkv",
+                "transcribed.mkv",
+                "running.mkv",
+                "blocked.mkv",
+                "completed.mkv",
+                "subtitled.mkv",
+            ):
+                (media_root / name).write_bytes(b"media")
+            (media_root / "subtitled.ko.srt").write_text(
+                "subtitle",
+                encoding="utf-8",
+            )
+
+            with TestClient(
+                create_app(self.settings(root, media_root))
+            ) as client:
+                service = client.app.state.orchestrator
+                service.stop()
+
+                def add_job(
+                    job_id: str,
+                    source_rel: str,
+                    status: str,
+                    *,
+                    blocked_stage: str | None = None,
+                ) -> None:
+                    job = service.store.create(
+                        job_id=job_id,
+                        source_rel=source_rel,
+                        force_overwrite=False,
+                        options={},
+                    )
+                    service.store.update(
+                        job.id,
+                        status=status,
+                        blocked_stage=blocked_stage,
+                    )
+
+                add_job("audio-job", "audio.mkv", "audio_completed")
+                add_job(
+                    "transcribed-job",
+                    "transcribed.mkv",
+                    "transcription_completed",
+                )
+                add_job(
+                    "running-job",
+                    "running.mkv",
+                    "translation_running",
+                )
+                add_job(
+                    "blocked-job",
+                    "blocked.mkv",
+                    "blocked",
+                    blocked_stage="translation",
+                )
+                add_job("completed-job", "completed.mkv", "completed")
+                response = client.get("/")
+
+            self.assertEqual(response.status_code, 200)
+            expected_stages = {
+                "pending": "미처리",
+                "audio_completed": "오디오 추출 완료",
+                "transcription_completed": "전사 완료",
+                "translation_running": "번역 중",
+                "blocked": "확인 필요 · 번역",
+                "completed": "자막 생성 완료",
+                "subtitle_present": "한국어 자막 있음",
+            }
+            for stage, label in expected_stages.items():
+                self.assertRegex(
+                    response.text,
+                    rf'data-processing-stage="{stage}"\s*>\s*{label}',
+                )
+            self.assertIn("하위 미완료 작업 선택", response.text)
+            self.assertIn("이미 완료된 파일을 자동 제외", response.text)
 
     def test_completed_job_streams_video_range_and_webvtt(self) -> None:
         with TemporaryDirectory() as directory:
@@ -795,9 +986,9 @@ class WebAppTests(unittest.TestCase):
 
                 page = client.get("/")
 
-            self.assertIn("대기", page.text)
-            self.assertIn("생성 중", page.text)
-            self.assertIn("생성 완료", page.text)
+            self.assertIn("미처리", page.text)
+            self.assertIn("번역 중", page.text)
+            self.assertIn("자막 생성 완료", page.text)
             self.assertIn("확인 필요", page.text)
             self.assertIn('href="/jobs/running-job"', page.text)
             self.assertIn('href="/jobs/done-job"', page.text)
@@ -1008,6 +1199,76 @@ class WebAppTests(unittest.TestCase):
             self.assertEqual(extraction.status, "blocked")
             self.assertIn("전체 작업 중단 요청됨", refreshed.text)
 
+    def test_bulk_retry_restarts_all_attention_jobs(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            (media_root / "series").mkdir()
+
+            with TestClient(create_app(self.settings(root, media_root))) as client:
+                service = client.app.state.orchestrator
+                service.stop()
+                blocked = service.store.create(
+                    job_id="blocked",
+                    source_rel="blocked.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                service.store.update(
+                    blocked.id,
+                    status="blocked",
+                    blocked_stage="transcription",
+                    error="stopped",
+                )
+                failed = service.store.create(
+                    job_id="failed",
+                    source_rel="failed.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                service.store.update(
+                    failed.id,
+                    status="failed",
+                    blocked_stage="translation",
+                    error="failed",
+                )
+                queued = service.store.create(
+                    job_id="queued",
+                    source_rel="queued.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+
+                fragment = client.get("/jobs-fragment?folder=series")
+                response = client.post(
+                    "/jobs/retry-all",
+                    data={"return_folder": "series"},
+                    follow_redirects=False,
+                )
+                notice = client.get(response.headers["location"])
+                refreshed = client.get("/jobs-fragment?folder=series")
+                blocked = service.store.get(blocked.id)
+                failed = service.store.get(failed.id)
+                queued = service.store.get(queued.id)
+
+            self.assertIn('action="/jobs/retry-all"', fragment.text)
+            self.assertIn("중단 작업 일괄 재시도 (2)", fragment.text)
+            self.assertIn(
+                'name="return_folder" value="series"',
+                fragment.text,
+            )
+            self.assertEqual(response.status_code, 303)
+            self.assertEqual(
+                response.headers["location"],
+                "/?folder=series&jobs_retried=2",
+            )
+            self.assertIn("중단·실패 작업 2개를 재시도했습니다.", notice.text)
+            self.assertIn("중단 작업 일괄 재시도 (0)", refreshed.text)
+            self.assertEqual(blocked.status, "queued")
+            self.assertEqual(failed.status, "queued")
+            self.assertEqual(queued.status, "queued")
+
     def test_all_jobs_are_merged_and_paginated_by_creation_time(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1091,6 +1352,180 @@ class WebAppTests(unittest.TestCase):
             self.assertEqual(response.headers["location"], "/?queued=1")
             self.assertEqual(jobs[0].operation, "transcribe")
             self.assertNotIn("translation_prompt", jobs[0].options)
+
+    def test_job_list_selects_completed_transcripts_for_translation(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            for filename in ("first.mp4", "second.mp4", "waiting.mp4"):
+                (media_root / filename).write_bytes(b"media")
+
+            with TestClient(
+                create_app(self.settings(root, media_root))
+            ) as client:
+                service = client.app.state.orchestrator
+                service.stop()
+                completed_jobs = []
+                for index, filename in enumerate(
+                    ("first.mp4", "second.mp4"),
+                    start=1,
+                ):
+                    job = service.store.create(
+                        job_id=f"transcribed-{index}",
+                        source_rel=filename,
+                        force_overwrite=False,
+                        options={"backend": "hybrid"},
+                        operation="transcribe",
+                    )
+                    artifact_dir = root / "state" / "jobs" / job.id
+                    artifact_dir.mkdir(parents=True, exist_ok=True)
+                    transcript = artifact_dir / f"{Path(filename).stem}_translate.json"
+                    transcript.write_text(
+                        json.dumps(
+                            {
+                                "schema_version": 1,
+                                "job_id": f"remote-{index}",
+                                "segments": [
+                                    {
+                                        "id": "segment-000001",
+                                        "start": 0,
+                                        "end": 1,
+                                        "speaker": "SPEAKER_00",
+                                        "text": f"원문 {index}",
+                                    }
+                                ],
+                            },
+                            ensure_ascii=False,
+                        ),
+                        encoding="utf-8",
+                    )
+                    service.store.update(
+                        job.id,
+                        status="transcription_completed",
+                        transcript_path=str(transcript),
+                    )
+                    completed_jobs.append(service.store.get(job.id))
+                waiting = service.store.create(
+                    job_id="waiting",
+                    source_rel="waiting.mp4",
+                    force_overwrite=False,
+                    options={},
+                    operation="transcribe",
+                )
+
+                page = client.get("/jobs?status_group=completed")
+                response = client.post(
+                    "/jobs/translate-selected",
+                    data={
+                        "job_ids": [job.id for job in completed_jobs],
+                        "prompt_category_id": "variety",
+                        "return_status_group": "completed",
+                        "return_jobs_page": "1",
+                    },
+                    follow_redirects=False,
+                )
+                all_jobs = service.store.list_jobs(limit=None)
+                translated = [
+                    service.store.get(job.id) for job in completed_jobs
+                ]
+                notice = client.get(response.headers["location"])
+                stale_response = client.post(
+                    "/jobs/translate-selected",
+                    data={
+                        "job_ids": completed_jobs[0].id,
+                        "prompt_category_id": "variety",
+                        "return_status_group": "completed",
+                    },
+                )
+
+            self.assertEqual(page.status_code, 200)
+            self.assertIn('action="/jobs/translate-selected"', page.text)
+            self.assertEqual(
+                page.text.count("data-translation-job-checkbox"),
+                2,
+            )
+            for job in completed_jobs:
+                self.assertIn(f'value="{job.id}"', page.text)
+            self.assertNotIn(f'value="{waiting.id}"', page.text)
+            self.assertIn("선택 번역 하기", page.text)
+            self.assertIn("job-selection.js", page.text)
+            self.assertEqual(response.status_code, 303)
+            self.assertEqual(
+                response.headers["location"],
+                "/jobs?status_group=completed&jobs_page=1&translations_queued=2",
+            )
+            self.assertEqual(len(all_jobs), 3)
+            self.assertEqual(
+                {job.id for job in translated},
+                {job.id for job in completed_jobs},
+            )
+            self.assertTrue(all(job.status == "transcribed" for job in translated))
+            self.assertTrue(
+                all(job.operation == "translate" for job in translated)
+            )
+            self.assertTrue(all(job.force_overwrite for job in translated))
+            self.assertTrue(
+                all(job.prompt_category_name == "버라이어티" for job in translated)
+            )
+            self.assertTrue(
+                all(
+                    job.transcript_path
+                    and Path(job.transcript_path).is_file()
+                    for job in translated
+                )
+            )
+            self.assertIn(
+                "선택한 전사 작업 2개를 번역으로 전환했습니다.",
+                notice.text,
+            )
+            self.assertEqual(stale_response.status_code, 400)
+            self.assertIn(
+                "최신 전사 완료 작업만 번역할 수 있습니다.",
+                stale_response.text,
+            )
+
+    def test_job_list_marks_legacy_split_translation_as_transitioned(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            (media_root / "movie.mp4").write_bytes(b"media")
+
+            with TestClient(
+                create_app(self.settings(root, media_root))
+            ) as client:
+                service = client.app.state.orchestrator
+                service.stop()
+                transcription = service.store.create(
+                    job_id="legacy-transcription",
+                    source_rel="movie.mp4",
+                    force_overwrite=False,
+                    options={},
+                    operation="transcribe",
+                )
+                service.store.update(
+                    transcription.id,
+                    status="transcription_completed",
+                    transcript_path="/tmp/transcript.json",
+                )
+                translation = service.store.create(
+                    job_id="legacy-translation",
+                    source_rel="movie.mp4",
+                    force_overwrite=True,
+                    options={},
+                    operation="translate",
+                )
+                service.store.update(translation.id, status="completed")
+
+                page = client.get("/jobs?status_group=completed")
+
+            self.assertEqual(page.status_code, 200)
+            self.assertIn("번역 이행됨", page.text)
+            self.assertNotIn(
+                'value="legacy-transcription"',
+                page.text,
+            )
 
 
 if __name__ == "__main__":
