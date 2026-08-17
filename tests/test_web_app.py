@@ -1438,7 +1438,7 @@ class WebAppTests(unittest.TestCase):
                 r'value="done\.mp4"[^>]*\s+data-auto-select',
             )
 
-    def test_deletes_legacy_audio_and_missing_remote_job_records(
+    def test_deletes_attention_legacy_audio_and_missing_remote_job_records(
         self,
     ) -> None:
         missing_error = (
@@ -1481,6 +1481,24 @@ class WebAppTests(unittest.TestCase):
                     blocked_stage="transcription",
                     error="transcription server is unavailable",
                 )
+                failed = service.store.create(
+                    job_id="failed-job",
+                    source_rel=source.name,
+                    force_overwrite=False,
+                    options={},
+                )
+                service.store.update(
+                    failed.id,
+                    status="failed",
+                    blocked_stage="translation",
+                    error="translation server is unavailable",
+                )
+                active = service.store.create(
+                    job_id="active-job",
+                    source_rel=source.name,
+                    force_overwrite=False,
+                    options={},
+                )
                 audio = service.store.create(
                     job_id="audio-job",
                     source_rel=audio_source.name,
@@ -1506,7 +1524,15 @@ class WebAppTests(unittest.TestCase):
                 detail = client.get(f"/jobs/{missing.id}")
                 audio_detail = client.get(f"/jobs/{audio.id}")
                 rejected = client.post(
+                    f"/jobs/{active.id}/delete",
+                    follow_redirects=False,
+                )
+                blocked_deleted = client.post(
                     f"/jobs/{other.id}/delete",
+                    follow_redirects=False,
+                )
+                failed_deleted = client.post(
+                    f"/jobs/{failed.id}/delete",
                     follow_redirects=False,
                 )
                 deleted = client.post(
@@ -1518,7 +1544,9 @@ class WebAppTests(unittest.TestCase):
                     follow_redirects=False,
                 )
 
-                self.assertIsNotNone(service.store.get(other.id))
+                self.assertIsNotNone(service.store.get(active.id))
+                self.assertIsNone(service.store.get(other.id))
+                self.assertIsNone(service.store.get(failed.id))
                 self.assertIsNone(service.store.get(missing.id))
                 self.assertIsNone(service.store.get(audio.id))
 
@@ -1526,8 +1554,16 @@ class WebAppTests(unittest.TestCase):
                 f'action="/jobs/{missing.id}/delete"',
                 dashboard.text,
             )
-            self.assertNotIn(
+            self.assertIn(
                 f'action="/jobs/{other.id}/delete"',
+                dashboard.text,
+            )
+            self.assertIn(
+                f'action="/jobs/{failed.id}/delete"',
+                dashboard.text,
+            )
+            self.assertNotIn(
+                f'action="/jobs/{active.id}/delete"',
                 dashboard.text,
             )
             self.assertIn(
@@ -1540,6 +1576,8 @@ class WebAppTests(unittest.TestCase):
             )
             self.assertIn("기록 삭제", audio_detail.text)
             self.assertEqual(rejected.status_code, 400)
+            self.assertEqual(blocked_deleted.status_code, 303)
+            self.assertEqual(failed_deleted.status_code, 303)
             self.assertEqual(deleted.status_code, 303)
             self.assertEqual(audio_deleted.status_code, 303)
             self.assertEqual(deleted.headers["location"], "/")

@@ -154,6 +154,7 @@ class PipelineJob:
     def can_delete_record(self) -> bool:
         return (
             self.status == "audio_completed"
+            or self.status in RETRYABLE_STATUSES
             or self.remote_transcription_missing
         )
 

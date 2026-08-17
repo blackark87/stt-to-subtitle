@@ -1418,8 +1418,9 @@ class SubtitleOrchestrator:
             raise ValueError("job not found")
         if not job.can_delete_record:
             raise ValueError(
-                "only completed audio extraction records or jobs missing "
-                "from the remote transcription server can be deleted"
+                "only completed audio extraction records, attention jobs, "
+                "or jobs missing from the remote transcription server can "
+                "be deleted"
             )
         if not self.store.delete(job.id):
             raise RuntimeError("job could not be deleted")
