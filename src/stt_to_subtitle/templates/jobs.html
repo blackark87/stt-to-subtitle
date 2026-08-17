@@ -2,7 +2,7 @@
 {% import "_icons.html" as icons %}
 {% block title %}{{ job_list_title }} · STT to Subtitle{% endblock %}
 {% block content %}
-  <div class="page-heading">
+  <div class="page-heading workspace-heading">
     <div>
       <p class="page-kicker">JOB HISTORY</p>
       <h1>{{ job_list_title }}</h1>
@@ -11,9 +11,14 @@
     <a class="button" href="/media">{{ icons.folder(16) }}새 작업 만들기</a>
   </div>
   <nav class="job-status-filter" aria-label="작업 상태 필터">
+    <a
+      class="button{% if not selected_status_group %} is-filter-active{% else %} secondary{% endif %}"
+      href="/jobs"
+      {% if not selected_status_group %}aria-current="page"{% endif %}
+    >전체</a>
     {% for group, label in status_groups.items() %}
       <a
-        class="button{% if group != selected_status_group %} secondary{% endif %}"
+        class="button{% if group == selected_status_group %} is-filter-active{% else %} secondary{% endif %}"
         href="/jobs?status_group={{ group }}"
         {% if group == selected_status_group %}aria-current="page"{% endif %}
       >{{ label }}</a>
@@ -23,7 +28,7 @@
   {% if notice %}<p class="notice">{{ notice }}</p>{% endif %}
   <section class="card recent-jobs-card">
     <div
-      data-update-url="/jobs-fragment?status_group={{ selected_status_group }}&amp;jobs_page={{ jobs_page }}"
+      data-update-url="/jobs-fragment?status_group={{ selected_status_group or '' }}&amp;jobs_page={{ jobs_page }}"
       aria-live="off"
     >
       {% include "_jobs_table.html" %}

@@ -37,36 +37,47 @@
         {% if translation_transitioned %}
           <span class="status status-completed" title="후속 번역 작업이 생성된 기존 전사 기록">번역 이행됨</span>
         {% else %}
-          <span class="status status-{{ job.status }}" title="내부 상태: {{ job.status }}">{{ job.status|job_status }}</span>
+          <span
+            class="status status-{{ job.status }}{% if job.error %} has-detail{% endif %}"
+            title="내부 상태: {{ job.status }}{% if job.error %}&#10;error: {{ job.error }}{% endif %}"
+          >{{ job.status|job_status }}</span>
         {% endif %}
       </div>
       <div class="recent-job-meta">
         <span>최근 갱신 <time datetime="{{ job.updated_at|datetime_iso }}">{{ job.updated_at|datetime }}</time></span>
         <code title="작업 ID: {{ job.id }}">#{{ job.id[:8] }}</code>
-        <span>작업 범위 {{ job.operation|job_operation }}</span>
-        {% if job.operation in ["translate", "full"] %}<span>프롬프트 {{ job.prompt_category_name }}</span>{% endif %}
-        {% if job.blocked_stage %}<span class="recent-job-stage">{{ job.blocked_stage|job_stage }} 단계</span>{% endif %}
+        {% if job.operation in ["translate", "full"] and job.options.translation_prompt %}
+          <span>프롬프트 {{ job.prompt_category_name }}</span>
+        {% endif %}
       </div>
-      {% if job.chunks_created %}
-        <div class="recent-job-progress">
-          <span>전사</span>
-          <progress value="{{ job.chunks_completed }}" max="{{ job.chunks_created }}" aria-label="전사 청크 진행률"></progress>
-          <strong>{{ job.chunks_completed }}/{{ job.chunks_created }}</strong>
-        </div>
-      {% endif %}
-      {% if job.translation_chunks_total %}
-        <div class="recent-job-progress">
-          <span>번역</span>
-          <progress value="{{ job.translation_chunks_completed }}" max="{{ job.translation_chunks_total }}" aria-label="번역 청크 진행률"></progress>
-          <strong>{{ job.translation_chunks_completed }}/{{ job.translation_chunks_total }}</strong>
-        </div>
-      {% endif %}
+      <ol class="job-stage-strip" aria-label="{{ job.source_rel|filename }} 단계별 진행 상황">
+        {% for stage in job|job_stages %}
+          <li
+            class="job-stage is-{{ stage.state }}"
+            style="--stage-percent: {{ stage.percent }}%"
+            {% if stage.state == 'failed' and job.error %}title="error: {{ job.error }}"{% endif %}
+          >
+            <span class="job-stage-icon" aria-hidden="true">
+              {%- if stage.state == 'done' %}{{ icons.check(13) }}
+              {%- elif stage.state == 'running' %}{{ icons.activity(13) }}
+              {%- elif stage.state == 'failed' %}{{ icons.alert_triangle(13) }}
+              {%- elif stage.state == 'paused' %}{{ icons.pause(13) }}
+              {%- else %}{{ icons.clock(13) }}{% endif -%}
+            </span>
+            <span class="job-stage-label">{{ stage.label }}</span>
+            {% if stage.total %}
+              <span class="job-stage-count">{{ stage.completed }}/{{ stage.total }}</span>
+            {% else %}
+              <span class="job-stage-count">{{ stage.state_label }}</span>
+            {% endif %}
+          </li>
+        {% endfor %}
+      </ol>
       {% if job.job_stop_requested %}
         <p class="muted">전체 작업 중단 요청됨 · 현재 단계를 안전하게 마치는 중</p>
       {% elif job.translation_pause_requested and job.status != "translation_paused" %}
         <p class="muted">번역 중단 요청됨{% if job.status not in ["transcribed", "translation_running"] %} · 전사 완료 후 번역 전에 멈춤{% endif %}</p>
       {% endif %}
-      {% if job.error %}<p class="recent-job-error" title="{{ job.error }}">{{ job.error }}</p>{% endif %}
     </div>
     <div class="recent-job-actions">
       <a class="button secondary compact" href="/jobs/{{ job.id }}">상세 보기</a>

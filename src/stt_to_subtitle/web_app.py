@@ -56,6 +56,7 @@ from .time_display import (
 LOGGER = logging.getLogger(__name__)
 PACKAGE_DIR = Path(__file__).parent
 RECENT_JOB_LIMIT = 20
+DASHBOARD_JOB_LIMIT = 5
 WAITING_STATUSES = {
     "queued",
     "audio_ready",
@@ -117,6 +118,101 @@ JOB_STAGE_LABELS = {
     "translation": "번역",
     "render": "자막 생성",
 }
+STAGE_SEQUENCE = (
+    "audio extraction",
+    "transcription",
+    "translation",
+    "render",
+)
+OPERATION_STAGES = {
+    "extract": ("audio extraction",),
+    "transcribe": ("audio extraction", "transcription"),
+    "translate": ("translation", "render"),
+    "full": STAGE_SEQUENCE,
+}
+STATUS_ACTIVE_STAGE = {
+    "extracting": ("audio extraction", "running"),
+    "audio_ready": ("transcription", "waiting"),
+    "transcription_running": ("transcription", "running"),
+    "transcribed": ("translation", "waiting"),
+    "translation_running": ("translation", "running"),
+    "translation_paused": ("translation", "paused"),
+    "translated": ("render", "waiting"),
+    "rendering": ("render", "running"),
+}
+STAGE_FINISHED_STATUSES = {
+    "audio_completed",
+    "transcription_completed",
+    "completed",
+}
+STAGE_STATE_LABELS = {
+    "done": "완료",
+    "running": "진행 중",
+    "waiting": "대기",
+    "paused": "중단됨",
+    "failed": "확인 필요",
+    "pending": "예정",
+}
+
+
+def job_stage_view(job: Any) -> list[dict[str, Any]]:
+    """작업이 거치는 모든 파이프라인 단계와 각 단계의 상태를 돌려준다."""
+    stages = OPERATION_STAGES.get(str(job.operation), STAGE_SEQUENCE)
+    chunk_counts = {
+        "transcription": (job.chunks_completed, job.chunks_created),
+        "translation": (
+            job.translation_chunks_completed,
+            job.translation_chunks_total,
+        ),
+    }
+    status = str(job.status)
+    if status in STAGE_FINISHED_STATUSES:
+        active: str | None = None
+        active_state = "done"
+    elif status in {"blocked", "failed"}:
+        blocked = str(job.blocked_stage or "")
+        active = blocked if blocked in stages else stages[0]
+        active_state = "failed"
+    elif status == "queued":
+        active = stages[0]
+        active_state = "waiting"
+    else:
+        active, active_state = STATUS_ACTIVE_STAGE.get(
+            status,
+            (stages[0], "waiting"),
+        )
+        if active not in stages:
+            active = stages[0]
+
+    view: list[dict[str, Any]] = []
+    reached_active = False
+    for stage in stages:
+        if active is None:
+            state = "done"
+        elif stage == active:
+            state = active_state
+            reached_active = True
+        elif reached_active:
+            state = "pending"
+        else:
+            state = "done"
+        completed, total = chunk_counts.get(stage, (0, 0))
+        view.append(
+            {
+                "key": stage,
+                "label": JOB_STAGE_LABELS.get(stage, stage),
+                "state": state,
+                "state_label": STAGE_STATE_LABELS[state],
+                "completed": completed,
+                "total": total,
+                "percent": (
+                    round(completed * 100 / total)
+                    if total
+                    else (100 if state == "done" else 0)
+                ),
+            }
+        )
+    return view
 EVENT_LEVEL_LABELS = {
     "info": "정보",
     "warning": "주의",
@@ -139,6 +235,7 @@ TEMPLATES.env.filters["job_stage"] = lambda value: JOB_STAGE_LABELS.get(
     str(value),
     str(value),
 )
+TEMPLATES.env.filters["job_stages"] = job_stage_view
 TEMPLATES.env.filters["event_level"] = lambda value: EVENT_LEVEL_LABELS.get(
     str(value),
     str(value),
@@ -305,11 +402,19 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                 **values,
             }
             return f"/jobs?{urlencode(query)}"
-        return dashboard_location(
-            return_folder,
-            jobs_page=(return_jobs_page if return_jobs_page > 1 else None),
-            **values,
-        )
+        if return_folder:
+            return media_location(return_folder, **values)
+        query = {
+            key: value
+            for key, value in {
+                "jobs_page": (
+                    return_jobs_page if return_jobs_page > 1 else None
+                ),
+                **values,
+            }.items()
+            if value not in (None, "")
+        }
+        return f"/jobs?{urlencode(query)}" if query else "/jobs"
 
     def job_stats(service: SubtitleOrchestrator) -> dict[str, int]:
         return {
@@ -323,6 +428,8 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         jobs_page: int,
         status_group: str | None = None,
         folder: str = "",
+        limit: int = RECENT_JOB_LIMIT,
+        paginated: bool = True,
     ) -> dict[str, Any]:
         if status_group is not None and status_group not in JOB_STATUS_GROUPS:
             raise ValueError("지원하지 않는 작업 상태 필터입니다.")
@@ -331,12 +438,12 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             if status_group is not None
             else None
         )
-        jobs_page = max(1, jobs_page)
+        jobs_page = max(1, jobs_page) if paginated else 1
         job_count = service.store.count_jobs(statuses=statuses)
-        jobs_offset = (jobs_page - 1) * RECENT_JOB_LIMIT
+        jobs_offset = (jobs_page - 1) * limit
         open_jobs = service.store.list_open_jobs()
         recent_jobs = service.store.list_jobs(
-            limit=RECENT_JOB_LIMIT,
+            limit=limit,
             offset=jobs_offset,
             statuses=statuses,
         )
@@ -359,11 +466,12 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         }
 
         def page_location(page: int) -> str:
-            if status_group is None:
-                return dashboard_location(folder, jobs_page=page)
-            return "/jobs?" + urlencode(
-                {"status_group": status_group, "jobs_page": page}
-            )
+            if folder:
+                return media_location(folder, jobs_page=page)
+            query = {"jobs_page": page}
+            if status_group is not None:
+                query = {"status_group": status_group, **query}
+            return "/jobs?" + urlencode(query)
 
         label = (
             JOB_STATUS_GROUP_LABELS[status_group]
@@ -383,22 +491,29 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                 job.can_pause_translation for job in open_jobs
             ),
             "jobs_page": jobs_page,
-            "jobs_has_previous": jobs_page > 1,
-            "jobs_has_next": jobs_offset + RECENT_JOB_LIMIT < job_count,
+            "jobs_has_previous": paginated and jobs_page > 1,
+            "jobs_has_next": (
+                paginated and jobs_offset + limit < job_count
+            ),
             "jobs_previous_url": (
-                page_location(jobs_page - 1) if jobs_page > 1 else None
+                page_location(jobs_page - 1)
+                if paginated and jobs_page > 1
+                else None
             ),
             "jobs_next_url": (
                 page_location(jobs_page + 1)
-                if jobs_offset + RECENT_JOB_LIMIT < job_count
+                if paginated and jobs_offset + limit < job_count
                 else None
             ),
             "job_count": job_count,
             "job_list_title": f"{label} 작업",
             "job_list_description": (
-                f"{label} 상태만 최신순으로, 페이지당 20개씩 표시합니다."
+                f"{label} 상태만 최신순으로, 페이지당 {limit}개씩 표시합니다."
                 if status_group is not None
-                else "최신순, 페이지당 20개 · 중단 요청은 안전한 지점에서 반영됩니다."
+                else (
+                    f"최신순, 페이지당 {limit}개 · "
+                    "중단 요청은 안전한 지점에서 반영됩니다."
+                )
             ),
             "job_list_empty_message": (
                 f"{label} 상태의 작업이 없습니다."
@@ -473,12 +588,16 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         *,
         error: str | None = None,
         notice: str | None = None,
-        jobs_page: int = 1,
     ) -> dict[str, Any]:
         service = orchestrator(request)
         return {
             "request": request,
-            **job_list_context(service, jobs_page=jobs_page),
+            **job_list_context(
+                service,
+                jobs_page=1,
+                limit=DASHBOARD_JOB_LIMIT,
+                paginated=False,
+            ),
             "job_stats": job_stats(service),
             "csrf_token": request.session.get("csrf_token", ""),
             "error": error,
@@ -632,8 +751,6 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         translations_queued: int | None = None,
         skipped: int | None = None,
         folder: str = "",
-        jobs_page: int = 1,
-        completed_page: int | None = None,
     ) -> Any:
         if not is_authenticated(request):
             return login_redirect()
@@ -661,15 +778,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                 "전환했습니다."
             )
         try:
-            context = dashboard_context(
-                request,
-                notice=notice,
-                jobs_page=(
-                    completed_page
-                    if completed_page is not None and jobs_page == 1
-                    else jobs_page
-                ),
-            )
+            context = dashboard_context(request, notice=notice)
             response_status = status.HTTP_200_OK
         except ValueError as error:
             context = dashboard_context(request, error=str(error))
@@ -733,7 +842,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
     @app.get("/jobs", response_class=HTMLResponse)
     def jobs_page(
         request: Request,
-        status_group: str = "running",
+        status_group: str = "",
         jobs_page: int = 1,
         translations_queued: int | None = None,
     ) -> Any:
@@ -745,7 +854,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                 **job_list_context(
                     orchestrator(request),
                     jobs_page=jobs_page,
-                    status_group=status_group,
+                    status_group=status_group or None,
                 ),
                 "status_groups": JOB_STATUS_GROUP_LABELS,
                 "csrf_token": request.session.get("csrf_token", ""),
@@ -1036,15 +1145,19 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         try:
             context = job_list_context(
                 service,
-                jobs_page=jobs_page,
-                status_group=status_group,
+                jobs_page=1 if compact else jobs_page,
+                status_group=status_group or None,
                 folder=folder,
+                limit=DASHBOARD_JOB_LIMIT if compact else RECENT_JOB_LIMIT,
+                paginated=not compact,
             )
             if compact:
                 context.update(
                     {
                         "job_list_title": "최근 작업",
-                        "job_list_description": "최신순, 페이지당 20개",
+                        "job_list_description": (
+                            f"가장 최근에 갱신된 {DASHBOARD_JOB_LIMIT}건"
+                        ),
                         "show_bulk_actions": False,
                         "translatable_job_ids": set(),
                         "translatable_job_count": 0,
@@ -1537,37 +1650,26 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                 prompt_category_id=prompt_category_id,
             )
         except (OSError, UnicodeError, ValueError) as error:
-            if return_status_group:
-                context = {
-                    "request": request,
-                    **job_list_context(
-                        service,
-                        jobs_page=return_jobs_page,
-                        status_group=return_status_group,
-                    ),
-                    "status_groups": JOB_STATUS_GROUP_LABELS,
-                    "csrf_token": request.session.get("csrf_token", ""),
-                    "prompt_categories": service.active_prompt_categories(),
-                    "notice": None,
-                    "error": str(error),
-                }
-                return TEMPLATES.TemplateResponse(
-                    request,
-                    "jobs.html",
-                    context,
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                )
-            try:
-                context = dashboard_context(
-                    request,
-                    error=str(error),
+            context = {
+                "request": request,
+                **job_list_context(
+                    service,
                     jobs_page=return_jobs_page,
-                )
-            except ValueError:
-                context = dashboard_context(request, error=str(error))
+                    status_group=(
+                        return_status_group
+                        if return_status_group in JOB_STATUS_GROUPS
+                        else None
+                    ),
+                ),
+                "status_groups": JOB_STATUS_GROUP_LABELS,
+                "csrf_token": request.session.get("csrf_token", ""),
+                "prompt_categories": service.active_prompt_categories(),
+                "notice": None,
+                "error": str(error),
+            }
             return TEMPLATES.TemplateResponse(
                 request,
-                "dashboard.html",
+                "jobs.html",
                 context,
                 status_code=status.HTTP_400_BAD_REQUEST,
             )
