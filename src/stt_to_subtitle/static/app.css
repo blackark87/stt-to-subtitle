@@ -699,9 +699,11 @@ th, td { border-bottom: 1px solid var(--line); padding: 10px 8px; text-align: le
 .status-audio_completed,
 .status-transcription_completed { background: color-mix(in srgb, var(--success) 16%, var(--card)); color: var(--success); }
 .status-translation_paused { background: color-mix(in srgb, var(--warning-strong) 18%, var(--card)); color: var(--warning); }
-.status-blocked, .status-failed { background: color-mix(in srgb, var(--danger) 14%, var(--card)); color: var(--danger); }
+.status-blocked { background: color-mix(in srgb, var(--warning-strong) 14%, var(--card)); color: var(--warning); }
+.status-failed { background: color-mix(in srgb, var(--danger) 14%, var(--card)); color: var(--danger); }
 .status-stage-running { background: color-mix(in srgb, var(--accent) 18%, var(--card)); color: var(--accent); }
 .status-stage-done { background: color-mix(in srgb, var(--success) 16%, var(--card)); color: var(--success); }
+.status-stage-blocked { background: color-mix(in srgb, var(--warning-strong) 14%, var(--card)); color: var(--warning); }
 .status-stage-failed { background: color-mix(in srgb, var(--danger) 14%, var(--card)); color: var(--danger); }
 .status-stage-waiting,
 .status-stage-pending { color: var(--muted); }
@@ -748,6 +750,7 @@ th, td { border-bottom: 1px solid var(--line); padding: 10px 8px; text-align: le
 .recent-job-status-icon { display: grid; place-items: center; width: 34px; height: 34px; border-radius: var(--radius-sm); background: var(--surface-well); color: var(--muted); }
 .recent-job-status-running { background: var(--accent-subtle); color: var(--accent); }
 .recent-job-status-attention { background: color-mix(in srgb, var(--danger) 14%, var(--card)); color: var(--danger); }
+.recent-job-status-blocked { background: color-mix(in srgb, var(--warning-strong) 14%, var(--card)); color: var(--warning); }
 .recent-job-status-completed { background: color-mix(in srgb, var(--success) 16%, var(--card)); color: var(--success); }
 .recent-job-status-waiting { background: color-mix(in srgb, var(--warning-strong) 14%, var(--card)); color: var(--warning); }
 .recent-job-extracting,
@@ -760,7 +763,8 @@ th, td { border-bottom: 1px solid var(--line); padding: 10px 8px; text-align: le
 .recent-job-transcribed,
 .recent-job-translated,
 .recent-job-completed { border-left-color: var(--success); }
-.recent-job-blocked, .recent-job-failed { border-left-color: var(--danger); }
+.recent-job-blocked { border-left-color: var(--warning-strong); }
+.recent-job-failed { border-left-color: var(--danger); }
 .recent-job-translation_paused { border-left-color: var(--warning-strong); }
 .recent-job-leading { display: grid; justify-items: center; gap: 7px; }
 .recent-job-select { min-height: 1.3rem; }
@@ -808,12 +812,12 @@ th, td { border-bottom: 1px solid var(--line); padding: 10px 8px; text-align: le
 .job-stage.is-done { color: var(--success); border-color: color-mix(in srgb, var(--success) 30%, var(--line)); }
 .job-stage.is-running { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); background: var(--accent-subtle); }
 .job-stage.is-failed { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 40%, var(--line)); background: color-mix(in srgb, var(--danger) 8%, var(--card)); }
+.job-stage.is-blocked { color: var(--warning); border-color: color-mix(in srgb, var(--warning-strong) 35%, var(--line)); }
 .job-stage.is-paused { color: var(--warning); border-color: color-mix(in srgb, var(--warning-strong) 35%, var(--line)); }
 .job-stage.is-waiting { color: var(--muted); border-style: dashed; }
 .job-stage.is-pending { color: var(--muted); border-style: dashed; background: transparent; opacity: .62; }
 .job-stage.is-pending .job-stage-label { color: var(--muted); font-weight: 650; }
 .job-detail-stage-strip { margin: 8px 0 18px; }
-.job-progress-note { margin: -1px 0 0; color: var(--muted); font-size: .68rem; line-height: 1.4; }
 .status.has-detail { cursor: help; text-decoration: underline dotted currentColor; text-underline-offset: 3px; }
 .recent-job-actions { display: flex; align-items: flex-start; justify-content: flex-end; gap: 7px; flex-wrap: wrap; }
 .recent-job-actions form { display: flex; align-items: stretch; gap: 7px; margin: 0; flex-wrap: wrap; }
@@ -1017,6 +1021,49 @@ code { overflow-wrap: anywhere; }
   .model-picker { grid-template-columns: 1fr; }
   .page-heading, .section-heading, .job-overview-heading { align-items: flex-start; }
   .workspace-heading { display: grid; }
+  .job-stage-filter {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    align-items: start;
+  }
+  .job-stage-filter > .button,
+  .job-stage-filter-group > .button { width: 100%; min-width: 0; }
+  .job-stage-filter-group { min-width: 0; }
+  .job-stage-filter-children {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 3px;
+    border-left: 0;
+    padding-left: 0;
+  }
+  .job-stage-filter-children .button {
+    min-width: 0;
+    padding-right: 4px;
+    padding-left: 4px;
+    white-space: nowrap;
+  }
+  .job-list-heading { display: grid; width: 100%; }
+  .job-bulk-actions {
+    display: grid;
+    width: 100%;
+    min-width: 0;
+    justify-content: stretch;
+  }
+  .job-bulk-actions > form { width: 100%; min-width: 0; }
+  .job-bulk-actions > form > button { width: 100%; }
+  .job-translation-actions {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    width: 100%;
+    min-width: 0;
+  }
+  .job-translation-actions .job-selection-count,
+  .job-translation-actions select,
+  .job-translation-actions [data-translate-selected] {
+    grid-column: 1 / -1;
+    width: 100%;
+    max-width: none;
+  }
   .job-page-heading, .job-overview-heading { display: grid; }
   .job-overview-updated { justify-items: start; }
   .recent-job-item { grid-template-columns: 1fr; gap: 12px; }

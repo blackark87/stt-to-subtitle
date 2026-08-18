@@ -9,6 +9,7 @@ from importlib.metadata import version
 import json
 import os
 from pathlib import Path
+import sys
 import time
 from typing import Any, Mapping, Sequence
 
@@ -21,7 +22,26 @@ DEFAULT_WHISPERX_MODEL = "large-v3"
 DEFAULT_WHISPERX_LANGUAGE = "ja"
 DEFAULT_WHISPERX_COMPUTE_TYPE = "float16"
 WHISPERX_MAX_CHUNK_LENGTH_SECONDS = 30
+WHISPERX_MIN_BATCH_SIZE = 1
+WHISPERX_MAX_BATCH_SIZE = 64
 WHISPERX_TIMESTAMP_POSTPROCESSOR = "whisperx-forced-alignment"
+DEFAULT_SUBTITLE_SEGMENTATION = {
+    "split_on_speaker_change": True,
+    "max_gap_sec": 0.8,
+    "max_duration_sec": 8.0,
+    "max_chars": 36,
+    "prefer_punctuation_boundary": True,
+}
+
+
+def _log(message: str) -> None:
+    """Emit one worker diagnostic line on stderr.
+
+    The parent process captures stderr and surfaces it when the worker fails,
+    so keep these lines short and free of transcript content.
+    """
+
+    print(f"[whisperx_worker] {message}", file=sys.stderr, flush=True)
 
 
 @dataclass(frozen=True)
@@ -38,10 +58,14 @@ class WhisperXSegmentationOptions:
     def from_options(
         cls,
         options: Mapping[str, Any],
+        *,
+        defaults: Mapping[str, Any] | None = None,
     ) -> WhisperXSegmentationOptions:
         raw = options.get("subtitle_segmentation", {})
         if not isinstance(raw, Mapping):
             raise ValueError("subtitle_segmentation must be a JSON object")
+        if defaults is not None:
+            raw = {**defaults, **raw}
         allowed = {
             "split_on_speaker_change",
             "max_gap_sec",
@@ -399,6 +423,62 @@ def _release_cuda() -> None:
             ipc_collect()
 
 
+# CUDA exhaustion does not always surface as "out of memory". CTranslate2
+# reports the same condition through cuBLAS allocation failures and through
+# misleading cuda error ordinals raised by its thrust/cub launches, so a
+# batch-size retry has to recognise all three spellings.
+RETRYABLE_CUDA_FAILURES = (
+    "out of memory",
+    "cublas_status_alloc_failed",
+    "cudaerrorinvaliddevice",
+    "parallel_for failed",
+)
+
+
+def _is_retryable_cuda_failure(error: BaseException) -> bool:
+    message = str(error).lower()
+    return any(marker in message for marker in RETRYABLE_CUDA_FAILURES)
+
+
+def _transcribe_with_oom_backoff(
+    model: Any,
+    audio: Any,
+    *,
+    batch_size: int,
+    language: str,
+    chunk_size: int,
+) -> tuple[Any, int]:
+    """Transcribe, halving the batch size whenever CUDA runs out of room.
+
+    Returns the WhisperX result together with the batch size that produced it
+    so callers can report the effective value.
+    """
+
+    effective_batch_size = batch_size
+    while True:
+        try:
+            result = model.transcribe(
+                audio,
+                batch_size=effective_batch_size,
+                language=language,
+                chunk_size=chunk_size,
+            )
+        except RuntimeError as error:
+            if (
+                not _is_retryable_cuda_failure(error)
+                or effective_batch_size <= 1
+            ):
+                raise
+            _release_cuda()
+            effective_batch_size = max(1, effective_batch_size // 2)
+            _log(
+                f"CUDA failure ({error}), retrying with batch_size="
+                f"{effective_batch_size}"
+            )
+            continue
+        return result, effective_batch_size
+
+
 def run_whisperx(
     audio_path: Path,
     options: Mapping[str, Any],
@@ -449,6 +529,11 @@ def run_whisperx(
     cache_dir.mkdir(parents=True, exist_ok=True)
     batch_size = int(options.get("batch_size", 1))
     threads = options.get("threads")
+    _log(
+        "transcribe batch_size="
+        f"{batch_size} threads={threads} "
+        f"chunk={options['chunk_length_seconds']}"
+    )
     segmentation = WhisperXSegmentationOptions.from_options(options)
     repetition_policy = str(options.get("repetition_policy", "flag"))
     if repetition_policy not in {"flag", "reject"}:
@@ -471,7 +556,8 @@ def run_whisperx(
         use_auth_token=hf_token,
     )
     try:
-        result = model.transcribe(
+        result, effective_batch_size = _transcribe_with_oom_backoff(
+            model,
             audio,
             batch_size=batch_size,
             language=language,
@@ -607,6 +693,8 @@ def run_whisperx(
             "device": device,
             "diarization_device": diarization_device,
             "elapsed_seconds": round(time.monotonic() - started, 3),
+            "requested_batch_size": batch_size,
+            "effective_batch_size": effective_batch_size,
         },
         "noise_filter": {
             "enabled": True,

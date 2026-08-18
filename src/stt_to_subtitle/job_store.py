@@ -51,6 +51,10 @@ TRANSLATION_PAUSABLE_STATUSES = {
 }
 PROMPT_NAME_MAX_LENGTH = 80
 PROMPT_TEXT_MAX_LENGTH = 50_000
+_COMPARISON_TRANSCRIPTION_SQL = (
+    "operation = 'transcribe' AND "
+    "json_extract(options_json, '$.comparison_id') IS NOT NULL"
+)
 
 
 @dataclass(frozen=True)
@@ -90,6 +94,7 @@ class PipelineJob:
     translation_pause_requested: bool
     job_stop_requested: bool
     created_at: float
+    status_updated_at: float
     updated_at: float
 
     @property
@@ -249,6 +254,7 @@ class JobStore:
                     translation_pause_requested INTEGER NOT NULL DEFAULT 0,
                     job_stop_requested INTEGER NOT NULL DEFAULT 0,
                     created_at REAL NOT NULL,
+                    status_updated_at REAL NOT NULL,
                     updated_at REAL NOT NULL
                 );
 
@@ -334,6 +340,32 @@ class JobStore:
             for column, statement in migrations.items():
                 if column not in columns:
                     connection.execute(statement)
+            if "status_updated_at" not in columns:
+                connection.execute(
+                    "ALTER TABLE jobs ADD COLUMN status_updated_at REAL"
+                )
+                connection.execute(
+                    """
+                    UPDATE jobs
+                    SET status_updated_at = COALESCE(
+                        (
+                            SELECT MAX(job_events.created_at)
+                            FROM job_events
+                            WHERE job_events.job_id = jobs.id
+                              AND job_events.message NOT LIKE
+                                  'transcription chunks:%'
+                              AND job_events.message NOT LIKE
+                                  'translation checkpoint saved%'
+                        ),
+                        updated_at,
+                        created_at
+                    )
+                    """
+                )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS jobs_status_updated_idx "
+                "ON jobs(status_updated_at DESC, created_at DESC)"
+            )
             server_columns = {
                 str(row["name"])
                 for row in connection.execute(
@@ -625,6 +657,7 @@ class JobStore:
             ),
             job_stop_requested=bool(row["job_stop_requested"]),
             created_at=float(row["created_at"]),
+            status_updated_at=float(row["status_updated_at"]),
             updated_at=float(row["updated_at"]),
         )
 
@@ -649,8 +682,8 @@ class JobStore:
                     id, source_rel, status, force_overwrite, operation,
                     options_json, audio_path, audio_sha256,
                     chunks_total_estimate,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    created_at, status_updated_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job_id,
@@ -662,6 +695,7 @@ class JobStore:
                     audio_path,
                     audio_sha256,
                     max(0, int(chunks_total_estimate)),
+                    now,
                     now,
                     now,
                 ),
@@ -690,53 +724,56 @@ class JobStore:
         *,
         offset: int = 0,
         statuses: Collection[str] | None = None,
+        include_comparison_transcriptions: bool = True,
     ) -> list[PipelineJob]:
         status_values = (
             tuple(sorted(set(statuses))) if statuses is not None else None
         )
         if status_values == ():
             return []
+        conditions: list[str] = []
+        parameters: list[object] = []
+        if status_values is not None:
+            placeholders = ", ".join("?" for _ in status_values)
+            conditions.append(f"status IN ({placeholders})")
+            parameters.extend(status_values)
+        if not include_comparison_transcriptions:
+            conditions.append(f"NOT ({_COMPARISON_TRANSCRIPTION_SQL})")
+        query = "SELECT * FROM jobs"
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        query += " ORDER BY status_updated_at DESC, created_at DESC"
+        if limit is not None:
+            query += " LIMIT ? OFFSET ?"
+            parameters.extend((limit, offset))
         with self._connect() as connection:
-            if status_values is None and limit is None:
-                rows = connection.execute(
-                    "SELECT * FROM jobs ORDER BY created_at DESC"
-                ).fetchall()
-            elif status_values is None:
-                rows = connection.execute(
-                    "SELECT * FROM jobs ORDER BY created_at DESC LIMIT ? OFFSET ?",
-                    (limit, offset),
-                ).fetchall()
-            else:
-                placeholders = ", ".join("?" for _ in status_values)
-                limit_clause = "" if limit is None else " LIMIT ? OFFSET ?"
-                parameters: tuple[object, ...] = status_values
-                if limit is not None:
-                    parameters += (limit, offset)
-                rows = connection.execute(
-                    f"SELECT * FROM jobs WHERE status IN ({placeholders}) "
-                    f"ORDER BY created_at DESC{limit_clause}",
-                    parameters,
-                ).fetchall()
+            rows = connection.execute(query, tuple(parameters)).fetchall()
         return [job for row in rows if (job := self._from_row(row)) is not None]
 
-    def count_jobs(self, *, statuses: Collection[str] | None = None) -> int:
+    def count_jobs(
+        self,
+        *,
+        statuses: Collection[str] | None = None,
+        include_comparison_transcriptions: bool = True,
+    ) -> int:
         status_values = (
             tuple(sorted(set(statuses))) if statuses is not None else None
         )
         if status_values == ():
             return 0
+        conditions: list[str] = []
+        parameters: list[object] = []
+        if status_values is not None:
+            placeholders = ", ".join("?" for _ in status_values)
+            conditions.append(f"status IN ({placeholders})")
+            parameters.extend(status_values)
+        if not include_comparison_transcriptions:
+            conditions.append(f"NOT ({_COMPARISON_TRANSCRIPTION_SQL})")
+        query = "SELECT COUNT(*) AS count FROM jobs"
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
         with self._connect() as connection:
-            if status_values is None:
-                row = connection.execute(
-                    "SELECT COUNT(*) AS count FROM jobs"
-                ).fetchone()
-            else:
-                placeholders = ", ".join("?" for _ in status_values)
-                row = connection.execute(
-                    f"SELECT COUNT(*) AS count FROM jobs "
-                    f"WHERE status IN ({placeholders})",
-                    status_values,
-                ).fetchone()
+            row = connection.execute(query, tuple(parameters)).fetchone()
         return int(row["count"]) if row is not None else 0
 
     def list_open_jobs(self) -> list[PipelineJob]:
@@ -780,7 +817,8 @@ class JobStore:
         latest: dict[str, PipelineJob] = {}
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT * FROM jobs ORDER BY updated_at DESC, created_at DESC"
+                "SELECT * FROM jobs "
+                "ORDER BY status_updated_at DESC, created_at DESC"
             ).fetchall()
         for row in rows:
             job = self._from_row(row)
@@ -851,12 +889,13 @@ class JobStore:
             else ""
         )
         with self._connect() as connection:
+            now = time.time()
             result = connection.execute(
                 "UPDATE jobs SET status = ?, blocked_stage = NULL, "
-                "error = NULL, updated_at = ? "
+                "error = NULL, status_updated_at = ?, updated_at = ? "
                 "WHERE id = ? AND status = ? AND job_stop_requested = 0"
                 f"{translation_condition}",
-                (running_status, time.time(), job_id, waiting_status),
+                (running_status, now, now, job_id, waiting_status),
             )
         claimed = result.rowcount == 1
         if claimed:
@@ -871,8 +910,12 @@ class JobStore:
             raise ValueError(f"unsupported job fields: {sorted(unknown)}")
         assignments = [f"{field} = ?" for field in fields]
         values = [fields[field] for field in fields]
+        now = time.time()
+        if "status" in fields:
+            assignments.append("status_updated_at = ?")
+            values.append(now)
         assignments.append("updated_at = ?")
-        values.extend([time.time(), job_id])
+        values.extend([now, job_id])
         with self._connect() as connection:
             result = connection.execute(
                 f"UPDATE jobs SET {', '.join(assignments)} WHERE id = ?",
@@ -894,9 +937,13 @@ class JobStore:
             raise ValueError(f"unsupported job fields: {sorted(unknown)}")
         assignments = [f"{field} = ?" for field in fields]
         values = [fields[field] for field in fields]
+        now = time.time()
+        if "status" in fields:
+            assignments.append("status_updated_at = ?")
+            values.append(now)
         assignments.append("updated_at = ?")
         placeholders = ", ".join("?" for _ in statuses)
-        values.extend([time.time(), job_id, *sorted(statuses)])
+        values.extend([now, job_id, *sorted(statuses)])
         with self._connect() as connection:
             result = connection.execute(
                 f"UPDATE jobs SET {', '.join(assignments)} "

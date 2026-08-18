@@ -6,7 +6,6 @@
     <div>
       <p class="page-kicker">TRANSCRIPTION COMPARISON</p>
       <h1>전사 엔진 비교</h1>
-      <p class="muted">동일한 미디어를 다음 엔진으로 전사한 결과입니다: {{ comparison_backend_labels }}</p>
     </div>
     <a href="/comparisons" class="button secondary">{{ icons.chevron_left(16) }}비교 이력</a>
   </div>
@@ -19,7 +18,6 @@
     <div class="section-heading compact-heading">
       <div>
         <h2>같은 미디어의 비교 기록</h2>
-        <p class="muted">같은 파일 세트로 실행한 비교를 분할 설정별 기록으로 표시합니다.</p>
       </div>
       <span class="history-count">{{ comparison_records|length }}건</span>
     </div>
@@ -57,21 +55,16 @@
       {% endfor %}
     </div>
   </section>
-  <p class="comparison-guidance">
-    정답 전사문이 없으므로 자동으로 우열을 판정하지 않습니다. 누락·반복·화자 분리와 문장 자연스러움을 나란히 확인하세요.
-  </p>
   <section class="card comparison-actions-card">
     <div class="section-heading">
       <div>
         <h2>다시 실행</h2>
-        <p class="muted">실패 작업만 이어서 재시도하거나, 엔진별 분할 설정을 바꿔 새 비교를 실행합니다.</p>
       </div>
     </div>
     <div class="comparison-action-grid">
       <div class="comparison-action-block">
         <div>
           <h3>실패 작업 재시도</h3>
-          <p>현재 비교에서 실패·중단된 엔진만 기존 설정으로 다시 실행합니다.</p>
         </div>
         <form method="post" action="/comparisons/{{ comparison_id }}/retry">
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
@@ -83,7 +76,6 @@
       <div class="comparison-action-block">
         <div>
           <h3>분할 설정 변경 후 새 비교</h3>
-          <p>현재 결과와 추출 오디오는 보존하고, 같은 WAV로 전사만 다시 실행합니다.</p>
         </div>
         <form
           method="post"
@@ -137,7 +129,6 @@
               >
             </label>
           </div>
-          <p class="field-help">각 값은 해당 엔진을 사용하는 모든 비교 작업에 적용됩니다.</p>
           <button type="submit">{{ icons.play(15) }}새 비교 실행</button>
         </form>
       </div>

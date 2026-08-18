@@ -5,7 +5,7 @@
     {% if all_terminal %}
       <span>비교 작업이 종료되었습니다.</span>
     {% else %}
-      <span>작업 상태가 바뀌면 이 화면을 자동으로 갱신합니다.</span>
+      <span>진행 중</span>
     {% endif %}
   </div>
   {% if translatable_source_count %}
@@ -21,7 +21,6 @@
       <section class="card comparison-translation-toolbar">
         <div>
           <h2>선택한 전사 결과로 번역</h2>
-          <p class="muted">완료된 결과 중 파일마다 사용할 엔진을 하나씩 선택하면 비교 기록은 유지하고 새 번역 작업으로 이어갑니다.</p>
         </div>
         <div class="comparison-translation-actions">
           <label>번역 프롬프트

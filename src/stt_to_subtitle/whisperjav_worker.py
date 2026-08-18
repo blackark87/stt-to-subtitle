@@ -1,4 +1,10 @@
-"""Run the pinned WhisperJAV domain ensemble in an isolated environment."""
+"""Run the pinned WhisperJAV domain ensemble in an isolated environment.
+
+The ensemble itself is vendored under ``stt_to_subtitle.vendor.whisperjav``
+and runs in this process. This module keeps the CLI contract and the result
+schema, resolves the pinned model snapshots, and performs forced alignment
+on the merged cues.
+"""
 
 from __future__ import annotations
 
@@ -8,15 +14,18 @@ import json
 import os
 from pathlib import Path
 import re
-import subprocess
 from tempfile import TemporaryDirectory
 import time
 from typing import Any, Mapping, Sequence
 import wave
 
 from .files import write_json_atomic
+from .vendor.whisperjav import presets
+from .vendor.whisperjav.runner import Cue, run_ensemble
 
 WHISPERJAV_RECIPE = "whisperjav-domain-ensemble-v1"
+# Upstream commit the vendored tree was copied from (see
+# vendor/whisperjav/VENDOR.md). Reported as the recipe revision.
 WHISPERJAV_COMMIT = "a69a43244e14612ebd3a1eb417bdd0de6d494d0f"
 ANIME_MODEL_ID = "litagin/anime-whisper"
 ANIME_MODEL_REVISION = "22e2008a8182b357da3922a6308d095008f72973"
@@ -138,95 +147,10 @@ def parse_srt(content: str) -> list[SubtitleCue]:
     return sorted(cues, key=lambda cue: (cue.start, cue.end, cue.text))
 
 
-def build_whisperjav_command(
-    *,
-    python: Path,
-    audio_path: Path,
-    output_dir: Path,
-    temp_dir: Path,
-    anime_model_path: Path,
-    qwen_model_path: Path,
-    options: WhisperJAVOptions,
-) -> list[str]:
-    """Build the fixed, auditable two-pass domain recipe."""
-    pass1_params = {
-        "generator_backend": "anime-whisper",
-        "model_id": str(anime_model_path),
-        "max_group_duration": options.anime_max_group_duration_seconds,
-        "timestamp_mode": "vad_only",
-        "use_aligner": False,
-        "context": "",
-    }
-    pass2_params = {
-        "generator_backend": "qwen3",
-        "model_id": str(qwen_model_path),
-        "max_group_duration": options.qwen_max_group_duration_seconds,
-        "timestamp_mode": "vad_only",
-        "use_aligner": False,
-        "context": "",
-    }
-    return [
-        str(python),
-        "-m",
-        "whisperjav.main",
-        str(audio_path),
-        "--ensemble",
-        "--ensemble-serial",
-        "--pass1-pipeline",
-        "qwen",
-        "--pass1-sensitivity",
-        "aggressive",
-        "--pass1-scene-detector",
-        "semantic",
-        "--pass1-speech-segmenter",
-        "whisperseg",
-        "--pass1-qwen-params",
-        json.dumps(pass1_params, sort_keys=True),
-        "--pass2-pipeline",
-        "qwen",
-        "--pass2-sensitivity",
-        "balanced",
-        "--pass2-scene-detector",
-        "semantic",
-        "--pass2-speech-segmenter",
-        "ten",
-        "--pass2-qwen-params",
-        json.dumps(pass2_params, sort_keys=True),
-        "--merge-strategy",
-        "pass1_primary",
-        "--language",
-        "japanese",
-        "--output-dir",
-        str(output_dir),
-        "--temp-dir",
-        str(temp_dir),
-        "--no-progress",
-        "--log-level",
-        "INFO",
-    ]
-
-
 def _snapshot(repo_id: str, revision: str) -> Path:
     from huggingface_hub import snapshot_download
 
     return Path(snapshot_download(repo_id=repo_id, revision=revision))
-
-
-def _ensemble_result(temp_dir: Path) -> tuple[Path, dict[str, Any]]:
-    summaries = sorted(temp_dir.glob("ensemble_summary_*.json"))
-    if not summaries:
-        raise RuntimeError("WhisperJAV did not write an ensemble summary")
-    try:
-        summary = json.loads(summaries[-1].read_text(encoding="utf-8"))
-        file_result = summary["files"][0]
-        final_output = Path(file_result["final_output"])
-    except (KeyError, IndexError, TypeError, json.JSONDecodeError) as error:
-        raise RuntimeError("WhisperJAV ensemble summary is invalid") from error
-    if not final_output.is_file():
-        raise RuntimeError("WhisperJAV final SRT is unavailable")
-    if str(file_result.get("status", "")) == "failed":
-        raise RuntimeError("WhisperJAV primary pass failed")
-    return final_output, dict(file_result)
 
 
 def _read_pcm16(audio_path: Path) -> tuple[Any, int]:
@@ -243,17 +167,21 @@ def _read_pcm16(audio_path: Path) -> tuple[Any, int]:
 
 
 def align_cues(
-    audio_path: Path,
-    cues: Sequence[SubtitleCue],
+    cues: Sequence[Cue],
     *,
+    audio: Any,
+    sample_rate: int,
     aligner_path: Path,
 ) -> tuple[list[dict[str, Any]], int]:
-    """Align final merged cues once and retain a bounded cue fallback."""
-    from whisperjav.modules.subtitle_pipeline.aligners.qwen3 import (
+    """Align final merged cues once and retain a bounded cue fallback.
+
+    Takes the decoded waveform rather than a path so the WAV is read once per
+    job instead of once here and once in ``run_whisperjav``.
+    """
+    from .vendor.whisperjav.modules.subtitle_pipeline.aligners.qwen3 import (
         Qwen3ForcedAlignerAdapter,
     )
 
-    audio, sample_rate = _read_pcm16(audio_path)
     slices = [
         audio[
             max(0, round(cue.start * sample_rate)) :
@@ -330,59 +258,49 @@ def run_whisperjav(
     anime_path = _snapshot(ANIME_MODEL_ID, ANIME_MODEL_REVISION)
     qwen_path = _snapshot(QWEN_MODEL_ID, QWEN_MODEL_REVISION)
     aligner_path = _snapshot(ALIGNER_MODEL_ID, ALIGNER_MODEL_REVISION)
+    audio, sample_rate = _read_pcm16(audio_path)
 
     with TemporaryDirectory(prefix="stt-whisperjav-") as directory:
-        work = Path(directory)
-        output_dir = work / "output"
-        temp_dir = work / "temp"
-        output_dir.mkdir()
-        temp_dir.mkdir()
-        command = build_whisperjav_command(
-            python=Path(os.sys.executable),
-            audio_path=audio_path,
-            output_dir=output_dir,
-            temp_dir=temp_dir,
-            anime_model_path=anime_path,
-            qwen_model_path=qwen_path,
-            options=validated,
-        )
-        completed = subprocess.run(
-            command,
-            check=False,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            env=os.environ.copy(),
-        )
-        if completed.returncode != 0:
-            detail = (completed.stderr or completed.stdout).strip()
-            raise RuntimeError(
-                "WhisperJAV ensemble failed"
-                + (f": {detail[-4000:]}" if detail else "")
-            )
-        final_srt, ensemble = _ensemble_result(temp_dir)
-        cues = parse_srt(final_srt.read_text(encoding="utf-8-sig"))
-        words, fallback_count = align_cues(
+        ensemble = run_ensemble(
             audio_path,
+            pass1=presets.pass1_config(
+                str(anime_path),
+                max_group_duration=(
+                    validated.anime_max_group_duration_seconds
+                ),
+            ),
+            pass2=presets.pass2_config(
+                str(qwen_path),
+                max_group_duration=(
+                    validated.qwen_max_group_duration_seconds
+                ),
+            ),
+            work_dir=Path(directory),
+            debug_artifact_dir=debug_artifact_dir,
+        )
+        cues = ensemble.cues
+        words, fallback_count = align_cues(
             cues,
+            audio=audio,
+            sample_rate=sample_rate,
             aligner_path=aligner_path,
         )
         if debug_artifact_dir is not None:
             debug_artifact_dir.mkdir(parents=True, exist_ok=True)
             (debug_artifact_dir / "merged.srt").write_text(
-                final_srt.read_text(encoding="utf-8-sig"),
+                ensemble.merged_srt_path.read_text(encoding="utf-8-sig"),
                 encoding="utf-8",
             )
             write_json_atomic(
                 debug_artifact_dir / "ensemble.json",
-                ensemble,
+                _ensemble_report(ensemble),
             )
             write_json_atomic(
                 debug_artifact_dir / "aligned_words.json",
                 {"words": words, "fallback_count": fallback_count},
             )
 
+    report = _ensemble_report(ensemble)
     return {
         "model": {
             "id": "whisperjav-domain-ensemble",
@@ -407,12 +325,15 @@ def run_whisperjav(
             "asr_pass_count": 2,
             "alignment_pass_count": 1,
             "simultaneous_model_residency": False,
+            "internalized": True,
+            "scene_count": ensemble.scene_count,
+            "stage_elapsed": dict(ensemble.stage_elapsed),
         },
         "quality": {
-            "ensemble_status": ensemble.get("status", "completed"),
-            "pass1": ensemble.get("pass1", {}),
-            "pass2": ensemble.get("pass2", {}),
-            "merge": ensemble.get("merge", {}),
+            "ensemble_status": report["status"],
+            "pass1": report["pass1"],
+            "pass2": report["pass2"],
+            "merge": report["merge"],
             "alignment_fallback_count": fallback_count,
         },
         "options": {"whisperjav": asdict(validated)},
@@ -426,6 +347,37 @@ def run_whisperjav(
             }
             for cue in cues
         ],
+    }
+
+
+def _ensemble_report(ensemble: Any) -> dict[str, Any]:
+    """Summarise one ensemble run for the result payload and debug artifact."""
+
+    def summary(outcome: Any) -> dict[str, Any]:
+        # Same keys the external CLI reported, minus the SRT paths: those
+        # pointed into a temporary directory that no longer exists by the
+        # time a caller could read them.
+        record = {
+            "status": outcome.status,
+            "subtitles": outcome.subtitle_count,
+            "processing_time": outcome.elapsed_seconds,
+            "filters": outcome.filter_stats,
+        }
+        if outcome.error is not None:
+            record["error"] = outcome.error
+        return record
+
+    return {
+        "status": ensemble.status,
+        "scene_count": ensemble.scene_count,
+        "stage_elapsed": dict(ensemble.stage_elapsed),
+        "pass1": summary(ensemble.pass1),
+        "pass2": summary(ensemble.pass2),
+        "merge": {
+            "status": ensemble.status,
+            "strategy": ensemble.merge_stats.get("strategy"),
+            "statistics": dict(ensemble.merge_stats),
+        },
     }
 
 

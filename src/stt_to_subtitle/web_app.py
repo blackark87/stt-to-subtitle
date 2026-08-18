@@ -13,7 +13,7 @@ import os
 from pathlib import Path
 import secrets
 from typing import Any, AsyncIterator
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urlsplit
 
 from fastapi import FastAPI, Form, HTTPException, Request, status
 from fastapi.responses import (
@@ -88,7 +88,7 @@ JOB_STATUS_GROUPS = {
 }
 JOB_STATUS_GROUP_LABELS = {
     "running": "진행 중",
-    "attention": "확인 필요",
+    "attention": "중단·실패",
     "waiting": "대기",
     "completed": "완료",
 }
@@ -160,7 +160,7 @@ JOB_STATUS_LABELS = {
     "translated": "자막 생성 대기",
     "rendering": "자막 생성 중",
     "completed": "완료",
-    "blocked": "확인 필요",
+    "blocked": "중단",
     "failed": "실패",
 }
 MEDIA_PROCESSING_LABELS = {
@@ -227,7 +227,8 @@ STAGE_STATE_LABELS = {
     "running": "진행 중",
     "waiting": "대기",
     "paused": "중단됨",
-    "failed": "확인 필요",
+    "blocked": "중단",
+    "failed": "실패",
     "pending": "대기",
 }
 
@@ -252,7 +253,7 @@ def job_stage_view(job: Any) -> list[dict[str, Any]]:
     elif status in {"blocked", "failed"}:
         blocked = str(job.blocked_stage or "")
         active = blocked if blocked in stages else stages[0]
-        active_state = "failed"
+        active_state = "blocked" if status == "blocked" else "failed"
     elif status == "queued":
         active = (
             "translation" if str(job.operation) == "translate" else stages[0]
@@ -316,7 +317,8 @@ def job_progress_view(job: Any) -> dict[str, Any]:
         (
             stage
             for stage in stages
-            if stage["state"] in {"running", "failed", "paused", "waiting"}
+            if stage["state"]
+            in {"running", "blocked", "failed", "paused", "waiting"}
         ),
         stages[-1] if stages else None,
     )
@@ -343,6 +345,8 @@ def comparison_audio_stage(jobs: Sequence[Any]) -> dict[str, str]:
         state = "done"
     elif "failed" in states:
         state = "failed"
+    elif "blocked" in states:
+        state = "blocked"
     elif "running" in states or "done" in states:
         state = "running"
     elif "waiting" in states:
@@ -526,6 +530,29 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             "Permissions-Policy",
             "xr-spatial-tracking=(self)",
         )
+        if (
+            request.method == "POST"
+            and (
+                request.url.path == "/jobs"
+                or request.url.path.startswith("/jobs/")
+                or request.url.path.startswith("/comparisons/")
+            )
+            and response.status_code
+            in {status.HTTP_302_FOUND, status.HTTP_303_SEE_OTHER}
+            and response.headers.get("location") != "/login"
+        ):
+            referer = request.headers.get("referer", "").strip()
+            parsed_referer = urlsplit(referer)
+            if (
+                parsed_referer.scheme == request.url.scheme
+                and parsed_referer.netloc == request.url.netloc
+                and parsed_referer.path.startswith("/")
+                and not parsed_referer.path.startswith("//")
+            ):
+                return_location = parsed_referer.path
+                if parsed_referer.query:
+                    return_location += f"?{parsed_referer.query}"
+                response.headers["location"] = return_location
         return response
 
     app.add_middleware(
@@ -631,7 +658,10 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
 
     def job_stats(service: SubtitleOrchestrator) -> dict[str, int]:
         return {
-            group: service.store.count_jobs(statuses=statuses)
+            group: service.store.count_jobs(
+                statuses=statuses,
+                include_comparison_transcriptions=False,
+            )
             for group, statuses in JOB_STATUS_GROUPS.items()
         }
 
@@ -661,7 +691,8 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             "job_stage_filters": JOB_STAGE_FILTER_NAV,
             "job_stage_counts": {
                 stage["key"]: service.store.count_jobs(
-                    statuses=JOB_STAGE_FILTERS[stage["key"]]
+                    statuses=JOB_STAGE_FILTERS[stage["key"]],
+                    include_comparison_transcriptions=False,
                 )
                 for stage in JOB_STAGE_FILTER_NAV
             },
@@ -693,13 +724,25 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         else:
             statuses = None
         jobs_page = max(1, jobs_page) if paginated else 1
-        job_count = service.store.count_jobs(statuses=statuses)
+        job_count = service.store.count_jobs(
+            statuses=statuses,
+            include_comparison_transcriptions=False,
+        )
         jobs_offset = (jobs_page - 1) * limit
-        open_jobs = service.store.list_open_jobs()
+        all_visible_jobs = service.store.list_jobs(
+            limit=None,
+            include_comparison_transcriptions=False,
+        )
+        open_jobs = [
+            job
+            for job in all_visible_jobs
+            if job.status not in SUCCESS_STATUSES
+        ]
         recent_jobs = service.store.list_jobs(
             limit=limit,
             offset=jobs_offset,
             statuses=statuses,
+            include_comparison_transcriptions=False,
         )
         latest_jobs = service.store.latest_jobs_by_source()
         translatable_job_ids = {
@@ -710,6 +753,16 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             and latest_jobs.get(job.source_rel) is not None
             and latest_jobs[job.source_rel].id == job.id
         }
+        stoppable_job_ids = (
+            {
+                job.id
+                for job in all_visible_jobs
+                if job.can_stop
+                and (statuses is None or job.status in statuses)
+            }
+            if paginated
+            else set()
+        )
 
         def page_location(page: int) -> str:
             if folder:
@@ -735,6 +788,8 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             "recent_jobs": recent_jobs,
             "translatable_job_ids": translatable_job_ids,
             "translatable_job_count": len(translatable_job_ids),
+            "stoppable_job_ids": stoppable_job_ids,
+            "stoppable_selection_count": len(stoppable_job_ids),
             "stoppable_job_count": sum(job.can_stop for job in open_jobs),
             "retriable_job_count": sum(job.can_retry for job in open_jobs),
             "pausable_translation_count": sum(
@@ -757,14 +812,6 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             ),
             "job_count": job_count,
             "job_list_title": f"{label} 작업",
-            "job_list_description": (
-                f"{label} 단계만 최신순으로, 페이지당 {limit}개씩 표시합니다."
-                if filtered
-                else (
-                    f"최신순, 페이지당 {limit}개 · "
-                    "중단 요청은 안전한 지점에서 반영됩니다."
-                )
-            ),
             "job_list_empty_message": (
                 f"{label} 단계의 작업이 없습니다."
                 if filtered
@@ -963,7 +1010,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                 )
             elif "attention" in states:
                 media["subtitle_state"] = "attention"
-                media["processing_label"] = "일부 파트 확인 필요"
+                media["processing_label"] = "일부 파트 중단·실패"
             elif "running" in states:
                 media["subtitle_state"] = "running"
                 media["processing_label"] = "일부 파트 처리 중"
@@ -1156,6 +1203,12 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         attention_count = sum(
             job.status in RETRYABLE_STATUSES for job in comparison_jobs
         )
+        blocked_count = sum(
+            job.status == "blocked" for job in comparison_jobs
+        )
+        failed_count = sum(
+            job.status == "failed" for job in comparison_jobs
+        )
         active_count = sum(
             job.status in RUNNING_STATUSES for job in comparison_jobs
         )
@@ -1166,10 +1219,14 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             0,
             len(comparison_jobs) - terminal_count - active_count,
         )
-        if attention_count:
+        if failed_count:
             status_group = "attention"
-            status_label = "확인 필요"
+            status_label = "실패"
             status_value = "failed"
+        elif blocked_count:
+            status_group = "attention"
+            status_label = "중단"
+            status_value = "blocked"
         elif active_count:
             status_group = "running"
             status_label = "진행 중"
@@ -1192,6 +1249,8 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             "job_count": len(comparison_jobs),
             "completed_count": completed_count,
             "attention_count": attention_count,
+            "blocked_count": blocked_count,
+            "failed_count": failed_count,
             "active_count": active_count,
             "waiting_count": waiting_count,
             "terminal_count": terminal_count,
@@ -1959,12 +2018,11 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                 context.update(
                     {
                         "job_list_title": "최근 작업",
-                        "job_list_description": (
-                            f"가장 최근에 갱신된 {DASHBOARD_JOB_LIMIT}건"
-                        ),
                         "show_bulk_actions": False,
                         "translatable_job_ids": set(),
                         "translatable_job_count": 0,
+                        "stoppable_job_ids": set(),
+                        "stoppable_selection_count": 0,
                     }
                 )
         except ValueError as error:
@@ -2912,6 +2970,40 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         stopped_count = orchestrator(request).stop_all_jobs()
         return RedirectResponse(
             dashboard_location(return_folder, jobs_stopped=stopped_count),
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+
+    @app.post("/jobs/stop-selected")
+    def stop_selected_jobs(
+        request: Request,
+        job_ids: list[str] | None = Form(None),
+        csrf_token: str = Form(""),
+        return_folder: str = Form(""),
+        return_status_group: str = Form(""),
+        return_stage_filter: str = Form(""),
+        return_jobs_page: int = Form(1),
+    ) -> Any:
+        if not is_authenticated(request):
+            return login_redirect()
+        validate_csrf(request, csrf_token)
+        redirect_page = (
+            1
+            if return_status_group or return_stage_filter
+            else return_jobs_page
+        )
+        try:
+            return_location = job_list_action_location(
+                return_folder=return_folder,
+                return_status_group=return_status_group,
+                return_stage_filter=return_stage_filter,
+                return_jobs_page=redirect_page,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        stopped_count = orchestrator(request).stop_jobs(job_ids or [])
+        separator = "&" if "?" in return_location else "?"
+        return RedirectResponse(
+            f"{return_location}{separator}jobs_stopped={stopped_count}",
             status_code=status.HTTP_303_SEE_OTHER,
         )
 

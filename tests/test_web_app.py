@@ -110,7 +110,7 @@ class JobStageViewTests(unittest.TestCase):
             [
                 ("추출", "done"),
                 ("전사", "done"),
-                ("번역", "failed"),
+                ("번역", "blocked"),
                 ("완료", "pending"),
             ],
         )
@@ -354,7 +354,6 @@ class WebAppTests(unittest.TestCase):
                         options={},
                     )
                     service.store.update(job.id, status=status)
-
                 page = client.get("/jobs")
                 transcription = client.get(
                     "/jobs?stage_filter=transcription"
@@ -417,20 +416,22 @@ class WebAppTests(unittest.TestCase):
                     stage_counts.text,
                     rf'href="/jobs\?stage_filter={stage_filter}"[^>]*>'
                     rf'\s*<span>{label}</span>\s*'
-                    rf'<span class="job-stage-filter-count" '
-                    rf'aria-label="{count}건">{count}</span>',
+                    rf'<span\s+class="job-stage-filter-count"\s+'
+                    rf'aria-label="{count}건"\s*>\s*{count}</span>',
                 )
             self.assertRegex(
                 refreshed_stage_counts.text,
                 r'href="/jobs\?stage_filter=extraction"[^>]*>\s*'
-                r'<span>추출</span>\s*<span '
-                r'class="job-stage-filter-count" aria-label="0건">0</span>',
+                r'<span>추출</span>\s*<span\s+'
+                r'class="job-stage-filter-count"\s+aria-label="0건"\s*>'
+                r'\s*0</span>',
             )
             self.assertRegex(
                 refreshed_stage_counts.text,
                 r'href="/jobs\?stage_filter=transcription"[^>]*>\s*'
-                r'<span>전사</span>\s*<span '
-                r'class="job-stage-filter-count" aria-label="4건">4</span>',
+                r'<span>전사</span>\s*<span\s+'
+                r'class="job-stage-filter-count"\s+aria-label="4건"\s*>'
+                r'\s*4</span>',
             )
             self.assertIn("transcription-waiting.mkv", transcription.text)
             self.assertIn("transcription-running.mkv", transcription.text)
@@ -460,6 +461,72 @@ class WebAppTests(unittest.TestCase):
             )
             self.assertEqual(invalid.status_code, 400)
 
+    def test_comparison_only_transcriptions_stay_out_of_job_history(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            for filename in (
+                "regular.mkv",
+                "comparison-only.mkv",
+                "translated-comparison.mkv",
+            ):
+                (media_root / filename).write_bytes(b"media")
+            with TestClient(create_app(self.settings(root, media_root))) as client:
+                service = client.app.state.orchestrator
+                service.stop()
+                regular = service.store.create(
+                    job_id="regular-transcription",
+                    source_rel="regular.mkv",
+                    force_overwrite=False,
+                    options={},
+                    operation="transcribe",
+                )
+                service.store.update(
+                    regular.id,
+                    status="transcription_completed",
+                )
+                comparison = service.store.create(
+                    job_id="comparison-only",
+                    source_rel="comparison-only.mkv",
+                    force_overwrite=False,
+                    options={"comparison_id": "comparison-1"},
+                    operation="transcribe",
+                )
+                service.store.update(
+                    comparison.id,
+                    status="transcription_completed",
+                )
+                translated = service.store.create(
+                    job_id="translated-comparison",
+                    source_rel="translated-comparison.mkv",
+                    force_overwrite=True,
+                    options={"comparison_id": "comparison-1"},
+                    operation="full",
+                )
+                service.store.update(translated.id, status="completed")
+
+                jobs = client.get("/jobs")
+                transcription = client.get(
+                    "/jobs?stage_filter=transcription_completed"
+                )
+                comparison_history = client.get(
+                    "/comparisons/comparison-1"
+                )
+
+            self.assertNotIn("comparison-only.mkv", jobs.text)
+            self.assertNotIn("comparison-only.mkv", transcription.text)
+            self.assertIn("regular.mkv", transcription.text)
+            self.assertEqual(
+                transcription.text.count('class="recent-job-item'),
+                1,
+            )
+            self.assertIn("translated-comparison.mkv", jobs.text)
+            self.assertEqual(jobs.text.count('class="recent-job-item'), 2)
+            self.assertIn("엔진 작업 2개", comparison_history.text)
+
     def test_primary_pages_separate_overview_media_and_job_history(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -473,14 +540,16 @@ class WebAppTests(unittest.TestCase):
                 jobs = client.get("/jobs")
                 stylesheet = client.get("/static/app.css")
 
-            self.assertIn("파이프라인 상태와 최근 작업", dashboard.text)
+            self.assertIn("<h1>대시보드</h1>", dashboard.text)
+            self.assertNotIn("파이프라인 상태와 최근 작업", dashboard.text)
             self.assertNotIn('class="media-board"', dashboard.text)
             self.assertIn('aria-current="page"', dashboard.text)
             self.assertIn('href="/media"', dashboard.text)
             self.assertIn("movie.mp4", media.text)
             self.assertIn('class="media-board"', media.text)
             self.assertNotIn("최근 작업", media.text)
-            self.assertIn("상태별 작업", jobs.text)
+            self.assertIn("<h1>전체 작업</h1>", jobs.text)
+            self.assertNotIn("상태별 작업", jobs.text)
             self.assertIn('href="/jobs" class="is-active"', jobs.text)
             self.assertNotIn('class="topbar"', dashboard.text)
             self.assertIn("position: fixed", stylesheet.text)
@@ -488,6 +557,50 @@ class WebAppTests(unittest.TestCase):
                 "grid-template-columns: repeat(4, minmax(0, 1fr))",
                 stylesheet.text,
             )
+
+    def test_job_mutations_keep_the_exact_current_page(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            (media_root / "show").mkdir()
+            (media_root / "show" / "movie.mp4").write_bytes(b"media")
+            (media_root / "show" / "new.mp4").write_bytes(b"media")
+
+            with TestClient(create_app(self.settings(root, media_root))) as client:
+                service = client.app.state.orchestrator
+                service.stop()
+                waiting = service.store.create(
+                    job_id="stay-put",
+                    source_rel="show/movie.mp4",
+                    force_overwrite=False,
+                    options={},
+                )
+                service.store.update(waiting.id, status="transcribed")
+
+                jobs_location = (
+                    "/jobs?stage_filter=translation_waiting&jobs_page=4"
+                )
+                paused = client.post(
+                    f"/jobs/{waiting.id}/pause-translation",
+                    headers={"referer": f"http://testserver{jobs_location}"},
+                    follow_redirects=False,
+                )
+                media_location = "/media?folder=show&q=movie"
+                queued = client.post(
+                    "/jobs",
+                    data={
+                        "source_rels": "show/new.mp4",
+                        "operation": "transcribe",
+                    },
+                    headers={"referer": f"http://testserver{media_location}"},
+                    follow_redirects=False,
+                )
+
+            self.assertEqual(paused.status_code, 303)
+            self.assertEqual(paused.headers["location"], jobs_location)
+            self.assertEqual(queued.status_code, 303)
+            self.assertEqual(queued.headers["location"], media_location)
 
     def test_dashboard_renders_live_gpu_metrics_without_leaving_stt(self) -> None:
         with TemporaryDirectory() as directory:
@@ -891,11 +1004,12 @@ class WebAppTests(unittest.TestCase):
             self.assertNotIn("<table", dashboard.text)
             self.assertIn("최근 작업", dashboard.text)
             self.assertIn("전사 중", dashboard.text)
-            self.assertIn("확인 필요", dashboard.text)
+            self.assertIn("중단", dashboard.text)
+            self.assertNotIn("확인 필요", dashboard.text)
             self.assertIn('class="job-stage-strip"', dashboard.text)
             self.assertIn('class="job-progress-overview"', dashboard.text)
             self.assertIn("전체 진행률", dashboard.text)
-            self.assertIn("추출된 WAV 재생 시간", dashboard.text)
+            self.assertNotIn("추출된 WAV 재생 시간", dashboard.text)
             self.assertIn(">7/≈15<", dashboard.text)
             self.assertIn("movie.mkv", dashboard.text)
             self.assertIn("show", dashboard.text)
@@ -1244,7 +1358,7 @@ class WebAppTests(unittest.TestCase):
                 "audio_completed": "오디오 추출 완료",
                 "transcription_completed": "전사 완료",
                 "translation_running": "번역 중",
-                "blocked": "확인 필요 · 번역",
+                "blocked": "중단 · 번역",
                 "completed": "자막 생성 완료",
                 "subtitle_present": "한국어 자막 있음",
             }
@@ -1901,6 +2015,58 @@ class WebAppTests(unittest.TestCase):
             self.assertEqual(extraction.status, "blocked")
             self.assertIn("전체 작업 중단 요청됨", refreshed.text)
 
+    def test_job_list_stops_selected_jobs_across_filtered_pages(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+
+            with TestClient(create_app(self.settings(root, media_root))) as client:
+                service = client.app.state.orchestrator
+                service.stop()
+                jobs = []
+                for index in range(25):
+                    job = service.store.create(
+                        job_id=f"waiting-{index:02d}",
+                        source_rel=f"waiting-{index:02d}.mkv",
+                        force_overwrite=False,
+                        options={},
+                    )
+                    service.store.update(job.id, status="transcribed")
+                    jobs.append(job)
+
+                page = client.get(
+                    "/jobs?stage_filter=translation_waiting&jobs_page=1"
+                )
+                response = client.post(
+                    "/jobs/stop-selected",
+                    data={
+                        "job_ids": [jobs[0].id, jobs[-1].id],
+                        "return_stage_filter": "translation_waiting",
+                        "return_jobs_page": "2",
+                    },
+                    follow_redirects=False,
+                )
+                selected = [
+                    service.store.get(jobs[0].id),
+                    service.store.get(jobs[-1].id),
+                ]
+                untouched = service.store.get(jobs[1].id)
+
+            self.assertEqual(page.status_code, 200)
+            self.assertEqual(page.text.count("data-stop-job-checkbox"), 20)
+            self.assertEqual(page.text.count("data-stop-job-candidate"), 25)
+            self.assertIn('action="/jobs/stop-selected"', page.text)
+            self.assertIn("목록 전체 선택", page.text)
+            self.assertEqual(response.status_code, 303)
+            self.assertEqual(
+                response.headers["location"],
+                "/jobs?stage_filter=translation_waiting&jobs_page=1"
+                "&jobs_stopped=2",
+            )
+            self.assertTrue(all(job.status == "blocked" for job in selected))
+            self.assertEqual(untouched.status, "transcribed")
+
     def test_bulk_retry_restarts_all_attention_jobs(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2306,6 +2472,7 @@ class WebAppTests(unittest.TestCase):
                     "speaker_debounce_sec": 0.1,
                     "kotoba_chunk_length_seconds": 15,
                     "whisperx_chunk_length_seconds": 30,
+                    "rescue_scope": "windows",
                 },
             )
             self.assertEqual(
@@ -2384,7 +2551,8 @@ class WebAppTests(unittest.TestCase):
                 f'value="{jobs[0].id}"',
                 partial_comparison.text,
             )
-            self.assertIn(
+            self.assertIn("선택한 전사 결과로 번역", partial_comparison.text)
+            self.assertNotIn(
                 "완료된 결과 중 파일마다 사용할 엔진",
                 partial_comparison.text,
             )
@@ -2717,8 +2885,9 @@ class WebAppTests(unittest.TestCase):
                 "기존 WhisperX 청크 1개는 30초로 보정했습니다.",
                 notice.text,
             )
-            self.assertIn(
-                "동일한 미디어를 다음 엔진으로 전사한 결과입니다: WhisperX",
+            self.assertIn("<h1>전사 엔진 비교</h1>", notice.text)
+            self.assertNotIn(
+                "동일한 미디어를 다음 엔진으로 전사한 결과입니다",
                 notice.text,
             )
             self.assertNotIn("<h3>WhisperJAV</h3>", notice.text)

@@ -46,6 +46,12 @@ RUN /opt/venvs/kotoba/bin/python -m pip install --no-cache-dir --no-deps \
         /tmp/stt-wheel/*.whl \
     && rm -rf /tmp/stt-wheel
 
+# The vendored ensemble must be importable, and the upstream package must be
+# gone — otherwise the worker could silently keep using the old install.
+RUN /opt/venvs/whisperjav/bin/python -c \
+        "from stt_to_subtitle.vendor.whisperjav.runner import run_ensemble" \
+    && ! /opt/venvs/whisperjav/bin/python -c "import whisperjav" 2>/dev/null
+
 USER app
 WORKDIR /app
 EXPOSE 8100

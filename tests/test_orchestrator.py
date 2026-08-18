@@ -142,6 +142,87 @@ class SubtitleOrchestratorTests(unittest.TestCase):
             finally:
                 orchestrator.stop()
 
+    def test_keeps_an_optional_batch_size_for_whisperx_backends(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            (media_root / "movie.mkv").write_bytes(b"media")
+            orchestrator = self.make_orchestrator(root, media_root)
+            try:
+                for index, backend in enumerate(("whisperx", "hybrid")):
+                    with self.subTest(backend=backend):
+                        job = orchestrator.create_job(
+                            "movie.mkv",
+                            force_overwrite=True,
+                            options={
+                                "backend": backend,
+                                "batch_size": 16,
+                                "start_seconds": index,
+                            },
+                        )
+
+                        self.assertEqual(job.options["batch_size"], 16)
+            finally:
+                orchestrator.stop()
+
+    def test_omits_batch_size_when_the_request_leaves_it_unset(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            (media_root / "movie.mkv").write_bytes(b"media")
+            orchestrator = self.make_orchestrator(root, media_root)
+            try:
+                job = orchestrator.create_job(
+                    "movie.mkv",
+                    force_overwrite=False,
+                    options={"backend": "hybrid"},
+                )
+
+                self.assertNotIn("batch_size", job.options)
+            finally:
+                orchestrator.stop()
+
+    def test_rejects_batch_size_that_the_stt_service_would_refuse(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            (media_root / "movie.mkv").write_bytes(b"media")
+            orchestrator = self.make_orchestrator(root, media_root)
+            try:
+                for backend in ("kotoba", "whisperjav"):
+                    with self.subTest(backend=backend):
+                        with self.assertRaisesRegex(
+                            ValueError, "batch_size requires backend"
+                        ):
+                            orchestrator.create_job(
+                                "movie.mkv",
+                                force_overwrite=True,
+                                options={
+                                    "backend": backend,
+                                    "batch_size": 8,
+                                },
+                            )
+                for value in (0, 65):
+                    with self.subTest(value=value):
+                        with self.assertRaisesRegex(
+                            ValueError, "between 1 and 64"
+                        ):
+                            orchestrator.create_job(
+                                "movie.mkv",
+                                force_overwrite=True,
+                                options={
+                                    "backend": "whisperx",
+                                    "batch_size": value,
+                                },
+                            )
+            finally:
+                orchestrator.stop()
+
     def test_updates_and_reloads_remote_servers_without_restart(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -185,7 +266,9 @@ class SubtitleOrchestratorTests(unittest.TestCase):
             finally:
                 reloaded.stop()
 
-    def test_translation_worker_limit_does_not_limit_file_dispatch(self) -> None:
+    def test_translation_workers_are_reserved_for_one_file_at_a_time(
+        self,
+    ) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
             media_root = root / "media"
@@ -213,17 +296,34 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                     orchestrator.store.update(job.id, status="transcribed")
                 orchestrator._translation_executor.submit = Mock()
 
-                dispatched = orchestrator._dispatch_translations()
+                first_dispatched = orchestrator._dispatch_translations()
                 running = orchestrator.store.ids_with_status(
                     "translation_running"
                 )
                 waiting = orchestrator.store.ids_with_status("transcribed")
+                second_dispatched = orchestrator._dispatch_translations()
+                orchestrator.store.update(running[0], status="translated")
+                third_dispatched = orchestrator._dispatch_translations()
+                next_running = orchestrator.store.ids_with_status(
+                    "translation_running"
+                )
+                next_waiting = orchestrator.store.ids_with_status(
+                    "transcribed"
+                )
             finally:
                 orchestrator.stop()
 
-            self.assertEqual(dispatched, 3)
-            self.assertEqual(len(running), 3)
-            self.assertEqual(len(waiting), 0)
+            self.assertEqual(first_dispatched, 1)
+            self.assertEqual(len(running), 1)
+            self.assertEqual(len(waiting), 2)
+            self.assertEqual(second_dispatched, 0)
+            self.assertEqual(third_dispatched, 1)
+            self.assertEqual(len(next_running), 1)
+            self.assertEqual(len(next_waiting), 1)
+            self.assertEqual(
+                orchestrator._translation_executor.submit.call_count,
+                2,
+            )
 
     def test_requires_web_server_settings_before_creating_job(self) -> None:
         with TemporaryDirectory() as directory:
@@ -823,6 +923,54 @@ class SubtitleOrchestratorTests(unittest.TestCase):
             self.assertFalse(running_after_stop.job_stop_requested)
             self.assertEqual(paused_after_request.status, "translation_paused")
 
+    def test_stops_only_selected_jobs(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            orchestrator = self.make_orchestrator(root, media_root)
+            try:
+                waiting = orchestrator.store.create(
+                    job_id="selected-waiting",
+                    source_rel="selected-waiting.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                running = orchestrator.store.create(
+                    job_id="selected-running",
+                    source_rel="selected-running.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                orchestrator.store.update(
+                    running.id,
+                    status="transcription_running",
+                )
+                untouched = orchestrator.store.create(
+                    job_id="untouched",
+                    source_rel="untouched.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+
+                stopped_count = orchestrator.stop_jobs(
+                    [waiting.id, running.id, waiting.id, "missing"]
+                )
+                waiting = orchestrator.store.get(waiting.id)
+                running = orchestrator.store.get(running.id)
+                untouched = orchestrator.store.get(untouched.id)
+            finally:
+                orchestrator.stop()
+
+            self.assertEqual(stopped_count, 2)
+            self.assertEqual(waiting.status, "blocked")
+            self.assertEqual(
+                waiting.error,
+                "사용자 요청으로 작업이 중단되었습니다.",
+            )
+            self.assertTrue(running.job_stop_requested)
+            self.assertEqual(untouched.status, "queued")
+
     def test_retries_all_blocked_and_failed_jobs(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1111,6 +1259,7 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                     options={
                         "start_seconds": "10",
                         "backend": "hybrid",
+                        "batch_size": 12,
                     },
                 )
                 audio_path = root / "state" / "jobs" / job.id / "audio.wav"
@@ -1192,6 +1341,7 @@ class SubtitleOrchestratorTests(unittest.TestCase):
             self.assertEqual(sent_options["chunk_length_seconds"], 15)
             self.assertTrue(sent_options["noise_filter"])
             self.assertEqual(sent_options["backend"], "hybrid")
+            self.assertEqual(sent_options["batch_size"], 12)
             self.assertEqual(
                 sent_options["subtitle_segmentation"],
                 {
@@ -1215,6 +1365,7 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                     "speaker_debounce_sec": 0.1,
                     "kotoba_chunk_length_seconds": 15,
                     "whisperx_chunk_length_seconds": 30,
+                    "rescue_scope": "windows",
                 },
             )
             self.assertEqual(completed_job.status, "completed")
@@ -1468,5 +1619,142 @@ class SubtitleOrchestratorTests(unittest.TestCase):
             try:
                 with self.assertRaisesRegex(ValueError, "completed jobs"):
                     orchestrator.restart_translation(job.id)
+            finally:
+                orchestrator.stop()
+
+
+class _RecordingExecutor:
+    """Capture dispatches without running the stage operation."""
+
+    def __init__(self) -> None:
+        self.submitted: list[tuple[str, str]] = []
+
+    def submit(self, _run_stage, job_id, stage, _operation):  # noqa: ANN001
+        self.submitted.append((stage, job_id))
+
+    def shutdown(self, **_kwargs) -> None:
+        return None
+
+
+class SchedulerDispatchTests(unittest.TestCase):
+    def make_orchestrator(
+        self,
+        root: Path,
+        media_root: Path,
+        *,
+        audio_workers: int = 1,
+    ) -> SubtitleOrchestrator:
+        orchestrator = SubtitleOrchestrator(
+            WebSettings(
+                state_dir=root / "state",
+                media_root=media_root,
+                admin_password="admin-password",
+                session_secret="a" * 32,
+                stt_base_url="http://stt.test",
+                stt_token="stt-token",
+                lm_base_url="http://lm.test/v1",
+                lm_token="lm-token",
+                lm_model="model",
+                audio_workers=audio_workers,
+            )
+        )
+        orchestrator._audio_executor = _RecordingExecutor()
+        orchestrator._render_executor = _RecordingExecutor()
+        orchestrator._stt_executor = _RecordingExecutor()
+        orchestrator._translation_executor = _RecordingExecutor()
+        return orchestrator
+
+    def test_render_does_not_block_the_next_audio_extraction(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            (media_root / "one.mkv").write_bytes(b"media")
+            (media_root / "two.mkv").write_bytes(b"media")
+            orchestrator = self.make_orchestrator(root, media_root)
+            try:
+                ready = orchestrator.create_job(
+                    "one.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                queued = orchestrator.create_job(
+                    "two.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                orchestrator.store.update(ready.id, status="translated")
+
+                orchestrator._scheduler_tick()
+
+                self.assertEqual(
+                    orchestrator._render_executor.submitted,
+                    [("render", ready.id)],
+                )
+                self.assertEqual(
+                    orchestrator._audio_executor.submitted,
+                    [("audio extraction", queued.id)],
+                )
+            finally:
+                orchestrator.stop()
+
+    def test_extraction_keeps_running_while_a_render_is_in_flight(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            (media_root / "one.mkv").write_bytes(b"media")
+            (media_root / "two.mkv").write_bytes(b"media")
+            orchestrator = self.make_orchestrator(root, media_root)
+            try:
+                rendering = orchestrator.create_job(
+                    "one.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                queued = orchestrator.create_job(
+                    "two.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                orchestrator.store.update(rendering.id, status="rendering")
+
+                orchestrator._scheduler_tick()
+
+                self.assertEqual(orchestrator._render_executor.submitted, [])
+                self.assertEqual(
+                    orchestrator._audio_executor.submitted,
+                    [("audio extraction", queued.id)],
+                )
+            finally:
+                orchestrator.stop()
+
+    def test_audio_workers_bound_the_concurrent_extractions(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            for name in ("one.mkv", "two.mkv", "three.mkv"):
+                (media_root / name).write_bytes(b"media")
+            orchestrator = self.make_orchestrator(
+                root,
+                media_root,
+                audio_workers=2,
+            )
+            try:
+                orchestrator.create_jobs(
+                    ["one.mkv", "two.mkv", "three.mkv"],
+                    force_overwrite=False,
+                    options={},
+                )
+
+                orchestrator._scheduler_tick()
+
+                self.assertEqual(
+                    len(orchestrator._audio_executor.submitted),
+                    2,
+                )
             finally:
                 orchestrator.stop()

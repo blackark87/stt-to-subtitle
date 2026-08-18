@@ -20,7 +20,7 @@ class ReleaseConfigurationTests(unittest.TestCase):
         self.assertIn("dockerfile: Dockerfile.stt-runtime", compose)
         self.assertEqual(compose.count("context: ${WORKSPACE:-.}"), 3)
         self.assertIn("STT_RUNTIME_IMAGE:", compose)
-        self.assertIn("stt-to-subtitle-stt-runtime:py311-cuda-v2", compose)
+        self.assertIn("stt-to-subtitle-stt-runtime:py311-cuda-v4", compose)
         stt_dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
         runtime_dockerfile = (ROOT / "Dockerfile.stt-runtime").read_text(
             encoding="utf-8"
@@ -35,18 +35,21 @@ class ReleaseConfigurationTests(unittest.TestCase):
             "COPY --from=whisperjav-builder /opt/venvs/whisperjav",
             runtime_dockerfile,
         )
-        self.assertIn("--extra qwen", runtime_dockerfile)
-        self.assertNotIn("--extra cli", runtime_dockerfile)
-        self.assertIn("ten-vad==1.0.6.8", runtime_dockerfile)
-        self.assertIn("onnxruntime-gpu==1.23.2", runtime_dockerfile)
+        # WhisperJAV is vendored, so the image installs pinned dependencies
+        # instead of cloning the upstream project.
+        self.assertIn("requirements-whisperjav.txt", runtime_dockerfile)
+        self.assertNotIn("github.com/meizhong986/WhisperJAV", runtime_dockerfile)
+        self.assertNotIn("--extra qwen", runtime_dockerfile)
+        whisperjav_requirements = (
+            ROOT / "requirements-whisperjav.txt"
+        ).read_text(encoding="utf-8")
+        self.assertIn("ten-vad==1.0.6.8", whisperjav_requirements)
+        self.assertIn("onnxruntime-gpu==1.23.2", whisperjav_requirements)
+        for excluded in ("faster-whisper", "ctranslate2", "auditok"):
+            self.assertNotIn(f"\n{excluded}==", whisperjav_requirements)
         self.assertIn("libc++1", runtime_dockerfile)
         self.assertIn("libc++abi1", runtime_dockerfile)
         self.assertIn("from ten_vad import TenVad", runtime_dockerfile)
-        self.assertIn(
-            "uv pip install --python /opt/venvs/whisperjav/bin/python",
-            runtime_dockerfile,
-        )
-        self.assertIn("-m ensurepip --upgrade", runtime_dockerfile)
         self.assertIn(
             "/opt/venvs/whisperjav/bin/python -m pip",
             stt_dockerfile,
@@ -115,12 +118,12 @@ class ReleaseConfigurationTests(unittest.TestCase):
         self.assertTrue((ROOT / "requirements-kotoba.txt").is_file())
         self.assertFalse((ROOT / "requirements-cuda.txt").exists())
 
-    def test_project_and_package_versions_are_3_4_0(self) -> None:
+    def test_project_and_package_versions_are_4_0_0(self) -> None:
         project = tomllib.loads(
             (ROOT / "pyproject.toml").read_text(encoding="utf-8")
         )
-        self.assertEqual(project["project"]["version"], "3.4.0")
-        self.assertEqual(__version__, "3.4.0")
+        self.assertEqual(project["project"]["version"], "4.0.0")
+        self.assertEqual(__version__, "4.0.0")
 
 
 if __name__ == "__main__":

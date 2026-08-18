@@ -21,10 +21,7 @@
       </time>
     </p>
   </div>
-  <div
-    class="job-progress-overview"
-    title="파이프라인 단계를 같은 비중으로 계산한 진행률이며 남은 시간 추정치는 아닙니다."
-  >
+  <div class="job-progress-overview">
     <div class="job-progress-heading">
       <span>전체 진행률</span>
       <strong>{{ pipeline.percent }}%</strong>
@@ -49,11 +46,12 @@
     {% for stage in pipeline.stages %}
       <li
         class="job-stage is-{{ stage.state }}"
-        {% if stage.state == 'failed' and job.error %}title="error: {{ job.error }}"{% endif %}
+        {% if stage.state in ['blocked', 'failed'] and job.error %}title="error: {{ job.error }}"{% endif %}
       >
         <span class="job-stage-icon" aria-hidden="true">
           {%- if stage.state == 'done' %}{{ icons.check(13) }}
           {%- elif stage.state == 'running' %}{{ icons.activity(13) }}
+          {%- elif stage.state == 'blocked' %}{{ icons.pause(13) }}
           {%- elif stage.state == 'failed' %}{{ icons.alert_triangle(13) }}
           {%- elif stage.state == 'paused' %}{{ icons.pause(13) }}
           {%- else %}{{ icons.clock(13) }}{% endif -%}
@@ -165,7 +163,6 @@
     <div class="reprocess-actions">
       <div>
         <strong>새 작업으로 다시 처리</strong>
-        <span class="muted">현재 결과와 히스토리는 보존됩니다.</span>
       </div>
       <div class="actions">
         <form method="post" action="/jobs/{{ job.id }}/reprocess" class="reprocess-form">

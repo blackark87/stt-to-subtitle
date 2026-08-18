@@ -50,7 +50,10 @@ from .translation_prompt import (
     KOREAN_TRANSLATION_REVIEW_PROMPT,
 )
 from .whisperx_worker import (
+    DEFAULT_SUBTITLE_SEGMENTATION,
+    WHISPERX_MAX_BATCH_SIZE,
     WHISPERX_MAX_CHUNK_LENGTH_SECONDS,
+    WHISPERX_MIN_BATCH_SIZE,
     WhisperXSegmentationOptions,
 )
 from .whisperjav_worker import (
@@ -74,6 +77,7 @@ RUNNING_STATUSES = {
     "rendering",
 }
 USER_STOP_MESSAGE = "사용자 요청으로 전체 작업이 중단되었습니다."
+USER_SELECTED_STOP_MESSAGE = "사용자 요청으로 작업이 중단되었습니다."
 TRANSLATION_PROMPT_OPTION = "translation_prompt"
 TRANSLATION_REVIEW_ROUNDS = 2
 SUPPORTED_OPERATIONS = {"extract", "transcribe", "translate", "full"}
@@ -86,7 +90,6 @@ TRANSCRIPTION_COMPARISON_BACKENDS = (
 )
 TRANSCRIPTION_COMPARISON_SCHEMA_VERSION = 2
 MAX_TRANSCRIPTION_COMPARISON_SOURCES = 20
-MAX_CONCURRENT_TRANSLATION_JOBS = 8
 COMPARISON_PARENT_ID_OPTION = "comparison_parent_id"
 COMPARISON_AUDIO_SOURCE_JOB_ID_OPTION = "comparison_audio_source_job_id"
 
@@ -171,23 +174,6 @@ def _audio_extraction_signature(
 
 
 SUPPORTED_STT_BACKENDS = {"kotoba", "whisperx", "hybrid", "whisperjav"}
-HYBRID_SUBTITLE_SEGMENTATION_DEFAULTS = {
-    "max_gap_sec": 0.8,
-    "max_duration_sec": 8.0,
-    "max_chars": 36,
-    "split_on_speaker_change": True,
-    "prefer_punctuation_boundary": True,
-}
-HYBRID_RESCUE_DEFAULTS = {
-    "window_padding_sec": 5.0,
-    "max_word_duration_sec": 8.0,
-    "short_segment_duration_sec": 0.2,
-    "short_segment_cluster_window_sec": 5.0,
-    "short_segment_cluster_count": 3,
-    "speaker_debounce_sec": 0.1,
-    "kotoba_chunk_length_seconds": 15,
-    "whisperx_chunk_length_seconds": 30,
-}
 
 
 def _operation_is_completed(
@@ -247,15 +233,25 @@ class SubtitleOrchestrator:
             daemon=True,
         )
         self._audio_executor = ThreadPoolExecutor(
-            max_workers=1,
+            max_workers=settings.audio_workers,
             thread_name_prefix="pipeline-audio",
+        )
+        # Rendering only writes subtitle files, so it never contends with
+        # ffmpeg extraction. Keeping it on its own single-slot executor lets
+        # the next job's extraction start while the previous one renders.
+        self._render_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="pipeline-render",
         )
         self._stt_executor = ThreadPoolExecutor(
             max_workers=1,
             thread_name_prefix="pipeline-stt",
         )
         self._translation_executor = ThreadPoolExecutor(
-            max_workers=MAX_CONCURRENT_TRANSLATION_JOBS,
+            # translation_workers belongs to parallel batches within one
+            # file. Keep files serial so one file owns those workers until
+            # its translation is complete.
+            max_workers=1,
             thread_name_prefix="pipeline-translation",
         )
 
@@ -370,6 +366,7 @@ class SubtitleOrchestrator:
             self._scheduler.join(timeout=5)
         for executor in (
             self._audio_executor,
+            self._render_executor,
             self._stt_executor,
             self._translation_executor,
         ):
@@ -1165,6 +1162,23 @@ class SubtitleOrchestrator:
             "add_punctuation": transcription.add_punctuation,
             "noise_filter": transcription.noise_filter,
         }
+        raw_batch_size = options.get("batch_size")
+        if raw_batch_size not in (None, ""):
+            if backend not in {"hybrid", "whisperx"}:
+                raise ValueError(
+                    "batch_size requires backend='whisperx' or 'hybrid'"
+                )
+            batch_size = int(raw_batch_size)
+            if not (
+                WHISPERX_MIN_BATCH_SIZE
+                <= batch_size
+                <= WHISPERX_MAX_BATCH_SIZE
+            ):
+                raise ValueError(
+                    "batch_size must be between "
+                    f"{WHISPERX_MIN_BATCH_SIZE} and {WHISPERX_MAX_BATCH_SIZE}"
+                )
+            normalized_options["batch_size"] = batch_size
         raw_segmentation = options.get("subtitle_segmentation")
         if raw_segmentation is not None and not isinstance(
             raw_segmentation,
@@ -1174,23 +1188,15 @@ class SubtitleOrchestrator:
         if backend == "hybrid":
             if "whisperjav" in options:
                 raise ValueError("whisperjav options require backend='whisperjav'")
-            segmentation = dict(HYBRID_SUBTITLE_SEGMENTATION_DEFAULTS)
-            if isinstance(raw_segmentation, Mapping):
-                segmentation.update(raw_segmentation)
             segmentation = asdict(
                 WhisperXSegmentationOptions.from_options(
-                    {"subtitle_segmentation": segmentation}
+                    options,
+                    defaults=DEFAULT_SUBTITLE_SEGMENTATION,
                 )
             )
 
-            raw_rescue = options.get("hybrid_rescue")
-            if raw_rescue is not None and not isinstance(raw_rescue, Mapping):
-                raise ValueError("hybrid_rescue must be an object")
-            rescue = dict(HYBRID_RESCUE_DEFAULTS)
-            if isinstance(raw_rescue, Mapping):
-                rescue.update(raw_rescue)
             rescue = asdict(
-                HybridRescueOptions.from_options({"hybrid_rescue": rescue})
+                HybridRescueOptions.from_options(options)
             )
             kotoba_chunk_length = rescue["kotoba_chunk_length_seconds"]
             repetition_policy = str(
@@ -1251,12 +1257,10 @@ class SubtitleOrchestrator:
                     "unsupported WhisperJAV quality options: "
                     f"{sorted(forbidden)}"
                 )
-            segmentation = dict(HYBRID_SUBTITLE_SEGMENTATION_DEFAULTS)
-            if isinstance(raw_segmentation, Mapping):
-                segmentation.update(raw_segmentation)
             normalized_options["subtitle_segmentation"] = asdict(
                 WhisperXSegmentationOptions.from_options(
-                    {"subtitle_segmentation": segmentation}
+                    options,
+                    defaults=DEFAULT_SUBTITLE_SEGMENTATION,
                 )
             )
             normalized_options["whisperjav"] = asdict(
@@ -1604,27 +1608,35 @@ class SubtitleOrchestrator:
                     break
         return paused_count
 
-    def stop_all_jobs(self) -> int:
+    def stop_jobs(
+        self,
+        job_ids: Sequence[str],
+        *,
+        stop_message: str = USER_SELECTED_STOP_MESSAGE,
+    ) -> int:
         stopped_count = 0
-        for listed in self.store.list_open_jobs():
+        unique_job_ids = tuple(
+            dict.fromkeys(job_id.strip() for job_id in job_ids if job_id.strip())
+        )
+        for job_id in unique_job_ids:
             for _attempt in range(3):
-                job = self.store.get(listed.id)
+                job = self.store.get(job_id)
                 if job is None or not job.can_stop:
                     break
                 if job.status in RUNNING_STATUSES:
                     fields: dict[str, Any] = {"job_stop_requested": 1}
                     event_message = (
-                        "bulk job stop requested; waiting for a safe stop point"
+                        "job stop requested; waiting for a safe stop point"
                     )
                 else:
                     fields = {
                         "status": "blocked",
                         "blocked_stage": WAITING_STAGE_BY_STATUS[job.status],
-                        "error": USER_STOP_MESSAGE,
+                        "error": stop_message,
                         "translation_pause_requested": 0,
                         "job_stop_requested": 0,
                     }
-                    event_message = "job stopped by bulk user request"
+                    event_message = "job stopped by user request"
                 if self.store.update_if_status(
                     job.id,
                     {job.status},
@@ -1634,6 +1646,12 @@ class SubtitleOrchestrator:
                     stopped_count += 1
                     break
         return stopped_count
+
+    def stop_all_jobs(self) -> int:
+        return self.stop_jobs(
+            [job.id for job in self.store.list_open_jobs()],
+            stop_message=USER_STOP_MESSAGE,
+        )
 
     def resume_translation(self, job_id: str) -> PipelineJob:
         job = self.store.get(job_id)
@@ -1760,56 +1778,50 @@ class SubtitleOrchestrator:
 
     def _scheduler_loop(self) -> None:
         while not self._stop_event.is_set():
-            audio_busy = bool(
-                self.store.ids_with_status("extracting")
-                or self.store.ids_with_status("rendering")
-            )
-            if not audio_busy:
-                if self.store.ids_with_status("translated"):
-                    self._dispatch_one(
-                        "translated",
-                        "rendering",
-                        "render",
-                        self._audio_executor,
-                        self._render,
-                    )
-                else:
-                    self._dispatch_one(
-                        "queued",
-                        "extracting",
-                        "audio extraction",
-                        self._audio_executor,
-                        self._extract,
-                    )
-            if not self.store.ids_with_status("transcription_running"):
-                self._dispatch_one(
-                    "audio_ready",
-                    "transcription_running",
-                    "transcription",
-                    self._stt_executor,
-                    self._transcribe,
-                )
-            self._dispatch_translations()
+            self._scheduler_tick()
             self._stop_event.wait(1.0)
 
-    def _dispatch_translations(self) -> int:
-        slots = max(
-            0,
-            MAX_CONCURRENT_TRANSLATION_JOBS
-            - len(self.store.ids_with_status("translation_running")),
-        )
-        dispatched = 0
-        for _ in range(slots):
+    def _scheduler_tick(self) -> None:
+        if not self.store.ids_with_status("rendering"):
+            self._dispatch_one(
+                "translated",
+                "rendering",
+                "render",
+                self._render_executor,
+                self._render,
+            )
+        extracting = len(self.store.ids_with_status("extracting"))
+        for _ in range(max(0, self.settings.audio_workers - extracting)):
             if not self._dispatch_one(
+                "queued",
+                "extracting",
+                "audio extraction",
+                self._audio_executor,
+                self._extract,
+            ):
+                break
+        if not self.store.ids_with_status("transcription_running"):
+            self._dispatch_one(
+                "audio_ready",
+                "transcription_running",
+                "transcription",
+                self._stt_executor,
+                self._transcribe,
+            )
+        self._dispatch_translations()
+
+    def _dispatch_translations(self) -> int:
+        if self.store.ids_with_status("translation_running"):
+            return 0
+        return int(
+            self._dispatch_one(
                 "transcribed",
                 "translation_running",
                 "translation",
                 self._translation_executor,
                 self._translate,
-            ):
-                break
-            dispatched += 1
-        return dispatched
+            )
+        )
 
     def _dispatch_one(
         self,
@@ -1953,6 +1965,7 @@ class SubtitleOrchestrator:
             "noise_filter": job.options.get("noise_filter", True),
         }
         for key in (
+            "batch_size",
             "subtitle_segmentation",
             "repetition_policy",
             "repetition_min_count",

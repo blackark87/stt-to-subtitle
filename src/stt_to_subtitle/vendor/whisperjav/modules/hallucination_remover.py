@@ -1,0 +1,882 @@
+# whisperjav/modules/hallucination_remover.py
+#V13 - Added hallucination filter caching for offline use
+
+
+import re
+import json
+import requests
+import time
+from pathlib import Path
+from typing import Dict, List, Set, Tuple, Optional, Any
+from difflib import SequenceMatcher
+from stt_to_subtitle.vendor.whisperjav.utils.logger import logger
+from stt_to_subtitle.vendor.whisperjav.config.sanitization_constants import HallucinationConstants
+
+
+# Cache configuration
+CACHE_DIR = Path.home() / ".cache" / "whisperjav" / "hallucination_filters"
+CACHE_MAX_AGE_DAYS = 7  # Re-download if cache is older than this
+DOWNLOAD_TIMEOUT = 10  # Seconds to wait for download
+
+# Bash-style substring slice syntax used by regexp_v09.json replacements:
+#   ${N:0:M}  ->  keep first M characters of match.group(N)
+# See hallucination_remover._apply_regex_replacement_safe for semantics.
+_SLICE_SYNTAX_RE = re.compile(r'^\$\{(\d+):0:(\d+)\}$')
+
+# ---------------------------------------------------------------------------
+# v1.8.11 Round-2 sanitizer hardening — module-level constants/helpers.
+# ---------------------------------------------------------------------------
+# Stage 1.1.a.5: Emoji-contains drop gate.
+# Lines containing ANY character in these blocks are dropped entirely — in JAV
+# speech-to-text output, emoji are pathological (training-data bleed, SDH
+# markers, channel watermarks like "🐯 Sound Hodori"). Ranges:
+#   U+2600-U+26FF   Miscellaneous Symbols (★ ☆ ♡ ♥ ♪ ♫ ♩ ♬ ...)
+#   U+2702-U+27B0   Dingbats
+#   U+1F300-U+1FAFF Emoji blocks (pictographs, emoticons, transport,
+#                   supplemental, extended-A)
+_EMOJI_RE = re.compile(
+    r'[\u2600-\u26FF\u2702-\u27B0\U0001F300-\U0001FAFF]'
+)
+
+# Stage 1.1.d: Full-normalized exact-match.
+# Characters stripped during normalization for filter-list matching.
+# Deliberately excluded (NOT stripped): ー U+30FC prolonged-sound mark
+# (letter-like, part of words like ふぅー), ゛ U+3099 combining voicing mark
+# (diacritic, important for CAT5 voiced-vowel moans like あ゛ぁん), and all
+# hiragana / katakana / CJK / alphanumeric characters.
+_NORMALIZATION_STRIP_CHARS = frozenset(
+    # Whitespace (ASCII + fullwidth space)
+    ' \t\n\r\x0b\x0c\u3000'
+    # Quotes (ASCII + smart + JP brackets used as quotes)
+    '"\'`'
+    '\u2018\u2019\u201C\u201D'       # ' ' " "
+    '\u300C\u300D\u300E\u300F'       # 「 」 『 』
+    # Punctuation — ASCII
+    '.,!?;:-'
+    # Punctuation — fullwidth
+    '\uFF0E\uFF0C\uFF01\uFF1F\uFF1B\uFF1A'  # ． ， ！ ？ ； ：
+    # Punctuation — Japanese
+    '\u3002\u3001\u30FB'             # 。 、 ・
+    '\u2026'                         # …
+    # Stylistic dashes / tildes
+    '\u301C\u3030\uFF5E~'            # 〜 〰 ～ ~
+)
+
+
+def _normalize_for_match(text: str) -> str:
+    """Normalize text for stage 1.1.d full-normalized hallucination match.
+
+    Strips whitespace, quotes, and punctuation listed in
+    _NORMALIZATION_STRIP_CHARS; case-folds Latin. Preserves letter-like marks
+    (U+30FC ー) and diacritics (U+3099 ゛) — these are semantic, not
+    punctuation.
+
+    Empty return value means the text was pure-punct/whitespace and cannot
+    meaningfully match a filter entry (would match anything).
+    """
+    if not text:
+        return ''
+    return ''.join(ch for ch in text if ch not in _NORMALIZATION_STRIP_CHARS).lower()
+
+class HallucinationRemover:
+    """Handles exact, regex, and fuzzy hallucination detection with improved debugging"""
+
+    # Map ISO language codes to JSON filter list keys
+    # The filter_list_v08.json uses full language names as keys
+    LANGUAGE_CODE_MAP: Dict[str, str] = {
+        'ja': 'japanese', 'jp': 'japanese', 'japanese': 'japanese',
+        'ko': 'korean', 'korean': 'korean',
+        'zh': 'chinese', 'zh-cn': 'chinese', 'zh-tw': 'chinese', 'chinese': 'chinese',
+        'en': 'english', 'english': 'english',
+    }
+
+    BRACKET_PAIRS: Tuple[Tuple[str, str], ...] = (
+        ("(", ")"),
+        ("[", "]"),
+        ("{", "}"),
+        ("（", "）"),
+        ("［", "］"),
+        ("｛", "｝"),
+        ("【", "】"),
+        ("『", "』"),
+        ("「", "」"),
+        ("《", "》"),
+        ("★", "★"),    # Whisper hallucination pattern: ★content★
+    )
+
+    def __init__(self, constants: HallucinationConstants,
+                 primary_language: Optional[str] = None,
+                 user_blacklist: Optional[List[str]] = None):
+        self.constants = constants
+        self.primary_language = primary_language
+        self.user_blacklist = user_blacklist or []
+
+        # Caches for loaded patterns
+        self._exact_lists: Optional[Dict[str, Set[str]]] = None
+        self._regex_patterns: Optional[List[Dict[str, Any]]] = None
+        self._blacklist_phrases: Optional[List[str]] = None
+        self._load_sources: List[str] = []  # Track where data was loaded from
+
+        # v1.8.11 Round-2: normalized-form exact-match sets per language.
+        # Built once from _exact_lists after loading; used by stage 1.1.d in
+        # remove_hallucinations to catch escapees that differ from list
+        # entries only in whitespace / punctuation / case.
+        self._normalized_exact_lists: Optional[Dict[str, Set[str]]] = None
+
+        # Load patterns on init with fallback
+        self._load_patterns_safe()
+        self._build_normalized_exact_lists()
+
+    def _load_patterns_safe(self):
+        """Load patterns with fallback on any failure, then report to user."""
+        try:
+            self._load_patterns()
+            if not self._exact_lists and not self._regex_patterns:
+                raise Exception("No patterns loaded from external sources")
+        except Exception as e:
+            logger.warning(f"Hallucination filter: external loading failed ({e}), using minimal built-in fallback")
+            self._load_fallback_patterns()
+            self._load_sources = ["built-in fallback (5 phrases, 2 regex — network and bundled data both unavailable)"]
+
+        # Report what was loaded — visible to users at INFO level
+        exact_total = sum(
+            len(phrases) for phrases in (self._exact_lists or {}).values()
+            if isinstance(phrases, (list, set))
+        )
+        regex_total = len(self._regex_patterns or [])
+        sources = ", ".join(self._load_sources) if self._load_sources else "unknown"
+        logger.info(f"Hallucination filter: {exact_total} phrases + {regex_total} regex patterns loaded ({sources})")
+
+    def _load_fallback_patterns(self):
+        """QUICK FIX: Minimal built-in patterns when external sources fail"""
+        self._exact_lists = {
+            'ja': {'www', 'ok', '笑', 'wwwww', 'ｗｗｗ'},
+            'japanese': {'www', 'ok', '笑', 'wwwww', 'ｗｗｗ'},
+            'jp': {'www', 'ok', '笑', 'wwwww', 'ｗｗｗ'}
+        }
+
+        self._regex_patterns = [
+            {
+                'pattern': r'^(OK|www|笑|W+|ｗ+)$',
+                'category': 'common_hallucination',
+                'confidence': 1.0,
+                'replacement': ''
+            },
+            {
+                'pattern': r'^ご視聴.*ありがとう.*$',
+                'category': 'closing_phrase',
+                'confidence': 0.95,
+                'replacement': ''
+            }
+        ]
+
+        self._blacklist_phrases = ['www', 'ok', '笑', 'wwwww']
+        logger.debug(f"Loaded fallback patterns: {len(self._exact_lists)} exact lists, {len(self._regex_patterns)} regex patterns")
+
+    def _build_normalized_exact_lists(self) -> None:
+        """Build per-language normalized-form sets for stage 1.1.d.
+
+        Called once at init after _load_patterns_safe. For each language
+        section in _exact_lists, normalizes every raw entry using
+        _normalize_for_match and stores the resulting set in
+        _normalized_exact_lists. Entries that normalize to empty (pure
+        punctuation / whitespace) are skipped — they would match any sub.
+
+        This runs at load time so the per-sub matching path in
+        remove_hallucinations only does a single normalize + set membership
+        check (O(n) on text length, O(1) on lookup).
+        """
+        self._normalized_exact_lists = {}
+        if not self._exact_lists:
+            return
+
+        for lang, phrases in self._exact_lists.items():
+            if not isinstance(phrases, (list, set)):
+                continue
+            normalized: Set[str] = set()
+            for phrase in phrases:
+                if not phrase or not isinstance(phrase, str):
+                    continue
+                norm = _normalize_for_match(phrase)
+                if norm:
+                    normalized.add(norm)
+            if normalized:
+                self._normalized_exact_lists[lang] = normalized
+
+        total = sum(len(s) for s in self._normalized_exact_lists.values())
+        logger.debug(
+            f"Built normalized exact-match sets: {total} unique entries "
+            f"across {len(self._normalized_exact_lists)} languages"
+        )
+
+    def _get_normalized_lang_set(
+        self, mapped_language: str, effective_language: str
+    ) -> Optional[Set[str]]:
+        """Fetch the normalized exact-match set for a language.
+
+        Uses the same fallback chain as the raw _exact_lists lookup in
+        remove_hallucinations: mapped name (e.g. 'japanese') → ISO code
+        (e.g. 'ja') → final fallback to 'japanese'/'ja'.
+        """
+        if not self._normalized_exact_lists:
+            return None
+        nset = self._normalized_exact_lists.get(mapped_language)
+        if not nset:
+            nset = self._normalized_exact_lists.get(effective_language)
+        if not nset:
+            for fallback in ('japanese', 'ja'):
+                if fallback in self._normalized_exact_lists:
+                    nset = self._normalized_exact_lists[fallback]
+                    break
+        return nset
+
+    def _load_patterns(self):
+        """Load all hallucination patterns with improved error handling"""
+        # Load exact match list
+        try:
+            self._exact_lists = self._load_json_from_url(self.constants.FILTER_LIST_URL)
+            if self._exact_lists:
+                # Convert lists to sets for faster lookup
+                self._exact_lists = {
+                    lang: set(phrases) if isinstance(phrases, list) else phrases
+                    for lang, phrases in self._exact_lists.items()
+                }
+                total_phrases = sum(len(phrases) for phrases in self._exact_lists.values() if isinstance(phrases, (list, set)))
+                logger.debug(f"Loaded exact hallucination lists for {len(self._exact_lists)} languages ({total_phrases} total phrases)")
+            else:
+                logger.warning("No exact hallucination lists loaded - hallucination removal may be ineffective")
+                self._exact_lists = {}
+        except Exception as e:
+            logger.error(f"Failed to load exact hallucination list: {e}")
+            self._exact_lists = {}
+
+        # Load regex patterns
+        try:
+            pattern_data = self._load_json_from_url(self.constants.EXACT_LIST_URL)
+            if pattern_data and 'patterns' in pattern_data:
+                self._regex_patterns = pattern_data['patterns']
+                logger.debug(f"Loaded {len(self._regex_patterns)} regex patterns")
+
+                # Extract phrases for fuzzy matching
+                self._blacklist_phrases = self._extract_blacklist_phrases(self._regex_patterns)
+                logger.debug(f"Extracted {len(self._blacklist_phrases)} phrases for fuzzy matching")
+            else:
+                logger.warning("No regex patterns loaded from URL")
+                self._regex_patterns = []
+                self._blacklist_phrases = []
+        except Exception as e:
+            logger.error(f"Failed to load regex patterns: {e}")
+            self._regex_patterns = []
+            self._blacklist_phrases = []
+
+    def _get_cache_path(self, url: str) -> Path:
+        """Get cache file path for a URL."""
+        # Extract filename from URL or create hash-based name
+        if "filter" in url.lower():
+            return CACHE_DIR / "filter_list.json"
+        elif "regexp" in url.lower():
+            return CACHE_DIR / "regexp_patterns.json"
+        else:
+            # Fallback: use hash of URL
+            import hashlib
+            url_hash = hashlib.md5(url.encode()).hexdigest()[:12]
+            return CACHE_DIR / f"cached_{url_hash}.json"
+
+    def _is_cache_valid(self, cache_path: Path) -> bool:
+        """Check if cache file exists and is not too old."""
+        if not cache_path.exists():
+            return False
+
+        # Check age
+        cache_age_days = (time.time() - cache_path.stat().st_mtime) / (24 * 3600)
+        return cache_age_days < CACHE_MAX_AGE_DAYS
+
+    def _load_from_cache(self, cache_path: Path) -> Optional[Dict]:
+        """Load JSON from cache file."""
+        try:
+            with open(cache_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                logger.debug(f"Loaded hallucination filter from cache: {cache_path.name}")
+                return data
+        except Exception as e:
+            logger.debug(f"Cache read failed for {cache_path}: {e}")
+            return None
+
+    def _save_to_cache(self, cache_path: Path, data: Dict) -> bool:
+        """Save JSON data to cache file."""
+        try:
+            CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            with open(cache_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            logger.debug(f"Saved hallucination filter to cache: {cache_path.name}")
+            return True
+        except Exception as e:
+            logger.debug(f"Cache write failed for {cache_path}: {e}")
+            return False
+
+    def _load_from_bundled(self, url: str) -> Optional[Dict]:
+        """Load from bundled fallback data in package."""
+        try:
+            from stt_to_subtitle.vendor.whisperjav.data.hallucination_filters import (
+                get_bundled_filter_list_path,
+                get_bundled_regexp_path
+            )
+
+            if "filter" in url.lower():
+                bundled_path = get_bundled_filter_list_path()
+            elif "regexp" in url.lower():
+                bundled_path = get_bundled_regexp_path()
+            else:
+                return None
+
+            if bundled_path.exists():
+                with open(bundled_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    logger.debug(f"Read bundled hallucination data: {bundled_path.name}")
+                    return data
+        except ImportError:
+            logger.debug("Bundled hallucination filter data not available")
+        except Exception as e:
+            logger.debug(f"Failed to load bundled data: {e}")
+
+        return None
+
+    def _download_from_url(self, url: str) -> Optional[Dict]:
+        """Download JSON from URL with timeout."""
+        try:
+            logger.debug(f"Downloading hallucination filter from: {url}")
+            response = requests.get(url, timeout=DOWNLOAD_TIMEOUT)
+            response.raise_for_status()
+            return response.json()
+        except requests.Timeout:
+            logger.debug(f"Download timeout for {url}")
+            return None
+        except requests.RequestException as e:
+            logger.debug(f"Download failed for {url}: {e}")
+            return None
+        except json.JSONDecodeError as e:
+            logger.debug(f"Invalid JSON from {url}: {e}")
+            return None
+
+    def _load_json_from_url(self, url: str) -> Optional[Dict]:
+        """
+        Load hallucination filter JSON with caching and fallback chain.
+
+        Loading priority:
+        1. Valid cache (< 7 days old)
+        2. Fresh download from URL (updates cache on success)
+        3. Stale cache (> 7 days old but still usable)
+        4. Bundled fallback data in package
+
+        This ensures offline use works (China, air-gapped networks) while
+        still allowing updates when network is available.
+        """
+        # Handle local file paths directly
+        if not url.startswith(('http://', 'https://')):
+            try:
+                logger.debug(f"Loading hallucination patterns from file: {url}")
+                with open(url, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except Exception as e:
+                logger.warning(f"Failed to load from file {url}: {e}")
+                return None
+
+        # Identify which file this is for clearer logging
+        filter_name = "filter list" if "filter" in url.lower() else "regex patterns"
+
+        # LOCAL MODIFICATION (stt-to-subtitle): the bundled package data is
+        # the only source. Upstream downloaded a gist on every construction
+        # and cached it under ``$HOME/.cache``, which is not writable in our
+        # read-only container. That made each pass2 cleaner pay two network
+        # timeouts and made the phrase list vary with whatever the gist held
+        # that day. Vendored data keeps the run reproducible and offline.
+        bundled_data = self._load_from_bundled(url)
+        if bundled_data:
+            self._load_sources.append(f"{filter_name}: bundled package data")
+            return bundled_data
+
+        self._load_sources.append(f"{filter_name}: FAILED — bundled data missing")
+        return None
+
+    def _extract_blacklist_phrases(self, patterns: List[Dict]) -> List[str]:
+        """Extract phrases for fuzzy matching from patterns"""
+        blacklist_phrases = []
+        fuzzy_categories = {
+            "meta_reference", "media_reference", "closing_phrase",
+            "nonsensical", "user_defined"
+        }
+
+        for pattern_info in patterns:
+            category = pattern_info.get('category', '')
+            pattern = pattern_info.get('pattern', '')
+
+            if category not in fuzzy_categories:
+                continue
+
+            # Count special regex characters
+            special_chars = r'.*+?^${}()|[]\\<>'
+            special_count = sum(1 for char in pattern if char in special_chars)
+
+            # If pattern has few special characters, it might be a literal phrase
+            if special_count <= 2 and len(pattern) > 5:
+                # Clean basic regex elements
+                cleaned = pattern
+                for char in r'\^$.*+?()[]{}|':
+                    cleaned = cleaned.replace(char, '')
+
+                if cleaned and len(cleaned) >= 3:
+                    blacklist_phrases.append(cleaned)
+
+        # Add user blacklist
+        blacklist_phrases.extend(self.user_blacklist)
+
+        return blacklist_phrases
+
+    def remove_hallucinations(self, text: str, language: Optional[str] = None) -> Tuple[str, List[Dict[str, Any]]]:
+        """
+        Multi-stage hallucination detection: bracket detection, exact matching
+        (with punctuation normalization), and regex pattern matching.
+
+        Priority order:
+        1. Bracket context detection (fully wrapped text)
+        2. Exact full-line matching against filter list
+        3. Exact matching with trailing punctuation stripped
+        4. Regex patterns from regexp_v09.json (closing phrases, sound effects, etc.)
+        """
+        if not text or not text.strip() or not self._exact_lists:
+            return text, []
+
+        effective_language = (language or self.primary_language).lower()
+
+        # Map ISO code to JSON key (e.g., 'ko' -> 'korean', 'zh' -> 'chinese')
+        mapped_language = self.LANGUAGE_CODE_MAP.get(effective_language, effective_language)
+
+        # Get the correct list for the language, with fallbacks
+        lang_list = self._exact_lists.get(mapped_language)
+        if not lang_list:
+            # Try the original language code as fallback
+            lang_list = self._exact_lists.get(effective_language)
+        if not lang_list:
+            # Final fallback to Japanese
+            for fallback in ['japanese', 'ja']:
+                if fallback in self._exact_lists:
+                    lang_list = self._exact_lists[fallback]
+                    logger.debug(f"No hallucination list for '{effective_language}', falling back to Japanese")
+                    break
+        if not lang_list:
+            return text, []
+
+        # Normalize text for comparison: lowercase and remove leading/trailing whitespace
+        normalized_text = text.strip().lower()
+
+        bracket_info = self._is_bracketed_context(text)
+        if bracket_info:
+            modifications = [{
+                'type': 'bracketed_context',
+                'pattern': bracket_info['wrapper_sequence'],
+                'category': 'context_caption',
+                'confidence': 1.0,
+                'original': text,
+                'modified': '',
+                'language': effective_language,
+            }]
+            return '', modifications
+
+        # Stage 1.1.a.5 (v1.8.11 Round-2) — Emoji-contains drop gate.
+        # Any character in the broad emoji ranges (see _EMOJI_RE above)
+        # anywhere in the sub triggers a full-sub drop. Runs immediately
+        # after bracket detection so emoji lines skip exact-match, regex,
+        # repetition cleaning, and CPS checks. Covers CAT2 channel
+        # watermarks (🐯 Sound Hodori…), CAT1 emoji-tailed outros, and
+        # any sub sprinkled with music notes / pictograms.
+        if _EMOJI_RE.search(text):
+            modifications = [{
+                'type': 'emoji_contains_drop',
+                'pattern': '_EMOJI_RE',
+                'category': 'emoji_hallucination',
+                'confidence': 1.0,
+                'original': text,
+                'modified': '',
+                'language': effective_language,
+            }]
+            return '', modifications
+
+        # Strict, full-line, exact matching (try raw first, then punctuation-stripped)
+        if normalized_text in lang_list:
+            modifications = [{
+                'type': 'exact_match_full_line',
+                'pattern': normalized_text,
+                'category': 'hallucination',
+                'confidence': 1.0,
+                'original': text,
+                'modified': '',
+                'language': effective_language,
+            }]
+            return '', modifications
+
+        # Retry with trailing punctuation stripped (catches おやすみなさい。 → おやすみなさい)
+        punct_stripped = re.sub(r'[。！!？?～〜~♪☆♡♥❤💕💛]+$', '', normalized_text).strip()
+        if punct_stripped and punct_stripped != normalized_text and punct_stripped in lang_list:
+            modifications = [{
+                'type': 'exact_match_punct_normalized',
+                'pattern': punct_stripped,
+                'category': 'hallucination',
+                'confidence': 1.0,
+                'original': text,
+                'modified': '',
+                'language': effective_language,
+            }]
+            return '', modifications
+
+        # Stage 1.1.d (v1.8.11 Round-2) — Full-normalized exact match.
+        # Strips all whitespace + quotes + punctuation anywhere in the text
+        # (not just trailing) and case-folds Latin, then checks against a
+        # pre-built normalized set. Catches escapees that differ from list
+        # entries by internal spaces ("はぁっ はぁっ"), multi-character
+        # ellipsis ("はぁ……" vs list "はぁ…"), non-trailing punctuation,
+        # or case ("by H." vs "BY H.").
+        normalized_for_match = _normalize_for_match(text)
+        if normalized_for_match:
+            lang_normalized_set = self._get_normalized_lang_set(
+                mapped_language, effective_language
+            )
+            if lang_normalized_set and normalized_for_match in lang_normalized_set:
+                modifications = [{
+                    'type': 'exact_match_full_normalized',
+                    'pattern': normalized_for_match,
+                    'category': 'hallucination',
+                    'confidence': 1.0,
+                    'original': text,
+                    'modified': '',
+                    'language': effective_language,
+                }]
+                return '', modifications
+
+        # Apply regex patterns from regexp_v09.json (closing phrases, sound effects, etc.)
+        if self._regex_patterns:
+            regex_text, regex_mods = self._apply_regex_matching(normalized_text)
+            if regex_mods:
+                # If regex fully emptied the text, remove the subtitle
+                if not regex_text.strip():
+                    return '', regex_mods
+                # If regex partially stripped (e.g., parenthetical prefix removed),
+                # return the cleaned text
+                return regex_text.strip(), regex_mods
+
+        return text, []
+
+    def _is_bracketed_context(self, text: str) -> Optional[Dict[str, Any]]:
+        stripped = text.strip()
+        if len(stripped) < 3:
+            return None
+
+        inner = stripped
+        wrappers: List[str] = []
+
+        while True:
+            matched = False
+            for left, right in self.BRACKET_PAIRS:
+                if inner.startswith(left) and inner.endswith(right) and len(inner) > len(left) + len(right):
+                    inner = inner[len(left):-len(right)].strip()
+                    wrappers.append(f"{left}{right}")
+                    matched = True
+                    break
+            if not matched:
+                break
+
+        if wrappers and inner:
+            return {
+                'wrapper_sequence': wrappers,
+                'inner_text': inner,
+            }
+
+        return None
+
+    def _looks_like_valid_japanese_expression(self, text: str) -> bool:
+        """NEW: Check if text looks like valid Japanese expression to prevent false positives"""
+        text = text.strip()
+
+        # Very short expressions with punctuation are likely valid
+        if len(text) <= 10 and any(p in text for p in ['、', '。', 'です', 'だ', 'である']):
+            return True
+
+        # Mixed content (hiragana + something else) is likely valid
+        import regex
+        has_hiragana = bool(regex.search(r'[\p{Hiragana}]', text))
+        has_katakana = bool(regex.search(r'[\p{Katakana}]', text))
+        has_kanji = bool(regex.search(r'[\p{Han}]', text))
+
+        script_count = sum([has_hiragana, has_katakana, has_kanji])
+        if script_count >= 2:
+            return True
+
+        # Don't remove expressions with numbers or currency
+        if regex.search(r'[\d¥$€£円]', text):
+            return True
+
+        # Expressions with common Japanese particles/endings are likely valid
+        japanese_indicators = ['です', 'だ', 'である', 'ます', 'でした', 'いる', 'ある', 'する', 'した']
+        if any(indicator in text for indicator in japanese_indicators):
+            return True
+
+        return False
+
+    def _apply_exact_matching(self, text: str, language: str) -> Tuple[str, List[Dict]]:
+        """Apply exact COMPLETE LINE matching with improved patterns"""
+        modifications = []
+
+        # FIRST: Check local hallucination patterns
+        hallucination_pattern = re.compile(r'^(OK|www|笑|W+)$', re.IGNORECASE)
+        if hallucination_pattern.match(text.strip()):
+            logger.debug(f"Local hallucination pattern match: '{text.strip()}'")
+            modifications.append({
+                'type': 'exact_match_local_hallucination',
+                'pattern': 'local_hallucination_patterns',
+                'category': 'hallucination',
+                'confidence': 1.0,
+                'original': text,
+                'modified': '',
+                'language': 'local',
+                'match_type': 'complete_line_local'
+            })
+            return '', modifications
+
+        # Closing phrase patterns (complete line removal)
+        closing_phrase_pattern = re.compile(r'^(ご|お)?視聴(して)?[いただきくれて]?(ありがとう|ございました)$')
+        if closing_phrase_pattern.match(text.strip()):
+            logger.debug(f"Closing phrase pattern match: '{text.strip()}'")
+            modifications.append({
+                'type': 'exact_match_closing_phrase',
+                'pattern': 'closing_phrase_complete',
+                'category': 'closing_phrase',
+                'confidence': 1.0,
+                'original': text,
+                'modified': '',
+                'language': 'ja',
+                'match_type': 'complete_line_closing'
+            })
+            return '', modifications
+
+        # Map ISO code to JSON key (e.g., 'ko' -> 'korean', 'zh' -> 'chinese')
+        language_lower = language.lower() if language else language
+        mapped_language = self.LANGUAGE_CODE_MAP.get(language_lower, language_lower)
+
+        # Check external database patterns (from JSON files)
+        lang_list = self._exact_lists.get(mapped_language, set())
+        if not lang_list:
+            # Try original language code
+            lang_list = self._exact_lists.get(language_lower, set())
+        if not lang_list:
+            # Final fallback to Japanese
+            for fallback in ['japanese', 'ja']:
+                if fallback in self._exact_lists:
+                    lang_list = self._exact_lists[fallback]
+                    logger.debug(f"Using fallback language 'japanese' for exact matching (original: {language})")
+                    break
+
+        if not lang_list:
+            logger.debug(f"No exact match list available for language '{language}' (mapped: {mapped_language})")
+            return text, []
+
+        # Normalize COMPLETE text for comparison
+        normalized_text = text.strip().lower()
+
+        # CRITICAL: Only match COMPLETE lines, no substring removal
+        if normalized_text in lang_list:
+            logger.debug(f"COMPLETE LINE exact hallucination match found: '{normalized_text}'")
+            modifications.append({
+                'type': 'exact_match_complete_line',
+                'pattern': normalized_text,
+                'category': 'hallucination',
+                'confidence': 1.0,
+                'original': text,
+                'modified': '',
+                'language': language,
+                'match_type': 'complete_line_database'
+            })
+            return '', modifications
+        else:
+            logger.debug(f"No complete line exact match for: '{normalized_text[:50]}...'")
+
+        return text, modifications
+
+    # Categories where a regex match means the ENTIRE line is a hallucination
+    # and should be fully removed (not just the matched portion stripped).
+    FULL_LINE_REMOVAL_CATEGORIES = {
+        'closing_phrase',       # "ご視聴ありがとうございます" — entire line is hallucination
+        'meta_reference',       # "チャンネル登録お願いします" — entire line is hallucination
+        'media_reference',      # "私のチャンネル" — entire line is hallucination
+        'nonsensical',          # gibberish patterns — entire line is hallucination
+    }
+
+    def _apply_regex_matching(self, text: str) -> Tuple[str, List[Dict]]:
+        """Apply regex pattern matching from regexp_v09.json.
+
+        For 'closing_phrase'/'meta_reference'/'media_reference'/'nonsensical' categories:
+            A match means the entire line is a hallucination → full removal.
+        For 'sound_effect'/'emoji'/'repeated_vocalization' categories:
+            A match strips only the matched portion (e.g., parenthetical prefix).
+        """
+        modifications = []
+        current_text = text
+
+        for pattern_info in self._regex_patterns:
+            pattern = pattern_info.get('pattern', '')
+            category = pattern_info.get('category', '')
+            confidence = pattern_info.get('confidence', 0.9)
+            replacement = pattern_info.get('replacement', '')
+
+            # Skip if confidence too low
+            if confidence < self.constants.MIN_CONFIDENCE_THRESHOLD:
+                continue
+
+            try:
+                if re.search(pattern, current_text):
+                    if category in self.FULL_LINE_REMOVAL_CATEGORIES:
+                        # Full-line removal: the entire subtitle is a hallucination
+                        modifications.append({
+                            'type': 'regex_full_line_removal',
+                            'pattern': pattern,
+                            'category': category,
+                            'confidence': confidence,
+                            'original': current_text,
+                            'modified': ''
+                        })
+                        return '', modifications
+                    else:
+                        # Partial strip: remove only the matched portion (e.g., parenthetical prefix)
+                        new_text = self._apply_regex_replacement_safe(pattern, replacement, current_text)
+                        if new_text != current_text:
+                            modifications.append({
+                                'type': 'regex_partial_strip',
+                                'pattern': pattern,
+                                'category': category,
+                                'confidence': confidence,
+                                'original': current_text,
+                                'modified': new_text
+                            })
+                            current_text = new_text.strip()
+
+            except re.error as e:
+                logger.warning(f"Regex error for pattern '{pattern[:30]}...': {e}")
+                continue
+
+        return current_text, modifications
+
+    def _apply_regex_replacement_safe(self, pattern: str, replacement: str, text: str) -> str:
+        """Safe regex replacement with ${N:0:M} slice-syntax support.
+
+        Supported replacement forms:
+            ''                  -> drop match (empty replacement)
+            '<literal>'         -> standard re.sub replacement
+            '${N:0:M}'          -> keep first M chars of match.group(N)
+            '${...}' malformed  -> drop match (safe fallback)
+
+        The ${N:0:M} syntax is required by several patterns in
+        regexp_v09.json that partially strip excessive kana repetition
+        (e.g. "あああああ..." -> "ああ"). Before this fix, all ${...}
+        replacements fell through to empty, producing the #287 symptom
+        where long kana runs with trailing punctuation would leave only
+        the punctuation (e.g. "いいいいい...?" -> "?").
+        """
+        try:
+            if not replacement or replacement in ['', 'null', 'None']:
+                return re.sub(pattern, '', text)
+
+            # Slice syntax: keep first M chars of group N
+            slice_match = _SLICE_SYNTAX_RE.match(replacement)
+            if slice_match:
+                group_num = int(slice_match.group(1))
+                keep_count = int(slice_match.group(2))
+
+                def _slice_replace(m):
+                    try:
+                        captured = m.group(group_num)
+                        if captured is None:
+                            return ''
+                        return captured[:keep_count]
+                    except (IndexError, TypeError):
+                        return ''
+
+                return re.sub(pattern, _slice_replace, text)
+
+            # Malformed or unsupported ${...} form — safe fallback to empty
+            if replacement.startswith('${') and '}' not in replacement:
+                logger.debug(f"Malformed replacement '{replacement}' - using empty replacement")
+                return re.sub(pattern, '', text)
+            if replacement.startswith('${'):
+                logger.debug(f"Unsupported ${{...}} replacement '{replacement}' - using empty replacement")
+                return re.sub(pattern, '', text)
+
+            return re.sub(pattern, replacement, text)
+
+        except re.error as e:
+            logger.warning(f"Regex error in pattern '{pattern[:30]}...': {e}")
+            return text
+        except Exception as e:
+            logger.warning(f"Unexpected error in regex replacement: {e}")
+            return text
+
+    def _apply_fuzzy_matching(self, text: str) -> Tuple[str, List[Dict]]:
+        """Apply fuzzy string matching"""
+        if not text or not self._blacklist_phrases:
+            return text, []
+
+        modifications = []
+        normalized_text = text.strip().lower()
+
+        # Skip very short texts
+        if len(normalized_text) < 3:
+            return text, []
+
+        best_match = None
+        best_score = 0
+        best_phrase = None
+
+        for phrase in self._blacklist_phrases:
+            normalized_phrase = phrase.strip().lower()
+
+            # Skip very short phrases
+            if len(normalized_phrase) < 3:
+                continue
+
+            # Skip if phrase is much shorter than text
+            if len(normalized_phrase) < len(normalized_text) * 0.3:
+                continue
+
+            # Calculate similarity
+            similarity = SequenceMatcher(None, normalized_text, normalized_phrase).ratio()
+
+            if similarity > best_score and similarity >= self.constants.FUZZY_MATCH_THRESHOLD:
+                best_score = similarity
+                best_match = normalized_text
+                best_phrase = phrase
+
+        if best_match and best_phrase:
+            logger.debug(f"Fuzzy hallucination match: '{text}' matches '{best_phrase}' with {best_score:.2f} similarity")
+            modifications.append({
+                'type': 'fuzzy_match',
+                'pattern': f"fuzzy:{best_phrase}",
+                'category': 'blacklisted_phrase',
+                'confidence': best_score,
+                'original': text,
+                'modified': '',
+                'matched_phrase': best_phrase
+            })
+            return '', modifications
+
+        return text, modifications
+
+    def get_database_stats(self) -> Dict[str, Any]:
+        """Get statistics about loaded hallucination databases"""
+        stats = {
+            'exact_lists': {},
+            'regex_patterns_count': len(self._regex_patterns) if self._regex_patterns else 0,
+            'blacklist_phrases_count': len(self._blacklist_phrases) if self._blacklist_phrases else 0
+        }
+
+        if self._exact_lists:
+            for lang, phrases in self._exact_lists.items():
+                stats['exact_lists'][lang] = len(phrases) if isinstance(phrases, (list, set)) else 0
+
+        return stats

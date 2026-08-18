@@ -16,9 +16,10 @@ from pathlib import Path
 import platform
 import queue
 import subprocess
+import tempfile
 import threading
 import time
-from typing import Any, AsyncIterator, Mapping
+from typing import Any, AsyncIterator, Mapping, Sequence
 from uuid import uuid4
 import wave
 
@@ -35,6 +36,7 @@ from .hybrid_stt import (
     debounce_word_speakers,
     detect_hybrid_issues,
     fuse_hybrid_segments,
+    map_fallback_speakers,
     mark_rescued_words,
     merge_issue_windows,
 )
@@ -60,10 +62,13 @@ from .stt_quality import (
 )
 from .stt_trace import TRACE_SCHEMA_VERSION
 from .whisperx_worker import (
+    DEFAULT_SUBTITLE_SEGMENTATION,
     DEFAULT_WHISPERX_COMPUTE_TYPE,
     DEFAULT_WHISPERX_LANGUAGE,
     DEFAULT_WHISPERX_MODEL,
+    WHISPERX_MAX_BATCH_SIZE,
     WHISPERX_MAX_CHUNK_LENGTH_SECONDS,
+    WHISPERX_MIN_BATCH_SIZE,
     WhisperXSegmentationOptions,
     rebuild_whisperx_segments,
 )
@@ -71,13 +76,6 @@ from .whisperjav_worker import WhisperJAVOptions
 
 LOGGER = logging.getLogger(__name__)
 STT_BACKENDS = {"hybrid", "kotoba", "whisperjav", "whisperx"}
-DEFAULT_HYBRID_SEGMENTATION = {
-    "split_on_speaker_change": True,
-    "max_gap_sec": 0.8,
-    "max_duration_sec": 8.0,
-    "max_chars": 36,
-    "prefer_punctuation_boundary": True,
-}
 
 
 class TranscriptionChangeHook:
@@ -139,6 +137,7 @@ class STTAPISettings:
     device: str = "mps"
     diarization_device: str = "cpu"
     batch_size: int = 1
+    whisperx_batch_size: int = 8
     threads: int | None = None
     max_upload_bytes: int = 2 * 1024 * 1024 * 1024
     progress_interval: float = 30.0
@@ -167,6 +166,9 @@ class STTAPISettings:
                 "STT_DIARIZATION_DEVICE", "cpu"
             ).strip(),
             batch_size=int(os.environ.get("STT_BATCH_SIZE", "1")),
+            whisperx_batch_size=int(
+                os.environ.get("WHISPERX_BATCH_SIZE", "8")
+            ),
             threads=int(threads_value) if threads_value else None,
             max_upload_bytes=int(
                 os.environ.get(
@@ -238,6 +240,8 @@ class STTAPISettings:
         )
         if self.batch_size < 1:
             raise ValueError("STT_BATCH_SIZE must be at least 1")
+        if self.whisperx_batch_size < 1:
+            raise ValueError("WHISPERX_BATCH_SIZE must be at least 1")
         if self.threads is not None and self.threads < 1:
             raise ValueError("STT_THREADS must be at least 1")
         if self.max_upload_bytes < 1:
@@ -322,6 +326,40 @@ def _venv_nvidia_library_paths(python: Path) -> list[str]:
     )
 
 
+def _resolve_batch_size(
+    decoded: Mapping[str, Any],
+    backend: str,
+    settings: STTAPISettings,
+) -> int:
+    """Resolve the effective batch size for a transcription request.
+
+    Client overrides are only honoured for the WhisperX-backed paths; the
+    Kotoba pipeline caches its batch size at load time and WhisperJAV uses a
+    different batching concept entirely.
+    """
+
+    if decoded.get("batch_size") is not None:
+        if backend not in {"whisperx", "hybrid"}:
+            raise ValueError(
+                f"{backend} batch_size is fixed at pipeline load; "
+                "set STT_BATCH_SIZE instead"
+            )
+        raw_value = decoded["batch_size"]
+        if isinstance(raw_value, bool) or not isinstance(raw_value, int):
+            raise ValueError("batch_size must be an integer")
+        if not (
+            WHISPERX_MIN_BATCH_SIZE <= raw_value <= WHISPERX_MAX_BATCH_SIZE
+        ):
+            raise ValueError(
+                "batch_size must be between "
+                f"{WHISPERX_MIN_BATCH_SIZE} and {WHISPERX_MAX_BATCH_SIZE}"
+            )
+        return raw_value
+    if backend in {"whisperx", "hybrid"}:
+        return settings.whisperx_batch_size
+    return settings.batch_size
+
+
 def _parse_options(raw_options: str, settings: STTAPISettings) -> dict[str, Any]:
     try:
         decoded = json.loads(raw_options)
@@ -332,6 +370,7 @@ def _parse_options(raw_options: str, settings: STTAPISettings) -> dict[str, Any]
 
     allowed = {
         "backend",
+        "batch_size",
         "chunk_length_seconds",
         "num_speakers",
         "min_speakers",
@@ -365,8 +404,9 @@ def _parse_options(raw_options: str, settings: STTAPISettings) -> dict[str, Any]
         raise ValueError(
             f"{backend} backend requires noise_filter=true for VAD"
         )
+    batch_size = _resolve_batch_size(decoded, backend, settings)
     options = TranscriptionOptions(
-        batch_size=settings.batch_size,
+        batch_size=batch_size,
         chunk_length_seconds=int(
             decoded.get(
                 "chunk_length_seconds",
@@ -412,13 +452,13 @@ def _parse_options(raw_options: str, settings: STTAPISettings) -> dict[str, Any]
     if backend in {"hybrid", "whisperx"}:
         if backend == "whisperx" and "hybrid_rescue" in decoded:
             raise ValueError("hybrid_rescue requires backend='hybrid'")
-        segmentation_input = dict(decoded)
-        if backend == "hybrid" and "subtitle_segmentation" not in decoded:
-            segmentation_input["subtitle_segmentation"] = (
-                DEFAULT_HYBRID_SEGMENTATION
-            )
         segmentation = WhisperXSegmentationOptions.from_options(
-            segmentation_input
+            decoded,
+            defaults=(
+                DEFAULT_SUBTITLE_SEGMENTATION
+                if backend == "hybrid"
+                else None
+            ),
         )
         repetition_policy = str(decoded.get("repetition_policy", "flag"))
         if repetition_policy not in {"flag", "reject"}:
@@ -455,13 +495,11 @@ def _parse_options(raw_options: str, settings: STTAPISettings) -> dict[str, Any]
                 "unsupported WhisperJAV quality options: "
                 f"{sorted(forbidden)}"
             )
-        segmentation_input = dict(decoded)
-        if "subtitle_segmentation" not in segmentation_input:
-            segmentation_input["subtitle_segmentation"] = (
-                DEFAULT_HYBRID_SEGMENTATION
-            )
         parsed["subtitle_segmentation"] = asdict(
-            WhisperXSegmentationOptions.from_options(segmentation_input)
+            WhisperXSegmentationOptions.from_options(
+                decoded,
+                defaults=DEFAULT_SUBTITLE_SEGMENTATION,
+            )
         )
         parsed["whisperjav"] = asdict(
             WhisperJAVOptions.from_options(decoded)
@@ -480,6 +518,30 @@ def _parse_options(raw_options: str, settings: STTAPISettings) -> dict[str, Any]
             "WhisperX quality options require backend='whisperx' or 'hybrid'"
         )
     return parsed
+
+
+def write_wav_slice(
+    source: Path,
+    destination: Path,
+    start_seconds: float,
+    end_seconds: float,
+) -> float:
+    """Copy one time span of a PCM WAV file and return its real duration."""
+    with wave.open(str(source), "rb") as reader:
+        frame_rate = reader.getframerate()
+        total_frames = reader.getnframes()
+        first = max(0, min(total_frames, int(start_seconds * frame_rate)))
+        last = max(first, min(total_frames, int(end_seconds * frame_rate)))
+        if last <= first:
+            return 0.0
+        reader.setpos(first)
+        frames = reader.readframes(last - first)
+        with wave.open(str(destination), "wb") as writer:
+            writer.setnchannels(reader.getnchannels())
+            writer.setsampwidth(reader.getsampwidth())
+            writer.setframerate(frame_rate)
+            writer.writeframes(frames)
+    return (last - first) / float(frame_rate)
 
 
 def _validate_wav(path: Path) -> None:
@@ -704,6 +766,154 @@ class TranscriptionService:
             LOGGER.info("transcription model loaded")
         return self._pipeline
 
+    def _run_kotoba_rescue_windows(
+        self,
+        job: TranscriptionJob,
+        windows: Sequence[Mapping[str, Any]],
+        primary_segments: Sequence[Mapping[str, Any]],
+        options: TranscriptionOptions,
+        *,
+        artifact_dir: Path | None = None,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Decode only the rescue windows and restore absolute timestamps.
+
+        Each window is diarized on its own, so speaker labels are local to
+        the window and are reconciled at the transcript-normalization
+        boundary.
+        """
+        pipeline = self._get_pipeline()
+        source = Path(job.audio_path)
+        segments: list[dict[str, Any]] = []
+        removed_spans: list[dict[str, Any]] = []
+        encoding_warning: Mapping[str, Any] | None = None
+        timestamp_postprocessor = "model-default"
+        decoded_seconds = 0.0
+        executed = 0
+        created_base = 0
+        completed_base = 0
+        with tempfile.TemporaryDirectory(prefix="hybrid-rescue-") as scratch:
+            work_dir = Path(scratch)
+            for index, window in enumerate(windows):
+                start = float(window["start"])
+                slice_path = work_dir / f"window-{index:03d}.wav"
+                duration = write_wav_slice(
+                    source,
+                    slice_path,
+                    start,
+                    float(window["end"]),
+                )
+                if duration <= 0.0:
+                    slice_path.unlink(missing_ok=True)
+                    continue
+
+                def report(
+                    progress: ChunkProgress,
+                    *,
+                    created_base: int = created_base,
+                    completed_base: int = completed_base,
+                ) -> None:
+                    self._record_chunk_progress(
+                        job.id,
+                        ChunkProgress(
+                            created=created_base + progress.created,
+                            completed=completed_base + progress.completed,
+                            final=False,
+                        ),
+                    )
+
+                window_result = run_pipeline(
+                    pipeline,
+                    slice_path,
+                    options,
+                    progress_callback=report,
+                    progress_every=self.settings.chunk_progress_every,
+                    debug_artifact_dir=(
+                        artifact_dir / "kotoba" / f"window-{index:03d}"
+                        if artifact_dir is not None
+                        else None
+                    ),
+                )
+                slice_path.unlink(missing_ok=True)
+                executed += 1
+                decoded_seconds += duration
+                window_segments = normalize_segments(
+                    window_result,
+                    offset_seconds=start,
+                )
+                speaker_mapping = map_fallback_speakers(
+                    primary_segments,
+                    window_segments,
+                )
+                window_id = str(
+                    window.get("window_id", f"rescue-window-{index + 1:06d}")
+                )
+                speaker_namespace = window_id.upper().replace("-", "_")
+                for segment in window_segments:
+                    local_speaker = str(
+                        segment.get("speaker", "UNKNOWN")
+                    )
+                    mapped_speaker = speaker_mapping.get(
+                        local_speaker,
+                        f"KOTOBA_{local_speaker}",
+                    )
+                    if mapped_speaker == f"KOTOBA_{local_speaker}":
+                        mapped_speaker = (
+                            f"KOTOBA_{speaker_namespace}_{local_speaker}"
+                        )
+                    segment["speaker"] = mapped_speaker
+                segments.extend(window_segments)
+                chunks = window_result.get("chunks", [])
+                if isinstance(chunks, list):
+                    created_base += len(chunks)
+                    completed_base += len(chunks)
+                window_noise = window_result.get("noise_filter")
+                if isinstance(window_noise, Mapping):
+                    for span in window_noise.get("removed_spans", []) or []:
+                        if not isinstance(span, Mapping):
+                            continue
+                        shifted = dict(span)
+                        shifted["start"] = round(
+                            float(span.get("start", 0.0)) + start, 3
+                        )
+                        shifted["end"] = round(
+                            float(span.get("end", 0.0)) + start, 3
+                        )
+                        removed_spans.append(shifted)
+                window_encoding = window_result.get("encoding_warning")
+                if isinstance(window_encoding, Mapping) and window_encoding:
+                    encoding_warning = window_encoding
+                timestamp_postprocessor = str(
+                    window_result.get(
+                        "timestamp_postprocessor",
+                        timestamp_postprocessor,
+                    )
+                )
+        segments.sort(key=lambda segment: (segment["start"], segment["end"]))
+        LOGGER.info(
+            "hybrid job %s rescued %d window(s) covering %.1fs of audio",
+            job.id,
+            executed,
+            decoded_seconds,
+        )
+        result: dict[str, Any] = {
+            "timestamp_postprocessor": timestamp_postprocessor,
+            "noise_filter": {
+                "enabled": options.noise_filter,
+                "provider": "kotoba-noise-filter-v1",
+                "execution_state": (
+                    "run_removed" if removed_spans else "run_no_removal"
+                ),
+                "scope": "windows",
+                "window_count": executed,
+                "decoded_seconds": round(decoded_seconds, 3),
+                "removed_count": len(removed_spans),
+                "removed_spans": removed_spans,
+            },
+        }
+        if encoding_warning is not None:
+            result["encoding_warning"] = dict(encoding_warning)
+        return segments, result
+
     def _release_pipeline(self) -> None:
         if self._pipeline is None:
             return
@@ -734,6 +944,13 @@ class TranscriptionService:
             self._release_pipeline()
         worker_result = self.result_dir / f".{job.id}.whisperx.json"
         worker_result.unlink(missing_ok=True)
+        worker_options = job.options if options is None else options
+        LOGGER.info(
+            "starting WhisperX worker for %s with batch_size=%s threads=%s",
+            job.id,
+            worker_options.get("batch_size"),
+            worker_options.get("threads"),
+        )
         environment = os.environ.copy()
         environment.update(
             {
@@ -756,10 +973,7 @@ class TranscriptionService:
             "--output",
             str(worker_result),
             "--options",
-            json.dumps(
-                job.options if options is None else options,
-                sort_keys=True,
-            ),
+            json.dumps(worker_options, sort_keys=True),
         ]
         if self.settings.debug_artifacts:
             command.extend(
@@ -1075,7 +1289,6 @@ class TranscriptionService:
                         hybrid_options.kotoba_chunk_length_seconds
                     ),
                 )
-                pipeline = self._get_pipeline()
                 whisperx_options = {
                     **job.options,
                     "chunk_length_seconds": (
@@ -1083,9 +1296,13 @@ class TranscriptionService:
                     ),
                     "repetition_policy": "flag",
                 }
+                # Kotoba is loaded only after WhisperX finishes. Holding both
+                # on a 10GB card makes CTranslate2 fail its batch allocations,
+                # and the rescue pass cannot start before the primary result
+                # exists anyway.
                 primary_result = self._run_whisperx_worker(
                     job,
-                    release_kotoba=False,
+                    release_kotoba=True,
                     options=whisperx_options,
                 )
                 raw_primary_segments = primary_result.get("segments")
@@ -1132,40 +1349,76 @@ class TranscriptionService:
                     audio_duration=audio_duration,
                 )
 
+                # Without a structurally failed window the rescue pass has
+                # nothing to replace, so decoding the whole file a second time
+                # buys nothing. Fusing an empty fallback returns the primary
+                # segments unchanged.
+                kotoba_skipped = not rescue_windows
                 kotoba_started = time.monotonic()
-                fallback_result = run_pipeline(
-                    pipeline,
-                    Path(job.audio_path),
-                    kotoba_options,
-                    progress_callback=lambda progress: self._record_chunk_progress(
+                fallback_result: Mapping[str, Any] = {}
+                fallback_segments: list[dict[str, Any]] = []
+                fallback_issues: list[dict[str, Any]] = []
+                if kotoba_skipped:
+                    LOGGER.info(
+                        "hybrid job %s has no rescue window; skipping the "
+                        "Kotoba pass",
                         job.id,
-                        progress,
-                    ),
-                    progress_every=self.settings.chunk_progress_every,
-                    debug_artifact_dir=(
-                        artifact_dir / "kotoba"
-                        if artifact_dir is not None
-                        else None
-                    ),
-                )
-                fallback_segments = add_segment_ids(
-                    normalize_segments(fallback_result)
-                )
+                    )
+                elif hybrid_options.rescue_scope == "windows":
+                    (
+                        window_segments,
+                        fallback_result,
+                    ) = self._run_kotoba_rescue_windows(
+                        job,
+                        rescue_windows,
+                        primary_segments,
+                        kotoba_options,
+                        artifact_dir=artifact_dir,
+                    )
+                    fallback_segments = add_segment_ids(window_segments)
+                else:
+                    pipeline = self._get_pipeline()
+                    fallback_result = run_pipeline(
+                        pipeline,
+                        Path(job.audio_path),
+                        kotoba_options,
+                        progress_callback=lambda progress: (
+                            self._record_chunk_progress(job.id, progress)
+                        ),
+                        progress_every=self.settings.chunk_progress_every,
+                        debug_artifact_dir=(
+                            artifact_dir / "kotoba"
+                            if artifact_dir is not None
+                            else None
+                        ),
+                    )
+                    fallback_segments = add_segment_ids(
+                        normalize_segments(fallback_result)
+                    )
                 for segment in fallback_segments:
                     source_id = f"kotoba-{segment['id']}"
                     segment["id"] = source_id
                     segment["span_id"] = source_id
                     segment["parent_span_ids"] = list(
                         dict.fromkeys(
-                            [*segment.get("parent_span_ids", []), source_id]
+                            [
+                                *segment.get("parent_span_ids", []),
+                                source_id,
+                            ]
                         )
                     )
                     segment.setdefault("provider", "kotoba")
-                fallback_issues = detect_hybrid_issues(
-                    fallback_segments,
-                    [],
-                    options=hybrid_options,
-                    repetition_min_count=repetition_min_count,
+                if fallback_segments:
+                    fallback_issues = detect_hybrid_issues(
+                        fallback_segments,
+                        [],
+                        options=hybrid_options,
+                        repetition_min_count=repetition_min_count,
+                    )
+                kotoba_elapsed = (
+                    0.0
+                    if kotoba_skipped
+                    else round(time.monotonic() - kotoba_started, 3)
                 )
                 fused_segments, hybrid_quality = fuse_hybrid_segments(
                     primary_segments,
@@ -1174,6 +1427,9 @@ class TranscriptionService:
                     fallback_issues=fallback_issues,
                     audio_duration=audio_duration,
                     primary_words=words,
+                    fallback_speakers_preassigned=(
+                        hybrid_options.rescue_scope == "windows"
+                    ),
                 )
                 words = mark_rescued_words(
                     words,
@@ -1200,7 +1456,11 @@ class TranscriptionService:
                     {
                         "enabled": kotoba_options.noise_filter,
                         "provider": "kotoba-noise-filter-v1",
-                        "execution_state": "not_configured",
+                        "execution_state": (
+                            "skipped"
+                            if kotoba_skipped
+                            else "not_configured"
+                        ),
                         "removed_count": None,
                         "removed_spans": [],
                     },
@@ -1231,13 +1491,14 @@ class TranscriptionService:
                     "device": self.settings.device,
                     "diarization_device": self.settings.diarization_device,
                     "elapsed_seconds": round(time.monotonic() - started, 3),
-                    "simultaneous_model_residency": True,
+                    "simultaneous_model_residency": False,
+                    "kotoba_skipped": kotoba_skipped,
                     "primary": dict(primary_runtime),
                     "rescue": {
                         "backend": "kotoba",
-                        "elapsed_seconds": round(
-                            time.monotonic() - kotoba_started, 3
-                        ),
+                        "skipped": kotoba_skipped,
+                        "scope": hybrid_options.rescue_scope,
+                        "elapsed_seconds": kotoba_elapsed,
                     },
                 }
                 noise_filter = {

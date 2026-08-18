@@ -1,5 +1,6 @@
 (() => {
   const selectedJobIds = new Set();
+  const selectedStopJobIds = new Set();
   const selectedPrompts = new Map();
   const selectedComparisonJobs = new Map();
 
@@ -27,6 +28,57 @@
       forms.unshift(root);
     }
     return forms;
+  };
+
+  const stopFormsIn = (root) => {
+    const forms = Array.from(
+      root.querySelectorAll?.("[data-job-stop-form]") || [],
+    );
+    if (root.matches?.("[data-job-stop-form]")) {
+      forms.unshift(root);
+    }
+    return forms;
+  };
+
+  const stopCheckboxesFor = (form) => Array.from(
+    document.querySelectorAll(`[data-stop-job-checkbox][form="${form.id}"]`),
+  );
+
+  const stopCandidateIdsFor = (form) => new Set(
+    Array.from(form.querySelectorAll("[data-stop-job-candidate]"))
+      .map((input) => input.value),
+  );
+
+  const syncStopForm = (form) => {
+    const candidateIds = stopCandidateIdsFor(form);
+    for (const jobId of selectedStopJobIds) {
+      if (!candidateIds.has(jobId)) {
+        selectedStopJobIds.delete(jobId);
+      }
+    }
+    for (const checkbox of stopCheckboxesFor(form)) {
+      checkbox.checked = selectedStopJobIds.has(checkbox.value);
+    }
+    const selectedIds = Array.from(selectedStopJobIds)
+      .filter((jobId) => candidateIds.has(jobId));
+    const inputs = form.querySelector("[data-stop-selected-inputs]");
+    if (inputs) {
+      inputs.replaceChildren(...selectedIds.map((jobId) => {
+        const input = document.createElement("input");
+        input.type = "hidden";
+        input.name = "job_ids";
+        input.value = jobId;
+        return input;
+      }));
+    }
+    const count = form.querySelector("[data-stop-selection-count]");
+    if (count) {
+      count.textContent = String(selectedIds.length);
+    }
+    const submit = form.querySelector("[data-stop-selected]");
+    if (submit) {
+      submit.disabled = selectedIds.length === 0;
+    }
   };
 
   const comparisonSelectsFor = (form) => Array.from(
@@ -103,6 +155,9 @@
     for (const form of comparisonFormsIn(root)) {
       syncComparisonForm(form);
     }
+    for (const form of stopFormsIn(root)) {
+      syncStopForm(form);
+    }
   };
 
   document.addEventListener("change", (event) => {
@@ -116,6 +171,20 @@
       const form = document.getElementById(checkbox.getAttribute("form"));
       if (form) {
         syncForm(form);
+      }
+      return;
+    }
+
+    const stopCheckbox = event.target.closest?.("[data-stop-job-checkbox]");
+    if (stopCheckbox) {
+      if (stopCheckbox.checked) {
+        selectedStopJobIds.add(stopCheckbox.value);
+      } else {
+        selectedStopJobIds.delete(stopCheckbox.value);
+      }
+      const form = document.getElementById(stopCheckbox.getAttribute("form"));
+      if (form) {
+        syncStopForm(form);
       }
       return;
     }
@@ -162,6 +231,25 @@
   });
 
   document.addEventListener("click", (event) => {
+    const selectAllStops = event.target.closest?.("[data-select-stop-jobs]");
+    const clearStops = event.target.closest?.("[data-clear-stop-jobs]");
+    const stopControl = selectAllStops || clearStops;
+    if (stopControl) {
+      const form = stopControl.closest("[data-job-stop-form]");
+      if (!form) {
+        return;
+      }
+      for (const jobId of stopCandidateIdsFor(form)) {
+        if (selectAllStops) {
+          selectedStopJobIds.add(jobId);
+        } else {
+          selectedStopJobIds.delete(jobId);
+        }
+      }
+      syncStopForm(form);
+      return;
+    }
+
     const selectAll = event.target.closest?.("[data-select-translation-jobs]");
     const clear = event.target.closest?.("[data-clear-translation-jobs]");
     const control = selectAll || clear;

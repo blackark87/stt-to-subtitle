@@ -1,0 +1,45 @@
+# Dependencies for the whisperjav venv in the STT runtime image.
+#
+# The WhisperJAV ensemble itself is vendored under
+# src/stt_to_subtitle/vendor/whisperjav, so the upstream package is no longer
+# installed. Versions are pinned to the set the previous image resolved, so
+# internalizing the code does not silently move any dependency.
+#
+# Deliberately absent versus the upstream project: faster-whisper, ctranslate2,
+# pydantic, PyYAML, ffmpeg-python, auditok, silero-vad, pyloudnorm, pydub,
+# jsonschema, and the GUI / translate / enhancement extras. Our recipe reaches
+# none of them. openai-whisper stays because stable-ts imports it at module
+# load time.
+
+--extra-index-url https://download.pytorch.org/whl/cu128
+
+torch==2.10.0+cu128
+torchaudio==2.10.0+cu128
+
+transformers==4.57.6
+accelerate==1.12.0
+huggingface_hub==0.36.2
+safetensors==0.7.0
+tokenizers==0.22.2
+
+qwen-asr==0.0.6
+stable-ts @ git+https://github.com/meizhong986/stable-ts-fix-setup.git@db1358dcc5f4ef7b252a64cdfa7f885e4d60d999
+openai-whisper @ git+https://github.com/openai/whisper@c0d2f624c09dc18e709e37c2ad90c039a4eb72a2
+
+onnxruntime-gpu==1.23.2
+ten-vad==1.0.6.8
+
+librosa==0.11.0
+soundfile==0.12.1
+numba==0.64.0
+numpy==2.4.3
+scipy==1.17.1
+scikit-learn==1.8.0
+
+pysrt==1.1.2
+srt==3.5.3
+regex==2026.2.28
+requests==2.32.5
+tqdm==4.67.3
+colorama==0.4.6
+typing_extensions==4.15.0

@@ -5,7 +5,7 @@ services:
     profiles:
       - build
     platform: linux/amd64
-    image: ${STT_RUNTIME_IMAGE:-stt-to-subtitle-stt-runtime:py311-cuda-v2}
+    image: ${STT_RUNTIME_IMAGE:-stt-to-subtitle-stt-runtime:py311-cuda-v4}
     build:
       context: ${WORKSPACE:-.}
       dockerfile: Dockerfile.stt-runtime
@@ -54,6 +54,7 @@ services:
       GPU_METRICS_TIMEOUT_SECONDS: ${GPU_METRICS_TIMEOUT_SECONDS:-3}
       TRANSLATION_BATCH_SEGMENTS: ${TRANSLATION_BATCH_SEGMENTS:-30}
       TRANSLATION_BATCH_CHARACTERS: ${TRANSLATION_BATCH_CHARACTERS:-6000}
+      WEB_AUDIO_WORKERS: ${WEB_AUDIO_WORKERS:-1}
     volumes:
       - ${MEDIA_PATH:-./media}:/media:rw
       - type: bind
@@ -72,7 +73,7 @@ services:
       context: ${WORKSPACE:-.}
       dockerfile: Dockerfile
       args:
-        STT_RUNTIME_IMAGE: ${STT_RUNTIME_IMAGE:-stt-to-subtitle-stt-runtime:py311-cuda-v2}
+        STT_RUNTIME_IMAGE: ${STT_RUNTIME_IMAGE:-stt-to-subtitle-stt-runtime:py311-cuda-v4}
     user: "${PUID:-1000}:${PGID:-1000}"
     init: true
     restart: unless-stopped
@@ -86,7 +87,9 @@ services:
       STT_STATE_DIR: /var/lib/stt
       STT_DEVICE: ${STT_DEVICE:-cuda}
       STT_DIARIZATION_DEVICE: ${STT_DIARIZATION_DEVICE:-cuda}
-      STT_BATCH_SIZE: ${STT_BATCH_SIZE:-1}
+      STT_BATCH_SIZE: ${STT_BATCH_SIZE:-8}
+      WHISPERX_BATCH_SIZE: ${WHISPERX_BATCH_SIZE:-8}
+      STT_THREADS: ${STT_THREADS:-8}
       STT_PROGRESS_INTERVAL_SECONDS: ${STT_PROGRESS_INTERVAL_SECONDS:-30}
       STT_CHUNK_PROGRESS_EVERY: ${STT_CHUNK_PROGRESS_EVERY:-10}
       STT_NOISE_FILTER_TRIGGER_LEVEL: ${STT_NOISE_FILTER_TRIGGER_LEVEL:-7.0}

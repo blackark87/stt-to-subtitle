@@ -27,7 +27,6 @@
     <div class="editor-toolbar">
       <div>
         <strong>JSON 편집</strong>
-        <span class="muted">저장 전에 형식과 세그먼트 ID를 검증합니다.</span>
       </div>
       <button type="button" class="secondary compact" data-format-json>{{ icons.braces(14) }}JSON 정렬</button>
     </div>
@@ -46,9 +45,4 @@
       <a class="button secondary" href="/jobs/{{ job.id }}">취소</a>
     </div>
   </form>
-
-  <p class="muted editor-note">
-    저장은 원자적으로 처리됩니다. 전사와 번역 JSON이 모두 유효하면 한국어 SRT와 ASS를 즉시 다시 생성합니다.
-    완료·중단·실패 상태의 작업만 편집할 수 있습니다.
-  </p>
 {% endblock %}

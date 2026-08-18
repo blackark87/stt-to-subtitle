@@ -33,6 +33,24 @@ class HybridRescueOptionsTests(unittest.TestCase):
                 {"hybrid_rescue": {"max_word_duration_sec": "nan"}}
             )
 
+    def test_rescue_scope_defaults_to_windows_and_accepts_full(self) -> None:
+        self.assertEqual(
+            HybridRescueOptions.from_options({}).rescue_scope,
+            "windows",
+        )
+        self.assertEqual(
+            HybridRescueOptions.from_options(
+                {"hybrid_rescue": {"rescue_scope": "full"}}
+            ).rescue_scope,
+            "full",
+        )
+
+    def test_rejects_unknown_rescue_scope(self) -> None:
+        with self.assertRaisesRegex(ValueError, "rescue_scope must be one of"):
+            HybridRescueOptions.from_options(
+                {"hybrid_rescue": {"rescue_scope": "partial"}}
+            )
+
     def test_rejects_whisperx_chunks_longer_than_native_window(self) -> None:
         with self.assertRaisesRegex(ValueError, "must be at most 30"):
             HybridRescueOptions.from_options(
