@@ -82,13 +82,15 @@ WAITING_STATUSES = {
 }
 JOB_STATUS_GROUPS = {
     "running": RUNNING_STATUSES,
-    "attention": RETRYABLE_STATUSES,
+    "blocked": {"blocked"},
+    "failed": {"failed"},
     "waiting": WAITING_STATUSES,
     "completed": SUCCESS_STATUSES,
 }
 JOB_STATUS_GROUP_LABELS = {
     "running": "진행 중",
-    "attention": "중단·실패",
+    "blocked": "중단",
+    "failed": "실패",
     "waiting": "대기",
     "completed": "완료",
 }
@@ -933,7 +935,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             latest = latest_jobs.get(source_rel)
             linked_job = None
             if latest is not None and latest.status in {"blocked", "failed"}:
-                media["subtitle_state"] = "attention"
+                media["subtitle_state"] = latest.status
                 stage = JOB_STAGE_LABELS.get(
                     str(latest.blocked_stage),
                     str(latest.blocked_stage or ""),
@@ -1008,9 +1010,31 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                 media["processing_label"] = (
                     f"{next(iter(labels))} · {len(parts)}파트"
                 )
-            elif "attention" in states:
-                media["subtitle_state"] = "attention"
-                media["processing_label"] = "일부 파트 중단·실패"
+            elif "failed" in states:
+                media["subtitle_state"] = "failed"
+                failed_parts = sum(
+                    state == "failed"
+                    for state in (
+                        str(part["subtitle_state"]) for part in parts
+                    )
+                )
+                blocked_parts = sum(
+                    state == "blocked"
+                    for state in (
+                        str(part["subtitle_state"]) for part in parts
+                    )
+                )
+                media["processing_label"] = (
+                    f"실패 {failed_parts}파트"
+                    + (
+                        f" · 중단 {blocked_parts}파트"
+                        if blocked_parts
+                        else ""
+                    )
+                )
+            elif "blocked" in states:
+                media["subtitle_state"] = "blocked"
+                media["processing_label"] = "일부 파트 중단"
             elif "running" in states:
                 media["subtitle_state"] = "running"
                 media["processing_label"] = "일부 파트 처리 중"
@@ -1579,7 +1603,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         elif jobs_stopped is not None:
             notice = f"진행 중인 작업 {jobs_stopped}개에 중단을 요청했습니다."
         elif jobs_retried is not None:
-            notice = f"중단·실패 작업 {jobs_retried}개를 재시도했습니다."
+            notice = f"작업 {jobs_retried}개를 재시도했습니다."
         elif translations_queued is not None:
             notice = (
                 f"선택한 전사 작업 {translations_queued}개를 번역으로 "
@@ -1625,7 +1649,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         elif jobs_stopped is not None:
             notice = f"진행 중인 작업 {jobs_stopped}개에 중단을 요청했습니다."
         elif jobs_retried is not None:
-            notice = f"중단·실패 작업 {jobs_retried}개를 재시도했습니다."
+            notice = f"작업 {jobs_retried}개를 재시도했습니다."
         elif translations_queued is not None:
             notice = (
                 f"선택한 전사 작업 {translations_queued}개를 번역으로 "

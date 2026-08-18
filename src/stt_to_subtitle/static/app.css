@@ -125,7 +125,7 @@ a { color: var(--accent); }
 .auth-container { max-width: 520px; }
 .card { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius-card); padding: 20px; margin: 20px 0; box-shadow: var(--shadow-card); }
 .job-overview-card { border-color: var(--line-strong); border-left: 3px solid var(--accent); box-shadow: var(--shadow-sm); }
-.stat-strip { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin: 20px 0; }
+.stat-strip { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; margin: 20px 0; }
 .stat-tile {
   display: grid;
   grid-template-columns: auto 1fr;
@@ -149,8 +149,10 @@ a { color: var(--accent); }
 .stat-label { color: var(--muted); font-size: .8rem; font-weight: 650; }
 .stat-running { border-top-color: var(--accent); }
 .stat-running .stat-icon { background: var(--accent-subtle); color: var(--accent); }
-.stat-attention { border-top-color: var(--danger); }
-.stat-attention .stat-icon { background: color-mix(in srgb, var(--danger) 14%, var(--card)); color: var(--danger); }
+.stat-blocked { border-top-color: var(--warning-strong); }
+.stat-blocked .stat-icon { background: color-mix(in srgb, var(--warning-strong) 14%, var(--card)); color: var(--warning); }
+.stat-failed { border-top-color: var(--danger); }
+.stat-failed .stat-icon { background: color-mix(in srgb, var(--danger) 14%, var(--card)); color: var(--danger); }
 .stat-waiting { border-top-color: var(--warning-strong); }
 .stat-waiting .stat-icon { background: color-mix(in srgb, var(--warning-strong) 16%, var(--card)); color: var(--warning); }
 .stat-completed { border-top-color: var(--success); }
@@ -450,7 +452,8 @@ button:disabled, .button:disabled { opacity: .5; cursor: not-allowed; box-shadow
 .subtitle-state.is-completed { background: color-mix(in srgb, var(--success) 16%, var(--card)); color: var(--success); }
 .subtitle-state.is-progress { background: color-mix(in srgb, var(--accent) 14%, var(--card)); color: var(--accent); }
 .subtitle-state.is-running { background: color-mix(in srgb, var(--accent) 16%, var(--card)); color: var(--accent); }
-.subtitle-state.is-attention { background: color-mix(in srgb, var(--danger) 14%, var(--card)); color: var(--danger); }
+.subtitle-state.is-blocked { background: color-mix(in srgb, var(--warning-strong) 14%, var(--card)); color: var(--warning); }
+.subtitle-state.is-failed { background: color-mix(in srgb, var(--danger) 14%, var(--card)); color: var(--danger); }
 .subtitle-state.is-pending { background: color-mix(in srgb, var(--line) 60%, transparent); color: var(--muted); }
 a.subtitle-state { text-decoration: none; }
 a.subtitle-state:hover { text-decoration: underline; }
@@ -749,7 +752,7 @@ th, td { border-bottom: 1px solid var(--line); padding: 10px 8px; text-align: le
 }
 .recent-job-status-icon { display: grid; place-items: center; width: 34px; height: 34px; border-radius: var(--radius-sm); background: var(--surface-well); color: var(--muted); }
 .recent-job-status-running { background: var(--accent-subtle); color: var(--accent); }
-.recent-job-status-attention { background: color-mix(in srgb, var(--danger) 14%, var(--card)); color: var(--danger); }
+.recent-job-status-failed { background: color-mix(in srgb, var(--danger) 14%, var(--card)); color: var(--danger); }
 .recent-job-status-blocked { background: color-mix(in srgb, var(--warning-strong) 14%, var(--card)); color: var(--warning); }
 .recent-job-status-completed { background: color-mix(in srgb, var(--success) 16%, var(--card)); color: var(--success); }
 .recent-job-status-waiting { background: color-mix(in srgb, var(--warning-strong) 14%, var(--card)); color: var(--warning); }
@@ -950,6 +953,7 @@ code { overflow-wrap: anywhere; }
 }
 @media (max-width: 900px) {
   .stat-strip { grid-template-columns: repeat(2, 1fr); }
+  .stat-strip .stat-tile:last-child { grid-column: 1 / -1; }
   .grid-form { grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); }
   .media-board { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 14px 10px; }
   .model-picker { grid-template-columns: 1fr; }

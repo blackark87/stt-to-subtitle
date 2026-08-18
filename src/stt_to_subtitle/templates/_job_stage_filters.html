@@ -31,8 +31,13 @@
     </div>
   {% endfor %}
   <a
-    class="button{% if selected_status_group == 'attention' %} is-filter-active{% else %} secondary{% endif %}"
-    href="/jobs?status_group=attention"
-    {% if selected_status_group == 'attention' %}aria-current="page"{% endif %}
-  >중단·실패</a>
+    class="button{% if selected_status_group == 'blocked' %} is-filter-active{% else %} secondary{% endif %}"
+    href="/jobs?status_group=blocked"
+    {% if selected_status_group == 'blocked' %}aria-current="page"{% endif %}
+  >중단</a>
+  <a
+    class="button{% if selected_status_group == 'failed' %} is-filter-active{% else %} secondary{% endif %}"
+    href="/jobs?status_group=failed"
+    {% if selected_status_group == 'failed' %}aria-current="page"{% endif %}
+  >실패</a>
 </nav>

@@ -1422,7 +1422,7 @@ class SubtitleOrchestrator:
             raise ValueError("job not found")
         if not job.can_delete_record:
             raise ValueError(
-                "only completed audio extraction records, attention jobs, "
+                "only completed audio extraction records, retriable jobs, "
                 "or jobs missing from the remote transcription server can "
                 "be deleted"
             )

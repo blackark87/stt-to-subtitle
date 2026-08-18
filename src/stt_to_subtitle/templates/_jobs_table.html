@@ -3,11 +3,11 @@
   {% set pipeline = job|job_progress %}
   {% set is_running = job.status in ['extracting', 'transcription_running', 'translation_running', 'rendering'] %}
   {% set is_blocked = job.status == 'blocked' %}
-  {% set is_attention = job.status == 'failed' %}
+  {% set is_failed = job.status == 'failed' %}
   {% set is_completed = job.status in ['audio_completed', 'transcription_completed', 'completed'] %}
   {% set can_translate = job.id in translatable_job_ids %}
   {% set can_stop = job.id in stoppable_job_ids %}
-  {% set status_group = 'running' if is_running else ('blocked' if is_blocked else ('attention' if is_attention else ('completed' if is_completed else 'waiting'))) %}
+  {% set status_group = 'running' if is_running else ('blocked' if is_blocked else ('failed' if is_failed else ('completed' if is_completed else 'waiting'))) %}
   <article class="recent-job-item recent-job-{{ job.status }}{% if is_completed %} is-completed{% endif %}">
     <div class="recent-job-leading">
       <div class="recent-job-select">
@@ -33,7 +33,7 @@
       <div class="recent-job-status-icon recent-job-status-{{ status_group }}" aria-hidden="true">
         {% if status_group == 'running' %}{{ icons.activity(18) }}
         {% elif status_group == 'blocked' %}{{ icons.pause(18) }}
-        {% elif status_group == 'attention' %}{{ icons.alert_triangle(18) }}
+        {% elif status_group == 'failed' %}{{ icons.alert_triangle(18) }}
         {% elif status_group == 'completed' %}{{ icons.check(18) }}
         {% else %}{{ icons.clock(18) }}
         {% endif %}
@@ -213,10 +213,10 @@
       </form>
       {% endif %}
       {% if show_bulk_actions|default(true) %}
-      <form method="post" action="/jobs/retry-all" data-confirm-message="중단·실패 상태의 모든 작업을 마지막으로 저장된 단계부터 재시도하시겠습니까?">
+      <form method="post" action="/jobs/retry-all" data-confirm-message="중단 또는 실패한 모든 작업을 마지막으로 저장된 단계부터 재시도하시겠습니까?">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <input type="hidden" name="return_folder" value="{{ current_folder }}">
-        <button type="submit" class="compact"{% if not retriable_job_count %} disabled{% endif %}>{{ icons.refresh(14) }}중단 작업 일괄 재시도 ({{ retriable_job_count }})</button>
+        <button type="submit" class="compact"{% if not retriable_job_count %} disabled{% endif %}>{{ icons.refresh(14) }}전체 재시도 ({{ retriable_job_count }})</button>
       </form>
       <form method="post" action="/jobs/pause-all-translations" data-confirm-message="대기·실행 중인 모든 번역을 중단하시겠습니까? 오디오 추출과 전사는 계속 진행됩니다.">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">

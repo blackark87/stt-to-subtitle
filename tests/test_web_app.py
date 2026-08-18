@@ -301,27 +301,39 @@ class WebAppTests(unittest.TestCase):
                     running.id,
                     status="transcription_running",
                 )
-                attention = service.store.create(
-                    job_id="attention-job",
-                    source_rel="attention.mkv",
+                blocked = service.store.create(
+                    job_id="blocked-job",
+                    source_rel="blocked.mkv",
                     force_overwrite=False,
                     options={},
                 )
-                service.store.update(attention.id, status="blocked")
+                service.store.update(blocked.id, status="blocked")
+                failed = service.store.create(
+                    job_id="failed-job",
+                    source_rel="failed.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                service.store.update(failed.id, status="failed")
 
                 dashboard = client.get("/")
                 running_page = client.get("/jobs?status_group=running")
-                attention_page = client.get("/jobs?status_group=attention")
+                blocked_page = client.get("/jobs?status_group=blocked")
+                failed_page = client.get("/jobs?status_group=failed")
                 invalid_page = client.get("/jobs?status_group=unknown")
 
             self.assertIn('href="/jobs?status_group=running"', dashboard.text)
-            self.assertIn('href="/jobs?status_group=attention"', dashboard.text)
+            self.assertIn('href="/jobs?status_group=blocked"', dashboard.text)
+            self.assertIn('href="/jobs?status_group=failed"', dashboard.text)
             self.assertIn('href="/jobs?status_group=waiting"', dashboard.text)
             self.assertIn('href="/jobs?status_group=completed"', dashboard.text)
             self.assertIn("running.mkv", running_page.text)
-            self.assertNotIn("attention.mkv", running_page.text)
-            self.assertIn("attention.mkv", attention_page.text)
-            self.assertNotIn("running.mkv", attention_page.text)
+            self.assertNotIn("blocked.mkv", running_page.text)
+            self.assertNotIn("failed.mkv", running_page.text)
+            self.assertIn("blocked.mkv", blocked_page.text)
+            self.assertNotIn("failed.mkv", blocked_page.text)
+            self.assertIn("failed.mkv", failed_page.text)
+            self.assertNotIn("blocked.mkv", failed_page.text)
             self.assertIn(
                 "data-update-url=\"/jobs-fragment?status_group=running",
                 running_page.text,
@@ -1646,7 +1658,13 @@ class WebAppTests(unittest.TestCase):
             root = Path(directory)
             media_root = root / "media"
             media_root.mkdir()
-            for name in ("pending.mp4", "running.mp4", "done.mp4", "bad.mp4"):
+            for name in (
+                "pending.mp4",
+                "running.mp4",
+                "done.mp4",
+                "stopped.mp4",
+                "bad.mp4",
+            ):
                 (media_root / name).write_bytes(b"media")
             done_subtitle = media_root / "done.ko.srt"
             done_subtitle.write_text("subtitle", encoding="utf-8")
@@ -1672,6 +1690,17 @@ class WebAppTests(unittest.TestCase):
                     status="completed",
                     srt_path=str(done_subtitle),
                 )
+                blocked = service.store.create(
+                    job_id="blocked-job",
+                    source_rel="stopped.mp4",
+                    force_overwrite=False,
+                    options={},
+                )
+                service.store.update(
+                    blocked.id,
+                    status="blocked",
+                    error="stopped",
+                )
                 failed = service.store.create(
                     job_id="failed-job",
                     source_rel="bad.mp4",
@@ -1685,10 +1714,14 @@ class WebAppTests(unittest.TestCase):
             self.assertIn("미처리", page.text)
             self.assertIn("번역 중", page.text)
             self.assertIn("자막 생성 완료", page.text)
+            self.assertIn("중단", page.text)
             self.assertIn("실패", page.text)
             self.assertIn('href="/jobs/running-job"', page.text)
             self.assertIn('href="/jobs/done-job"', page.text)
+            self.assertIn('href="/jobs/blocked-job"', page.text)
             self.assertIn('href="/jobs/failed-job"', page.text)
+            self.assertIn("subtitle-state is-blocked", page.text)
+            self.assertIn("subtitle-state is-failed", page.text)
             self.assertIn('value="pending.mp4"', page.text)
             # 완료된 항목도 다시 번역하려면 개별 선택이 되어야 한다.
             self.assertIn('value="done.mp4"', page.text)
@@ -1702,7 +1735,7 @@ class WebAppTests(unittest.TestCase):
                 r'value="done\.mp4"[^>]*\s+data-auto-select',
             )
 
-    def test_deletes_attention_legacy_audio_and_missing_remote_job_records(
+    def test_deletes_retriable_legacy_audio_and_missing_remote_job_records(
         self,
     ) -> None:
         missing_error = (
@@ -1797,11 +1830,14 @@ class WebAppTests(unittest.TestCase):
                 artifact.write_bytes(b"audio")
 
                 dashboard = client.get("/jobs-fragment")
-                attention_page = client.get(
-                    "/jobs?status_group=attention&jobs_page=1"
+                blocked_page = client.get(
+                    "/jobs?status_group=blocked&jobs_page=1"
+                )
+                failed_page = client.get(
+                    "/jobs?status_group=failed&jobs_page=1"
                 )
                 detail = client.get(
-                    f"/jobs/{missing.id}?return_status_group=attention"
+                    f"/jobs/{missing.id}?return_status_group=blocked"
                     "&return_jobs_page=2"
                 )
                 audio_detail = client.get(f"/jobs/{audio.id}")
@@ -1812,7 +1848,7 @@ class WebAppTests(unittest.TestCase):
                 blocked_deleted = client.post(
                     f"/jobs/{other.id}/delete",
                     data={
-                        "return_status_group": "attention",
+                        "return_status_group": "blocked",
                         "return_jobs_page": "1",
                     },
                     follow_redirects=False,
@@ -1820,7 +1856,7 @@ class WebAppTests(unittest.TestCase):
                 failed_deleted = client.post(
                     f"/jobs/{failed.id}/delete",
                     data={
-                        "return_status_group": "attention",
+                        "return_status_group": "failed",
                         "return_jobs_page": "1",
                     },
                     follow_redirects=False,
@@ -1828,7 +1864,7 @@ class WebAppTests(unittest.TestCase):
                 deleted = client.post(
                     f"/jobs/{missing.id}/delete",
                     data={
-                        "return_status_group": "attention",
+                        "return_status_group": "blocked",
                         "return_jobs_page": "2",
                     },
                     follow_redirects=False,
@@ -1875,11 +1911,11 @@ class WebAppTests(unittest.TestCase):
                 detail.text,
             )
             self.assertIn(
-                'href="/jobs?status_group=attention&amp;jobs_page=2"',
+                'href="/jobs?status_group=blocked&amp;jobs_page=2"',
                 detail.text,
             )
             self.assertIn(
-                'name="return_status_group" value="attention"',
+                'name="return_status_group" value="blocked"',
                 detail.text,
             )
             self.assertIn(
@@ -1887,8 +1923,12 @@ class WebAppTests(unittest.TestCase):
                 detail.text,
             )
             self.assertIn(
-                'name="return_status_group" value="attention"',
-                attention_page.text,
+                'name="return_status_group" value="blocked"',
+                blocked_page.text,
+            )
+            self.assertIn(
+                'name="return_status_group" value="failed"',
+                failed_page.text,
             )
             self.assertIn(
                 f'action="/jobs/{audio.id}/delete"',
@@ -1903,15 +1943,15 @@ class WebAppTests(unittest.TestCase):
             self.assertEqual(invalid_return_rejected.status_code, 400)
             self.assertEqual(
                 blocked_deleted.headers["location"],
-                "/jobs?status_group=attention&jobs_page=1",
+                "/jobs?status_group=blocked&jobs_page=1",
             )
             self.assertEqual(
                 failed_deleted.headers["location"],
-                "/jobs?status_group=attention&jobs_page=1",
+                "/jobs?status_group=failed&jobs_page=1",
             )
             self.assertEqual(
                 deleted.headers["location"],
-                "/jobs?status_group=attention&jobs_page=2",
+                "/jobs?status_group=blocked&jobs_page=2",
             )
             self.assertEqual(
                 audio_deleted.headers["location"],
@@ -2067,7 +2107,7 @@ class WebAppTests(unittest.TestCase):
             self.assertTrue(all(job.status == "blocked" for job in selected))
             self.assertEqual(untouched.status, "transcribed")
 
-    def test_bulk_retry_restarts_all_attention_jobs(self) -> None:
+    def test_bulk_retry_restarts_all_blocked_and_failed_jobs(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
             media_root = root / "media"
@@ -2121,7 +2161,7 @@ class WebAppTests(unittest.TestCase):
                 queued = service.store.get(queued.id)
 
             self.assertIn('action="/jobs/retry-all"', fragment.text)
-            self.assertIn("중단 작업 일괄 재시도 (2)", fragment.text)
+            self.assertIn("전체 재시도 (2)", fragment.text)
             self.assertIn(
                 'name="return_folder" value="series"',
                 fragment.text,
@@ -2131,8 +2171,8 @@ class WebAppTests(unittest.TestCase):
                 response.headers["location"],
                 "/media?folder=series&jobs_retried=2",
             )
-            self.assertIn("중단·실패 작업 2개를 재시도했습니다.", notice.text)
-            self.assertIn("중단 작업 일괄 재시도 (0)", refreshed.text)
+            self.assertIn("작업 2개를 재시도했습니다.", notice.text)
+            self.assertIn("전체 재시도 (0)", refreshed.text)
             self.assertEqual(blocked.status, "queued")
             self.assertEqual(failed.status, "queued")
             self.assertEqual(queued.status, "queued")
