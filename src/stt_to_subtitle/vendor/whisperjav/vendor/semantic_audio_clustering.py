@@ -1,0 +1,1129 @@
+"""
+Acoustic Scene Segmenter V7: Long Form & Silence Snapping
+=========================================================
+Changes from V6:
+1. MIN_DUR increased to 20s (Segments are ~2x longer).
+2. SPLIT LOGIC changed to 'Snap to Silence' (cuts at lowest energy).
+3. FULL COVERAGE guaranteed (0.0 -> Duration).
+4. Class naming fixed (SemanticSegmenter).
+
+WhisperJAV modifications (v7.2.0, 2026-08 — diverges from upstream v7.1):
+A. Per-chunk anchored time axis: the feature time axis is built per 60s
+   chunk from the chunk's TRUE start time instead of one global arange over
+   the concatenated frame count. Librosa's centered framing yields ~1 extra
+   frame per chunk, so the old axis drifted late by ~32ms per chunk
+   (~2s/hour) — boundary timestamps late in long files were systematically
+   wrong.
+B. Silence-aware, onset-anchored boundary snapping: _snap_to_silence now
+   uses the calibrated silence floor (rms_base — previously computed by
+   AdaptiveClassifier but never used here) to find actual silence runs, and
+   places the cut near the END of the run so the NEXT scene starts at sound
+   onset (leading silence in an ASR chunk provokes hallucination; trailing
+   silence belongs to the previous scene). Pure argmin remains only as the
+   fallback when the window contains no silence at all.
+C. Silence-clamped per-boundary padding: the fixed ±0.35s ASR pad (which
+   empirically overshot into speech at 81% of cuts) is replaced by
+   per-segment pads clamped to the measured silence extent around each
+   boundary (floor 0.05s, cap 0.35s) — padding never deliberately reaches
+   into neighbouring speech.
+D. Overlong scenes are LOGGED, not split: max_duration remains a merge
+   ceiling only (docstrings previously claimed splitting that never
+   existed); a warning now reports any final segment exceeding it.
+"""
+
+import numpy as np
+import librosa
+import soundfile as sf
+import json
+import os
+import argparse
+import warnings
+import shutil
+import subprocess
+import tempfile
+import logging
+import time
+from typing import Optional, Callable, List, Dict
+from scipy.ndimage import median_filter
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import AgglomerativeClustering
+from sklearn.metrics.pairwise import cosine_similarity
+from dataclasses import dataclass
+from enum import Enum
+
+warnings.filterwarnings('ignore')
+
+__version__ = "7.2.0"  # 7.1.0 + WhisperJAV modifications A-D (see module docstring)
+
+
+def _diagnose_environment(log_fn=None):
+    """Log library versions and compatibility status for semantic scene detection.
+
+    This diagnostic runs once per process.  It checks numpy/librosa/numba/
+    soundfile versions and known incompatibilities that can cause hangs or
+    crashes during feature extraction.  (#267)
+    """
+    _log = log_fn or (lambda msg, *a, **kw: print(msg))
+
+    def _ver(module_name):
+        try:
+            mod = __import__(module_name)
+            return getattr(mod, "__version__", getattr(mod, "version", "?"))
+        except ImportError:
+            return "NOT INSTALLED"
+
+    np_ver = _ver("numpy")
+    lr_ver = _ver("librosa")
+    nb_ver = _ver("numba")
+    sf_ver = _ver("soundfile")
+
+    _log(f"[Semantic Diag] numpy={np_ver}  librosa={lr_ver}  numba={nb_ver}  soundfile={sf_ver}")
+
+    # --- compatibility checks ---
+    warnings_found = []
+
+    # numpy 2.x + old librosa
+    try:
+        np_major = int(str(np_ver).split(".")[0])
+    except (ValueError, IndexError):
+        np_major = 0
+
+    if np_major >= 2:
+        # librosa < 0.11.0 uses np.complex (removed in numpy 2.0)
+        try:
+            lr_parts = [int(x) for x in str(lr_ver).split(".")[:3] if x.isdigit()]
+            if len(lr_parts) >= 2 and (lr_parts[0], lr_parts[1]) < (0, 11):
+                warnings_found.append(
+                    f"librosa {lr_ver} is NOT compatible with numpy {np_ver} "
+                    f"(need librosa >= 0.11.0).  This may cause AttributeError or hang."
+                )
+        except Exception:
+            pass
+
+        # numba < 0.60.0 does not support numpy 2.x binary ABI
+        try:
+            nb_parts = [int(x) for x in str(nb_ver).split(".")[:2] if x.isdigit()]
+            if len(nb_parts) >= 2 and (nb_parts[0], nb_parts[1]) < (0, 60):
+                warnings_found.append(
+                    f"numba {nb_ver} is NOT compatible with numpy {np_ver} "
+                    f"(need numba >= 0.60.0).  JIT compilation may hang."
+                )
+        except Exception:
+            pass
+
+    # ffmpeg version (informational)
+    try:
+        ffmpeg_result = subprocess.run(
+            ["ffmpeg", "-version"], capture_output=True, text=True, timeout=5
+        )
+        ffmpeg_line = ffmpeg_result.stdout.split("\n")[0] if ffmpeg_result.stdout else "?"
+        _log(f"[Semantic Diag] ffmpeg: {ffmpeg_line}")
+    except Exception as e:
+        _log(f"[Semantic Diag] ffmpeg: unavailable ({e})")
+
+    for w in warnings_found:
+        _log(f"[Semantic Diag] *** WARNING: {w}")
+
+    if not warnings_found:
+        _log("[Semantic Diag] All version checks passed.")
+
+    return warnings_found
+
+# ==========================================
+# 0. EXCEPTIONS
+# ==========================================
+
+class SegmentationError(Exception):
+    """Base exception for segmentation errors."""
+    pass
+
+class AudioLoadError(SegmentationError):
+    """Failed to load audio file."""
+    pass
+
+class FeatureExtractionError(SegmentationError):
+    """Feature extraction failed."""
+    pass
+
+# ==========================================
+# 1. CONFIG & REGISTRY
+# ==========================================
+
+@dataclass
+class SegmentationConfig:
+    """
+    Configuration for the Semantic Audio Clustering pipeline.
+
+    Attributes:
+        min_duration (float): Minimum duration of a segment in seconds.
+                              Segments shorter than this will be merged. Default: 20.0
+        max_duration (float): Merge ceiling in seconds: merges that would
+                              produce a segment longer than this are declined.
+                              NOTE: overlong segments are NOT split — if
+                              clustering yields one, it is kept and a warning
+                              is logged (WJAV mod D). Default: 420.0 (7 mins)
+        snap_window (float):  Window size in seconds for snapping boundaries to silence. Default: 5.0
+        sample_rate (int):    Target sample rate for processing. Default: 16000
+        chunk_duration (int): Duration of audio chunks for streaming in seconds. Default: 60
+        viz_duration (int):   Maximum duration in seconds to visualize in the plot. Default: 300
+    """
+    min_duration: float = 20.0
+    max_duration: float = 420.0
+    snap_window: float = 5.0
+    sample_rate: int = 16000
+    chunk_duration: int = 60
+    viz_duration: int = 300
+
+    # Feature Extraction
+    n_mfcc: int = 13
+    hop_length: int = 512
+    min_samples_multiplier: int = 10
+
+    # Clustering
+    fps: int = 31
+    smoothing_window: int = 15
+    clustering_threshold: float = 18.0
+    rms_smoothing_window: int = 5
+
+    # Classification
+    silence_threshold_multiplier: float = 1.5
+    std_rms_threshold: float = 0.02
+
+class SceneType(Enum):
+    QUIET_DIALOGUE = "quiet_dialogue"
+    NOISY_DIALOGUE = "noisy_dialogue"
+    MUSIC_DOMINANT = "music_dominant"
+    HIGH_ENERGY = "high_energy"
+    SILENCE = "silence"
+    MIXED = "mixed_content"
+    GAP_FILLER = "silence"
+    AMBIENT = "ambient_noise"
+
+class FeatureRegistry:
+    """Central source of truth for feature indices."""
+    MFCC = slice(0, 13)
+    DELTA = slice(13, 26)
+    RMS = 26
+    ZCR = 27
+    CONTRAST = slice(28, 35)
+    CHROMA_STD = 35
+    TOTAL_DIM = 36
+
+@dataclass
+class Segment:
+    start: float
+    end: float
+    scene_type: SceneType
+    confidence: float
+    avg_db: float
+    # WJAV mod C: per-boundary ASR pads, clamped to the measured silence
+    # extent around each boundary by compute_adaptive_pads(). The historical
+    # behavior was a fixed 0.35s on both sides regardless of what the audio
+    # contained — on the GT clips that pad overshot into neighbouring speech
+    # at 81% of cuts, duplicating boundary audio into both scenes. Defaults
+    # keep the historical value for any caller that doesn't set pads.
+    start_pad: float = 0.35
+    end_pad: float = 0.35
+
+    def to_dict(self):
+        safe_start = max(0.0, self.start - self.start_pad)
+        # Note: We don't clamp the end to duration here because we don't always
+        # have the total duration handy in this class, but ffmpeg handles over-reading fine.
+        safe_end = self.end + self.end_pad
+
+        return {
+            # 1. STRICT TIMESTAMPS (For SRT / Timeline / Database)
+            # Continuous, no gaps, no overlap.
+            "timestamps": {
+                "start": round(self.start, 3),
+                "end": round(self.end, 3),
+                "duration": round(self.end - self.start, 3)
+            },
+            # 2. BUFFERED TIMESTAMPS (For ASR Processing)
+            # Overlapping. Use THESE for ffmpeg extraction.
+            "asr_processing": {
+                "start": round(safe_start, 3),
+                "end": round(safe_end, 3),
+                "duration": round(safe_end - safe_start, 3),
+                "padding_applied": {
+                    "start": round(self.start_pad, 3),
+                    "end": round(self.end_pad, 3),
+                },
+            },
+            "context": {
+                "label": self.scene_type.value,
+                "confidence": round(self.confidence, 2),
+                "loudness_db": round(self.avg_db, 1),
+            },
+            "asr_prompt": self._get_prompt()
+        }
+
+    def _get_prompt(self):
+        prompts = {
+            SceneType.NOISY_DIALOGUE: "Dialogue mixed with rhythmic background noise. Transcribe speech only.",
+            SceneType.MUSIC_DOMINANT: "Music playing. Transcribe lyrics only if clearly audible.",
+            SceneType.QUIET_DIALOGUE: "Clear dialogue. Transcribe accurately.",
+            SceneType.HIGH_ENERGY: "Loud chaotic audio. Focus on speech.",
+            SceneType.MIXED: "Dialogue with background music. Focus on the speech.",
+            SceneType.SILENCE: "Silence."
+        }
+        return prompts.get(self.scene_type, "Transcribe speech.")
+
+# ==========================================
+# 2. STREAMING EXTRACTION
+# ==========================================
+
+def convert_to_temp_wav(input_path, target_sr=16000):
+    if shutil.which("ffmpeg") is None:
+        raise RuntimeError("ffmpeg not found.")
+    fd, temp_path = tempfile.mkstemp(suffix='.wav')
+    os.close(fd)
+    cmd = ['ffmpeg', '-y', '-i', input_path, '-ar', str(target_sr), '-ac', '1', '-vn', temp_path]
+    try:
+        subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return temp_path
+    except Exception as e:
+        if os.path.exists(temp_path): os.remove(temp_path)
+        raise RuntimeError(f"ffmpeg conversion failed: {e}") from e
+
+class StreamFeatureExtractor:
+    def __init__(self, config: SegmentationConfig, logger: Optional[logging.Logger] = None):
+        self.config = config
+        self.sr = config.sample_rate
+        self.chunk_dur = config.chunk_duration
+        self.hop_length = config.hop_length
+        self.logger = logger
+
+    def _log(self, msg, level=logging.INFO):
+        if self.logger: self.logger.log(level, msg)
+        else: print(msg)
+
+    def extract(self, file_path, progress_callback: Optional[Callable[[float, str], None]] = None) -> tuple:
+        if progress_callback: progress_callback(0.0, "Initializing feature extraction...")
+        self._log(f"--> [1/5] Streaming features ({self.chunk_dur}s chunks)...")
+
+        # --- Diagnostic: environment check (runs once per process) ---
+        if not getattr(StreamFeatureExtractor, '_diag_done', False):
+            _diagnose_environment(self._log)
+            StreamFeatureExtractor._diag_done = True
+
+        temp_wav = None
+        process_path = file_path
+
+        # --- Diagnostic step 1: soundfile probe ---
+        self._log(f"[1/5 diag] Step 1: sf.info({os.path.basename(file_path)})...")
+        t0 = time.time()
+        try:
+            probe = sf.info(file_path)
+            self._log(
+                f"[1/5 diag] Step 1 OK: {probe.format} {probe.subtype}, "
+                f"{probe.samplerate}Hz, {probe.channels}ch, "
+                f"{probe.duration:.1f}s ({time.time()-t0:.2f}s)"
+            )
+        except Exception as e:
+            self._log(f"[1/5 diag] Step 1 FAILED: {e} — falling back to ffmpeg conversion")
+            try:
+                if progress_callback: progress_callback(0.05, "Converting to WAV...")
+                t1 = time.time()
+                temp_wav = convert_to_temp_wav(file_path, self.sr)
+                self._log(f"[1/5 diag] Step 1b: ffmpeg conversion OK ({time.time()-t1:.2f}s)")
+                process_path = temp_wav
+            except Exception as e2:
+                self._log(f"Error: {e2}", logging.ERROR)
+                raise AudioLoadError(f"Failed to convert/load audio: {e2}")
+
+        try:
+            # --- Diagnostic step 2: audio info ---
+            self._log("[1/5 diag] Step 2: Reading audio metadata...")
+            t0 = time.time()
+            info = sf.info(process_path)
+            total_dur = info.duration
+            native_sr = info.samplerate
+            block_size = int(self.chunk_dur * native_sr)
+            feature_list = []
+            chunk_start_times = []   # WJAV mod A: true start time of each chunk (s)
+            chunk_frame_counts = []  # WJAV mod A: frames produced per chunk
+            total_blocks = int(np.ceil(info.frames / block_size))
+            self._log(
+                f"[1/5 diag] Step 2 OK: {total_dur:.1f}s, {native_sr}Hz, "
+                f"block_size={block_size}, total_blocks={total_blocks} ({time.time()-t0:.2f}s)"
+            )
+            if native_sr != self.sr:
+                self._log(f"[1/5 diag] Will resample {native_sr}Hz → {self.sr}Hz (librosa)")
+
+            # --- Diagnostic step 3: streaming loop ---
+            self._log("[1/5 diag] Step 3: Starting sf.blocks() iterator...")
+            t_loop = time.time()
+
+            for i, block in enumerate(sf.blocks(process_path, blocksize=block_size, always_2d=True)):
+                t_chunk = time.time()
+                if i == 0:
+                    self._log(
+                        f"[1/5 diag] Step 3 OK: First block received "
+                        f"(shape={block.shape}, {time.time()-t_loop:.2f}s)"
+                    )
+
+                # Update progress (0.1 to 0.8 range reserved for extraction)
+                if progress_callback:
+                    p = 0.1 + (0.7 * (i / total_blocks))
+                    progress_callback(p, f"Extracting features: Chunk {i+1}/{total_blocks}")
+
+                if block.shape[1] > 1: y = np.mean(block, axis=1)
+                else: y = block.flatten()
+
+                if native_sr != self.sr:
+                    t_rs = time.time()
+                    y = librosa.resample(y, orig_sr=native_sr, target_sr=self.sr)
+                    if i == 0:
+                        self._log(f"[1/5 diag] Step 4: librosa.resample OK ({time.time()-t_rs:.2f}s)")
+
+                min_samples = self.hop_length * self.config.min_samples_multiplier
+                if len(y) < min_samples:
+                    y = np.pad(y, (0, min_samples - len(y)), mode='constant')
+
+                # Extract
+                try:
+                    if i == 0:
+                        self._log("[1/5 diag] Step 5: librosa feature extraction (first chunk)...")
+
+                    mfcc = librosa.feature.mfcc(y=y, sr=self.sr, n_mfcc=self.config.n_mfcc)
+                    delta = librosa.feature.delta(mfcc)
+                    rms = librosa.feature.rms(y=y)
+                    zcr = librosa.feature.zero_crossing_rate(y=y)
+                    contrast = librosa.feature.spectral_contrast(y=y, sr=self.sr)
+                    chroma = librosa.feature.chroma_stft(y=y, sr=self.sr)
+                    chroma_std = np.std(chroma, axis=0, keepdims=True)
+
+                    feats = np.vstack([mfcc, delta, rms, zcr, contrast, chroma_std])
+                    feature_list.append(feats)
+                    # WJAV mod A: anchor this chunk's frames to its true start.
+                    chunk_start_times.append(i * block_size / native_sr)
+                    chunk_frame_counts.append(feats.shape[1])
+
+                    if i == 0:
+                        self._log(
+                            f"[1/5 diag] Step 5 OK: First chunk features extracted "
+                            f"(shape={feats.shape}, {time.time()-t_chunk:.2f}s)"
+                        )
+                except Exception as e:
+                    raise FeatureExtractionError(f"Extraction failed at chunk {i}: {e}")
+
+            self._log(
+                f"[1/5 diag] Streaming complete: {len(feature_list)} chunks "
+                f"in {time.time()-t_loop:.1f}s"
+            )
+
+            full_features = np.hstack(feature_list)
+            # WJAV mod A: build the time axis PER CHUNK, anchored to each
+            # chunk's true start time. The previous global
+            # frames_to_time(arange(total_frames)) treated the concatenated
+            # frames as one continuous stream, but librosa's centered framing
+            # emits ~1 extra frame per chunk — the axis drifted late by
+            # ~hop/sr (32ms) per chunk, i.e. ~2s per hour of audio, so late
+            # boundaries were systematically misplaced. Frame j of a chunk is
+            # centered at chunk_start + j*hop/sr. Seam frames of adjacent
+            # chunks may share a timestamp (non-strict monotonicity); all
+            # consumers use searchsorted/masks, which tolerate ties.
+            frame_dt = self.hop_length / self.sr
+            times = np.concatenate([
+                start_t + np.arange(n) * frame_dt
+                for start_t, n in zip(chunk_start_times, chunk_frame_counts)
+            ]) if feature_list else np.array([])
+            return full_features, times, total_dur
+
+        finally:
+            if temp_wav and os.path.exists(temp_wav):
+                try:
+                    os.remove(temp_wav)
+                except Exception as e:
+                    self._log(f"Warning: Failed to remove temp file {temp_wav}: {e}", logging.WARNING)
+
+# ==========================================
+# 3. SEMANTIC SEGMENTATION
+# ==========================================
+
+# --- WJAV mod B/C helpers (module-level for unit-testability) ---------------
+
+def compute_silence_floor(features, config: SegmentationConfig) -> float:
+    """Calibrated silence floor.
+
+    Same formula as AdaptiveClassifier.calibrate's rms_base (20th percentile,
+    clamped) times the configured multiplier — kept in one place so the
+    snapper, the pad computation, and the classifier agree on what "silence"
+    means for this file.
+    """
+    rms = features[FeatureRegistry.RMS, :]
+    rms_base = max(float(np.percentile(rms, 20)), 0.001)
+    return rms_base * config.silence_threshold_multiplier
+
+
+def smoothed_rms(features, config: SegmentationConfig):
+    """Median-smoothed RMS curve (matches the snapper's historical smoothing)."""
+    return median_filter(
+        features[FeatureRegistry.RMS, :], size=config.rms_smoothing_window
+    )
+
+
+def _silence_runs(mask) -> List[tuple]:
+    """Contiguous True runs in a boolean mask -> [(start_idx, end_idx)] inclusive."""
+    runs = []
+    start = None
+    for i, v in enumerate(mask):
+        if v and start is None:
+            start = i
+        elif not v and start is not None:
+            runs.append((start, i - 1))
+            start = None
+    if start is not None:
+        runs.append((start, len(mask) - 1))
+    return runs
+
+
+def compute_adaptive_pads(
+    seg_start: float,
+    seg_end: float,
+    rms_curve,
+    times,
+    silence_floor: float,
+    min_pad: float = 0.05,
+    max_pad: float = 0.35,
+    is_first: bool = False,
+) -> tuple:
+    """WJAV mod C: per-segment ASR pads clamped to the measured silence extent.
+
+    start_pad: how far BACKWARD from seg_start RMS stays at/below the silence
+    floor (so the pad reaches into silence, never deliberately into the
+    previous scene's speech). end_pad: same, FORWARD from seg_end. Both are
+    clamped to [min_pad, max_pad]; min_pad covers framing edge effects at
+    boundaries that have no silence at all (argmin-fallback cuts).
+    The first segment gets start_pad 0 (file starts at 0.0).
+    """
+    n = len(times)
+    idx_s = int(np.searchsorted(times, seg_start))
+    idx_s = min(max(idx_s, 0), n - 1)
+    j = idx_s
+    while j > 0 and rms_curve[j - 1] <= silence_floor:
+        j -= 1
+    extent_back = max(0.0, float(times[idx_s] - times[j]))
+
+    idx_e = int(np.searchsorted(times, seg_end))
+    idx_e = min(max(idx_e, 0), n - 1)
+    k = idx_e
+    while k < n - 1 and rms_curve[k + 1] <= silence_floor:
+        k += 1
+    extent_fwd = max(0.0, float(times[k] - times[idx_e]))
+
+    start_pad = 0.0 if is_first else min(max(extent_back, min_pad), max_pad)
+    end_pad = min(max(extent_fwd, min_pad), max_pad)
+    return round(start_pad, 3), round(end_pad, 3)
+
+
+class SemanticSegmenter:
+    def __init__(self, config: SegmentationConfig, logger: Optional[logging.Logger] = None):
+        self.config = config
+        self.min_dur = config.min_duration
+        self.max_dur = config.max_duration
+        self.logger = logger
+
+    def _log(self, msg, level=logging.INFO):
+        if self.logger: self.logger.log(level, msg)
+        else: print(msg)
+
+    def segment(self, features, times, duration, silence_floor=None):
+        self._log("--> [2/5] Clustering, Merging & Snapping to Silence...")
+
+        # WJAV mod B: the silence floor is normally passed in by the caller
+        # (process_movie_v7 hands over the classifier's calibrated value); the
+        # self-computed fallback keeps the historical segment() signature
+        # working and produces the identical value by construction.
+        if silence_floor is None:
+            silence_floor = compute_silence_floor(features, self.config)
+
+        # 1. Pre-clustering Smoothing
+        fps = self.config.fps
+        feats_smooth = median_filter(features, size=(1, self.config.smoothing_window))
+
+        step = int(fps * 0.5)
+        X = feats_smooth[:, ::step].T
+        X_times = times[::step]
+
+        # 2. Dynamic Clustering
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X)
+        clusterer = AgglomerativeClustering(n_clusters=None, distance_threshold=self.config.clustering_threshold, linkage='ward')
+        labels = clusterer.fit_predict(X_scaled)
+
+        # 3. Raw Boundaries
+        boundaries = [0.0]
+        for i in range(1, len(labels)):
+            if labels[i] != labels[i-1]:
+                boundaries.append(X_times[i])
+        boundaries.append(duration)
+
+        # 4. Snap to SILENCE (Lowest Energy)
+        # This replaces the old Flux snapping to prioritize speech safety
+        boundaries = self._snap_to_silence(boundaries, features, times, silence_floor)
+
+        # 5. Smart Merge (Semantic)
+        segments = self._smart_merge(boundaries, features, times)
+
+        # 6. Forced Cleanup
+        segments = self._forced_cleanup(segments)
+
+        # 7. ABSOLUTE COVERAGE CHECK
+        segments = self._ensure_timeline_coverage(segments, duration)
+
+        return segments
+
+    def _snap_to_silence(self, boundaries, features, times, silence_floor):
+        """Refine boundaries onto actual silence, anchored to the sound ONSET.
+
+        WJAV mod B (replaces the pure-argmin snap, which had no notion of
+        silence at all and landed 35% of cuts in outright speech on the GT
+        clips): within ±snap_window of each raw boundary,
+
+        1. find contiguous runs of frames whose smoothed RMS is at/below the
+           calibrated silence floor;
+        2. prefer the run NEAREST the raw boundary among runs wide enough to
+           host a full ASR pad (~0.42s = 0.35s pad + onset back-off); when no
+           run is that wide, take the WIDEST run available. (Nearest-first
+           over marginal runs was tried and measured WORSE on the GT clips —
+           it favored ~100ms moan-gaps beside the boundary over the real
+           silence valley a few seconds away, which plain argmin used to
+           find. Quality beats proximity within the search window.)
+        3. place the cut near the END of the run (2-frame back-off), so the
+           NEXT scene begins at the sound onset — leading silence in an ASR
+           chunk provokes hallucination, and trailing silence belongs to the
+           scene that is ending;
+        4. only when the window contains no silence at all, fall back to the
+           historical argmin (lowest-energy frame) placement.
+        """
+        self._log("    -> Snapping cut points to silence (onset-anchored)...")
+
+        rms_smooth = smoothed_rms(features, self.config)
+        frame_dt = self.config.hop_length / self.config.sample_rate
+        onset_backoff_frames = 2  # cut this many frames before the onset
+        # A run must host the full 0.35s start pad plus the back-off for the
+        # cut to be pad-safe on both sides.
+        pad_safe_width_frames = max(2, int(round(0.42 / frame_dt)))  # ~420ms
+
+        refined = [0.0]
+        search_window = self.config.snap_window # Look +/- window seconds
+
+        for b in boundaries[1:-1]:
+            # Search range
+            start_idx = max(0, np.searchsorted(times, b - search_window))
+            end_idx = min(len(rms_smooth), np.searchsorted(times, b + search_window))
+
+            if end_idx <= start_idx:
+                refined.append(b)
+                continue
+
+            window_mask = rms_smooth[start_idx:end_idx] <= silence_floor
+            runs = _silence_runs(window_mask)
+
+            if not runs:
+                # Bounded second look: JAV audio has long silence-free
+                # stretches; one 2x-widened attempt converts a share of the
+                # hard cuts to real silences before giving up to argmin.
+                # min_duration merging downstream absorbs any tiny segment a
+                # far-moved cut could create.
+                w_start = max(0, np.searchsorted(times, b - 2 * search_window))
+                w_end = min(len(rms_smooth), np.searchsorted(times, b + 2 * search_window))
+                wide_mask = rms_smooth[w_start:w_end] <= silence_floor
+                wide_runs = _silence_runs(wide_mask)
+                if wide_runs:
+                    start_idx, end_idx = w_start, w_end
+                    runs = wide_runs
+
+            if runs:
+                b_local = int(np.searchsorted(times, b)) - start_idx
+                pad_safe = [
+                    r for r in runs if (r[1] - r[0] + 1) >= pad_safe_width_frames
+                ]
+
+                def _dist(run):
+                    lo, hi = run
+                    if lo <= b_local <= hi:
+                        return 0
+                    return min(abs(b_local - lo), abs(b_local - hi))
+
+                if pad_safe:
+                    # Semantic fidelity: nearest run among the fully safe ones.
+                    chosen = min(pad_safe, key=_dist)
+                else:
+                    # No run hosts a full pad — take the widest silence
+                    # available (ties broken toward the boundary).
+                    chosen = max(
+                        runs, key=lambda r: (r[1] - r[0], -_dist(r))
+                    )
+
+                cut_idx = start_idx + max(
+                    chosen[0], chosen[1] - onset_backoff_frames
+                )
+                refined.append(times[cut_idx])
+            else:
+                # Historical behavior: lowest-energy frame in the window.
+                window_slice = rms_smooth[start_idx:end_idx]
+                local_min_idx = np.argmin(window_slice) + start_idx
+                refined.append(times[local_min_idx])
+
+        refined.append(boundaries[-1])
+        return sorted(list(set(refined)))
+
+    def _smart_merge(self, boundaries, features, times):
+        segments = []
+        for i in range(len(boundaries)-1):
+            start, end = boundaries[i], boundaries[i+1]
+            mask = (times >= start) & (times < end)
+            if not np.any(mask): continue
+
+            seg_feat = np.mean(features[:, mask], axis=1)
+            segments.append({"start": start, "end": end, "vec": seg_feat, "dur": end-start})
+
+        changed = True
+        while changed:
+            changed = False
+            i = 0
+            while i < len(segments):
+                seg = segments[i]
+                if seg["dur"] >= self.min_dur:
+                    i += 1
+                    continue
+
+                left = segments[i-1] if i > 0 else None
+                right = segments[i+1] if i < len(segments)-1 else None
+                merge_target = None
+
+                if left and right:
+                    sim_l = cosine_similarity([seg["vec"]], [left["vec"]])[0][0]
+                    sim_r = cosine_similarity([seg["vec"]], [right["vec"]])[0][0]
+                    if sim_l >= sim_r:
+                        if (left["dur"] + seg["dur"]) <= self.max_dur: merge_target = -1
+                        elif (right["dur"] + seg["dur"]) <= self.max_dur: merge_target = 1
+                    else:
+                        if (right["dur"] + seg["dur"]) <= self.max_dur: merge_target = 1
+                        elif (left["dur"] + seg["dur"]) <= self.max_dur: merge_target = -1
+                elif left and (left["dur"] + seg["dur"]) <= self.max_dur: merge_target = -1
+                elif right and (right["dur"] + seg["dur"]) <= self.max_dur: merge_target = 1
+
+                if merge_target == -1:
+                    new_dur = left["dur"] + seg["dur"]
+                    new_vec = (left["vec"]*left["dur"] + seg["vec"]*seg["dur"]) / new_dur
+                    segments[i-1] = {"start": left["start"], "end": seg["end"], "dur": new_dur, "vec": new_vec}
+                    del segments[i]
+                    changed = True
+                elif merge_target == 1:
+                    new_dur = right["dur"] + seg["dur"]
+                    new_vec = (right["vec"]*right["dur"] + seg["vec"]*seg["dur"]) / new_dur
+                    segments[i+1] = {"start": seg["start"], "end": right["end"], "dur": new_dur, "vec": new_vec}
+                    del segments[i]
+                    changed = True
+                else:
+                    i += 1
+        return segments
+
+    def _forced_cleanup(self, segments):
+        final_segments = []
+        if not segments: return []
+        curr = segments[0]
+        for i in range(1, len(segments)):
+            next_seg = segments[i]
+            if curr["dur"] < self.min_dur:
+                total_dur = curr["dur"] + next_seg["dur"]
+                weighted_vec = (curr["vec"]*curr["dur"] + next_seg["vec"]*next_seg["dur"]) / total_dur
+                curr = {"start": curr["start"], "end": next_seg["end"], "dur": total_dur, "vec": weighted_vec}
+            else:
+                final_segments.append(curr)
+                curr = next_seg
+        if curr["dur"] < self.min_dur and final_segments:
+            last = final_segments.pop()
+            total_dur = last["dur"] + curr["dur"]
+            curr = {"start": last["start"], "end": curr["end"], "dur": total_dur, "vec": last["vec"]}
+        final_segments.append(curr)
+        return final_segments
+
+    def _ensure_timeline_coverage(self, segments, duration):
+        covered = []
+        if not segments:
+            return [{"start": 0.0, "end": duration, "dur": duration, "vec": np.zeros(36)}]
+
+        if segments[0]["start"] > 0.001:
+            covered.append({"start": 0.0, "end": segments[0]["start"], "dur": segments[0]["start"], "vec": np.zeros(36)})
+
+        covered.append(segments[0])
+        for i in range(1, len(segments)):
+            prev = covered[-1]
+            curr = segments[i]
+            gap = curr["start"] - prev["end"]
+
+            if gap > 0.001:
+                covered.append({"start": prev["end"], "end": curr["start"], "dur": gap, "vec": np.zeros(36)})
+
+            if curr["start"] < prev["end"]:
+                curr["start"] = prev["end"]
+                curr["dur"] = curr["end"] - curr["start"]
+
+            covered.append(curr)
+
+        last = covered[-1]
+        if last["end"] < (duration - 0.001):
+            covered.append({"start": last["end"], "end": duration, "dur": duration - last["end"], "vec": np.zeros(36)})
+        elif last["end"] > duration:
+            last["end"] = duration
+            last["dur"] = last["end"] - last["start"]
+
+        return covered
+
+# ==========================================
+# 4. ADAPTIVE CLASSIFIER
+# ==========================================
+
+class AdaptiveClassifier:
+    def __init__(self, config: SegmentationConfig, logger: Optional[logging.Logger] = None):
+        self.config = config
+        self.stats = {}
+        self.logger = logger
+
+    def _log(self, msg, level=logging.INFO):
+        if self.logger: self.logger.log(level, msg)
+        else: print(msg)
+
+    def calibrate(self, features):
+        self._log("--> [3/5] Calibrating thresholds...")
+        rms = features[FeatureRegistry.RMS, :]
+        chroma_std = features[FeatureRegistry.CHROMA_STD, :]
+        contrast = np.mean(features[FeatureRegistry.CONTRAST, :], axis=0)
+
+        self.stats = {
+            "rms_base": np.percentile(rms, 20),
+            "rms_peak": np.percentile(rms, 85),
+            "contrast_high": np.percentile(contrast, 75),
+            "chroma_high": np.percentile(chroma_std, 75),
+            "contrast_low": np.percentile(contrast, 25)
+        }
+        self.stats["rms_base"] = max(self.stats["rms_base"], 0.001)
+
+    def classify(self, start, end, features, times):
+        mask = (times >= start) & (times < end)
+        if not np.any(mask):
+            return SceneType.SILENCE, 0.99, -100.0
+
+        chunk = features[:, mask]
+
+        avg_rms = np.mean(chunk[FeatureRegistry.RMS])
+        std_rms = np.std(chunk[FeatureRegistry.RMS])
+        avg_contrast = np.mean(chunk[FeatureRegistry.CONTRAST])
+        avg_chroma = np.mean(chunk[FeatureRegistry.CHROMA_STD])
+
+        db = 20 * np.log10(avg_rms + 1e-9)
+
+        # 1. Silence
+        if avg_rms <= self.stats["rms_base"] * self.config.silence_threshold_multiplier:
+            return SceneType.SILENCE, 0.9, db
+
+        # 2. Music
+        is_tonal = (avg_contrast > self.stats["contrast_high"] and
+                   avg_chroma > self.stats["chroma_high"])
+
+        # 3. High Energy
+        is_loud = avg_rms > self.stats["rms_peak"]
+
+        if is_tonal:
+            if is_loud: return SceneType.MIXED, 0.7, db
+            return SceneType.MUSIC_DOMINANT, 0.85, db
+
+        if is_loud:
+            return SceneType.HIGH_ENERGY, 0.75, db
+
+        if std_rms > self.config.std_rms_threshold:
+            if avg_contrast < self.stats["contrast_low"]:
+                return SceneType.NOISY_DIALOGUE, 0.7, db
+            return SceneType.QUIET_DIALOGUE, 0.8, db
+        else:
+            return SceneType.AMBIENT, 0.6, db
+
+# ==========================================
+# 5. VISUALIZATION
+# ==========================================
+
+def generate_visualization(audio_path, segments, output_path, config: SegmentationConfig, logger: Optional[logging.Logger] = None):
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return
+
+    msg = f"--> [5/5] Generating Plot: {output_path}"
+    if logger: logger.info(msg)
+    else: print(msg)
+
+    SCENE_COLORS = {
+        SceneType.QUIET_DIALOGUE: 'green',
+        SceneType.NOISY_DIALOGUE: 'orange',
+        SceneType.MUSIC_DOMINANT: 'purple',
+        SceneType.HIGH_ENERGY: 'red',
+        SceneType.SILENCE: 'gray',
+        SceneType.MIXED: 'cyan',
+        SceneType.AMBIENT: 'blue',
+        SceneType.GAP_FILLER: 'black'
+    }
+
+    try:
+        y, sr = librosa.load(audio_path, sr=config.sample_rate, duration=config.viz_duration)
+        fig, ax = plt.subplots(figsize=(15, 6))
+        times = np.arange(len(y)) / sr
+        ax.plot(times, y, color='black', alpha=0.5, linewidth=0.5)
+
+        for seg in segments:
+            if seg.end > config.viz_duration: break
+            c = SCENE_COLORS.get(seg.scene_type, 'black')
+            ax.axvspan(seg.start, seg.end, color=c, alpha=0.3)
+            ax.text((seg.start+seg.end)/2, 0.9, seg.scene_type.value,
+                    rotation=90, ha='center', fontsize=8, transform=ax.get_xaxis_transform())
+
+        ax.set_title(f"Segmentation: {os.path.basename(audio_path)}")
+        plt.tight_layout()
+        plt.savefig(output_path)
+        plt.close()
+    except Exception as e:
+        err_msg = f"Viz Error: {e}"
+        if logger: logger.error(err_msg)
+        else: print(err_msg)
+
+# ==========================================
+# 6. MAIN
+# ==========================================
+
+def process_movie_v7(
+    file_path: str,
+    output_path: str,
+    config: Optional[SegmentationConfig] = None,
+    visualize: bool = False,
+    logger: Optional[logging.Logger] = None,
+    progress_callback: Optional[Callable[[float, str], None]] = None
+) -> str:
+    """
+    Process media file and generate segmentation metadata.
+
+    Returns:
+        Path to the generated JSON file (same as output_path on success)
+
+    Raises:
+        FileNotFoundError: If input file doesn't exist
+        RuntimeError: If ffmpeg is not available
+        ValueError: If config parameters are invalid
+        SegmentationError: Base class for other processing errors
+    """
+    start_time = time.time()
+
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"Input file not found: {file_path}")
+
+    if config is None:
+        config = SegmentationConfig()
+
+    # Helper for logging
+    def log(msg, level=logging.INFO):
+        if logger: logger.log(level, msg)
+        else: print(msg)
+
+    log(f"Starting processing for: {file_path}")
+    log(f"SemanticAudioClustering engine v{__version__}")
+
+    # 1. Extraction
+    extractor = StreamFeatureExtractor(config, logger)
+    # Pass callback to extractor
+    features, times, duration = extractor.extract(file_path, progress_callback)
+
+    if features is None:
+        raise FeatureExtractionError("Feature extraction returned None")
+
+    if progress_callback: progress_callback(0.8, "Calibrating classifier...")
+
+    # 2. Calibration
+    classifier = AdaptiveClassifier(config, logger)
+    classifier.calibrate(features)
+
+    if progress_callback: progress_callback(0.85, "Clustering and segmenting...")
+
+    # 3. Segmentation
+    # WJAV mod B: hand the classifier's calibrated silence floor to the
+    # segmenter so snapping, padding, and classification agree on "silence".
+    silence_floor = classifier.stats["rms_base"] * config.silence_threshold_multiplier
+    segmenter = SemanticSegmenter(config, logger)
+    raw_segments = segmenter.segment(features, times, duration, silence_floor=silence_floor)
+
+    # WJAV mod D: max_duration is a merge ceiling, NOT a splitter (no split
+    # exists; _forced_cleanup can even exceed it while absorbing sub-minimum
+    # neighbours). Owner heuristics say overlong scenes are rare — make that
+    # observable instead of silent so the claim stays measured.
+    _overlong = [s for s in raw_segments if (s["end"] - s["start"]) > config.max_duration + 0.5]
+    if _overlong:
+        _worst = max(s["end"] - s["start"] for s in _overlong)
+        log(
+            f"WARNING: {len(_overlong)} scene(s) exceed max_duration="
+            f"{config.max_duration:.0f}s (longest {_worst:.0f}s). max_duration "
+            f"limits merging only — overlong scenes are not split.",
+            logging.WARNING,
+        )
+
+    log(f"--> [4/5] Building Metadata...")
+    if progress_callback: progress_callback(0.9, "Building metadata...")
+
+    # 4. Metadata Construction
+    processing_time = time.time() - start_time
+
+    output = {
+        "meta": {
+            "filename": os.path.basename(file_path),
+            "version": __version__,
+            "algorithm": "agglomerative_clustering_ward",
+            "processing_time_seconds": round(processing_time, 3),
+            "total_duration_seconds": round(duration, 3),
+            "config": {
+                "min_duration": config.min_duration,
+                "max_duration": config.max_duration,
+                "snap_window": config.snap_window,
+                "clustering_threshold": config.clustering_threshold
+            }
+        },
+        "segments": []
+    }
+
+    # WJAV mod C: pads clamped to the measured silence around each boundary
+    # (same smoothed RMS + floor the snapper used).
+    _rms_smooth = smoothed_rms(features, config)
+
+    final_objs = []
+    for i, s_data in enumerate(raw_segments):
+        s_type, conf, db = classifier.classify(s_data["start"], s_data["end"], features, times)
+
+        start_pad, end_pad = compute_adaptive_pads(
+            s_data["start"], s_data["end"], _rms_smooth, times, silence_floor,
+            is_first=(i == 0),
+        )
+        seg = Segment(
+            s_data["start"], s_data["end"], s_type, conf, db,
+            start_pad=start_pad, end_pad=end_pad,
+        )
+        final_objs.append(seg)
+
+        # Add index to dict
+        seg_dict = seg.to_dict()
+        seg_dict["segment_index"] = i
+        output["segments"].append(seg_dict)
+
+    with open(output_path, 'w', encoding='utf-8') as f:
+        json.dump(output, f, indent=2)
+    log(f"Done! JSON at {output_path}")
+
+    if visualize:
+        if progress_callback: progress_callback(0.95, "Generating visualization...")
+        generate_visualization(file_path, final_objs, output_path.replace('.json', '.png'), config, logger)
+
+    if progress_callback: progress_callback(1.0, "Complete")
+
+    return output_path
+
+def extract_segments_to_wav(
+    source_file: str,
+    json_metadata_path: str,
+    output_dir: str,
+    use_asr_timestamps: bool = True,
+    naming_pattern: str = "{basename}_scene_{index:04d}.wav",
+    sample_rate: int = 16000,
+    raise_on_error: bool = False
+) -> List[Dict]:
+    """
+    Extract audio segments based on JSON metadata.
+
+    Returns:
+        List of dicts with 'path', 'start', 'end', 'duration', 'context'
+    """
+    if not os.path.exists(source_file):
+        raise FileNotFoundError(f"Source file not found: {source_file}")
+    if not os.path.exists(json_metadata_path):
+        raise FileNotFoundError(f"Metadata file not found: {json_metadata_path}")
+
+    with open(json_metadata_path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    basename = os.path.splitext(os.path.basename(source_file))[0]
+    results = []
+
+    segments = data.get("segments", [])
+    print(f"Extracting {len(segments)} segments to {output_dir}...")
+
+    for seg in segments:
+        idx = seg.get("segment_index", 0)
+
+        # Choose timestamp source
+        if use_asr_timestamps:
+            ts = seg["asr_processing"]
+        else:
+            ts = seg["timestamps"]
+
+        start = ts["start"]
+        duration = ts["duration"]
+
+        out_name = naming_pattern.format(basename=basename, index=idx)
+        out_path = os.path.join(output_dir, out_name)
+
+        # ffmpeg command
+        # -ss before -i is faster seeking
+        cmd = [
+            'ffmpeg', '-y',
+            '-ss', str(start),
+            '-i', source_file,
+            '-t', str(duration),
+            '-ar', str(sample_rate),
+            '-ac', '1',
+            '-vn', # No video
+            '-loglevel', 'error',
+            out_path
+        ]
+
+        try:
+            subprocess.check_call(cmd)
+            results.append({
+                "path": out_path,
+                "start": start,
+                "end": ts["end"],
+                "duration": duration,
+                "context": seg.get("context", {})
+            })
+        except subprocess.CalledProcessError as e:
+            print(f"Failed to extract segment {idx}: {e}")
+            if raise_on_error:
+                raise
+
+    return results
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("file", help="Input audio/video")
+    parser.add_argument("--out", help="Output JSON")
+    parser.add_argument("--viz", "-v", action="store_true", help="Generate PNG plot")
+
+    # Config overrides
+    parser.add_argument("--min-dur", type=float, default=20.0, help="Min segment duration (s)")
+    parser.add_argument("--max-dur", type=float, default=420.0, help="Max segment duration (s)")
+    parser.add_argument("--snap-window", type=float, default=5.0, help="Silence snap window (s)")
+    parser.add_argument("--cluster-threshold", type=float, default=18.0, help="Clustering distance threshold (lower=more segments)")
+
+    args = parser.parse_args()
+
+    # Create config from args
+    config = SegmentationConfig(
+        min_duration=args.min_dur,
+        max_duration=args.max_dur,
+        snap_window=args.snap_window,
+        clustering_threshold=args.cluster_threshold
+    )
+
+    out = args.out if args.out else f"{os.path.splitext(args.file)[0]}_v7.json"
+    process_movie_v7(args.file, out, config=config, visualize=args.viz)
+

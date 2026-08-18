@@ -47,7 +47,9 @@ class STTAPIHelpersTests(unittest.TestCase):
 
         self.assertEqual(app.version, __version__)
 
-    def test_parses_client_options_but_keeps_server_batch_size(self) -> None:
+    def test_parses_client_options_and_keeps_server_batch_size_for_kotoba(
+        self,
+    ) -> None:
         settings = STTAPISettings(
             state_dir=Path("/tmp/not-used"),
             api_token="api-token",
@@ -66,6 +68,77 @@ class STTAPIHelpersTests(unittest.TestCase):
         self.assertTrue(options["noise_filter"])
         self.assertEqual(options["backend"], "kotoba")
 
+    def test_uses_whisperx_batch_size_default_for_whisperx_paths(self) -> None:
+        settings = STTAPISettings(
+            state_dir=Path("/tmp/not-used"),
+            api_token="",
+            hf_token="hf-token",
+            batch_size=2,
+            whisperx_batch_size=8,
+        )
+
+        for backend in ("whisperx", "hybrid"):
+            with self.subTest(backend=backend):
+                options = _parse_options(
+                    json.dumps({"backend": backend}),
+                    settings,
+                )
+
+                self.assertEqual(options["batch_size"], 8)
+
+    def test_allows_per_job_batch_size_for_whisperx_paths(self) -> None:
+        settings = STTAPISettings(
+            state_dir=Path("/tmp/not-used"),
+            api_token="",
+            hf_token="hf-token",
+            whisperx_batch_size=8,
+        )
+
+        for backend in ("whisperx", "hybrid"):
+            with self.subTest(backend=backend):
+                options = _parse_options(
+                    json.dumps({"backend": backend, "batch_size": 16}),
+                    settings,
+                )
+
+                self.assertEqual(options["batch_size"], 16)
+
+    def test_rejects_per_job_batch_size_outside_the_supported_range(
+        self,
+    ) -> None:
+        settings = STTAPISettings(
+            state_dir=Path("/tmp/not-used"),
+            api_token="",
+            hf_token="hf-token",
+        )
+
+        for value in (0, 65):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "between 1 and 64"):
+                    _parse_options(
+                        json.dumps(
+                            {"backend": "whisperx", "batch_size": value}
+                        ),
+                        settings,
+                    )
+
+    def test_rejects_per_job_batch_size_for_load_time_backends(self) -> None:
+        settings = STTAPISettings(
+            state_dir=Path("/tmp/not-used"),
+            api_token="",
+            hf_token="hf-token",
+        )
+
+        for backend in ("kotoba", "whisperjav"):
+            with self.subTest(backend=backend):
+                with self.assertRaisesRegex(
+                    ValueError, "fixed at pipeline load"
+                ):
+                    _parse_options(
+                        json.dumps({"backend": backend, "batch_size": 4}),
+                        settings,
+                    )
+
     def test_accepts_request_level_whisperx_backend_case_insensitively(self) -> None:
         settings = STTAPISettings(
             state_dir=Path("/tmp/not-used"),
@@ -76,11 +149,37 @@ class STTAPIHelpersTests(unittest.TestCase):
         options = _parse_options('{"backend": "whisperX"}', settings)
 
         self.assertEqual(options["backend"], "whisperx")
+        self.assertEqual(options["chunk_length_seconds"], 30)
         self.assertTrue(options["noise_filter"])
         self.assertTrue(
             options["subtitle_segmentation"]["split_on_speaker_change"]
         )
         self.assertEqual(options["repetition_policy"], "flag")
+
+    def test_rejects_whisperx_chunks_longer_than_native_window(self) -> None:
+        settings = STTAPISettings(
+            state_dir=Path("/tmp/not-used"),
+            api_token="",
+            hf_token="hf-token",
+        )
+
+        with self.assertRaisesRegex(ValueError, "must be at most 30"):
+            _parse_options(
+                '{"backend":"whisperx","chunk_length_seconds":31}',
+                settings,
+            )
+        with self.assertRaisesRegex(ValueError, "must be at most 30"):
+            _parse_options(
+                json.dumps(
+                    {
+                        "backend": "hybrid",
+                        "hybrid_rescue": {
+                            "whisperx_chunk_length_seconds": 31,
+                        },
+                    }
+                ),
+                settings,
+            )
 
     def test_accepts_hybrid_backend_with_independent_chunk_defaults(self) -> None:
         settings = STTAPISettings(
@@ -103,6 +202,50 @@ class STTAPIHelpersTests(unittest.TestCase):
             options["subtitle_segmentation"]["max_duration_sec"], 8.0
         )
         self.assertEqual(options["repetition_policy"], "flag")
+
+    def test_accepts_fixed_whisperjav_recipe_with_group_overrides(self) -> None:
+        settings = STTAPISettings(
+            state_dir=Path("/tmp/not-used"),
+            api_token="",
+            hf_token="hf-token",
+        )
+
+        options = _parse_options(
+            json.dumps(
+                {
+                    "backend": "whisperjav",
+                    "whisperjav": {
+                        "anime_max_group_duration_seconds": 2.5,
+                        "qwen_max_group_duration_seconds": 4.0,
+                    },
+                }
+            ),
+            settings,
+        )
+
+        self.assertEqual(options["backend"], "whisperjav")
+        self.assertEqual(
+            options["whisperjav"]["recipe"],
+            "whisperjav-domain-ensemble-v1",
+        )
+        self.assertEqual(
+            options["whisperjav"]["anime_max_group_duration_seconds"],
+            2.5,
+        )
+        self.assertEqual(
+            options["whisperjav"]["qwen_max_group_duration_seconds"],
+            4.0,
+        )
+        self.assertTrue(
+            options["subtitle_segmentation"]["split_on_speaker_change"]
+        )
+
+        with self.assertRaisesRegex(ValueError, "must be between"):
+            _parse_options(
+                '{"backend":"whisperjav","whisperjav":'
+                '{"anime_max_group_duration_seconds":0.1}}',
+                settings,
+            )
 
     def test_hybrid_reject_policy_is_invalid_because_rescue_needs_flags(
         self,
@@ -171,7 +314,8 @@ class STTAPIHelpersTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             ValueError,
-            "backend must be 'kotoba', 'whisperx', or 'hybrid'",
+            "backend must be 'kotoba', 'whisperx', 'hybrid', or "
+            "'whisperjav'",
         ):
             _parse_options('{"backend": "other"}', settings)
 
@@ -385,6 +529,82 @@ class STTAPIHelpersTests(unittest.TestCase):
             )
             self.assertEqual(worker_options["chunk_length_seconds"], 30)
 
+    def test_whisperjav_worker_runs_ensemble_then_speaker_assignment(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            whisperjav_python = root / "whisperjav-python"
+            whisperx_python = root / "whisperx-python"
+            whisperjav_python.write_text("placeholder", encoding="utf-8")
+            whisperx_python.write_text("placeholder", encoding="utf-8")
+            settings = STTAPISettings(
+                state_dir=root / "state",
+                api_token="",
+                hf_token="secret-hf-token",
+                device="cpu",
+                diarization_device="cpu",
+                whisperjav_python=whisperjav_python,
+                whisperx_python=whisperx_python,
+            )
+            service = TranscriptionService(settings)
+            job = TranscriptionJob(
+                id="whisperjav-job",
+                idempotency_key="key",
+                status="running",
+                audio_path=str(root / "audio.wav"),
+                audio_sha256="hash",
+                options={"backend": "whisperjav", "whisperjav": {}},
+                result_path=None,
+                error=None,
+                chunks_created=0,
+                chunks_completed=0,
+                created_at=0.0,
+                updated_at=0.0,
+            )
+
+            commands = []
+
+            def fake_run(command, **kwargs):
+                commands.append((command, kwargs))
+                output = Path(command[command.index("--output") + 1])
+                if "stt_to_subtitle.whisperjav_worker" in command:
+                    output.write_text('{"words":[]}', encoding="utf-8")
+                else:
+                    output.write_text(
+                        json.dumps(
+                            {
+                                "model": {"id": "whisperjav-domain-ensemble"},
+                                "timing": {"postprocessor": "qwen3"},
+                                "runtime": {"backend": "whisperjav"},
+                                "noise_filter": {"enabled": True},
+                                "words": [],
+                                "segments": [],
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with patch.object(service, "_release_pipeline") as release:
+                with patch(
+                    "stt_to_subtitle.stt_api.subprocess.run",
+                    side_effect=fake_run,
+                ):
+                    result = service._run_whisperjav_worker(job)
+
+            release.assert_called_once_with()
+            self.assertEqual(len(commands), 2)
+            self.assertEqual(commands[0][0][0], str(whisperjav_python))
+            self.assertEqual(commands[1][0][0], str(whisperx_python))
+            self.assertIn(
+                "stt_to_subtitle.whisperjav_worker", commands[0][0]
+            )
+            self.assertIn("stt_to_subtitle.speaker_worker", commands[1][0])
+            self.assertNotIn("secret-hf-token", commands[0][0])
+            self.assertEqual(
+                commands[0][1]["env"]["HF_TOKEN"], "secret-hf-token"
+            )
+            self.assertEqual(result["model"]["id"], "whisperjav-domain-ensemble")
+
     def test_hybrid_job_runs_both_backends_and_rescues_failed_window(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -463,7 +683,8 @@ class STTAPIHelpersTests(unittest.TestCase):
 
             get_pipeline.assert_called_once_with()
             run_whisperx.assert_called_once()
-            self.assertFalse(
+            # Kotoba must not stay resident while WhisperX batches on the GPU.
+            self.assertTrue(
                 run_whisperx.call_args.kwargs["release_kotoba"]
             )
             self.assertEqual(
@@ -490,7 +711,7 @@ class STTAPIHelpersTests(unittest.TestCase):
             )
 
             self.assertEqual(payload["runtime"]["backend"], "hybrid")
-            self.assertTrue(
+            self.assertFalse(
                 payload["runtime"]["simultaneous_model_residency"]
             )
             self.assertEqual(payload["segments"][0]["text"], "はい")
@@ -511,6 +732,269 @@ class STTAPIHelpersTests(unittest.TestCase):
             )
             self.assertEqual(
                 request_trace["option_semantics"]["stt_call_count"], 2
+            )
+
+    def test_hybrid_window_scope_decodes_only_the_rescue_span(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_dir = root / "state"
+            audio_path = root / "audio.wav"
+            with wave.open(str(audio_path), "wb") as wav_file:
+                wav_file.setnchannels(1)
+                wav_file.setsampwidth(2)
+                wav_file.setframerate(16000)
+                wav_file.writeframes(b"\x00\x00" * 16000 * 40)
+            settings = STTAPISettings(
+                state_dir=state_dir,
+                api_token="",
+                hf_token="hf-token",
+                device="cpu",
+                diarization_device="cpu",
+            )
+            service = TranscriptionService(settings)
+            options = _parse_options(
+                '{"backend":"hybrid",'
+                '"hybrid_rescue":{"rescue_scope":"windows"}}',
+                settings,
+            )
+            service.store.create(
+                job_id="window-job",
+                idempotency_key="window-key",
+                audio_path=audio_path,
+                audio_sha256="window-sha",
+                options=options,
+            )
+            primary_result = {
+                "model": {"id": "large-v3", "revision": "whisperx-test"},
+                "timing": {"postprocessor": "whisperx-align"},
+                "runtime": {"backend": "whisperx", "device": "cpu"},
+                "noise_filter": {"enabled": True, "provider": "whisperx-vad"},
+                "quality": {"encoding_warning": {"flagged": False}},
+                "words": [],
+                "segments": [
+                    {
+                        "start": 20.0,
+                        "end": 20.9,
+                        "speaker": "WX_A",
+                        "text": "い" * 8,
+                        "provider": "whisperx",
+                    }
+                ],
+            }
+            window_result = {
+                "chunks": [
+                    {
+                        "timestamp": [5.0, 6.0],
+                        "speaker_id": "K_A",
+                        "text": "はい",
+                    }
+                ],
+                "timestamp_postprocessor": "kotoba-test",
+            }
+
+            with patch.object(service, "_get_pipeline", return_value=Mock()):
+                with patch.object(
+                    service,
+                    "_run_whisperx_worker",
+                    return_value=primary_result,
+                ):
+                    with patch(
+                        "stt_to_subtitle.stt_api.run_pipeline",
+                        return_value=window_result,
+                    ) as run_kotoba:
+                        service._run_job("window-job")
+
+            run_kotoba.assert_called_once()
+            sliced = run_kotoba.call_args.args[1]
+            self.assertNotEqual(sliced, audio_path)
+            self.assertTrue(sliced.name.startswith("window-"))
+
+            completed = service.store.get("window-job")
+            payload = json.loads(
+                Path(completed.result_path).read_text(encoding="utf-8")
+            )
+            rescued = payload["segments"][0]
+            self.assertEqual(rescued["text"], "はい")
+            self.assertAlmostEqual(rescued["start"], 20.0, places=3)
+            self.assertAlmostEqual(rescued["end"], 21.0, places=3)
+            self.assertEqual(payload["runtime"]["rescue"]["scope"], "windows")
+            self.assertEqual(
+                payload["noise_filter"]["rescue"]["window_count"], 1
+            )
+            self.assertLess(
+                payload["noise_filter"]["rescue"]["decoded_seconds"],
+                40.0,
+            )
+
+    def test_hybrid_job_skips_kotoba_when_no_window_needs_rescue(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            audio_path = root / "audio.wav"
+            with wave.open(str(audio_path), "wb") as wav_file:
+                wav_file.setnchannels(1)
+                wav_file.setsampwidth(2)
+                wav_file.setframerate(16000)
+                wav_file.writeframes(b"\x00\x00" * 16000)
+            settings = STTAPISettings(
+                state_dir=root / "state",
+                api_token="",
+                hf_token="hf-token",
+                device="cpu",
+                diarization_device="cpu",
+            )
+            service = TranscriptionService(settings)
+            options = _parse_options('{"backend":"hybrid"}', settings)
+            service.store.create(
+                job_id="clean-hybrid-job",
+                idempotency_key="clean-hybrid-key",
+                audio_path=audio_path,
+                audio_sha256="clean-sha",
+                options=options,
+            )
+            primary_result = {
+                "model": {"id": "large-v3", "revision": "whisperx-test"},
+                "timing": {"postprocessor": "whisperx-align"},
+                "runtime": {"backend": "whisperx", "device": "cpu"},
+                "noise_filter": {
+                    "enabled": True,
+                    "provider": "whisperx-vad",
+                },
+                "quality": {"encoding_warning": {"flagged": False}},
+                "words": [],
+                "segments": [
+                    {
+                        "start": 0.1,
+                        "end": 0.9,
+                        "speaker": "WX_A",
+                        "text": "こんにちは",
+                        "provider": "whisperx",
+                    }
+                ],
+            }
+
+            with patch.object(
+                service, "_get_pipeline", return_value=Mock()
+            ) as get_pipeline:
+                with patch.object(
+                    service,
+                    "_run_whisperx_worker",
+                    return_value=primary_result,
+                ):
+                    with patch(
+                        "stt_to_subtitle.stt_api.run_pipeline",
+                    ) as run_kotoba:
+                        service._run_job("clean-hybrid-job")
+
+            run_kotoba.assert_not_called()
+            get_pipeline.assert_not_called()
+            completed = service.store.get("clean-hybrid-job")
+            self.assertEqual(completed.status, "completed")
+            payload = json.loads(
+                Path(completed.result_path).read_text(encoding="utf-8")
+            )
+
+            self.assertTrue(payload["runtime"]["kotoba_skipped"])
+            self.assertTrue(payload["runtime"]["rescue"]["skipped"])
+            self.assertEqual(
+                payload["runtime"]["rescue"]["elapsed_seconds"], 0.0
+            )
+            self.assertEqual(
+                payload["noise_filter"]["rescue"]["execution_state"],
+                "skipped",
+            )
+            self.assertEqual(
+                [segment["text"] for segment in payload["segments"]],
+                ["こんにちは"],
+            )
+            self.assertEqual(
+                payload["quality"]["hybrid"]["replaced_window_count"], 0
+            )
+            self.assertEqual(
+                payload["quality"]["hybrid"]["fallback_segment_count"], 0
+            )
+
+
+    def test_whisperjav_job_persists_aligned_speaker_result(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            audio_path = root / "audio.wav"
+            with wave.open(str(audio_path), "wb") as wav_file:
+                wav_file.setnchannels(1)
+                wav_file.setsampwidth(2)
+                wav_file.setframerate(16000)
+                wav_file.writeframes(b"\x00\x00" * 16000)
+            settings = STTAPISettings(
+                state_dir=root / "state",
+                api_token="",
+                hf_token="hf-token",
+                device="cpu",
+                diarization_device="cpu",
+                debug_artifacts=True,
+            )
+            service = TranscriptionService(settings)
+            options = _parse_options('{"backend":"whisperjav"}', settings)
+            service.store.create(
+                job_id="whisperjav-job",
+                idempotency_key="whisperjav-key",
+                audio_path=audio_path,
+                audio_sha256="whisperjav-sha",
+                options=options,
+            )
+            worker_result = {
+                "model": {
+                    "id": "whisperjav-domain-ensemble",
+                    "revision": "pinned",
+                },
+                "timing": {"postprocessor": "qwen3-forced-alignment"},
+                "runtime": {"backend": "whisperjav"},
+                "noise_filter": {"enabled": True, "provider": "pyannote"},
+                "quality": {"alignment_fallback_count": 0},
+                "words": [
+                    {
+                        "word": "はい",
+                        "start": 0.0,
+                        "end": 1.0,
+                        "speaker": "SPEAKER_00",
+                    }
+                ],
+                "segments": [
+                    {
+                        "start": 0.0,
+                        "end": 1.0,
+                        "speaker": "SPEAKER_00",
+                        "text": "はい",
+                    }
+                ],
+            }
+
+            with patch.object(
+                service,
+                "_run_whisperjav_worker",
+                return_value=worker_result,
+            ) as run_worker:
+                service._run_job("whisperjav-job")
+
+            run_worker.assert_called_once()
+            completed = service.store.get("whisperjav-job")
+            payload = json.loads(
+                Path(completed.result_path).read_text(encoding="utf-8")
+            )
+            request_trace = json.loads(
+                (
+                    settings.artifacts_dir
+                    / "whisperjav-job"
+                    / "00_request.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(completed.status, "completed")
+            self.assertEqual(payload["pipeline"]["provider"], "whisperjav")
+            self.assertEqual(payload["segments"][0]["speaker"], "SPEAKER_00")
+            self.assertEqual(
+                request_trace["option_semantics"]["stt_call_count"], 2
+            )
+            self.assertEqual(
+                request_trace["option_semantics"]["alignment_call_count"],
+                1,
             )
 
     def test_completed_job_contains_additive_trace_and_debug_metrics(self) -> None:

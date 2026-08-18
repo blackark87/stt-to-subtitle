@@ -5,10 +5,15 @@
     <span class="stat-value">{{ job_stats.running }}</span>
     <span class="stat-label">진행 중</span>
   </a>
-  <a class="stat-tile stat-attention" href="/jobs?status_group=attention">
+  <a class="stat-tile stat-blocked" href="/jobs?status_group=blocked">
+    <span class="stat-icon">{{ icons.pause(18) }}</span>
+    <span class="stat-value">{{ job_stats.blocked }}</span>
+    <span class="stat-label">중단</span>
+  </a>
+  <a class="stat-tile stat-failed" href="/jobs?status_group=failed">
     <span class="stat-icon">{{ icons.alert_triangle(18) }}</span>
-    <span class="stat-value">{{ job_stats.attention }}</span>
-    <span class="stat-label">확인 필요</span>
+    <span class="stat-value">{{ job_stats.failed }}</span>
+    <span class="stat-label">실패</span>
   </a>
   <a class="stat-tile stat-waiting" href="/jobs?status_group=waiting">
     <span class="stat-icon">{{ icons.clock(18) }}</span>

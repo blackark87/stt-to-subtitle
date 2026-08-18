@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% import "_icons.html" as icons %}
+{% block title %}전사 비교 이력 · STT to Subtitle{% endblock %}
+{% block content %}
+  <div class="page-heading workspace-heading">
+    <div>
+      <p class="page-kicker">TRANSCRIPTION COMPARISONS</p>
+      <h1>전사 비교 이력</h1>
+    </div>
+    <a class="button" href="/media">{{ icons.play(16) }}새 전사 비교</a>
+  </div>
+  <section class="card recent-jobs-card">
+    <div
+      data-update-url="/comparisons-fragment?comparisons_page={{ comparisons_page }}"
+      aria-live="off"
+    >
+      {% include "_comparison_history.html" %}
+    </div>
+  </section>
+{% endblock %}

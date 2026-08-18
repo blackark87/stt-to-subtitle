@@ -239,18 +239,30 @@ class TranscriptionStore:
         if result.rowcount == 1:
             self._notify_change(job_id)
 
-    def requeue(self, job_id: str) -> None:
+    def requeue(
+        self,
+        job_id: str,
+        *,
+        options: Mapping[str, Any] | None = None,
+    ) -> None:
+        options_assignment = (
+            ", options_json = ?" if options is not None else ""
+        )
+        parameters: tuple[object, ...] = (time.time(),)
+        if options is not None:
+            parameters += (json.dumps(dict(options), sort_keys=True),)
+        parameters += (job_id,)
         with self._connect() as connection:
             result = connection.execute(
-                """
+                f"""
                 UPDATE transcription_jobs
                 SET status = 'queued', error = NULL,
                     chunks_created = 0, chunks_completed = 0,
                     attempt = attempt + 1,
-                    updated_at = ?
+                    updated_at = ?{options_assignment}
                 WHERE id = ?
                 """,
-                (time.time(), job_id),
+                parameters,
             )
         if result.rowcount == 1:
             self._notify_change(job_id)

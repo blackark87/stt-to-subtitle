@@ -68,7 +68,7 @@ class TranscriptionStoreTests(unittest.TestCase):
                 idempotency_key="key-1",
                 audio_path=Path(directory) / "audio.wav",
                 audio_sha256="abc",
-                options={},
+                options={"chunk_length_seconds": 60},
             )
             store.update_chunk_progress(
                 "job-1",
@@ -76,12 +76,16 @@ class TranscriptionStoreTests(unittest.TestCase):
                 completed=90,
             )
 
-            store.requeue("job-1")
+            store.requeue(
+                "job-1",
+                options={"chunk_length_seconds": 30},
+            )
 
             job = store.get("job-1")
             self.assertEqual(job.chunks_created, 0)
             self.assertEqual(job.chunks_completed, 0)
             self.assertEqual(job.attempt, 2)
+            self.assertEqual(job.options["chunk_length_seconds"], 30)
 
     def test_adds_chunk_columns_to_an_existing_database(self) -> None:
         with TemporaryDirectory() as directory:
@@ -159,6 +163,58 @@ class JobStoreTests(unittest.TestCase):
             self.assertEqual(store.count_jobs(), 3)
             self.assertEqual(queued.status, "queued")
 
+    def test_can_exclude_comparison_only_transcriptions(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = JobStore(Path(directory) / "jobs.sqlite3")
+            regular = store.create(
+                job_id="regular-transcription",
+                source_rel="regular.mkv",
+                force_overwrite=False,
+                options={},
+                operation="transcribe",
+            )
+            store.update(regular.id, status="transcription_completed")
+            comparison = store.create(
+                job_id="comparison-transcription",
+                source_rel="comparison.mkv",
+                force_overwrite=False,
+                options={"comparison_id": "comparison-1"},
+                operation="transcribe",
+            )
+            store.update(comparison.id, status="transcription_completed")
+            translated = store.create(
+                job_id="translated-comparison",
+                source_rel="translated.mkv",
+                force_overwrite=True,
+                options={"comparison_id": "comparison-1"},
+                operation="full",
+            )
+            store.update(translated.id, status="completed")
+
+            visible = store.list_jobs(
+                limit=None,
+                include_comparison_transcriptions=False,
+            )
+
+            self.assertEqual(
+                [job.id for job in visible],
+                [translated.id, regular.id],
+            )
+            self.assertEqual(
+                store.count_jobs(
+                    include_comparison_transcriptions=False,
+                ),
+                2,
+            )
+            self.assertEqual(
+                store.count_jobs(
+                    statuses={"transcription_completed"},
+                    include_comparison_transcriptions=False,
+                ),
+                1,
+            )
+            self.assertEqual(store.count_jobs(), 3)
+
     def test_calls_change_hook_after_job_mutations(self) -> None:
         with TemporaryDirectory() as directory:
             store = JobStore(Path(directory) / "jobs.sqlite3")
@@ -222,7 +278,9 @@ class JobStoreTests(unittest.TestCase):
                 },
             )
 
-    def test_lists_all_jobs_in_one_paginated_creation_order(self) -> None:
+    def test_lists_jobs_by_latest_status_change_without_progress_reordering(
+        self,
+    ) -> None:
         with TemporaryDirectory() as directory:
             store = JobStore(Path(directory) / "jobs.sqlite3")
             for index in range(3):
@@ -241,6 +299,16 @@ class JobStoreTests(unittest.TestCase):
             self.assertEqual(
                 [job.id for job in store.list_jobs(limit=2, offset=2)],
                 ["job-0"],
+            )
+            store.update("job-0", chunks_completed=1)
+            self.assertEqual(
+                [job.id for job in store.list_jobs(limit=3)],
+                ["job-2", "job-1", "job-0"],
+            )
+            store.update("job-0", status="blocked")
+            self.assertEqual(
+                [job.id for job in store.list_jobs(limit=3)],
+                ["job-0", "job-2", "job-1"],
             )
 
     def test_treats_transcription_as_success_and_finds_latest_transcript(

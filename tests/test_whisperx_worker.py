@@ -2,13 +2,56 @@ import unittest
 
 from stt_to_subtitle.whisperx_worker import (
     WhisperXSegmentationOptions,
+    _transcribe_with_oom_backoff,
     extract_whisperx_words,
+    install_whisperx_sentence_splitter_fallback,
     normalize_whisperx_segments,
     rebuild_whisperx_segments,
 )
 
 
+class _RecordingModel:
+    """Stub WhisperX model that fails with CUDA OOM below a batch threshold."""
+
+    def __init__(self, *, succeeds_at: int, error: Exception | None = None):
+        self.succeeds_at = succeeds_at
+        self.error = error
+        self.batch_sizes: list[int] = []
+
+    def transcribe(self, audio, *, batch_size, language, chunk_size):
+        self.batch_sizes.append(batch_size)
+        if batch_size > self.succeeds_at:
+            raise self.error or RuntimeError("CUDA out of memory. Tried ...")
+        return {"segments": [], "batch_size": batch_size}
+
+
 class WhisperXWorkerTests(unittest.TestCase):
+    def test_uses_whole_segment_when_punkt_data_is_unavailable(self) -> None:
+        other_resource = object()
+
+        class AlignmentModule:
+            @staticmethod
+            def nltk_load(resource: str) -> object:
+                if resource.startswith("tokenizers/punkt_tab/"):
+                    raise LookupError("punkt_tab is unavailable")
+                return other_resource
+
+        install_whisperx_sentence_splitter_fallback(AlignmentModule)
+
+        tokenizer = AlignmentModule.nltk_load(
+            "tokenizers/punkt_tab/english.pickle"
+        )
+        text = "一文目です。二文目です。"
+
+        self.assertEqual(
+            list(tokenizer.span_tokenize(text)),
+            [(0, len(text))],
+        )
+        self.assertIs(
+            AlignmentModule.nltk_load("tokenizers/other/resource"),
+            other_resource,
+        )
+
     def test_normalizes_sorts_and_filters_aligned_segments(self) -> None:
         segments = normalize_whisperx_segments(
             [
@@ -172,6 +215,72 @@ class WhisperXWorkerTests(unittest.TestCase):
         self.assertEqual(len(by_gap), 2)
         self.assertEqual(len(by_duration), 2)
         self.assertEqual(len(by_chars), 2)
+
+
+class WhisperXBatchBackoffTests(unittest.TestCase):
+    def _transcribe(self, model: _RecordingModel, batch_size: int):
+        return _transcribe_with_oom_backoff(
+            model,
+            object(),
+            batch_size=batch_size,
+            language="ja",
+            chunk_size=30,
+        )
+
+    def test_keeps_the_requested_batch_size_when_memory_suffices(self) -> None:
+        model = _RecordingModel(succeeds_at=16)
+
+        result, effective = self._transcribe(model, 8)
+
+        self.assertEqual(effective, 8)
+        self.assertEqual(result["batch_size"], 8)
+        self.assertEqual(model.batch_sizes, [8])
+
+    def test_halves_the_batch_size_until_the_transcription_fits(self) -> None:
+        model = _RecordingModel(succeeds_at=4)
+
+        result, effective = self._transcribe(model, 16)
+
+        self.assertEqual(effective, 4)
+        self.assertEqual(result["batch_size"], 4)
+        self.assertEqual(model.batch_sizes, [16, 8, 4])
+
+    def test_raises_when_a_single_item_batch_still_runs_out_of_memory(
+        self,
+    ) -> None:
+        model = _RecordingModel(succeeds_at=0)
+
+        with self.assertRaisesRegex(RuntimeError, "out of memory"):
+            self._transcribe(model, 2)
+
+        self.assertEqual(model.batch_sizes, [2, 1])
+
+    def test_retries_ctranslate2_allocation_failures(self) -> None:
+        for message in (
+            "cuBLAS failed with status CUBLAS_STATUS_ALLOC_FAILED",
+            "parallel_for failed: cudaErrorInvalidDevice: invalid device ordinal",
+        ):
+            with self.subTest(message=message):
+                model = _RecordingModel(
+                    succeeds_at=2,
+                    error=RuntimeError(message),
+                )
+
+                _, effective = self._transcribe(model, 8)
+
+                self.assertEqual(effective, 2)
+                self.assertEqual(model.batch_sizes, [8, 4, 2])
+
+    def test_reraises_unrelated_runtime_errors_without_retrying(self) -> None:
+        model = _RecordingModel(
+            succeeds_at=0,
+            error=RuntimeError("alignment model is missing"),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "alignment model"):
+            self._transcribe(model, 8)
+
+        self.assertEqual(model.batch_sizes, [8])
 
 
 if __name__ == "__main__":

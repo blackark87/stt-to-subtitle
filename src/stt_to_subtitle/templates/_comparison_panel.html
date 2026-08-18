@@ -1,12 +1,40 @@
+{% import "_icons.html" as icons %}
 <div{% if all_terminal %} data-update-stop{% endif %}>
   <div class="comparison-progress card">
     <strong>{{ completed_count }} / {{ jobs|length }}개 전사 완료</strong>
     {% if all_terminal %}
       <span>비교 작업이 종료되었습니다.</span>
     {% else %}
-      <span>작업 상태가 바뀌면 이 화면을 자동으로 갱신합니다.</span>
+      <span>진행 중</span>
     {% endif %}
   </div>
+  {% if translatable_source_count %}
+    <form
+      id="comparison-translation-form-{{ comparison_id }}"
+      method="post"
+      action="/comparisons/{{ comparison_id }}/translate"
+      class="comparison-translation-form"
+      data-comparison-translation-form
+      data-confirm-message="선택한 전사 결과로 번역과 자막 생성을 시작하시겠습니까? 기존 한국어 자막 파일이 있으면 새 결과로 덮어씁니다."
+    >
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <section class="card comparison-translation-toolbar">
+        <div>
+          <h2>선택한 전사 결과로 번역</h2>
+        </div>
+        <div class="comparison-translation-actions">
+          <label>번역 프롬프트
+            <select name="prompt_category_id" data-comparison-translation-prompt required>
+              <option value="">프롬프트 선택</option>
+              {% for category in prompt_categories %}
+                <option value="{{ category.id }}"{% if translation_prompt_category_id == category.id %} selected{% endif %}>{{ category.name }}</option>
+              {% endfor %}
+            </select>
+          </label>
+          <button type="submit" data-translate-comparison{% if not prompt_categories %} disabled{% endif %}>{{ icons.play(15) }}선택 결과 번역하기</button>
+        </div>
+      </section>
+  {% endif %}
   {% for source in sources %}
     <section class="card comparison-source">
       <div class="section-heading">
@@ -16,6 +44,28 @@
             <p class="muted">{{ source.source_rel|parent_path }}</p>
           {% endif %}
         </div>
+        {% if source.translatable_engines %}
+          <label class="comparison-transcript-picker">번역 전사 선택
+            <select name="job_ids" data-comparison-translation-source="{{ source.source_rel }}" required>
+              <option value="">엔진 선택</option>
+              {% for engine in source.translatable_engines %}
+                <option value="{{ engine.job.id }}"{% if engine.translation_selected %} selected{% endif %}>{{ engine.label }}</option>
+              {% endfor %}
+            </select>
+          </label>
+        {% elif all_terminal %}
+          <span class="status status-failed">번역 가능한 전사 없음</span>
+        {% endif %}
+      </div>
+      <div class="job-stage comparison-audio-stage is-{{ source.audio_stage.state }}">
+        <span class="job-stage-icon" aria-hidden="true">
+          {%- if source.audio_stage.state == 'done' %}{{ icons.check(13) }}
+          {%- elif source.audio_stage.state == 'running' %}{{ icons.activity(13) }}
+          {%- elif source.audio_stage.state == 'failed' %}{{ icons.alert_triangle(13) }}
+          {%- else %}{{ icons.clock(13) }}{% endif -%}
+        </span>
+        <span class="job-stage-label">{{ source.audio_stage.label }}</span>
+        <span class="job-stage-count">{{ source.audio_stage.state_label }}</span>
       </div>
       <div class="comparison-grid">
         {% for engine in source.engines %}
@@ -26,7 +76,7 @@
                 <h3>{{ engine.label }}</h3>
               </div>
               {% if engine.job %}
-                <a href="/jobs/{{ engine.job.id }}" class="status status-{{ engine.job.status }}">{{ engine.job.status|job_status }}</a>
+                <a href="/jobs/{{ engine.job.id }}" class="status status-stage-{{ engine.transcription_stage.state }}">전사 {{ engine.transcription_stage.state_label }}</a>
               {% else %}
                 <span class="status status-failed">작업 없음</span>
               {% endif %}
@@ -58,4 +108,7 @@
       </div>
     </section>
   {% endfor %}
+  {% if translatable_source_count %}
+    </form>
+  {% endif %}
 </div>

@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from contextlib import contextmanager, nullcontext
 import json
 import logging
 from pathlib import Path
+import threading
 import time
-from typing import Any
+from typing import Any, ContextManager
 
 import requests
 
@@ -33,6 +36,36 @@ class OperationStopped(RuntimeError):
     """A local pipeline stage reached a safe user-requested stop point."""
 
 
+class RequestConcurrencyLimiter:
+    """Share an adjustable concurrent-request limit across service clients."""
+
+    def __init__(self, limit: int) -> None:
+        self._condition = threading.Condition()
+        self._active = 0
+        self._limit = 1
+        self.set_limit(limit)
+
+    def set_limit(self, limit: int) -> None:
+        if limit < 1:
+            raise ValueError("request concurrency limit must be at least 1")
+        with self._condition:
+            self._limit = limit
+            self._condition.notify_all()
+
+    @contextmanager
+    def slot(self) -> Iterator[None]:
+        with self._condition:
+            while self._active >= self._limit:
+                self._condition.wait()
+            self._active += 1
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._active -= 1
+                self._condition.notify_all()
+
+
 def _safe_error(response: requests.Response) -> str:
     try:
         body = response.json()
@@ -49,13 +82,23 @@ class RetryingJSONClient:
         connect_timeout: float = 10.0,
         read_timeout: float = 120.0,
         attempts: int = 3,
+        request_limiter: RequestConcurrencyLimiter | None = None,
     ) -> None:
         if attempts < 1:
             raise ValueError("attempts must be at least 1")
         self.token = token
         self.timeout = (connect_timeout, read_timeout)
         self.attempts = attempts
-        self.session = requests.Session()
+        self.request_limiter = request_limiter
+        self._session_local = threading.local()
+
+    @property
+    def session(self) -> requests.Session:
+        session = getattr(self._session_local, "session", None)
+        if session is None:
+            session = requests.Session()
+            self._session_local.session = session
+        return session
 
     @property
     def headers(self) -> dict[str, str]:
@@ -69,12 +112,18 @@ class RetryingJSONClient:
         last_error: BaseException | None = None
         for attempt in range(1, self.attempts + 1):
             try:
-                response = self.session.request(
-                    method,
-                    url,
-                    timeout=self.timeout,
-                    **kwargs,
+                request_slot: ContextManager[None] = (
+                    self.request_limiter.slot()
+                    if self.request_limiter is not None
+                    else nullcontext()
                 )
+                with request_slot:
+                    response = self.session.request(
+                        method,
+                        url,
+                        timeout=self.timeout,
+                        **kwargs,
+                    )
                 if (
                     response.status_code not in transient_statuses
                     or attempt == self.attempts
@@ -534,11 +583,13 @@ class OpenAICompatibleClient(RetryingJSONClient):
         max_segments: int = 30,
         max_characters: int = 6000,
         attempts: int = 3,
+        request_limiter: RequestConcurrencyLimiter | None = None,
     ) -> None:
         super().__init__(
             token=token,
             read_timeout=600.0,
             attempts=attempts,
+            request_limiter=request_limiter,
         )
         if not model.strip():
             raise ValueError("OpenAI-compatible model name is required")
@@ -559,6 +610,7 @@ class OpenAICompatibleClient(RetryingJSONClient):
         on_progress: Callable[[int, int], None] | None = None,
         should_pause: Callable[[], bool] | None = None,
         on_review_warning: Callable[[str], None] | None = None,
+        max_workers: int = 1,
     ) -> list[dict[str, str]]:
         if not system_prompt.strip():
             raise ValueError("translation system prompt is required")
@@ -566,6 +618,8 @@ class OpenAICompatibleClient(RetryingJSONClient):
             raise ValueError("review_rounds must be between 0 and 2")
         if review_rounds and not review_prompt.strip():
             raise ValueError("translation review prompt is required")
+        if max_workers < 1:
+            raise ValueError("translation max_workers must be at least 1")
         expected_ids = [str(segment["id"]) for segment in segments]
         expected_set = set(expected_ids)
         known = {
@@ -592,41 +646,18 @@ class OpenAICompatibleClient(RetryingJSONClient):
         )
         if on_progress is not None:
             on_progress(0, len(batches))
-        for completed_batches, batch in enumerate(batches, start=1):
-            reference_context = self._reference_context(
-                segments,
-                batch,
-                before=5,
-                after=3,
-            )
-            draft = self._translate_batch_with_recovery(
-                batch,
-                reference_context,
-                system_prompt,
-            )
-            translated = draft
-            if review_rounds:
-                try:
-                    for _round in range(review_rounds):
-                        reviewed = self._review_batch_with_recovery(
-                            batch,
-                            reference_context,
-                            translated,
-                            review_prompt,
-                        )
-                        if reviewed == translated:
-                            break
-                        translated = reviewed
-                except ExternalServiceError as error:
-                    translated = draft
-                    LOGGER.warning(
-                        "translation review failed; using initial translation: %s",
-                        error,
-                    )
-                    if on_review_warning is not None:
-                        on_review_warning(str(error))
+        completed_batches = 0
+
+        def accept_batch(
+            translated: list[dict[str, str]],
+            review_warning: str | None,
+        ) -> None:
+            nonlocal completed_batches
+            if review_warning is not None and on_review_warning is not None:
+                on_review_warning(review_warning)
             for item in translated:
                 known[item["id"]] = item["text"]
+            completed_batches += 1
             if on_batch is not None:
                 on_batch(
                     [
@@ -637,8 +668,33 @@ class OpenAICompatibleClient(RetryingJSONClient):
                 )
             if on_progress is not None:
                 on_progress(completed_batches, len(batches))
-            if should_pause is not None and should_pause():
-                raise TranslationPaused("translation paused after checkpoint")
+
+        if len(batches) <= 1 or max_workers == 1:
+            for batch in batches:
+                accept_batch(
+                    *self._translate_logical_batch(
+                        segments,
+                        batch,
+                        system_prompt=system_prompt,
+                        review_prompt=review_prompt,
+                        review_rounds=review_rounds,
+                    )
+                )
+                if should_pause is not None and should_pause():
+                    raise TranslationPaused(
+                        "translation paused after checkpoint"
+                    )
+        else:
+            self._translate_batches_in_parallel(
+                segments,
+                batches,
+                system_prompt=system_prompt,
+                review_prompt=review_prompt,
+                review_rounds=review_rounds,
+                max_workers=max_workers,
+                accept_batch=accept_batch,
+                should_pause=should_pause,
+            )
 
         result = [
             {"id": segment_id, "text": known[segment_id]}
@@ -646,6 +702,121 @@ class OpenAICompatibleClient(RetryingJSONClient):
             if segment_id in known
         ]
         return validate_translation_items(result, expected_ids)
+
+    def _translate_batches_in_parallel(
+        self,
+        all_segments: Sequence[Mapping[str, Any]],
+        batches: Sequence[Sequence[Mapping[str, Any]]],
+        *,
+        system_prompt: str,
+        review_prompt: str,
+        review_rounds: int,
+        max_workers: int,
+        accept_batch: Callable[[list[dict[str, str]], str | None], None],
+        should_pause: Callable[[], bool] | None,
+    ) -> None:
+        worker_count = min(max_workers, len(batches))
+        executor = ThreadPoolExecutor(
+            max_workers=worker_count,
+            thread_name_prefix="translation-batch",
+        )
+        next_batch = 0
+        in_flight: dict[
+            Future[tuple[list[dict[str, str]], str | None]],
+            int,
+        ] = {}
+        first_error: BaseException | None = None
+        pause_requested = False
+
+        def fill_available_slots() -> None:
+            nonlocal next_batch
+            while len(in_flight) < worker_count and next_batch < len(batches):
+                batch_index = next_batch
+                batch = batches[batch_index]
+                next_batch += 1
+                future = executor.submit(
+                    self._translate_logical_batch,
+                    all_segments,
+                    batch,
+                    system_prompt=system_prompt,
+                    review_prompt=review_prompt,
+                    review_rounds=review_rounds,
+                )
+                in_flight[future] = batch_index
+
+        try:
+            fill_available_slots()
+            while in_flight:
+                done, _pending = wait(
+                    tuple(in_flight),
+                    return_when=FIRST_COMPLETED,
+                )
+                for future in sorted(done, key=in_flight.__getitem__):
+                    in_flight.pop(future)
+                    try:
+                        accept_batch(*future.result())
+                    except BaseException as error:
+                        if first_error is None:
+                            first_error = error
+                if (
+                    first_error is None
+                    and not pause_requested
+                    and should_pause is not None
+                    and should_pause()
+                ):
+                    pause_requested = True
+                if first_error is None and not pause_requested:
+                    fill_available_slots()
+        finally:
+            executor.shutdown(wait=True, cancel_futures=True)
+
+        if first_error is not None:
+            raise first_error
+        if pause_requested:
+            raise TranslationPaused("translation paused after checkpoint")
+
+    def _translate_logical_batch(
+        self,
+        all_segments: Sequence[Mapping[str, Any]],
+        batch: Sequence[Mapping[str, Any]],
+        *,
+        system_prompt: str,
+        review_prompt: str,
+        review_rounds: int,
+    ) -> tuple[list[dict[str, str]], str | None]:
+        reference_context = self._reference_context(
+            all_segments,
+            batch,
+            before=5,
+            after=3,
+        )
+        draft = self._translate_batch_with_recovery(
+            batch,
+            reference_context,
+            system_prompt,
+        )
+        translated = draft
+        review_warning: str | None = None
+        if review_rounds:
+            try:
+                for _round in range(review_rounds):
+                    reviewed = self._review_batch_with_recovery(
+                        batch,
+                        reference_context,
+                        translated,
+                        review_prompt,
+                    )
+                    if reviewed == translated:
+                        break
+                    translated = reviewed
+            except ExternalServiceError as error:
+                translated = draft
+                review_warning = str(error)
+                LOGGER.warning(
+                    "translation review failed; using initial translation: %s",
+                    error,
+                )
+        return translated, review_warning
 
     @staticmethod
     def _reference_context(

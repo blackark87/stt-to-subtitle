@@ -1,0 +1,551 @@
+"""
+Factory for creating speech segmenter instances.
+
+Supports lazy loading to avoid import overhead for unused backends.
+"""
+
+from typing import Dict, Type, Optional, Any, List, Tuple
+import importlib
+import importlib.util
+import logging
+
+from .base import SpeechSegmenter, SegmentationResult
+
+logger = logging.getLogger("whisperjav")
+
+# Registry of available backends: name -> module path
+_BACKEND_REGISTRY: Dict[str, str] = {
+    "ten": "stt_to_subtitle.vendor.whisperjav.modules.speech_segmentation.backends.ten.TenSpeechSegmenter",
+    "whisperseg": "stt_to_subtitle.vendor.whisperjav.modules.speech_segmentation.backends.whisperseg.WhisperSegSpeechSegmenter",
+}
+
+# Cache for loaded backend classes (avoid repeated imports)
+_BACKEND_CACHE: Dict[str, Type] = {}
+
+# Dependency information for each backend
+_BACKEND_DEPENDENCIES: Dict[str, Dict[str, Any]] = {
+    "silero": {
+        "packages": ["torch"],
+        "install_hint": "torch is already required by WhisperJAV",
+        "always_available": True,
+    },
+    "nemo": {
+        # NOTE: Use top-level "nemo" for availability check to avoid triggering heavy initialization
+        # The actual nemo.collections.asr import happens lazily when the backend is created
+        "packages": ["nemo"],
+        "install_hint": "pip install nemo_toolkit[asr] @ git+https://github.com/NVIDIA/NeMo.git@main",
+        "always_available": False,
+    },
+    "ten": {
+        "packages": ["ten_vad"],
+        "install_hint": "See https://github.com/ten-framework/ten-vad",
+        "always_available": False,
+    },
+    "silero-v6.2": {
+        "packages": ["silero_vad"],
+        "install_hint": "pip install silero-vad>=6.2",
+        "always_available": False,
+    },
+    "whisperseg": {
+        # onnxruntime is the real gate; transformers/huggingface_hub are usually present
+        "packages": ["onnxruntime"],
+        "install_hint": "pip install whisperjav[whisperseg] (or whisperjav[whisperseg-gpu] for CUDA)",
+        "always_available": False,
+    },
+    # v1.9.0 EXPERIMENTAL. Exact key required: the base-name fallback below
+    # would otherwise resolve "firered-vad" to unknown base "firered".
+    "firered-vad": {
+        "packages": ["fireredvad"],
+        "install_hint": "pip install fireredvad",
+        "always_available": False,
+    },
+    "whisper": {
+        "packages": ["faster_whisper"],
+        "install_hint": "pip install faster-whisper",
+        "always_available": True,  # faster-whisper already required by WhisperJAV
+    },
+    "none": {
+        "packages": [],
+        "install_hint": "",
+        "always_available": True,
+    },
+}
+
+# Parameter schemas for factory-level validation gate.
+# Stops GUI-originated type errors (strings, nulls) from reaching backends.
+# Schema: param_name -> (coerce_fn, default_value, nullable)
+#   - coerce_fn: Type constructor to coerce values (int, float, bool)
+#   - default_value: Fallback when value is None and nullable=False
+#   - nullable: If True, None is a valid value (don't substitute default)
+# v1.8.12: GUI-fallback defaults aligned to YAML balanced presets so that empty
+# input fields produce the same effective config as a freshly-loaded preset.
+# Prior values were stale relative to YAML and produced unexpected behavior on
+# the cleared-input path.
+_PARAM_SCHEMAS = {
+    "ten": {
+        "threshold":               (float, 0.32,  False),  # v1.8.12: 0.26→0.32 (YAML balanced)
+        "hop_size":                (int,   256,   False),
+        "min_speech_duration_ms":  (int,   150,   False),  # v1.8.12: 81→150 (YAML balanced)
+        "min_silence_duration_ms": (int,   150,   False),  # v1.8.12: 100→150 (YAML balanced)
+        "max_speech_duration_s":   (float, 5.0,   True),   # v1.8.12: NEW — was being stripped by foreign-key gate
+        "start_pad_ms":            (int,   0,     False),  # v1.8.12: 50→0 (YAML balanced)
+        "end_pad_ms":              (int,   200,   False),  # v1.8.12: 150→200 (YAML balanced)
+        "chunk_threshold_s":       (float, 1.0,   True),
+        "max_group_duration_s":    (float, 6.0,   True),   # v1.8.12: 29.0→6.0 (YAML balanced)
+    },
+    "silero": {
+        # All nullable: backend SileroSpeechSegmenter consumes None values via
+        # VERSION_DEFAULTS (v3.1 vs v4.0). Pydantic SileroVAD presets supply
+        # concrete values for the production path (legacy balanced/fidelity);
+        # silero.py:165 chunk_threshold_s=4.0 hardcoded fallback intentionally
+        # left as-is (impact unverified).
+        "threshold":               (float, None,  True),
+        "min_speech_duration_ms":  (int,   None,  True),
+        "min_silence_duration_ms": (int,   None,  True),
+        "speech_pad_ms":           (int,   None,  True),
+        "max_speech_duration_s":   (float, None,  True),
+        "chunk_threshold_s":       (float, None,  True),
+        "max_group_duration_s":    (float, None,  True),
+        "start_pad_samples":       (int,   11200, False),
+        "end_pad_samples":         (int,   20800, False),
+    },
+    "silero-v6.2": {
+        "threshold":                        (float, 0.32, False),  # v1.8.12: 0.35→0.32 (YAML balanced)
+        "min_speech_duration_ms":           (int,   150,  False),  # v1.8.12: 100→150 (YAML balanced)
+        "max_speech_duration_s":            (float, 5.0,  True),   # v1.8.12: None→5.0 (YAML balanced)
+        "min_silence_duration_ms":          (int,   150,  False),  # v1.8.12: 100→150 (YAML balanced)
+        "speech_pad_ms":                    (int,   250,  False),  # v1.8.12: 350→250 (YAML balanced)
+        "min_silence_at_max_speech":        (int,   98,   False),
+        "use_max_poss_sil_at_max_speech":   (bool,  True, False),
+        "chunk_threshold_s":                (float, 1.5,  True),   # v1.8.12: 1.0→1.5 (YAML balanced)
+        "max_group_duration_s":             (float, 6.0,  True),   # v1.8.12: 29.0→6.0 (YAML balanced)
+    },
+    "whisper-vad": {
+        "no_speech_threshold":     (float, 0.6,   False),
+        "logprob_threshold":       (float, -1.0,  False),
+        "cache_results":           (bool,  True,   False),
+        "chunk_threshold_s":       (float, 2.5,   True),
+        "max_group_duration_s":    (float, 29.0,  True),
+        "min_speech_duration_ms":  (int,   100,   False),
+    },
+    "nemo": {
+        "onset":                   (float, 0.4,   False),
+        "offset":                  (float, 0.3,   False),
+        "pad_onset":               (float, 0.2,   False),
+        "pad_offset":              (float, 0.10,  False),
+        "min_speech_duration_ms":  (int,   100,   False),
+        "min_silence_duration_ms": (int,   200,   False),
+        "filter_speech_first":     (bool,  True,  False),
+        "chunk_threshold_s":       (float, None,  True),
+        "max_group_duration_s":    (float, None,  True),
+        "use_overlap_smoothing":   (bool,  False, False),
+    },
+    "whisperseg": {
+        "threshold":               (float, 0.35, False),
+        "neg_threshold":           (float, None, True),   # v1.9.0: decoupled offset threshold (None=derive from threshold)
+        "speech_start_threshold":  (float, None, True),   # v1.9.0 "3a": refined display-start threshold (None=disabled)
+        "force_split_mode":        (str,   "dip", False),  # v1.9.0: "dip" (smart split) | "chop" (vendor-faithful reset)
+        "segmentation_decoder":    (str,   "hysteresis", False),  # v1.9.0: "hysteresis" | "offline" (two-level TEN-shape)
+        "grow_floor":              (float, 0.05, False),   # v1.9.0 offline: edge-growth floor (capture-vs-cut dial)
+        "gap_merge_ms":            (int,   350,  False),   # v1.9.0 offline: gaps >= this become cuts; shorter merge
+        "split_smooth_ms":         (int,   120,  False),   # v1.9.0 offline: smoothing window for overlong-split minima
+        "min_speech_duration_ms":  (int,   100,  False),
+        "min_silence_duration_ms": (int,   100,  False),
+        "speech_pad_ms":           (int,   300,  False),  # Symmetric fallback for start/end pad
+        "start_pad_ms":            (int,   100,  True),   # v1.9.0: asymmetric pad (qwen/anime default)
+        "end_pad_ms":              (int,   200,  True),   # v1.9.0: asymmetric pad (qwen/anime default)
+        "max_speech_duration_s":   (float, 5.0,  True),   # v1.8.12: None→5.0 (YAML balanced, explicit)
+        "chunk_threshold_s":       (float, 1.0,  True),
+        "max_group_duration_s":    (float, 6.0,  True),   # v1.8.12: None→6.0 (YAML balanced)
+        "force_cpu":               (bool,  False, False),
+        "num_threads":             (int,   1,    False),
+    },
+    # v1.9.0 EXPERIMENTAL: FireRedVAD (DFSMN, ~0.6M params). Detection defaults
+    # mirror upstream README (speech_threshold 0.4, min speech/silence 200ms);
+    # max_speech is JAV-capped at 6s (upstream default 20s produced ~9s segments
+    # in owner testing — JAV utterances rarely exceed ~5s). Upstream splits
+    # overlong runs at the lowest-probability frame, so the cap only affects
+    # segments that exceed it. Grouping matches the other backends' balanced.
+    "firered-vad": {
+        "threshold":               (float, 0.4,   False),
+        "smooth_window_size":      (int,   5,     False),
+        "min_speech_duration_ms":  (int,   200,   False),
+        "min_silence_duration_ms": (int,   200,   False),
+        "max_speech_duration_s":   (float, 6.0,   True),
+        "start_pad_ms":            (int,   50,    False),
+        "end_pad_ms":              (int,   150,   False),
+        "chunk_threshold_s":       (float, 1.0,   True),
+        "max_group_duration_s":    (float, 6.0,   True),
+        "use_gpu":                 (bool,  False, False),
+    },
+}
+
+
+class SpeechSegmenterFactory:
+    """
+    Factory for creating speech segmenter instances.
+
+    Supports lazy loading to avoid import overhead for unused backends.
+
+    Example:
+        # Create default Silero segmenter
+        segmenter = SpeechSegmenterFactory.create("silero")
+
+        # Create with custom parameters
+        segmenter = SpeechSegmenterFactory.create(
+            "silero-v4.0",
+            threshold=0.3,
+            min_speech_duration_ms=100
+        )
+
+        # Check availability before creating
+        available, hint = SpeechSegmenterFactory.is_backend_available("nemo")
+        if available:
+            segmenter = SpeechSegmenterFactory.create("nemo")
+    """
+
+    @staticmethod
+    def list_backends() -> List[str]:
+        """Return list of all registered backend names."""
+        return list(_BACKEND_REGISTRY.keys())
+
+    @staticmethod
+    def list_unique_backends() -> List[str]:
+        """Return list of unique backend names (without version aliases)."""
+        return ["silero", "nemo", "whisper", "ten", "whisperseg", "firered-vad", "none"]
+
+    @staticmethod
+    def is_backend_available(name: str) -> Tuple[bool, str]:
+        """
+        Check if a backend's dependencies are installed.
+
+        Args:
+            name: Backend name (e.g., "silero", "nemo")
+
+        Returns:
+            Tuple of (is_available, install_hint)
+            - is_available: True if backend can be used
+            - install_hint: Installation instructions if not available
+        """
+        # Check exact name first (e.g., "silero-v6.2" has its own entry),
+        # then fall back to base name (e.g., "silero-v4.0" -> "silero")
+        if name in _BACKEND_DEPENDENCIES:
+            dep_info = _BACKEND_DEPENDENCIES[name]
+        else:
+            base_name = name.split("-")[0] if "-" in name else name
+            if base_name not in _BACKEND_DEPENDENCIES:
+                return False, f"Unknown backend: {name}"
+            dep_info = _BACKEND_DEPENDENCIES[base_name]
+
+        if dep_info["always_available"]:
+            return True, ""
+
+        # Check if required packages are importable WITHOUT actually importing them
+        # This avoids triggering heavy initialization (like NeMo's Megatron init) at startup
+        for package in dep_info["packages"]:
+            spec = importlib.util.find_spec(package)
+            if spec is None:
+                return False, dep_info["install_hint"]
+
+        return True, ""
+
+    @staticmethod
+    def get_available_backends() -> List[Dict[str, Any]]:
+        """
+        Get information about all backends with availability status.
+
+        Returns:
+            List of dicts with name, display_name, available, install_hint
+        """
+        backends = []
+        display_names = {
+            "silero": "Silero VAD v4.0",
+            "silero-v3.1": "Silero VAD v3.1",
+            "nemo-lite": "NeMo Lite",
+            "nemo-diarization": "NeMo Diarization",
+            "whisper-vad": "Whisper VAD (small)",
+            "whisper-vad-tiny": "Whisper VAD (tiny)",
+            "whisper-vad-base": "Whisper VAD (base)",
+            "whisper-vad-medium": "Whisper VAD (medium)",
+            "silero-v6.2": "Silero VAD v6.2",
+            "ten": "TEN VAD",
+            "whisperseg": "WhisperSeg (JA-ASMR)",
+            "firered-vad": "FireRedVAD (experimental)",
+            "none": "None (Skip)",
+        }
+
+        for name in ["silero", "silero-v3.1", "silero-v6.2", "nemo-lite", "nemo-diarization", "whisper-vad", "whisper-vad-tiny", "whisper-vad-medium", "ten", "whisperseg", "firered-vad", "none"]:
+            available, hint = SpeechSegmenterFactory.is_backend_available(name)
+            backends.append({
+                "name": name,
+                "display_name": display_names.get(name, name),
+                "available": available,
+                "install_hint": hint,
+            })
+
+        return backends
+
+    @staticmethod
+    def _load_backend_class(name: str) -> Type:
+        """
+        Lazy load a backend class.
+
+        Args:
+            name: Backend name from registry
+
+        Returns:
+            Backend class
+
+        Raises:
+            ValueError: If backend name is unknown
+            ImportError: If backend dependencies not installed
+        """
+        # Check cache first
+        if name in _BACKEND_CACHE:
+            return _BACKEND_CACHE[name]
+
+        # Normalize name for registry lookup
+        registry_name = name
+        if name.startswith("silero") and name not in _BACKEND_REGISTRY:
+            registry_name = "silero"
+        elif name.startswith("nemo") and name not in _BACKEND_REGISTRY:
+            registry_name = "nemo"
+        elif name.startswith("whisper-vad") and name not in _BACKEND_REGISTRY:
+            registry_name = "whisper-vad"
+
+        if registry_name not in _BACKEND_REGISTRY:
+            available = SpeechSegmenterFactory.list_backends()
+            raise ValueError(
+                f"Unknown speech segmenter: '{name}'. "
+                f"Available backends: {available}"
+            )
+
+        # Check availability
+        available, hint = SpeechSegmenterFactory.is_backend_available(name)
+        if not available:
+            raise ImportError(
+                f"Speech segmenter '{name}' is not available. {hint}"
+            )
+
+        # Import module and get class
+        module_path = _BACKEND_REGISTRY[registry_name]
+        module_name, class_name = module_path.rsplit(".", 1)
+
+        try:
+            module = importlib.import_module(module_name)
+            backend_class = getattr(module, class_name)
+        except (ImportError, AttributeError) as e:
+            raise ImportError(
+                f"Failed to load speech segmenter '{name}': {e}"
+            )
+
+        # Cache for future use
+        _BACKEND_CACHE[name] = backend_class
+        return backend_class
+
+    @staticmethod
+    def _sanitize_params(name: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Sanitize parameters before passing to backend.
+
+        Handles three failure modes from GUI customize parameters:
+        1. String values where int/float expected (HTML inputs return strings)
+        2. None values where a concrete value is required (empty GUI fields)
+        3. Wrong types silently accepted by backends without coercion
+
+        Args:
+            name: Backend name (e.g., "ten", "silero-v4.0", "silero-v6.2")
+            params: Raw parameter dict from GUI/config
+
+        Returns:
+            Sanitized parameter dict with correct types
+        """
+        # Resolve schema: try exact name, then base family
+        schema = _PARAM_SCHEMAS.get(name)
+        if schema is None:
+            # silero-v6.2 has its own schema; other silero-* variants use "silero"
+            if name == "silero-v6.2":
+                schema = _PARAM_SCHEMAS.get("silero-v6.2")
+            elif name.startswith("silero"):
+                schema = _PARAM_SCHEMAS.get("silero")
+            elif name.startswith("whisper"):
+                schema = _PARAM_SCHEMAS.get("whisper-vad")
+            elif name.startswith("nemo"):
+                schema = _PARAM_SCHEMAS.get("nemo")
+            else:
+                base = name.split("-")[0] if "-" in name else name
+                schema = _PARAM_SCHEMAS.get(base)
+
+        if schema is None:
+            return params  # Unknown backend, pass through unchanged
+
+        sanitized = dict(params)
+
+        for param_name, (type_fn, default, nullable) in schema.items():
+            if param_name not in sanitized:
+                continue  # Not provided, let backend use its own default
+
+            value = sanitized[param_name]
+
+            # Handle None
+            if value is None:
+                if nullable:
+                    continue  # None is valid for this param
+                elif default is not None:
+                    logger.warning(
+                        f"[SegmenterFactory] Parameter '{param_name}' is None, "
+                        f"using default {default} for backend '{name}'"
+                    )
+                    sanitized[param_name] = default
+                else:
+                    continue  # Both value and default are None, let backend handle
+                continue
+
+            # Type coercion
+            try:
+                coerced = type_fn(value)
+                if coerced != value and not isinstance(value, bool):
+                    logger.debug(
+                        f"[SegmenterFactory] Coerced '{param_name}': "
+                        f"{value!r} ({type(value).__name__}) -> {coerced!r}"
+                    )
+                sanitized[param_name] = coerced
+            except (ValueError, TypeError) as e:
+                if default is not None:
+                    logger.warning(
+                        f"[SegmenterFactory] Cannot convert '{param_name}' value "
+                        f"{value!r} to {type_fn.__name__}, using default {default}: {e}"
+                    )
+                    sanitized[param_name] = default
+                else:
+                    logger.warning(
+                        f"[SegmenterFactory] Cannot convert '{param_name}' value "
+                        f"{value!r} to {type_fn.__name__}, removing: {e}"
+                    )
+                    del sanitized[param_name]
+
+        # Defense-in-depth: strip params not in this backend's schema.
+        # Prevents contamination from blind merges (e.g., Silero params reaching TEN).
+        # Shared params (threshold, min_speech_duration_ms) pass through because they
+        # exist in all backend schemas. Silero-only params (speech_pad_ms, neg_threshold)
+        # are stripped for non-Silero backends.
+        reserved_keys = {"backend", "version", "variant"}
+        foreign_keys = [
+            k for k in sanitized
+            if k not in schema and k not in reserved_keys
+        ]
+        if foreign_keys:
+            # LOCAL MODIFICATION (stt-to-subtitle): upstream dropped unknown
+            # keys with a debug log, so a typo in a preset silently changed
+            # the VAD's behaviour with no visible symptom. Our presets are
+            # code, not GUI input, so an unknown key is a bug worth failing on.
+            raise ValueError(
+                f"unsupported {name} speech segmenter parameters: "
+                f"{sorted(foreign_keys)}"
+            )
+
+        return sanitized
+
+    @staticmethod
+    def create(
+        name: str,
+        config: Optional[Dict[str, Any]] = None,
+        **kwargs
+    ) -> SpeechSegmenter:
+        """
+        Create a speech segmenter instance.
+
+        Args:
+            name: Backend name ('silero', 'silero-v4.0', 'silero-v3.1',
+                  'nemo', 'ten', 'none')
+            config: Configuration dict (from v4 YAML or resolved config)
+            **kwargs: Additional backend-specific parameters (override config)
+
+        Returns:
+            Configured SpeechSegmenter instance
+
+        Raises:
+            ValueError: If backend name is unknown
+            ImportError: If backend dependencies not installed
+
+        Example:
+            # Simple creation
+            segmenter = SpeechSegmenterFactory.create("silero")
+
+            # With version
+            segmenter = SpeechSegmenterFactory.create("silero-v3.1")
+
+            # With parameters
+            segmenter = SpeechSegmenterFactory.create(
+                "silero",
+                threshold=0.3,
+                min_speech_duration_ms=100
+            )
+        """
+        # Merge config with kwargs (kwargs take precedence)
+        params = dict(config or {})
+        params.update(kwargs)
+
+        # Handle Silero version suffix
+        if name.startswith("silero"):
+            if "-" in name:
+                version = name.split("-", 1)[1]
+                params["version"] = version
+            elif "version" not in params:
+                params["version"] = "v4.0"
+
+        # Handle NeMo variant suffix (nemo-lite, nemo-diarization)
+        if name.startswith("nemo"):
+            if "-" in name:
+                variant = name  # Pass full name as variant (e.g., "nemo-lite")
+            else:
+                variant = "nemo-lite"  # Default to nemo-lite
+            params["variant"] = variant
+
+        # Handle Whisper VAD variant suffix (whisper-vad, whisper-vad-tiny, etc.)
+        if name.startswith("whisper-vad"):
+            params["variant"] = name  # Pass full name as variant
+
+        # Sanitize parameters (validation gate for GUI-originated type errors)
+        params = SpeechSegmenterFactory._sanitize_params(name, params)
+
+        # Load and instantiate
+        backend_class = SpeechSegmenterFactory._load_backend_class(name)
+
+        logger.debug(f"Creating speech segmenter: {name} with params: {params}")
+        return backend_class(**params)
+
+    @staticmethod
+    def create_from_resolved_config(resolved_config: Dict[str, Any]) -> SpeechSegmenter:
+        """
+        Create segmenter from resolved pipeline configuration.
+
+        This is the integration point for pipelines using the legacy
+        config system.
+
+        Args:
+            resolved_config: Resolved configuration dict from main.py
+
+        Returns:
+            Configured SpeechSegmenter instance
+        """
+        params = resolved_config.get("params", {})
+        seg_config = params.get("speech_segmenter", {})
+
+        # Check for skip_vad flag (backward compatibility)
+        vad_params = params.get("vad", {})
+        if vad_params.get("skip_vad", False):
+            logger.info("VAD skip requested, using 'none' segmenter")
+            return SpeechSegmenterFactory.create("none")
+
+        # Get backend from config
+        backend = seg_config.get("backend", "silero")
+
+        # Merge VAD params only for Silero-family backends.
+        # Non-Silero backends use their own config only.
+        if backend.startswith("silero"):
+            merged_config = {**vad_params, **seg_config}
+        else:
+            merged_config = dict(seg_config)
+
+        return SpeechSegmenterFactory.create(backend, config=merged_config)

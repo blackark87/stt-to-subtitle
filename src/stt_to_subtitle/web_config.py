@@ -316,6 +316,7 @@ class WebSettings:
     maximum_listed_files: int = 5000
     translation_batch_segments: int = 30
     translation_batch_characters: int = 6000
+    audio_workers: int = 1
 
     @classmethod
     def from_env(cls) -> WebSettings:
@@ -366,6 +367,7 @@ class WebSettings:
             translation_batch_characters=int(
                 os.environ.get("TRANSLATION_BATCH_CHARACTERS", "6000")
             ),
+            audio_workers=int(os.environ.get("WEB_AUDIO_WORKERS", "1")),
         )
 
     def validate(self) -> None:
@@ -391,6 +393,8 @@ class WebSettings:
             or self.translation_batch_characters < 1
         ):
             raise ValueError("translation batch limits must be positive")
+        if self.audio_workers < 1:
+            raise ValueError("WEB_AUDIO_WORKERS must be at least 1")
 
     def remote_servers(self) -> RemoteServerSettings:
         return RemoteServerSettings(

@@ -1335,6 +1335,7 @@ tags
 !/requirements-api.txt
 !/requirements-kotoba.txt
 !/requirements-web.txt
+!/requirements-whisperjav.txt
 !/requirements-whisperx-cuda.in
 !/requirements-whisperx-cuda.txt
 !/requirements-test.txt
@@ -1358,3 +1359,7 @@ tags
 # Generated Python files
 **/__pycache__/
 *.py[cod]
+
+# Recorded WhisperJAV payloads hold transcribed dialogue; keep them local.
+/tests/golden/whisperjav/*_baseline*.json
+/tests/golden/whisperjav/*_candidate*.json

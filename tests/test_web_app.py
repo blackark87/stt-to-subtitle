@@ -97,10 +97,10 @@ class JobStageViewTests(unittest.TestCase):
         self.assertEqual(
             self.states(status="transcription_running"),
             [
-                ("오디오 추출", "done"),
+                ("추출", "done"),
                 ("전사", "running"),
                 ("번역", "pending"),
-                ("자막 생성", "pending"),
+                ("완료", "pending"),
             ],
         )
 
@@ -108,21 +108,31 @@ class JobStageViewTests(unittest.TestCase):
         self.assertEqual(
             self.states(status="blocked", blocked_stage="translation"),
             [
-                ("오디오 추출", "done"),
+                ("추출", "done"),
                 ("전사", "done"),
-                ("번역", "failed"),
-                ("자막 생성", "pending"),
+                ("번역", "blocked"),
+                ("완료", "pending"),
             ],
         )
 
-    def test_operation_scope_limits_the_listed_stages(self) -> None:
+    def test_completed_transcription_keeps_follow_up_stages_visible(self) -> None:
         self.assertEqual(
             self.states(status="transcription_completed", operation="transcribe"),
-            [("오디오 추출", "done"), ("전사", "done")],
+            [
+                ("추출", "done"),
+                ("전사", "done"),
+                ("번역", "waiting"),
+                ("완료", "pending"),
+            ],
         )
         self.assertEqual(
             self.states(status="queued", operation="translate"),
-            [("번역", "waiting"), ("자막 생성", "pending")],
+            [
+                ("추출", "done"),
+                ("전사", "done"),
+                ("번역", "waiting"),
+                ("완료", "pending"),
+            ],
         )
 
     def test_chunk_counts_drive_the_stage_progress_percentage(self) -> None:
@@ -211,10 +221,10 @@ class JobStageViewTests(unittest.TestCase):
         self.assertEqual(
             self.states(status="translation_paused"),
             [
-                ("오디오 추출", "done"),
+                ("추출", "done"),
                 ("전사", "done"),
                 ("번역", "paused"),
-                ("자막 생성", "pending"),
+                ("완료", "pending"),
             ],
         )
 
@@ -291,32 +301,243 @@ class WebAppTests(unittest.TestCase):
                     running.id,
                     status="transcription_running",
                 )
-                attention = service.store.create(
-                    job_id="attention-job",
-                    source_rel="attention.mkv",
+                blocked = service.store.create(
+                    job_id="blocked-job",
+                    source_rel="blocked.mkv",
                     force_overwrite=False,
                     options={},
                 )
-                service.store.update(attention.id, status="blocked")
+                service.store.update(blocked.id, status="blocked")
+                failed = service.store.create(
+                    job_id="failed-job",
+                    source_rel="failed.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                service.store.update(failed.id, status="failed")
 
                 dashboard = client.get("/")
                 running_page = client.get("/jobs?status_group=running")
-                attention_page = client.get("/jobs?status_group=attention")
+                blocked_page = client.get("/jobs?status_group=blocked")
+                failed_page = client.get("/jobs?status_group=failed")
                 invalid_page = client.get("/jobs?status_group=unknown")
 
             self.assertIn('href="/jobs?status_group=running"', dashboard.text)
-            self.assertIn('href="/jobs?status_group=attention"', dashboard.text)
+            self.assertIn('href="/jobs?status_group=blocked"', dashboard.text)
+            self.assertIn('href="/jobs?status_group=failed"', dashboard.text)
             self.assertIn('href="/jobs?status_group=waiting"', dashboard.text)
             self.assertIn('href="/jobs?status_group=completed"', dashboard.text)
             self.assertIn("running.mkv", running_page.text)
-            self.assertNotIn("attention.mkv", running_page.text)
-            self.assertIn("attention.mkv", attention_page.text)
-            self.assertNotIn("running.mkv", attention_page.text)
+            self.assertNotIn("blocked.mkv", running_page.text)
+            self.assertNotIn("failed.mkv", running_page.text)
+            self.assertIn("blocked.mkv", blocked_page.text)
+            self.assertNotIn("failed.mkv", blocked_page.text)
+            self.assertIn("failed.mkv", failed_page.text)
+            self.assertNotIn("blocked.mkv", failed_page.text)
             self.assertIn(
                 "data-update-url=\"/jobs-fragment?status_group=running",
                 running_page.text,
             )
             self.assertEqual(invalid_page.status_code, 400)
+
+    def test_job_list_uses_two_level_pipeline_stage_filters(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            with TestClient(create_app(self.settings(root, media_root))) as client:
+                service = client.app.state.orchestrator
+                service.stop()
+                for job_id, status in (
+                    ("extracting", "extracting"),
+                    ("transcription-waiting", "audio_ready"),
+                    ("transcription-running", "transcription_running"),
+                    ("transcription-completed", "transcription_completed"),
+                    ("translation-waiting", "transcribed"),
+                    ("translation-running", "translation_running"),
+                    ("translation-completed", "translated"),
+                    ("rendering", "rendering"),
+                    ("completed", "completed"),
+                ):
+                    job = service.store.create(
+                        job_id=job_id,
+                        source_rel=f"{job_id}.mkv",
+                        force_overwrite=False,
+                        options={},
+                    )
+                    service.store.update(job.id, status=status)
+                page = client.get("/jobs")
+                transcription = client.get(
+                    "/jobs?stage_filter=transcription"
+                )
+                transcription_waiting = client.get(
+                    "/jobs?stage_filter=transcription_waiting"
+                )
+                translation_completed = client.get(
+                    "/jobs?stage_filter=translation_completed"
+                )
+                completed = client.get("/jobs?stage_filter=completed")
+                invalid = client.get("/jobs?stage_filter=unknown")
+                stage_counts = client.get(
+                    "/job-stage-filters-fragment"
+                    "?stage_filter=transcription"
+                )
+                service.store.update("extracting", status="audio_ready")
+                refreshed_stage_counts = client.get(
+                    "/job-stage-filters-fragment"
+                    "?stage_filter=transcription"
+                )
+
+            self.assertEqual(page.status_code, 200)
+            for stage_filter, label in (
+                ("extraction", "추출"),
+                ("transcription", "전사"),
+                ("translation", "번역"),
+                ("completed", "완료"),
+            ):
+                self.assertIn(
+                    f'href="/jobs?stage_filter={stage_filter}"',
+                    page.text,
+                )
+                self.assertIn(f"<span>{label}</span>", page.text)
+            for stage_filter in (
+                "transcription_waiting",
+                "transcription_running",
+                "transcription_completed",
+                "translation_waiting",
+                "translation_running",
+                "translation_completed",
+            ):
+                self.assertIn(
+                    f'href="/jobs?stage_filter={stage_filter}"',
+                    page.text,
+                )
+            self.assertEqual(page.text.count("job-stage-filter-children"), 2)
+            self.assertEqual(page.text.count("job-stage-filter-count"), 4)
+            self.assertIn(
+                'data-update-url="/job-stage-filters-fragment?',
+                page.text,
+            )
+            for stage_filter, label, count in (
+                ("extraction", "추출", 1),
+                ("transcription", "전사", 3),
+                ("translation", "번역", 3),
+                ("completed", "완료", 2),
+            ):
+                self.assertRegex(
+                    stage_counts.text,
+                    rf'href="/jobs\?stage_filter={stage_filter}"[^>]*>'
+                    rf'\s*<span>{label}</span>\s*'
+                    rf'<span\s+class="job-stage-filter-count"\s+'
+                    rf'aria-label="{count}건"\s*>\s*{count}</span>',
+                )
+            self.assertRegex(
+                refreshed_stage_counts.text,
+                r'href="/jobs\?stage_filter=extraction"[^>]*>\s*'
+                r'<span>추출</span>\s*<span\s+'
+                r'class="job-stage-filter-count"\s+aria-label="0건"\s*>'
+                r'\s*0</span>',
+            )
+            self.assertRegex(
+                refreshed_stage_counts.text,
+                r'href="/jobs\?stage_filter=transcription"[^>]*>\s*'
+                r'<span>전사</span>\s*<span\s+'
+                r'class="job-stage-filter-count"\s+aria-label="4건"\s*>'
+                r'\s*4</span>',
+            )
+            self.assertIn("transcription-waiting.mkv", transcription.text)
+            self.assertIn("transcription-running.mkv", transcription.text)
+            self.assertIn("transcription-completed.mkv", transcription.text)
+            self.assertNotIn("translation-waiting.mkv", transcription.text)
+            self.assertIn(
+                "transcription-waiting.mkv",
+                transcription_waiting.text,
+            )
+            self.assertNotIn(
+                "transcription-running.mkv",
+                transcription_waiting.text,
+            )
+            self.assertIn(
+                "translation-completed.mkv",
+                translation_completed.text,
+            )
+            self.assertNotIn(
+                "translation-running.mkv",
+                translation_completed.text,
+            )
+            self.assertIn("rendering.mkv", completed.text)
+            self.assertIn("completed.mkv", completed.text)
+            self.assertIn(
+                "stage_filter=completed&amp;jobs_page=1",
+                completed.text,
+            )
+            self.assertEqual(invalid.status_code, 400)
+
+    def test_comparison_only_transcriptions_stay_out_of_job_history(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            for filename in (
+                "regular.mkv",
+                "comparison-only.mkv",
+                "translated-comparison.mkv",
+            ):
+                (media_root / filename).write_bytes(b"media")
+            with TestClient(create_app(self.settings(root, media_root))) as client:
+                service = client.app.state.orchestrator
+                service.stop()
+                regular = service.store.create(
+                    job_id="regular-transcription",
+                    source_rel="regular.mkv",
+                    force_overwrite=False,
+                    options={},
+                    operation="transcribe",
+                )
+                service.store.update(
+                    regular.id,
+                    status="transcription_completed",
+                )
+                comparison = service.store.create(
+                    job_id="comparison-only",
+                    source_rel="comparison-only.mkv",
+                    force_overwrite=False,
+                    options={"comparison_id": "comparison-1"},
+                    operation="transcribe",
+                )
+                service.store.update(
+                    comparison.id,
+                    status="transcription_completed",
+                )
+                translated = service.store.create(
+                    job_id="translated-comparison",
+                    source_rel="translated-comparison.mkv",
+                    force_overwrite=True,
+                    options={"comparison_id": "comparison-1"},
+                    operation="full",
+                )
+                service.store.update(translated.id, status="completed")
+
+                jobs = client.get("/jobs")
+                transcription = client.get(
+                    "/jobs?stage_filter=transcription_completed"
+                )
+                comparison_history = client.get(
+                    "/comparisons/comparison-1"
+                )
+
+            self.assertNotIn("comparison-only.mkv", jobs.text)
+            self.assertNotIn("comparison-only.mkv", transcription.text)
+            self.assertIn("regular.mkv", transcription.text)
+            self.assertEqual(
+                transcription.text.count('class="recent-job-item'),
+                1,
+            )
+            self.assertIn("translated-comparison.mkv", jobs.text)
+            self.assertEqual(jobs.text.count('class="recent-job-item'), 2)
+            self.assertIn("엔진 작업 2개", comparison_history.text)
 
     def test_primary_pages_separate_overview_media_and_job_history(self) -> None:
         with TemporaryDirectory() as directory:
@@ -331,14 +552,16 @@ class WebAppTests(unittest.TestCase):
                 jobs = client.get("/jobs")
                 stylesheet = client.get("/static/app.css")
 
-            self.assertIn("파이프라인 상태와 최근 작업", dashboard.text)
+            self.assertIn("<h1>대시보드</h1>", dashboard.text)
+            self.assertNotIn("파이프라인 상태와 최근 작업", dashboard.text)
             self.assertNotIn('class="media-board"', dashboard.text)
             self.assertIn('aria-current="page"', dashboard.text)
             self.assertIn('href="/media"', dashboard.text)
             self.assertIn("movie.mp4", media.text)
             self.assertIn('class="media-board"', media.text)
             self.assertNotIn("최근 작업", media.text)
-            self.assertIn("상태별 작업", jobs.text)
+            self.assertIn("<h1>전체 작업</h1>", jobs.text)
+            self.assertNotIn("상태별 작업", jobs.text)
             self.assertIn('href="/jobs" class="is-active"', jobs.text)
             self.assertNotIn('class="topbar"', dashboard.text)
             self.assertIn("position: fixed", stylesheet.text)
@@ -346,6 +569,50 @@ class WebAppTests(unittest.TestCase):
                 "grid-template-columns: repeat(4, minmax(0, 1fr))",
                 stylesheet.text,
             )
+
+    def test_job_mutations_keep_the_exact_current_page(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            (media_root / "show").mkdir()
+            (media_root / "show" / "movie.mp4").write_bytes(b"media")
+            (media_root / "show" / "new.mp4").write_bytes(b"media")
+
+            with TestClient(create_app(self.settings(root, media_root))) as client:
+                service = client.app.state.orchestrator
+                service.stop()
+                waiting = service.store.create(
+                    job_id="stay-put",
+                    source_rel="show/movie.mp4",
+                    force_overwrite=False,
+                    options={},
+                )
+                service.store.update(waiting.id, status="transcribed")
+
+                jobs_location = (
+                    "/jobs?stage_filter=translation_waiting&jobs_page=4"
+                )
+                paused = client.post(
+                    f"/jobs/{waiting.id}/pause-translation",
+                    headers={"referer": f"http://testserver{jobs_location}"},
+                    follow_redirects=False,
+                )
+                media_location = "/media?folder=show&q=movie"
+                queued = client.post(
+                    "/jobs",
+                    data={
+                        "source_rels": "show/new.mp4",
+                        "operation": "transcribe",
+                    },
+                    headers={"referer": f"http://testserver{media_location}"},
+                    follow_redirects=False,
+                )
+
+            self.assertEqual(paused.status_code, 303)
+            self.assertEqual(paused.headers["location"], jobs_location)
+            self.assertEqual(queued.status_code, 303)
+            self.assertEqual(queued.headers["location"], media_location)
 
     def test_dashboard_renders_live_gpu_metrics_without_leaving_stt(self) -> None:
         with TemporaryDirectory() as directory:
@@ -421,6 +688,13 @@ class WebAppTests(unittest.TestCase):
             self.assertEqual(root_response.status_code, 200)
             self.assertIn('class="folder-card media-card', root_response.text)
             self.assertIn("data-folder-link", root_response.text)
+            self.assertRegex(
+                root_response.text,
+                r'name="folder_rels"\s+type="checkbox"\s+'
+                r'value="show"\s+data-auto-select',
+            )
+            self.assertIn("폴더 전체 선택", root_response.text)
+            self.assertIn("하위 폴더까지 포함", root_response.text)
             self.assertIn("data-folder-loading", root_response.text)
             self.assertIn("data-media-loading", root_response.text)
             self.assertIn("data-media-search", root_response.text)
@@ -442,18 +716,25 @@ class WebAppTests(unittest.TestCase):
             self.assertIn("한국어 자막 있음", response.text)
             self.assertIn("일본어 구두점 모델 사용", response.text)
             self.assertIn("소음 오인식 필터 사용", response.text)
-            self.assertIn('<select name="backend">', response.text)
             self.assertIn(
-                '<option value="hybrid" selected>', response.text
-            )
-            self.assertIn('name="chunk_length_seconds"', response.text)
-            self.assertIn(
-                'name="hybrid_kotoba_chunk_length_seconds"', response.text
+                '<select name="backend" data-transcription-backend>',
+                response.text,
             )
             self.assertIn(
-                'name="hybrid_whisperx_chunk_length_seconds"', response.text
+                '<option value="auto" selected>', response.text
             )
-            self.assertIn('value="60"', response.text)
+            self.assertNotIn('name="chunk_length_seconds"', response.text)
+            self.assertIn(
+                'name="kotoba_chunk_length_seconds"', response.text
+            )
+            self.assertIn(
+                'name="whisperx_chunk_length_seconds"', response.text
+            )
+            self.assertNotIn("단독 엔진 청크", response.text)
+            self.assertNotIn("하이브리드 Kotoba 청크", response.text)
+            self.assertNotIn("하이브리드 WhisperX 청크", response.text)
+            self.assertIn("Kotoba 청크(초)", response.text)
+            self.assertIn("WhisperX 청크(초)", response.text)
             self.assertIn(
                 'name="noise_filter" type="checkbox" value="true" checked',
                 response.text,
@@ -735,11 +1016,12 @@ class WebAppTests(unittest.TestCase):
             self.assertNotIn("<table", dashboard.text)
             self.assertIn("최근 작업", dashboard.text)
             self.assertIn("전사 중", dashboard.text)
-            self.assertIn("확인 필요", dashboard.text)
+            self.assertIn("중단", dashboard.text)
+            self.assertNotIn("확인 필요", dashboard.text)
             self.assertIn('class="job-stage-strip"', dashboard.text)
             self.assertIn('class="job-progress-overview"', dashboard.text)
             self.assertIn("전체 진행률", dashboard.text)
-            self.assertIn("추출된 WAV 재생 시간", dashboard.text)
+            self.assertNotIn("추출된 WAV 재생 시간", dashboard.text)
             self.assertIn(">7/≈15<", dashboard.text)
             self.assertIn("movie.mkv", dashboard.text)
             self.assertIn("show", dashboard.text)
@@ -850,6 +1132,58 @@ class WebAppTests(unittest.TestCase):
                 )
             )
 
+    def test_auto_backend_applies_jav_prompt_and_whisperjav_preset(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            (media_root / "jav.mp4").write_bytes(b"media")
+            (media_root / "variety.mp4").write_bytes(b"media")
+
+            with TestClient(
+                create_app(self.settings(root, media_root))
+            ) as client:
+                service = client.app.state.orchestrator
+                service.stop()
+                jav_response = client.post(
+                    "/jobs",
+                    data={
+                        "source_rels": "jav.mp4",
+                        "backend": "auto",
+                        "operation": "full",
+                    },
+                    follow_redirects=False,
+                )
+                variety_response = client.post(
+                    "/jobs",
+                    data={
+                        "source_rels": "variety.mp4",
+                        "backend": "hybrid",
+                        "prompt_category_id": "variety",
+                        "operation": "full",
+                    },
+                    follow_redirects=False,
+                )
+                jobs = {
+                    job.source_rel: job
+                    for job in service.store.list_jobs(limit=None)
+                }
+
+            self.assertEqual(jav_response.status_code, 303)
+            self.assertEqual(variety_response.status_code, 303)
+            self.assertEqual(jobs["jav.mp4"].options["backend"], "whisperjav")
+            self.assertEqual(jobs["variety.mp4"].options["backend"], "hybrid")
+            self.assertEqual(
+                jobs["jav.mp4"].options["translation_prompt"]["category_id"],
+                "jav",
+            )
+            self.assertEqual(
+                jobs["variety.mp4"].options["translation_prompt"][
+                    "category_id"
+                ],
+                "variety",
+            )
+
     def test_multipart_card_queues_each_physical_file_as_a_job(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -936,6 +1270,7 @@ class WebAppTests(unittest.TestCase):
                     "/jobs",
                     data={
                         "folder_rels": "Shows",
+                        "backend": "hybrid",
                         "prompt_category_id": "variety",
                     },
                     follow_redirects=False,
@@ -961,7 +1296,7 @@ class WebAppTests(unittest.TestCase):
                 created.options["translation_prompt"]["review_rounds"],
                 2,
             )
-            self.assertEqual(created.options["backend"], "kotoba")
+            self.assertEqual(created.options["backend"], "hybrid")
 
     def test_media_cards_show_each_files_latest_processing_stage(self) -> None:
         with TemporaryDirectory() as directory:
@@ -1035,7 +1370,7 @@ class WebAppTests(unittest.TestCase):
                 "audio_completed": "오디오 추출 완료",
                 "transcription_completed": "전사 완료",
                 "translation_running": "번역 중",
-                "blocked": "확인 필요 · 번역",
+                "blocked": "중단 · 번역",
                 "completed": "자막 생성 완료",
                 "subtitle_present": "한국어 자막 있음",
             }
@@ -1044,7 +1379,12 @@ class WebAppTests(unittest.TestCase):
                     response.text,
                     rf'data-processing-stage="{stage}"[^>]*>\s*{label}',
                 )
-            self.assertIn("하위 미완료 작업 선택", response.text)
+            self.assertIn("폴더 전체 선택", response.text)
+            self.assertRegex(
+                response.text,
+                r'name="folder_rels"\s+type="checkbox"\s+'
+                r'value="nested"\s+data-auto-select',
+            )
             self.assertIn("이미 완료된 파일을 자동 제외", response.text)
 
     def test_completed_job_streams_video_range_and_webvtt(self) -> None:
@@ -1110,6 +1450,8 @@ class WebAppTests(unittest.TestCase):
             self.assertIn("data-vr-volume", page.text)
             self.assertIn("Space: 재생/일시정지", page.text)
             self.assertIn("vr180-player.js", page.text)
+            self.assertNotIn("전사·번역 결과를 화자별", page.text)
+            self.assertNotIn("지원하지 않는 MIME 형식", page.text)
             self.assertNotIn("<source", page.text)
             self.assertEqual(video.status_code, 206)
             self.assertEqual(video.content, b"2345")
@@ -1273,6 +1615,12 @@ class WebAppTests(unittest.TestCase):
             self.assertIn("20", page.text)
             self.assertIn("21 전체", page.text)
             self.assertIn("1 남음", page.text)
+            self.assertIn('class="job-stage-strip job-detail-stage-strip"', page.text)
+            for stage_label in ("추출", "전사", "번역", "완료"):
+                self.assertIn(
+                    f'<span class="job-stage-label">{stage_label}</span>',
+                    page.text,
+                )
             self.assertIn("한국어 결과 JSON 편집", page.text)
             self.assertEqual(editor.status_code, 200)
             self.assertIn("movie_result_ko.json", editor.text)
@@ -1310,7 +1658,13 @@ class WebAppTests(unittest.TestCase):
             root = Path(directory)
             media_root = root / "media"
             media_root.mkdir()
-            for name in ("pending.mp4", "running.mp4", "done.mp4", "bad.mp4"):
+            for name in (
+                "pending.mp4",
+                "running.mp4",
+                "done.mp4",
+                "stopped.mp4",
+                "bad.mp4",
+            ):
                 (media_root / name).write_bytes(b"media")
             done_subtitle = media_root / "done.ko.srt"
             done_subtitle.write_text("subtitle", encoding="utf-8")
@@ -1336,6 +1690,17 @@ class WebAppTests(unittest.TestCase):
                     status="completed",
                     srt_path=str(done_subtitle),
                 )
+                blocked = service.store.create(
+                    job_id="blocked-job",
+                    source_rel="stopped.mp4",
+                    force_overwrite=False,
+                    options={},
+                )
+                service.store.update(
+                    blocked.id,
+                    status="blocked",
+                    error="stopped",
+                )
                 failed = service.store.create(
                     job_id="failed-job",
                     source_rel="bad.mp4",
@@ -1349,10 +1714,14 @@ class WebAppTests(unittest.TestCase):
             self.assertIn("미처리", page.text)
             self.assertIn("번역 중", page.text)
             self.assertIn("자막 생성 완료", page.text)
+            self.assertIn("중단", page.text)
             self.assertIn("실패", page.text)
             self.assertIn('href="/jobs/running-job"', page.text)
             self.assertIn('href="/jobs/done-job"', page.text)
+            self.assertIn('href="/jobs/blocked-job"', page.text)
             self.assertIn('href="/jobs/failed-job"', page.text)
+            self.assertIn("subtitle-state is-blocked", page.text)
+            self.assertIn("subtitle-state is-failed", page.text)
             self.assertIn('value="pending.mp4"', page.text)
             # 완료된 항목도 다시 번역하려면 개별 선택이 되어야 한다.
             self.assertIn('value="done.mp4"', page.text)
@@ -1366,7 +1735,7 @@ class WebAppTests(unittest.TestCase):
                 r'value="done\.mp4"[^>]*\s+data-auto-select',
             )
 
-    def test_deletes_legacy_audio_and_missing_remote_job_records(
+    def test_deletes_retriable_legacy_audio_and_missing_remote_job_records(
         self,
     ) -> None:
         missing_error = (
@@ -1409,6 +1778,36 @@ class WebAppTests(unittest.TestCase):
                     blocked_stage="transcription",
                     error="transcription server is unavailable",
                 )
+                failed = service.store.create(
+                    job_id="failed-job",
+                    source_rel=source.name,
+                    force_overwrite=False,
+                    options={},
+                )
+                service.store.update(
+                    failed.id,
+                    status="failed",
+                    blocked_stage="translation",
+                    error="translation server is unavailable",
+                )
+                active = service.store.create(
+                    job_id="active-job",
+                    source_rel=source.name,
+                    force_overwrite=False,
+                    options={},
+                )
+                invalid_return = service.store.create(
+                    job_id="invalid-return-job",
+                    source_rel=source.name,
+                    force_overwrite=False,
+                    options={},
+                )
+                service.store.update(
+                    invalid_return.id,
+                    status="blocked",
+                    blocked_stage="translation",
+                    error="translation failed",
+                )
                 audio = service.store.create(
                     job_id="audio-job",
                     source_rel=audio_source.name,
@@ -1431,22 +1830,63 @@ class WebAppTests(unittest.TestCase):
                 artifact.write_bytes(b"audio")
 
                 dashboard = client.get("/jobs-fragment")
-                detail = client.get(f"/jobs/{missing.id}")
+                blocked_page = client.get(
+                    "/jobs?status_group=blocked&jobs_page=1"
+                )
+                failed_page = client.get(
+                    "/jobs?status_group=failed&jobs_page=1"
+                )
+                detail = client.get(
+                    f"/jobs/{missing.id}?return_status_group=blocked"
+                    "&return_jobs_page=2"
+                )
                 audio_detail = client.get(f"/jobs/{audio.id}")
                 rejected = client.post(
+                    f"/jobs/{active.id}/delete",
+                    follow_redirects=False,
+                )
+                blocked_deleted = client.post(
                     f"/jobs/{other.id}/delete",
+                    data={
+                        "return_status_group": "blocked",
+                        "return_jobs_page": "1",
+                    },
+                    follow_redirects=False,
+                )
+                failed_deleted = client.post(
+                    f"/jobs/{failed.id}/delete",
+                    data={
+                        "return_status_group": "failed",
+                        "return_jobs_page": "1",
+                    },
                     follow_redirects=False,
                 )
                 deleted = client.post(
                     f"/jobs/{missing.id}/delete",
+                    data={
+                        "return_status_group": "blocked",
+                        "return_jobs_page": "2",
+                    },
                     follow_redirects=False,
                 )
                 audio_deleted = client.post(
                     f"/jobs/{audio.id}/delete",
+                    data={
+                        "return_stage_filter": "extraction",
+                        "return_jobs_page": "3",
+                    },
+                    follow_redirects=False,
+                )
+                invalid_return_rejected = client.post(
+                    f"/jobs/{invalid_return.id}/delete",
+                    data={"return_status_group": "unknown"},
                     follow_redirects=False,
                 )
 
-                self.assertIsNotNone(service.store.get(other.id))
+                self.assertIsNotNone(service.store.get(active.id))
+                self.assertIsNotNone(service.store.get(invalid_return.id))
+                self.assertIsNone(service.store.get(other.id))
+                self.assertIsNone(service.store.get(failed.id))
                 self.assertIsNone(service.store.get(missing.id))
                 self.assertIsNone(service.store.get(audio.id))
 
@@ -1454,8 +1894,16 @@ class WebAppTests(unittest.TestCase):
                 f'action="/jobs/{missing.id}/delete"',
                 dashboard.text,
             )
-            self.assertNotIn(
+            self.assertIn(
                 f'action="/jobs/{other.id}/delete"',
+                dashboard.text,
+            )
+            self.assertIn(
+                f'action="/jobs/{failed.id}/delete"',
+                dashboard.text,
+            )
+            self.assertNotIn(
+                f'action="/jobs/{active.id}/delete"',
                 dashboard.text,
             )
             self.assertIn(
@@ -1463,14 +1911,52 @@ class WebAppTests(unittest.TestCase):
                 detail.text,
             )
             self.assertIn(
+                'href="/jobs?status_group=blocked&amp;jobs_page=2"',
+                detail.text,
+            )
+            self.assertIn(
+                'name="return_status_group" value="blocked"',
+                detail.text,
+            )
+            self.assertIn(
+                'name="return_jobs_page" value="2"',
+                detail.text,
+            )
+            self.assertIn(
+                'name="return_status_group" value="blocked"',
+                blocked_page.text,
+            )
+            self.assertIn(
+                'name="return_status_group" value="failed"',
+                failed_page.text,
+            )
+            self.assertIn(
                 f'action="/jobs/{audio.id}/delete"',
                 dashboard.text,
             )
             self.assertIn("기록 삭제", audio_detail.text)
             self.assertEqual(rejected.status_code, 400)
+            self.assertEqual(blocked_deleted.status_code, 303)
+            self.assertEqual(failed_deleted.status_code, 303)
             self.assertEqual(deleted.status_code, 303)
             self.assertEqual(audio_deleted.status_code, 303)
-            self.assertEqual(deleted.headers["location"], "/")
+            self.assertEqual(invalid_return_rejected.status_code, 400)
+            self.assertEqual(
+                blocked_deleted.headers["location"],
+                "/jobs?status_group=blocked&jobs_page=1",
+            )
+            self.assertEqual(
+                failed_deleted.headers["location"],
+                "/jobs?status_group=failed&jobs_page=1",
+            )
+            self.assertEqual(
+                deleted.headers["location"],
+                "/jobs?status_group=blocked&jobs_page=2",
+            )
+            self.assertEqual(
+                audio_deleted.headers["location"],
+                "/jobs?stage_filter=extraction&jobs_page=3",
+            )
             self.assertTrue(source.is_file())
             self.assertTrue(artifact.is_file())
             self.assertTrue(audio_source.is_file())
@@ -1569,7 +2055,59 @@ class WebAppTests(unittest.TestCase):
             self.assertEqual(extraction.status, "blocked")
             self.assertIn("전체 작업 중단 요청됨", refreshed.text)
 
-    def test_bulk_retry_restarts_all_attention_jobs(self) -> None:
+    def test_job_list_stops_selected_jobs_across_filtered_pages(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+
+            with TestClient(create_app(self.settings(root, media_root))) as client:
+                service = client.app.state.orchestrator
+                service.stop()
+                jobs = []
+                for index in range(25):
+                    job = service.store.create(
+                        job_id=f"waiting-{index:02d}",
+                        source_rel=f"waiting-{index:02d}.mkv",
+                        force_overwrite=False,
+                        options={},
+                    )
+                    service.store.update(job.id, status="transcribed")
+                    jobs.append(job)
+
+                page = client.get(
+                    "/jobs?stage_filter=translation_waiting&jobs_page=1"
+                )
+                response = client.post(
+                    "/jobs/stop-selected",
+                    data={
+                        "job_ids": [jobs[0].id, jobs[-1].id],
+                        "return_stage_filter": "translation_waiting",
+                        "return_jobs_page": "2",
+                    },
+                    follow_redirects=False,
+                )
+                selected = [
+                    service.store.get(jobs[0].id),
+                    service.store.get(jobs[-1].id),
+                ]
+                untouched = service.store.get(jobs[1].id)
+
+            self.assertEqual(page.status_code, 200)
+            self.assertEqual(page.text.count("data-stop-job-checkbox"), 20)
+            self.assertEqual(page.text.count("data-stop-job-candidate"), 25)
+            self.assertIn('action="/jobs/stop-selected"', page.text)
+            self.assertIn("목록 전체 선택", page.text)
+            self.assertEqual(response.status_code, 303)
+            self.assertEqual(
+                response.headers["location"],
+                "/jobs?stage_filter=translation_waiting&jobs_page=1"
+                "&jobs_stopped=2",
+            )
+            self.assertTrue(all(job.status == "blocked" for job in selected))
+            self.assertEqual(untouched.status, "transcribed")
+
+    def test_bulk_retry_restarts_all_blocked_and_failed_jobs(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
             media_root = root / "media"
@@ -1623,7 +2161,7 @@ class WebAppTests(unittest.TestCase):
                 queued = service.store.get(queued.id)
 
             self.assertIn('action="/jobs/retry-all"', fragment.text)
-            self.assertIn("중단 작업 일괄 재시도 (2)", fragment.text)
+            self.assertIn("전체 재시도 (2)", fragment.text)
             self.assertIn(
                 'name="return_folder" value="series"',
                 fragment.text,
@@ -1633,8 +2171,8 @@ class WebAppTests(unittest.TestCase):
                 response.headers["location"],
                 "/media?folder=series&jobs_retried=2",
             )
-            self.assertIn("중단·실패 작업 2개를 재시도했습니다.", notice.text)
-            self.assertIn("중단 작업 일괄 재시도 (0)", refreshed.text)
+            self.assertIn("작업 2개를 재시도했습니다.", notice.text)
+            self.assertIn("전체 재시도 (0)", refreshed.text)
             self.assertEqual(blocked.status, "queued")
             self.assertEqual(failed.status, "queued")
             self.assertEqual(queued.status, "queued")
@@ -1705,6 +2243,15 @@ class WebAppTests(unittest.TestCase):
             self.assertIn(">전사</button>", dashboard.text)
             self.assertIn(">번역</button>", dashboard.text)
             self.assertIn(">전체</button>", dashboard.text)
+            self.assertIn(
+                "자동 (JAV 프롬프트 + WhisperJAV)",
+                dashboard.text,
+            )
+            self.assertIn(
+                'data-auto-prompt-category="jav" disabled',
+                dashboard.text,
+            )
+            self.assertIn('value="jav" selected', dashboard.text)
             self.assertNotIn("오디오만 추출", dashboard.text)
             advanced_position = dashboard.text.index(
                 '<details class="advanced-options wide">'
@@ -1724,9 +2271,10 @@ class WebAppTests(unittest.TestCase):
             self.assertEqual(response.status_code, 303)
             self.assertEqual(response.headers["location"], "/media?queued=1")
             self.assertEqual(jobs[0].operation, "transcribe")
+            self.assertEqual(jobs[0].options["backend"], "whisperjav")
             self.assertNotIn("translation_prompt", jobs[0].options)
 
-    def test_transcription_comparison_queues_three_engines_and_renders_results(
+    def test_transcription_comparison_queues_four_engines_and_renders_results(
         self,
     ) -> None:
         with TemporaryDirectory() as directory:
@@ -1753,8 +2301,42 @@ class WebAppTests(unittest.TestCase):
                 waiting = client.get(
                     f"/comparisons/{comparison_id}"
                 )
-                for job in jobs:
+                service.store.update(
+                    jobs[0].id,
+                    status="failed",
+                    blocked_stage="transcription",
+                    error="transcription failed",
+                )
+                failed_comparison = client.get(
+                    f"/comparisons/{comparison_id}"
+                )
+                retry_response = client.post(
+                    f"/comparisons/{comparison_id}/retry",
+                    follow_redirects=False,
+                )
+                retry_notice = client.get(
+                    retry_response.headers["location"]
+                )
+                retried_job = service.store.get(jobs[0].id)
+                service.store.update(jobs[0].id, status="extracting")
+                extracting = client.get(
+                    f"/comparisons/{comparison_id}"
+                )
+                comparison_panel = client.get(
+                    f"/comparisons/{comparison_id}/panel"
+                )
+                partial_comparison = None
+                for index, job in enumerate(jobs):
                     backend = str(job.options["backend"])
+                    audio = (
+                        root
+                        / "state"
+                        / "jobs"
+                        / job.id
+                        / "audio.16k.wav"
+                    )
+                    audio.parent.mkdir(parents=True, exist_ok=True)
+                    audio.write_bytes(b"wave")
                     transcript = (
                         root
                         / "state"
@@ -1762,7 +2344,7 @@ class WebAppTests(unittest.TestCase):
                         / job.id
                         / "movie_translate.json"
                     )
-                    transcript.parent.mkdir(parents=True)
+                    transcript.parent.mkdir(parents=True, exist_ok=True)
                     transcript.write_text(
                         json.dumps(
                             {
@@ -1784,22 +2366,116 @@ class WebAppTests(unittest.TestCase):
                     service.store.update(
                         job.id,
                         status="transcription_completed",
+                        audio_path=str(audio),
+                        audio_sha256=f"audio-{job.id}",
                         transcript_path=str(transcript),
                     )
+                    if index == 0:
+                        partial_comparison = client.get(
+                            f"/comparisons/{comparison_id}"
+                        )
                 comparison = client.get(
                     f"/comparisons/{comparison_id}"
                 )
+                history = client.get("/comparisons")
+                history_fragment = client.get("/comparisons-fragment")
+                invalid_rerun = client.post(
+                    f"/comparisons/{comparison_id}/rerun",
+                    data={
+                        "kotoba_chunk_length_seconds": "0",
+                        "whisperx_chunk_length_seconds": "42",
+                    },
+                )
+                invalid_whisperx_rerun = client.post(
+                    f"/comparisons/{comparison_id}/rerun",
+                    data={
+                        "kotoba_chunk_length_seconds": "21",
+                        "whisperx_chunk_length_seconds": "31",
+                    },
+                )
+                invalid_whisperjav_rerun = client.post(
+                    f"/comparisons/{comparison_id}/rerun",
+                    data={
+                        "kotoba_chunk_length_seconds": "21",
+                        "whisperx_chunk_length_seconds": "24",
+                        "anime_max_group_duration_seconds": "0.1",
+                    },
+                )
+                rerun_response = client.post(
+                    f"/comparisons/{comparison_id}/rerun",
+                    data={
+                        "kotoba_chunk_length_seconds": "21",
+                        "whisperx_chunk_length_seconds": "24",
+                        "anime_max_group_duration_seconds": "2.7",
+                        "qwen_max_group_duration_seconds": "4.2",
+                    },
+                    follow_redirects=False,
+                )
+                new_comparison_id = rerun_response.headers[
+                    "location"
+                ].split("/")[2].split("?")[0]
+                rerun_notice = client.get(
+                    rerun_response.headers["location"]
+                )
+                rerun_jobs = [
+                    job
+                    for job in service.store.list_jobs(limit=None)
+                    if job.options.get("comparison_id")
+                    == new_comparison_id
+                ]
+                original_after_rerun = client.get(
+                    f"/comparisons/{comparison_id}"
+                )
+                history_after_rerun = client.get("/comparisons")
                 detail = client.get(f"/jobs/{jobs[0].id}")
+                selected_comparison_job = next(
+                    job
+                    for job in jobs
+                    if job.options.get("backend") == "hybrid"
+                )
+                missing_translation_selection = client.post(
+                    f"/comparisons/{comparison_id}/translate",
+                    data={"prompt_category_id": "jav"},
+                )
+                duplicate_translation_selection = client.post(
+                    f"/comparisons/{comparison_id}/translate",
+                    data={
+                        "job_ids": [jobs[0].id, jobs[1].id],
+                        "prompt_category_id": "jav",
+                    },
+                )
+                translation_response = client.post(
+                    f"/comparisons/{comparison_id}/translate",
+                    data={
+                        "job_ids": selected_comparison_job.id,
+                        "prompt_category_id": "jav",
+                    },
+                    follow_redirects=False,
+                )
+                translation_jobs = [
+                    job
+                    for job in service.store.list_jobs(limit=None)
+                    if isinstance(
+                        job.options.get("comparison_transcript_source"),
+                        dict,
+                    )
+                ]
+                preserved_comparison_job = service.store.get(
+                    selected_comparison_job.id
+                )
+                translation_notice = client.get(
+                    translation_response.headers["location"]
+                )
 
             self.assertEqual(queued.status_code, 303)
             self.assertEqual(
                 queued.headers["location"],
                 f"/comparisons/{comparison_id}",
             )
-            self.assertEqual(len(jobs), 3)
+            self.assertEqual(len(jobs), 4)
             self.assertEqual(
                 {job.options["backend"] for job in jobs},
-                {"hybrid", "whisperx", "kotoba"},
+                {"whisperjav", "hybrid", "whisperx", "kotoba"},
             )
             self.assertEqual(
                 {job.options["comparison_id"] for job in jobs},
@@ -1811,23 +2487,450 @@ class WebAppTests(unittest.TestCase):
             self.assertIn("hybrid_rescue", options_by_backend["hybrid"])
             self.assertNotIn("hybrid_rescue", options_by_backend["whisperx"])
             self.assertNotIn("hybrid_rescue", options_by_backend["kotoba"])
+            self.assertEqual(
+                options_by_backend["whisperjav"]["whisperjav"],
+                {
+                    "recipe": "whisperjav-domain-ensemble-v1",
+                    "anime_max_group_duration_seconds": 2.0,
+                    "qwen_max_group_duration_seconds": 3.0,
+                },
+            )
+            self.assertTrue(
+                all(
+                    job.options["comparison_schema_version"] == 2
+                    for job in jobs
+                )
+            )
+            self.assertEqual(
+                options_by_backend["hybrid"]["hybrid_rescue"],
+                {
+                    "window_padding_sec": 5.0,
+                    "max_word_duration_sec": 8.0,
+                    "short_segment_duration_sec": 0.2,
+                    "short_segment_cluster_window_sec": 5.0,
+                    "short_segment_cluster_count": 3,
+                    "speaker_debounce_sec": 0.1,
+                    "kotoba_chunk_length_seconds": 15,
+                    "whisperx_chunk_length_seconds": 30,
+                    "rescue_scope": "windows",
+                },
+            )
+            self.assertEqual(
+                options_by_backend["whisperx"]["chunk_length_seconds"],
+                30,
+            )
+            self.assertEqual(
+                options_by_backend["kotoba"]["chunk_length_seconds"],
+                15,
+            )
             self.assertTrue(all(job.operation == "transcribe" for job in jobs))
             self.assertIn(
                 f'data-update-url="/comparisons/{comparison_id}/panel"',
                 waiting.text,
             )
+            self.assertNotIn(
+                "data-comparison-translation-form",
+                waiting.text,
+            )
+            self.assertIn(
+                f'action="/comparisons/{comparison_id}/rerun"',
+                waiting.text,
+            )
+            self.assertIn(
+                'name="kotoba_chunk_length_seconds"',
+                waiting.text,
+            )
+            self.assertIn('value="15"', waiting.text)
+            self.assertIn(
+                'name="whisperx_chunk_length_seconds"',
+                waiting.text,
+            )
+            self.assertIn('max="30"', waiting.text)
+            self.assertIn('value="30"', waiting.text)
+            self.assertIn(
+                'name="anime_max_group_duration_seconds"', waiting.text
+            )
+            self.assertIn(
+                'name="qwen_max_group_duration_seconds"', waiting.text
+            )
+            self.assertEqual(waiting.text.count("오디오 추출"), 1)
+            self.assertEqual(waiting.text.count("전사 대기"), 4)
+            self.assertIn("실패 작업 재시도 (1)", failed_comparison.text)
+            self.assertEqual(retry_response.status_code, 303)
+            self.assertEqual(
+                retry_response.headers["location"],
+                f"/comparisons/{comparison_id}?retried=1",
+            )
+            self.assertIn(
+                "실패한 전사 작업 1개를 재시도했습니다.",
+                retry_notice.text,
+            )
+            self.assertEqual(retried_job.status, "queued")
+            self.assertIn(
+                "comparison-audio-stage is-running",
+                extracting.text,
+            )
+            self.assertEqual(extracting.text.count("오디오 추출"), 1)
+            self.assertNotIn("오디오 추출 중", extracting.text)
+            self.assertEqual(extracting.text.count("전사 대기"), 4)
+            self.assertEqual(comparison_panel.status_code, 200)
+            self.assertIn(
+                "comparison-audio-stage is-running",
+                comparison_panel.text,
+            )
+            self.assertIsNotNone(partial_comparison)
+            self.assertIn(
+                f'data-update-url="/comparisons/{comparison_id}/panel"',
+                partial_comparison.text,
+            )
+            self.assertIn(
+                f'action="/comparisons/{comparison_id}/translate"',
+                partial_comparison.text,
+            )
+            self.assertIn(
+                f'value="{jobs[0].id}"',
+                partial_comparison.text,
+            )
+            self.assertIn("선택한 전사 결과로 번역", partial_comparison.text)
+            self.assertNotIn(
+                "완료된 결과 중 파일마다 사용할 엔진",
+                partial_comparison.text,
+            )
             self.assertEqual(comparison.status_code, 200)
-            self.assertIn("3 / 3개 전사 완료", comparison.text)
+            self.assertEqual(comparison.text.count("오디오 추출"), 1)
+            self.assertIn("4 / 4개 전사 완료", comparison.text)
+            self.assertIn("WhisperJAV", comparison.text)
             self.assertIn("하이브리드", comparison.text)
             self.assertIn("WhisperX", comparison.text)
             self.assertIn("Kotoba", comparison.text)
             self.assertIn("hybrid 전사 결과", comparison.text)
             self.assertIn("whisperx 전사 결과", comparison.text)
             self.assertIn("kotoba 전사 결과", comparison.text)
+            self.assertIn("whisperjav 전사 결과", comparison.text)
+            self.assertIn(
+                f'action="/comparisons/{comparison_id}/translate"',
+                comparison.text,
+            )
+            self.assertIn("선택한 전사 결과로 번역", comparison.text)
+            self.assertIn('name="prompt_category_id"', comparison.text)
+            for job in jobs:
+                self.assertIn(f'value="{job.id}"', comparison.text)
+            self.assertIn(
+                'href="/comparisons" class="is-active"',
+                comparison.text,
+            )
+            self.assertEqual(history.status_code, 200)
+            self.assertIn("전사 비교 이력", history.text)
+            self.assertIn(
+                'href="/comparisons" class="is-active"',
+                history.text,
+            )
+            self.assertNotIn(
+                'href="/jobs" class="is-active"',
+                history.text,
+            )
+            self.assertEqual(
+                history.text.count('class="comparison-history-item'),
+                1,
+            )
+            self.assertEqual(
+                history.text.count('class="comparison-record-item'),
+                1,
+            )
+            self.assertIn("movie.mp4", history.text)
+            self.assertIn("완료 4", history.text)
+            self.assertIn(
+                f'href="/comparisons/{comparison_id}"',
+                history.text,
+            )
+            self.assertEqual(history_fragment.status_code, 200)
+            self.assertEqual(
+                history_fragment.text.count(
+                    'class="comparison-history-item'
+                ),
+                1,
+            )
+            self.assertEqual(
+                history_fragment.text.count(
+                    'class="comparison-record-item'
+                ),
+                1,
+            )
+            self.assertEqual(invalid_rerun.status_code, 400)
+            self.assertIn(
+                "Kotoba 청크는 1초 이상이어야 합니다.",
+                invalid_rerun.text,
+            )
+            self.assertIn('value="0"', invalid_rerun.text)
+            self.assertEqual(invalid_whisperx_rerun.status_code, 400)
+            self.assertIn(
+                "WhisperX 청크는 30초 이하여야 합니다.",
+                invalid_whisperx_rerun.text,
+            )
+            self.assertEqual(invalid_whisperjav_rerun.status_code, 400)
+            self.assertIn(
+                "WhisperJAV 1차 그룹 길이: 0.5초 이상 30.0초 이하여야 합니다.",
+                invalid_whisperjav_rerun.text,
+            )
+            self.assertEqual(rerun_response.status_code, 303)
+            self.assertNotEqual(new_comparison_id, comparison_id)
+            self.assertEqual(len(rerun_jobs), 4)
+            self.assertTrue(
+                all(job.status == "audio_ready" for job in rerun_jobs)
+            )
+            self.assertEqual(
+                len({job.audio_path for job in rerun_jobs}),
+                1,
+            )
+            self.assertTrue(
+                all(
+                    job.options["comparison_parent_id"] == comparison_id
+                    for job in rerun_jobs
+                )
+            )
+            self.assertTrue(
+                all(
+                    "comparison_audio_source_job_id" in job.options
+                    for job in rerun_jobs
+                )
+            )
+            rerun_options = {
+                str(job.options["backend"]): job.options
+                for job in rerun_jobs
+            }
+            self.assertEqual(
+                rerun_options["hybrid"]["hybrid_rescue"][
+                    "kotoba_chunk_length_seconds"
+                ],
+                21,
+            )
+            self.assertEqual(
+                rerun_options["hybrid"]["hybrid_rescue"][
+                    "whisperx_chunk_length_seconds"
+                ],
+                24,
+            )
+            self.assertEqual(
+                rerun_options["kotoba"]["chunk_length_seconds"],
+                21,
+            )
+            self.assertEqual(
+                rerun_options["whisperx"]["chunk_length_seconds"],
+                24,
+            )
+            self.assertEqual(
+                rerun_options["whisperjav"]["whisperjav"][
+                    "anime_max_group_duration_seconds"
+                ],
+                2.7,
+            )
+            self.assertEqual(
+                rerun_options["whisperjav"]["whisperjav"][
+                    "qwen_max_group_duration_seconds"
+                ],
+                4.2,
+            )
+            self.assertIn(
+                "변경한 분할 설정으로 새 전사 비교를 시작했습니다.",
+                rerun_notice.text,
+            )
+            self.assertIn(
+                "기존 추출 오디오 1개를 재사용하며 전사부터 실행합니다.",
+                rerun_notice.text,
+            )
+            self.assertIn(
+                f'href="/comparisons/{comparison_id}"',
+                rerun_notice.text,
+            )
+            self.assertIn("같은 미디어의 비교 기록", rerun_notice.text)
+            self.assertIn("현재 기록", rerun_notice.text)
+            self.assertNotIn("이전 결과", rerun_notice.text)
+            self.assertIn(
+                f'href="/comparisons/{new_comparison_id}"',
+                original_after_rerun.text,
+            )
+            self.assertIn("같은 미디어의 비교 기록", original_after_rerun.text)
+            self.assertNotIn("후속 실행", original_after_rerun.text)
+            self.assertEqual(
+                history_after_rerun.text.count(
+                    'class="comparison-history-item'
+                ),
+                1,
+            )
+            self.assertEqual(
+                history_after_rerun.text.count(
+                    'class="comparison-record-item'
+                ),
+                2,
+            )
+            self.assertIn("비교 기록 2건", history_after_rerun.text)
+            self.assertNotIn("재실행 · 이전", history_after_rerun.text)
             self.assertIn(
                 f'/comparisons/{comparison_id}',
                 detail.text,
             )
+            self.assertEqual(translation_response.status_code, 303)
+            self.assertEqual(missing_translation_selection.status_code, 400)
+            self.assertIn(
+                "번역에 사용할 전사 결과를 하나 이상 선택하세요.",
+                missing_translation_selection.text,
+            )
+            self.assertEqual(duplicate_translation_selection.status_code, 400)
+            self.assertIn(
+                "파일마다 하나의 전사 결과만 선택하세요.",
+                duplicate_translation_selection.text,
+            )
+            self.assertEqual(
+                translation_response.headers["location"],
+                "/jobs?translations_queued=1",
+            )
+            self.assertEqual(len(translation_jobs), 1)
+            translated = translation_jobs[0]
+            self.assertEqual(translated.status, "transcribed")
+            self.assertEqual(translated.operation, "translate")
+            self.assertTrue(translated.force_overwrite)
+            self.assertEqual(
+                translated.options["translation_prompt"]["category_id"],
+                "jav",
+            )
+            self.assertNotIn("comparison_id", translated.options)
+            self.assertEqual(
+                translated.options["comparison_transcript_source"],
+                {
+                    "comparison_id": comparison_id,
+                    "job_id": selected_comparison_job.id,
+                    "backend": "hybrid",
+                },
+            )
+            self.assertEqual(
+                preserved_comparison_job.status,
+                "transcription_completed",
+            )
+            self.assertNotEqual(
+                translated.transcript_path,
+                selected_comparison_job.transcript_path,
+            )
+            self.assertEqual(
+                json.loads(
+                    Path(translated.transcript_path).read_text(encoding="utf-8")
+                )["job_id"],
+                selected_comparison_job.id,
+            )
+            self.assertIn(
+                "선택한 전사 작업 1개를 번역으로 전환했습니다.",
+                translation_notice.text,
+            )
+
+    def test_transcription_comparison_accepts_completed_subtitled_media(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            (media_root / "movie.mp4").write_bytes(b"media")
+            (media_root / "movie.ko.srt").write_text(
+                "existing subtitle",
+                encoding="utf-8",
+            )
+
+            with TestClient(
+                create_app(self.settings(root, media_root))
+            ) as client:
+                service = client.app.state.orchestrator
+                service.stop()
+                completed = service.store.create(
+                    job_id="completed",
+                    source_rel="movie.mp4",
+                    force_overwrite=False,
+                    options={},
+                    operation="full",
+                )
+                service.store.update(completed.id, status="completed")
+
+                queued = client.post(
+                    "/jobs",
+                    data={
+                        "source_rels": "movie.mp4",
+                        "operation": "compare",
+                    },
+                    follow_redirects=False,
+                )
+                jobs = service.store.list_jobs(limit=None)
+
+            comparison_jobs = [
+                job for job in jobs if job.options.get("comparison_id")
+            ]
+            comparison_id = str(
+                comparison_jobs[0].options["comparison_id"]
+            )
+            self.assertEqual(queued.status_code, 303)
+            self.assertEqual(
+                queued.headers["location"],
+                f"/comparisons/{comparison_id}",
+            )
+            self.assertEqual(len(comparison_jobs), 4)
+            self.assertTrue(
+                all(not job.force_overwrite for job in comparison_jobs)
+            )
+            self.assertEqual(
+                (media_root / "movie.ko.srt").read_text(encoding="utf-8"),
+                "existing subtitle",
+            )
+
+    def test_comparison_retry_repairs_legacy_whisperx_chunk(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            (media_root / "movie.mp4").write_bytes(b"media")
+
+            with TestClient(
+                create_app(self.settings(root, media_root))
+            ) as client:
+                service = client.app.state.orchestrator
+                service.stop()
+                legacy = service.store.create(
+                    job_id="legacy-comparison-whisperx",
+                    source_rel="movie.mp4",
+                    force_overwrite=False,
+                    options={
+                        "backend": "whisperx",
+                        "chunk_length_seconds": 60,
+                        "comparison_id": "legacy-comparison",
+                    },
+                    operation="transcribe",
+                )
+                service.store.update(
+                    legacy.id,
+                    status="blocked",
+                    blocked_stage="transcription",
+                    error="invalid input shape",
+                )
+
+                response = client.post(
+                    "/comparisons/legacy-comparison/retry",
+                    follow_redirects=False,
+                )
+                notice = client.get(response.headers["location"])
+                retried = service.store.get(legacy.id)
+
+            self.assertEqual(response.status_code, 303)
+            self.assertEqual(
+                response.headers["location"],
+                "/comparisons/legacy-comparison?retried=1&adjusted=1",
+            )
+            self.assertEqual(retried.options["chunk_length_seconds"], 30)
+            self.assertIn(
+                "기존 WhisperX 청크 1개는 30초로 보정했습니다.",
+                notice.text,
+            )
+            self.assertIn("<h1>전사 엔진 비교</h1>", notice.text)
+            self.assertNotIn(
+                "동일한 미디어를 다음 엔진으로 전사한 결과입니다",
+                notice.text,
+            )
+            self.assertNotIn("<h3>WhisperJAV</h3>", notice.text)
 
     def test_job_list_selects_completed_transcripts_for_translation(self) -> None:
         with TemporaryDirectory() as directory:
@@ -1929,7 +3032,7 @@ class WebAppTests(unittest.TestCase):
             self.assertEqual(response.status_code, 303)
             self.assertEqual(
                 response.headers["location"],
-                "/jobs?status_group=completed&jobs_page=1&translations_queued=2",
+                "/jobs?translations_queued=2",
             )
             self.assertEqual(len(all_jobs), 3)
             self.assertEqual(
@@ -1938,7 +3041,7 @@ class WebAppTests(unittest.TestCase):
             )
             self.assertTrue(all(job.status == "transcribed" for job in translated))
             self.assertTrue(
-                all(job.operation == "translate" for job in translated)
+                all(job.operation == "full" for job in translated)
             )
             self.assertTrue(all(job.force_overwrite for job in translated))
             self.assertTrue(
@@ -1961,7 +3064,7 @@ class WebAppTests(unittest.TestCase):
                 stale_response.text,
             )
 
-    def test_job_list_marks_legacy_split_translation_as_transitioned(self) -> None:
+    def test_job_list_does_not_relabel_legacy_transcription_record(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
             media_root = root / "media"
@@ -1997,7 +3100,8 @@ class WebAppTests(unittest.TestCase):
                 page = client.get("/jobs?status_group=completed")
 
             self.assertEqual(page.status_code, 200)
-            self.assertIn("번역 이행됨", page.text)
+            self.assertNotIn("번역 이행됨", page.text)
+            self.assertIn("전사 완료", page.text)
             self.assertNotIn(
                 'value="legacy-transcription"',
                 page.text,

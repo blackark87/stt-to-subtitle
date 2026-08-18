@@ -13,7 +13,7 @@ import os
 from pathlib import Path
 import secrets
 from typing import Any, AsyncIterator
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urlsplit
 
 from fastapi import FastAPI, Form, HTTPException, Request, status
 from fastapi.responses import (
@@ -45,9 +45,10 @@ from .web_config import (
     normalize_server_url,
 )
 from .orchestrator import (
+    COMPARISON_AUDIO_SOURCE_JOB_ID_OPTION,
+    COMPARISON_PARENT_ID_OPTION,
     SubtitleOrchestrator,
     TRANSCRIPTION_COMPARISON_BACKENDS,
-    TRANSLATION_OPERATIONS,
 )
 from .service_clients import (
     ExternalServiceError,
@@ -59,10 +60,18 @@ from .time_display import (
     format_kst_iso,
     format_kst_timestamp,
 )
+from .whisperx_worker import WHISPERX_MAX_CHUNK_LENGTH_SECONDS
+from .whisperjav_worker import (
+    DEFAULT_ANIME_MAX_GROUP_SECONDS,
+    DEFAULT_QWEN_MAX_GROUP_SECONDS,
+    MAX_MAX_GROUP_SECONDS,
+    MIN_MAX_GROUP_SECONDS,
+)
 
 LOGGER = logging.getLogger(__name__)
 PACKAGE_DIR = Path(__file__).parent
 RECENT_JOB_LIMIT = 20
+COMPARISON_HISTORY_LIMIT = 20
 DASHBOARD_JOB_LIMIT = 5
 WAITING_STATUSES = {
     "queued",
@@ -73,16 +82,73 @@ WAITING_STATUSES = {
 }
 JOB_STATUS_GROUPS = {
     "running": RUNNING_STATUSES,
-    "attention": RETRYABLE_STATUSES,
+    "blocked": {"blocked"},
+    "failed": {"failed"},
     "waiting": WAITING_STATUSES,
     "completed": SUCCESS_STATUSES,
 }
 JOB_STATUS_GROUP_LABELS = {
     "running": "진행 중",
-    "attention": "확인 필요",
+    "blocked": "중단",
+    "failed": "실패",
     "waiting": "대기",
     "completed": "완료",
 }
+JOB_STAGE_FILTERS = {
+    "extraction": {"queued", "extracting", "audio_completed"},
+    "transcription": {
+        "audio_ready",
+        "transcription_running",
+        "transcription_completed",
+    },
+    "transcription_waiting": {"audio_ready"},
+    "transcription_running": {"transcription_running"},
+    "transcription_completed": {"transcription_completed"},
+    "translation": {
+        "transcribed",
+        "translation_running",
+        "translation_paused",
+        "translated",
+    },
+    "translation_waiting": {"transcribed"},
+    "translation_running": {"translation_running"},
+    "translation_completed": {"translated"},
+    "completed": {"rendering", "completed"},
+}
+JOB_STAGE_FILTER_LABELS = {
+    "extraction": "추출",
+    "transcription": "전사",
+    "transcription_waiting": "전사 · 대기",
+    "transcription_running": "전사 · 진행 중",
+    "transcription_completed": "전사 · 완료",
+    "translation": "번역",
+    "translation_waiting": "번역 · 대기",
+    "translation_running": "번역 · 진행 중",
+    "translation_completed": "번역 · 완료",
+    "completed": "완료",
+}
+JOB_STAGE_FILTER_NAV = (
+    {"key": "extraction", "label": "추출", "children": ()},
+    {
+        "key": "transcription",
+        "label": "전사",
+        "children": (
+            {"key": "transcription_waiting", "label": "대기"},
+            {"key": "transcription_running", "label": "진행 중"},
+            {"key": "transcription_completed", "label": "완료"},
+        ),
+    },
+    {
+        "key": "translation",
+        "label": "번역",
+        "children": (
+            {"key": "translation_waiting", "label": "대기"},
+            {"key": "translation_running", "label": "진행 중"},
+            {"key": "translation_completed", "label": "완료"},
+        ),
+    },
+    {"key": "completed", "label": "완료", "children": ()},
+)
 JOB_STATUS_LABELS = {
     "queued": "대기 중",
     "extracting": "오디오 추출 중",
@@ -96,7 +162,7 @@ JOB_STATUS_LABELS = {
     "translated": "자막 생성 대기",
     "rendering": "자막 생성 중",
     "completed": "완료",
-    "blocked": "확인 필요",
+    "blocked": "중단",
     "failed": "실패",
 }
 MEDIA_PROCESSING_LABELS = {
@@ -114,6 +180,7 @@ MEDIA_PROCESSING_LABELS = {
     "completed": "자막 생성 완료",
 }
 STT_BACKEND_LABELS = {
+    "whisperjav": "WhisperJAV",
     "hybrid": "하이브리드",
     "whisperx": "WhisperX",
     "kotoba": "Kotoba",
@@ -125,10 +192,10 @@ JOB_OPERATION_LABELS = {
     "full": "전체",
 }
 JOB_STAGE_LABELS = {
-    "audio extraction": "오디오 추출",
+    "audio extraction": "추출",
     "transcription": "전사",
     "translation": "번역",
-    "render": "자막 생성",
+    "render": "완료",
 }
 STAGE_SEQUENCE = (
     "audio extraction",
@@ -137,15 +204,16 @@ STAGE_SEQUENCE = (
     "render",
 )
 OPERATION_STAGES = {
-    "extract": ("audio extraction",),
-    "transcribe": ("audio extraction", "transcription"),
-    "translate": ("translation", "render"),
+    "extract": ("audio extraction", "render"),
+    "transcribe": STAGE_SEQUENCE,
+    "translate": STAGE_SEQUENCE,
     "full": STAGE_SEQUENCE,
 }
 STATUS_ACTIVE_STAGE = {
     "extracting": ("audio extraction", "running"),
     "audio_ready": ("transcription", "waiting"),
     "transcription_running": ("transcription", "running"),
+    "transcription_completed": ("translation", "waiting"),
     "transcribed": ("translation", "waiting"),
     "translation_running": ("translation", "running"),
     "translation_paused": ("translation", "paused"),
@@ -154,7 +222,6 @@ STATUS_ACTIVE_STAGE = {
 }
 STAGE_FINISHED_STATUSES = {
     "audio_completed",
-    "transcription_completed",
     "completed",
 }
 STAGE_STATE_LABELS = {
@@ -162,8 +229,9 @@ STAGE_STATE_LABELS = {
     "running": "진행 중",
     "waiting": "대기",
     "paused": "중단됨",
-    "failed": "확인 필요",
-    "pending": "예정",
+    "blocked": "중단",
+    "failed": "실패",
+    "pending": "대기",
 }
 
 
@@ -187,9 +255,11 @@ def job_stage_view(job: Any) -> list[dict[str, Any]]:
     elif status in {"blocked", "failed"}:
         blocked = str(job.blocked_stage or "")
         active = blocked if blocked in stages else stages[0]
-        active_state = "failed"
+        active_state = "blocked" if status == "blocked" else "failed"
     elif status == "queued":
-        active = stages[0]
+        active = (
+            "translation" if str(job.operation) == "translate" else stages[0]
+        )
         active_state = "waiting"
     else:
         active, active_state = STATUS_ACTIVE_STAGE.get(
@@ -249,7 +319,8 @@ def job_progress_view(job: Any) -> dict[str, Any]:
         (
             stage
             for stage in stages
-            if stage["state"] in {"running", "failed", "paused", "waiting"}
+            if stage["state"]
+            in {"running", "blocked", "failed", "paused", "waiting"}
         ),
         stages[-1] if stages else None,
     )
@@ -260,6 +331,34 @@ def job_progress_view(job: Any) -> dict[str, Any]:
         "complete": bool(stages) and all(
             stage["state"] == "done" for stage in stages
         ),
+    }
+
+
+def comparison_audio_stage(jobs: Sequence[Any]) -> dict[str, str]:
+    """여러 비교 작업의 오디오 준비 상태를 하나의 단계로 집계한다."""
+    audio_stages = [
+        stage
+        for job in jobs
+        for stage in job_stage_view(job)
+        if stage["key"] == "audio extraction"
+    ]
+    states = {str(stage["state"]) for stage in audio_stages}
+    if audio_stages and states == {"done"}:
+        state = "done"
+    elif "failed" in states:
+        state = "failed"
+    elif "blocked" in states:
+        state = "blocked"
+    elif "running" in states or "done" in states:
+        state = "running"
+    elif "waiting" in states:
+        state = "waiting"
+    else:
+        state = "pending"
+    return {
+        "label": "오디오 추출",
+        "state": state,
+        "state_label": STAGE_STATE_LABELS[state],
     }
 
 
@@ -433,6 +532,29 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             "Permissions-Policy",
             "xr-spatial-tracking=(self)",
         )
+        if (
+            request.method == "POST"
+            and (
+                request.url.path == "/jobs"
+                or request.url.path.startswith("/jobs/")
+                or request.url.path.startswith("/comparisons/")
+            )
+            and response.status_code
+            in {status.HTTP_302_FOUND, status.HTTP_303_SEE_OTHER}
+            and response.headers.get("location") != "/login"
+        ):
+            referer = request.headers.get("referer", "").strip()
+            parsed_referer = urlsplit(referer)
+            if (
+                parsed_referer.scheme == request.url.scheme
+                and parsed_referer.netloc == request.url.netloc
+                and parsed_referer.path.startswith("/")
+                and not parsed_referer.path.startswith("//")
+            ):
+                return_location = parsed_referer.path
+                if parsed_referer.query:
+                    return_location += f"?{parsed_referer.query}"
+                response.headers["location"] = return_location
         return response
 
     app.add_middleware(
@@ -494,8 +616,27 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         return_folder: str,
         return_status_group: str,
         return_jobs_page: int,
+        return_stage_filter: str = "",
         **values: object,
     ) -> str:
+        if return_status_group and return_stage_filter:
+            raise ValueError(
+                "작업 상태와 단계 필터를 동시에 사용할 수 없습니다."
+            )
+        if (
+            return_status_group
+            and return_status_group not in JOB_STATUS_GROUPS
+        ):
+            raise ValueError("지원하지 않는 작업 상태 필터입니다.")
+        if return_stage_filter and return_stage_filter not in JOB_STAGE_FILTERS:
+            raise ValueError("지원하지 않는 작업 단계 필터입니다.")
+        if return_stage_filter:
+            query = {
+                "stage_filter": return_stage_filter,
+                "jobs_page": max(1, return_jobs_page),
+                **values,
+            }
+            return f"/jobs?{urlencode(query)}"
         if return_status_group:
             query = {
                 "status_group": return_status_group,
@@ -519,8 +660,49 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
 
     def job_stats(service: SubtitleOrchestrator) -> dict[str, int]:
         return {
-            group: service.store.count_jobs(statuses=statuses)
+            group: service.store.count_jobs(
+                statuses=statuses,
+                include_comparison_transcriptions=False,
+            )
             for group, statuses in JOB_STATUS_GROUPS.items()
+        }
+
+    def validate_job_list_filters(
+        *,
+        status_group: str | None,
+        stage_filter: str | None,
+    ) -> None:
+        if status_group is not None and status_group not in JOB_STATUS_GROUPS:
+            raise ValueError("지원하지 않는 작업 상태 필터입니다.")
+        if stage_filter is not None and stage_filter not in JOB_STAGE_FILTERS:
+            raise ValueError("지원하지 않는 작업 단계 필터입니다.")
+        if status_group is not None and stage_filter is not None:
+            raise ValueError("작업 상태와 단계 필터를 동시에 사용할 수 없습니다.")
+
+    def job_stage_filter_context(
+        service: SubtitleOrchestrator,
+        *,
+        status_group: str | None,
+        stage_filter: str | None,
+    ) -> dict[str, Any]:
+        validate_job_list_filters(
+            status_group=status_group,
+            stage_filter=stage_filter,
+        )
+        return {
+            "job_stage_filters": JOB_STAGE_FILTER_NAV,
+            "job_stage_counts": {
+                stage["key"]: service.store.count_jobs(
+                    statuses=JOB_STAGE_FILTERS[stage["key"]],
+                    include_comparison_transcriptions=False,
+                )
+                for stage in JOB_STAGE_FILTER_NAV
+            },
+            "selected_status_group": status_group,
+            "selected_stage_filter": stage_filter,
+            "selected_stage_group": (
+                stage_filter.split("_", 1)[0] if stage_filter else None
+            ),
         }
 
     def job_list_context(
@@ -528,64 +710,88 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         *,
         jobs_page: int,
         status_group: str | None = None,
+        stage_filter: str | None = None,
         folder: str = "",
         limit: int = RECENT_JOB_LIMIT,
         paginated: bool = True,
     ) -> dict[str, Any]:
-        if status_group is not None and status_group not in JOB_STATUS_GROUPS:
-            raise ValueError("지원하지 않는 작업 상태 필터입니다.")
-        statuses = (
-            JOB_STATUS_GROUPS[status_group]
-            if status_group is not None
-            else None
+        validate_job_list_filters(
+            status_group=status_group,
+            stage_filter=stage_filter,
         )
+        if stage_filter is not None:
+            statuses = JOB_STAGE_FILTERS[stage_filter]
+        elif status_group is not None:
+            statuses = JOB_STATUS_GROUPS[status_group]
+        else:
+            statuses = None
         jobs_page = max(1, jobs_page) if paginated else 1
-        job_count = service.store.count_jobs(statuses=statuses)
+        job_count = service.store.count_jobs(
+            statuses=statuses,
+            include_comparison_transcriptions=False,
+        )
         jobs_offset = (jobs_page - 1) * limit
-        open_jobs = service.store.list_open_jobs()
+        all_visible_jobs = service.store.list_jobs(
+            limit=None,
+            include_comparison_transcriptions=False,
+        )
+        open_jobs = [
+            job
+            for job in all_visible_jobs
+            if job.status not in SUCCESS_STATUSES
+        ]
         recent_jobs = service.store.list_jobs(
             limit=limit,
             offset=jobs_offset,
             statuses=statuses,
+            include_comparison_transcriptions=False,
         )
         latest_jobs = service.store.latest_jobs_by_source()
         translatable_job_ids = {
             job.id
             for job in recent_jobs
             if job.can_start_translation
+            and not job.options.get("comparison_id")
             and latest_jobs.get(job.source_rel) is not None
             and latest_jobs[job.source_rel].id == job.id
         }
-        transitioned_transcription_job_ids = {
-            job.id
-            for job in recent_jobs
-            if job.status == "transcription_completed"
-            and latest_jobs.get(job.source_rel) is not None
-            and latest_jobs[job.source_rel].id != job.id
-            and latest_jobs[job.source_rel].operation
-            in TRANSLATION_OPERATIONS
-        }
+        stoppable_job_ids = (
+            {
+                job.id
+                for job in all_visible_jobs
+                if job.can_stop
+                and (statuses is None or job.status in statuses)
+            }
+            if paginated
+            else set()
+        )
 
         def page_location(page: int) -> str:
             if folder:
                 return media_location(folder, jobs_page=page)
             query = {"jobs_page": page}
-            if status_group is not None:
+            if stage_filter is not None:
+                query = {"stage_filter": stage_filter, **query}
+            elif status_group is not None:
                 query = {"status_group": status_group, **query}
             return "/jobs?" + urlencode(query)
 
         label = (
-            JOB_STATUS_GROUP_LABELS[status_group]
-            if status_group is not None
-            else "전체"
+            JOB_STAGE_FILTER_LABELS[stage_filter]
+            if stage_filter is not None
+            else (
+                JOB_STATUS_GROUP_LABELS[status_group]
+                if status_group is not None
+                else "전체"
+            )
         )
+        filtered = status_group is not None or stage_filter is not None
         return {
             "recent_jobs": recent_jobs,
             "translatable_job_ids": translatable_job_ids,
-            "transitioned_transcription_job_ids": (
-                transitioned_transcription_job_ids
-            ),
             "translatable_job_count": len(translatable_job_ids),
+            "stoppable_job_ids": stoppable_job_ids,
+            "stoppable_selection_count": len(stoppable_job_ids),
             "stoppable_job_count": sum(job.can_stop for job in open_jobs),
             "retriable_job_count": sum(job.can_retry for job in open_jobs),
             "pausable_translation_count": sum(
@@ -608,21 +814,17 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             ),
             "job_count": job_count,
             "job_list_title": f"{label} 작업",
-            "job_list_description": (
-                f"{label} 상태만 최신순으로, 페이지당 {limit}개씩 표시합니다."
-                if status_group is not None
-                else (
-                    f"최신순, 페이지당 {limit}개 · "
-                    "중단 요청은 안전한 지점에서 반영됩니다."
-                )
-            ),
             "job_list_empty_message": (
-                f"{label} 상태의 작업이 없습니다."
-                if status_group is not None
+                f"{label} 단계의 작업이 없습니다."
+                if filtered
                 else "등록된 작업이 없습니다."
             ),
-            "show_bulk_actions": status_group is None,
+            "show_bulk_actions": not filtered,
             "selected_status_group": status_group,
+            "selected_stage_filter": stage_filter,
+            "selected_stage_group": (
+                stage_filter.split("_", 1)[0] if stage_filter else None
+            ),
             "current_folder": folder,
         }
 
@@ -733,7 +935,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             latest = latest_jobs.get(source_rel)
             linked_job = None
             if latest is not None and latest.status in {"blocked", "failed"}:
-                media["subtitle_state"] = "attention"
+                media["subtitle_state"] = latest.status
                 stage = JOB_STAGE_LABELS.get(
                     str(latest.blocked_stage),
                     str(latest.blocked_stage or ""),
@@ -808,9 +1010,31 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                 media["processing_label"] = (
                     f"{next(iter(labels))} · {len(parts)}파트"
                 )
-            elif "attention" in states:
-                media["subtitle_state"] = "attention"
-                media["processing_label"] = "일부 파트 확인 필요"
+            elif "failed" in states:
+                media["subtitle_state"] = "failed"
+                failed_parts = sum(
+                    state == "failed"
+                    for state in (
+                        str(part["subtitle_state"]) for part in parts
+                    )
+                )
+                blocked_parts = sum(
+                    state == "blocked"
+                    for state in (
+                        str(part["subtitle_state"]) for part in parts
+                    )
+                )
+                media["processing_label"] = (
+                    f"실패 {failed_parts}파트"
+                    + (
+                        f" · 중단 {blocked_parts}파트"
+                        if blocked_parts
+                        else ""
+                    )
+                )
+            elif "blocked" in states:
+                media["subtitle_state"] = "blocked"
+                media["processing_label"] = "일부 파트 중단"
             elif "running" in states:
                 media["subtitle_state"] = "running"
                 media["processing_label"] = "일부 파트 처리 중"
@@ -841,13 +1065,10 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             **browser,
         }
 
-    def transcription_comparison_context(
-        request: Request,
+    def transcription_comparison_jobs(
+        service: SubtitleOrchestrator,
         comparison_id: str,
-        *,
-        skipped: int = 0,
-    ) -> dict[str, Any]:
-        service = orchestrator(request)
+    ) -> list[Any]:
         comparison_jobs = [
             job
             for job in service.store.list_jobs(limit=None)
@@ -858,19 +1079,284 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                 status_code=404,
                 detail="transcription comparison not found",
             )
+        return comparison_jobs
+
+    def transcription_comparison_chunk_lengths(
+        comparison_jobs: Sequence[Any],
+    ) -> dict[str, int | float]:
+        chunk_lengths = {
+            "kotoba_chunk_length_seconds": 15,
+            "whisperx_chunk_length_seconds": 30,
+            "anime_max_group_duration_seconds": (
+                DEFAULT_ANIME_MAX_GROUP_SECONDS
+            ),
+            "qwen_max_group_duration_seconds": (
+                DEFAULT_QWEN_MAX_GROUP_SECONDS
+            ),
+        }
+        for job in comparison_jobs:
+            if str(job.options.get("backend", "")) == "hybrid":
+                rescue = job.options.get("hybrid_rescue", {})
+                if isinstance(rescue, Mapping):
+                    for key in chunk_lengths:
+                        try:
+                            chunk_lengths[key] = int(rescue[key])
+                        except (KeyError, TypeError, ValueError):
+                            pass
+        for job in comparison_jobs:
+            backend = str(job.options.get("backend", ""))
+            if backend in {"kotoba", "whisperx"}:
+                key = f"{backend}_chunk_length_seconds"
+                try:
+                    chunk_lengths[key] = int(
+                        job.options["chunk_length_seconds"]
+                    )
+                except (KeyError, TypeError, ValueError):
+                    pass
+            if backend == "whisperjav":
+                raw_whisperjav = job.options.get("whisperjav", {})
+                if isinstance(raw_whisperjav, Mapping):
+                    for key in (
+                        "anime_max_group_duration_seconds",
+                        "qwen_max_group_duration_seconds",
+                    ):
+                        try:
+                            chunk_lengths[key] = float(raw_whisperjav[key])
+                        except (KeyError, TypeError, ValueError):
+                            pass
+        return chunk_lengths
+
+    def transcription_comparison_backends(
+        comparison_jobs: Sequence[Any],
+    ) -> tuple[str, ...]:
+        for job in comparison_jobs:
+            configured = job.options.get("comparison_backends")
+            if isinstance(configured, list):
+                normalized = tuple(
+                    backend
+                    for backend in configured
+                    if backend in TRANSCRIPTION_COMPARISON_BACKENDS
+                )
+                if normalized:
+                    return normalized
+        present = {
+            str(job.options.get("backend", "")) for job in comparison_jobs
+        }
+        return tuple(
+            backend
+            for backend in TRANSCRIPTION_COMPARISON_BACKENDS
+            if backend in present
+        )
+
+    def transcription_comparison_rerun_options(
+        comparison_jobs: Sequence[Any],
+        *,
+        kotoba_chunk_length_seconds: int,
+        whisperx_chunk_length_seconds: int,
+        anime_max_group_duration_seconds: float,
+        qwen_max_group_duration_seconds: float,
+    ) -> dict[str, Any]:
+        template_job = next(
+            (
+                job
+                for job in comparison_jobs
+                if str(job.options.get("backend", "")) == "hybrid"
+            ),
+            comparison_jobs[0],
+        )
+        options = dict(template_job.options)
+        options.pop("comparison_id", None)
+        options.pop("comparison_schema_version", None)
+        options.pop("comparison_backends", None)
+        options.pop(COMPARISON_PARENT_ID_OPTION, None)
+        options.pop(COMPARISON_AUDIO_SOURCE_JOB_ID_OPTION, None)
+        options["backend"] = "hybrid"
+        raw_rescue = options.get("hybrid_rescue", {})
+        rescue = dict(raw_rescue) if isinstance(raw_rescue, Mapping) else {}
+        rescue.update(
+            {
+                "kotoba_chunk_length_seconds": (
+                    kotoba_chunk_length_seconds
+                ),
+                "whisperx_chunk_length_seconds": (
+                    whisperx_chunk_length_seconds
+                ),
+            }
+        )
+        options["hybrid_rescue"] = rescue
+        options["whisperjav"] = {
+            "anime_max_group_duration_seconds": (
+                anime_max_group_duration_seconds
+            ),
+            "qwen_max_group_duration_seconds": (
+                qwen_max_group_duration_seconds
+            ),
+        }
+        options["chunk_length_seconds"] = kotoba_chunk_length_seconds
+        return options
+
+    def transcription_comparison_jobs_by_id(
+        service: SubtitleOrchestrator,
+    ) -> dict[str, list[Any]]:
+        jobs_by_comparison: dict[str, list[Any]] = {}
+        for job in service.store.list_jobs(limit=None):
+            candidate_id = str(job.options.get("comparison_id", "")).strip()
+            if candidate_id:
+                jobs_by_comparison.setdefault(candidate_id, []).append(job)
+        return jobs_by_comparison
+
+    def transcription_comparison_source_key(
+        comparison_jobs: Sequence[Any],
+    ) -> tuple[str, ...]:
+        return tuple(
+            sorted(
+                {job.source_rel for job in comparison_jobs},
+                key=str.casefold,
+            )
+        )
+
+    def transcription_comparison_run_summary(
+        comparison_id: str,
+        comparison_jobs: Sequence[Any],
+    ) -> dict[str, Any]:
+        source_rels = transcription_comparison_source_key(comparison_jobs)
+        terminal_statuses = SUCCESS_STATUSES | RETRYABLE_STATUSES
+        completed_count = sum(
+            job.status in SUCCESS_STATUSES for job in comparison_jobs
+        )
+        attention_count = sum(
+            job.status in RETRYABLE_STATUSES for job in comparison_jobs
+        )
+        blocked_count = sum(
+            job.status == "blocked" for job in comparison_jobs
+        )
+        failed_count = sum(
+            job.status == "failed" for job in comparison_jobs
+        )
+        active_count = sum(
+            job.status in RUNNING_STATUSES for job in comparison_jobs
+        )
+        terminal_count = sum(
+            job.status in terminal_statuses for job in comparison_jobs
+        )
+        waiting_count = max(
+            0,
+            len(comparison_jobs) - terminal_count - active_count,
+        )
+        if failed_count:
+            status_group = "attention"
+            status_label = "실패"
+            status_value = "failed"
+        elif blocked_count:
+            status_group = "attention"
+            status_label = "중단"
+            status_value = "blocked"
+        elif active_count:
+            status_group = "running"
+            status_label = "진행 중"
+            status_value = "transcription_running"
+        elif terminal_count == len(comparison_jobs):
+            status_group = "completed"
+            status_label = "완료"
+            status_value = "transcription_completed"
+        else:
+            status_group = "waiting"
+            status_label = "대기 중"
+            status_value = "queued"
+        return {
+            "id": comparison_id,
+            "source_rels": list(source_rels),
+            "source_names": [
+                Path(source_rel).name for source_rel in source_rels
+            ],
+            "source_count": len(source_rels),
+            "job_count": len(comparison_jobs),
+            "completed_count": completed_count,
+            "attention_count": attention_count,
+            "blocked_count": blocked_count,
+            "failed_count": failed_count,
+            "active_count": active_count,
+            "waiting_count": waiting_count,
+            "terminal_count": terminal_count,
+            "progress_percent": round(
+                terminal_count * 100 / len(comparison_jobs)
+            ),
+            "status_group": status_group,
+            "status_label": status_label,
+            "status_value": status_value,
+            "created_at": min(job.created_at for job in comparison_jobs),
+            "updated_at": max(job.updated_at for job in comparison_jobs),
+            "chunks": transcription_comparison_chunk_lengths(comparison_jobs),
+        }
+
+    def transcription_comparison_records(
+        service: SubtitleOrchestrator,
+        comparison_id: str,
+        comparison_jobs: Sequence[Any],
+    ) -> list[dict[str, Any]]:
+        source_key = transcription_comparison_source_key(comparison_jobs)
+        records = [
+            transcription_comparison_run_summary(candidate_id, jobs)
+            for candidate_id, jobs in transcription_comparison_jobs_by_id(
+                service
+            ).items()
+            if transcription_comparison_source_key(jobs) == source_key
+        ]
+        for record in records:
+            record["current"] = record["id"] == comparison_id
+        records.sort(
+            key=lambda record: (record["created_at"], record["id"]),
+            reverse=True,
+        )
+        return records
+
+    def transcription_comparison_context(
+        request: Request,
+        comparison_id: str,
+        *,
+        skipped: int = 0,
+        notice: str | None = None,
+        error: str | None = None,
+        chunk_values: Mapping[str, object] | None = None,
+        selected_translation_job_ids: Sequence[str] = (),
+        translation_prompt_category_id: str = "",
+    ) -> dict[str, Any]:
+        service = orchestrator(request)
+        comparison_jobs = transcription_comparison_jobs(
+            service,
+            comparison_id,
+        )
+        selected_translation_ids = set(selected_translation_job_ids)
+        chunk_lengths: dict[str, object] = {
+            **transcription_comparison_chunk_lengths(comparison_jobs),
+            **(dict(chunk_values) if chunk_values is not None else {}),
+        }
+        comparison_backends = transcription_comparison_backends(
+            comparison_jobs
+        )
 
         jobs_by_source: dict[str, dict[str, Any]] = {}
         for job in comparison_jobs:
             backend = str(job.options.get("backend", ""))
-            if backend in TRANSCRIPTION_COMPARISON_BACKENDS:
+            if backend in comparison_backends:
                 jobs_by_source.setdefault(job.source_rel, {})[backend] = job
 
         sources: list[dict[str, Any]] = []
         for source_rel in sorted(jobs_by_source, key=str.casefold):
             jobs_by_backend = jobs_by_source[source_rel]
             engines: list[dict[str, Any]] = []
-            for backend in TRANSCRIPTION_COMPARISON_BACKENDS:
+            for backend in comparison_backends:
                 job = jobs_by_backend.get(backend)
+                transcription_stage = None
+                if job is not None:
+                    transcription_stage = next(
+                        (
+                            stage
+                            for stage in job_stage_view(job)
+                            if stage["key"] == "transcription"
+                        ),
+                        None,
+                    )
                 segments: list[dict[str, Any]] = []
                 transcript_error: str | None = None
                 if job is not None and job.transcript_path:
@@ -895,6 +1381,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                         "backend": backend,
                         "label": STT_BACKEND_LABELS[backend],
                         "job": job,
+                        "transcription_stage": transcription_stage,
                         "segments": segments,
                         "segment_count": len(segments),
                         "character_count": sum(
@@ -906,12 +1393,28 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                             else None
                         ),
                         "transcript_error": transcript_error,
+                        "translatable": bool(
+                            job is not None
+                            and job.can_start_translation
+                            and transcript_error is None
+                        ),
+                        "translation_selected": bool(
+                            job is not None
+                            and job.id in selected_translation_ids
+                        ),
                     }
                 )
+            translatable_engines = [
+                engine for engine in engines if engine["translatable"]
+            ]
             sources.append(
                 {
                     "source_rel": source_rel,
+                    "audio_stage": comparison_audio_stage(
+                        list(jobs_by_backend.values())
+                    ),
                     "engines": engines,
+                    "translatable_engines": translatable_engines,
                 }
             )
 
@@ -921,6 +1424,23 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             "comparison_id": comparison_id,
             "sources": sources,
             "jobs": comparison_jobs,
+            "csrf_token": request.session.get("csrf_token", ""),
+            "retriable_count": sum(
+                job.status in RETRYABLE_STATUSES for job in comparison_jobs
+            ),
+            "comparison_chunks": chunk_lengths,
+            "comparison_backends": comparison_backends,
+            "comparison_backend_labels": ", ".join(
+                STT_BACKEND_LABELS[backend]
+                for backend in comparison_backends
+            ),
+            "prompt_categories": service.active_prompt_categories(),
+            "translation_prompt_category_id": (
+                translation_prompt_category_id
+            ),
+            "translatable_source_count": sum(
+                bool(source["translatable_engines"]) for source in sources
+            ),
             "completed_count": sum(
                 job.status == "transcription_completed"
                 for job in comparison_jobs
@@ -929,6 +1449,75 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                 job.status in terminal_statuses for job in comparison_jobs
             ),
             "skipped": skipped,
+            "notice": notice,
+            "error": error,
+            "comparison_records": transcription_comparison_records(
+                service, comparison_id, comparison_jobs
+            ),
+        }
+
+    def transcription_comparison_history_context(
+        service: SubtitleOrchestrator,
+        *,
+        comparisons_page: int,
+    ) -> dict[str, Any]:
+        comparisons = [
+            transcription_comparison_run_summary(comparison_id, jobs)
+            for comparison_id, jobs in transcription_comparison_jobs_by_id(
+                service
+            ).items()
+        ]
+        grouped_comparisons: dict[tuple[str, ...], list[dict[str, Any]]] = {}
+        for comparison in comparisons:
+            source_key = tuple(comparison["source_rels"])
+            grouped_comparisons.setdefault(source_key, []).append(comparison)
+
+        comparison_groups: list[dict[str, Any]] = []
+        for source_rels, records in grouped_comparisons.items():
+            records.sort(
+                key=lambda record: (record["created_at"], record["id"]),
+                reverse=True,
+            )
+            comparison_groups.append(
+                {
+                    "source_rels": list(source_rels),
+                    "source_names": [
+                        Path(source_rel).name for source_rel in source_rels
+                    ],
+                    "source_count": len(source_rels),
+                    "record_count": len(records),
+                    "records": records,
+                    "created_at": min(
+                        record["created_at"] for record in records
+                    ),
+                    "updated_at": max(
+                        record["updated_at"] for record in records
+                    ),
+                }
+            )
+        comparison_groups.sort(
+            key=lambda group: (
+                group["updated_at"],
+                group["source_rels"],
+            ),
+            reverse=True,
+        )
+
+        comparisons_page = max(1, comparisons_page)
+        comparison_count = len(comparisons)
+        comparison_group_count = len(comparison_groups)
+        offset = (comparisons_page - 1) * COMPARISON_HISTORY_LIMIT
+        return {
+            "comparison_groups": comparison_groups[
+                offset : offset + COMPARISON_HISTORY_LIMIT
+            ],
+            "comparison_count": comparison_count,
+            "comparison_group_count": comparison_group_count,
+            "comparisons_page": comparisons_page,
+            "comparisons_has_previous": comparisons_page > 1,
+            "comparisons_has_next": (
+                offset + COMPARISON_HISTORY_LIMIT < comparison_group_count
+            ),
         }
 
     @app.get("/healthz")
@@ -1014,7 +1603,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         elif jobs_stopped is not None:
             notice = f"진행 중인 작업 {jobs_stopped}개에 중단을 요청했습니다."
         elif jobs_retried is not None:
-            notice = f"중단·실패 작업 {jobs_retried}개를 재시도했습니다."
+            notice = f"작업 {jobs_retried}개를 재시도했습니다."
         elif translations_queued is not None:
             notice = (
                 f"선택한 전사 작업 {translations_queued}개를 번역으로 "
@@ -1060,7 +1649,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         elif jobs_stopped is not None:
             notice = f"진행 중인 작업 {jobs_stopped}개에 중단을 요청했습니다."
         elif jobs_retried is not None:
-            notice = f"중단·실패 작업 {jobs_retried}개를 재시도했습니다."
+            notice = f"작업 {jobs_retried}개를 재시도했습니다."
         elif translations_queued is not None:
             notice = (
                 f"선택한 전사 작업 {translations_queued}개를 번역으로 "
@@ -1088,6 +1677,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
     def jobs_page(
         request: Request,
         status_group: str = "",
+        stage_filter: str = "",
         jobs_page: int = 1,
         translations_queued: int | None = None,
     ) -> Any:
@@ -1100,6 +1690,12 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                     orchestrator(request),
                     jobs_page=jobs_page,
                     status_group=status_group or None,
+                    stage_filter=stage_filter or None,
+                ),
+                **job_stage_filter_context(
+                    orchestrator(request),
+                    status_group=status_group or None,
+                    stage_filter=stage_filter or None,
                 ),
                 "status_groups": JOB_STATUS_GROUP_LABELS,
                 "csrf_token": request.session.get("csrf_token", ""),
@@ -1117,6 +1713,50 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         except ValueError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
         return TEMPLATES.TemplateResponse(request, "jobs.html", context)
+
+    @app.get("/job-stage-filters-fragment", response_class=HTMLResponse)
+    def job_stage_filters_fragment(
+        request: Request,
+        status_group: str = "",
+        stage_filter: str = "",
+    ) -> Any:
+        if not is_authenticated(request):
+            raise HTTPException(
+                status_code=401,
+                detail="authentication required",
+            )
+        try:
+            context = job_stage_filter_context(
+                orchestrator(request),
+                status_group=status_group or None,
+                stage_filter=stage_filter or None,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        return TEMPLATES.TemplateResponse(
+            request,
+            "_job_stage_filters.html",
+            {"request": request, **context},
+        )
+
+    @app.get("/comparisons", response_class=HTMLResponse)
+    def transcription_comparison_history_page(
+        request: Request,
+        comparisons_page: int = 1,
+    ) -> Any:
+        if not is_authenticated(request):
+            return login_redirect()
+        return TEMPLATES.TemplateResponse(
+            request,
+            "comparisons.html",
+            {
+                "request": request,
+                **transcription_comparison_history_context(
+                    orchestrator(request),
+                    comparisons_page=comparisons_page,
+                ),
+            },
+        )
 
     def settings_context(
         request: Request,
@@ -1380,6 +2020,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         completed_page: int | None = None,
         folder: str = "",
         status_group: str | None = None,
+        stage_filter: str | None = None,
         compact: bool = False,
     ) -> Any:
         if not is_authenticated(request):
@@ -1392,6 +2033,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                 service,
                 jobs_page=1 if compact else jobs_page,
                 status_group=status_group or None,
+                stage_filter=stage_filter or None,
                 folder=folder,
                 limit=DASHBOARD_JOB_LIMIT if compact else RECENT_JOB_LIMIT,
                 paginated=not compact,
@@ -1400,12 +2042,11 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                 context.update(
                     {
                         "job_list_title": "최근 작업",
-                        "job_list_description": (
-                            f"가장 최근에 갱신된 {DASHBOARD_JOB_LIMIT}건"
-                        ),
                         "show_bulk_actions": False,
                         "translatable_job_ids": set(),
                         "translatable_job_count": 0,
+                        "stoppable_job_ids": set(),
+                        "stoppable_selection_count": 0,
                     }
                 )
         except ValueError as error:
@@ -1419,6 +2060,25 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                 "prompt_categories": service.active_prompt_categories(),
                 "csrf_token": request.session.get("csrf_token", ""),
             },
+        )
+
+    @app.get("/comparisons-fragment", response_class=HTMLResponse)
+    def transcription_comparison_history_fragment(
+        request: Request,
+        comparisons_page: int = 1,
+    ) -> Any:
+        if not is_authenticated(request):
+            raise HTTPException(
+                status_code=401,
+                detail="authentication required",
+            )
+        return TEMPLATES.TemplateResponse(
+            request,
+            "_comparison_history.html",
+            transcription_comparison_history_context(
+                orchestrator(request),
+                comparisons_page=comparisons_page,
+            ),
         )
 
     @app.get("/job-stats-fragment", response_class=HTMLResponse)
@@ -1483,13 +2143,14 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         return_query: str = Form(""),
         csrf_token: str = Form(""),
         force_overwrite: bool = Form(False),
-        backend: str = Form("kotoba"),
+        backend: str = Form("auto"),
         audio_stream: str = Form("0"),
         start_seconds: str = Form("0"),
         duration_seconds: str = Form(""),
-        chunk_length_seconds: str = Form("60"),
-        hybrid_kotoba_chunk_length_seconds: str = Form("15"),
-        hybrid_whisperx_chunk_length_seconds: str = Form("30"),
+        kotoba_chunk_length_seconds: str = Form("15"),
+        whisperx_chunk_length_seconds: str = Form("30"),
+        anime_max_group_duration_seconds: str = Form("2.0"),
+        qwen_max_group_duration_seconds: str = Form("3.0"),
         num_speakers: str = Form(""),
         min_speakers: str = Form(""),
         max_speakers: str = Form(""),
@@ -1501,25 +2162,40 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         if not is_authenticated(request):
             return login_redirect()
         validate_csrf(request, csrf_token)
+        normalized_backend = backend.strip().lower()
+        effective_prompt_category_id = prompt_category_id.strip()
+        if normalized_backend == "auto":
+            normalized_backend = "whisperjav"
+            if operation in {"translate", "full"}:
+                effective_prompt_category_id = "jav"
         options = {
-            "backend": backend,
+            "backend": normalized_backend,
             "audio_stream": audio_stream,
             "start_seconds": start_seconds,
             "duration_seconds": duration_seconds,
-            "chunk_length_seconds": chunk_length_seconds,
+            "chunk_length_seconds": (
+                whisperx_chunk_length_seconds
+                if normalized_backend == "whisperx"
+                else kotoba_chunk_length_seconds
+            ),
             "num_speakers": num_speakers,
             "min_speakers": min_speakers,
             "max_speakers": max_speakers,
             "add_punctuation": add_punctuation,
             "noise_filter": noise_filter[-1] if noise_filter else True,
         }
-        if backend.strip().lower() == "hybrid" or operation == "compare":
+        if normalized_backend == "hybrid" or operation == "compare":
             options["hybrid_rescue"] = {
-                "kotoba_chunk_length_seconds": (
-                    hybrid_kotoba_chunk_length_seconds
+                "kotoba_chunk_length_seconds": kotoba_chunk_length_seconds,
+                "whisperx_chunk_length_seconds": whisperx_chunk_length_seconds,
+            }
+        if normalized_backend == "whisperjav" or operation == "compare":
+            options["whisperjav"] = {
+                "anime_max_group_duration_seconds": (
+                    anime_max_group_duration_seconds
                 ),
-                "whisperx_chunk_length_seconds": (
-                    hybrid_whisperx_chunk_length_seconds
+                "qwen_max_group_duration_seconds": (
+                    qwen_max_group_duration_seconds
                 ),
             }
         try:
@@ -1530,17 +2206,14 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             ]
             if (
                 operation in {"translate", "full"}
-                and not prompt_category_id.strip()
+                and not effective_prompt_category_id
             ):
                 raise ValueError("번역 프롬프트 카테고리를 선택하세요.")
-            selection_operation = (
-                "transcribe" if operation == "compare" else operation
-            )
             selected_sources, skipped = service.expand_job_sources(
                 expanded_source_rels,
                 folder_rels or [],
                 force_overwrite=force_overwrite,
-                operation=selection_operation,
+                operation=operation,
             )
             comparison_id: str | None = None
             if operation == "compare":
@@ -1557,7 +2230,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                     options=options,
                     operation=operation,
                     prompt_category_id=(
-                        prompt_category_id
+                        effective_prompt_category_id
                         if operation in {"translate", "full"}
                         else None
                     ),
@@ -1735,13 +2408,37 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         request: Request,
         comparison_id: str,
         skipped: int = 0,
+        retried: int | None = None,
+        adjusted: int = 0,
+        rerun: bool = False,
+        reused_audio: int = 0,
     ) -> Any:
         if not is_authenticated(request):
             return login_redirect()
+        notice = None
+        if retried is not None:
+            notice = (
+                f"실패한 전사 작업 {max(0, retried)}개를 재시도했습니다."
+                if retried > 0
+                else "재시도할 실패 작업이 없습니다."
+            )
+            if adjusted > 0:
+                notice += (
+                    f" 기존 WhisperX 청크 {adjusted}개는 30초로 "
+                    "보정했습니다."
+                )
+        elif rerun:
+            notice = "변경한 분할 설정으로 새 전사 비교를 시작했습니다."
+            if reused_audio > 0:
+                notice += (
+                    f" 기존 추출 오디오 {reused_audio}개를 재사용하며 "
+                    "전사부터 실행합니다."
+                )
         context = transcription_comparison_context(
             request,
             comparison_id,
             skipped=max(0, skipped),
+            notice=notice,
         )
         return TEMPLATES.TemplateResponse(
             request,
@@ -1768,10 +2465,224 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             transcription_comparison_context(request, comparison_id),
         )
 
-    @app.get("/jobs/{job_id}", response_class=HTMLResponse)
-    def job_page(request: Request, job_id: str) -> Any:
+    @app.post("/comparisons/{comparison_id}/retry")
+    def retry_transcription_comparison(
+        request: Request,
+        comparison_id: str,
+        csrf_token: str = Form(""),
+    ) -> Any:
         if not is_authenticated(request):
             return login_redirect()
+        validate_csrf(request, csrf_token)
+        service = orchestrator(request)
+        comparison_jobs = transcription_comparison_jobs(
+            service,
+            comparison_id,
+        )
+        retried_count = 0
+        adjusted_count = 0
+        for job in comparison_jobs:
+            if job.status not in RETRYABLE_STATUSES:
+                continue
+            retried = service.retry(job.id)
+            if retried.options != job.options:
+                adjusted_count += 1
+            retried_count += 1
+        query = {"retried": retried_count}
+        if adjusted_count:
+            query["adjusted"] = adjusted_count
+        return RedirectResponse(
+            f"/comparisons/{comparison_id}?{urlencode(query)}",
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+
+    @app.post(
+        "/comparisons/{comparison_id}/rerun",
+        response_class=HTMLResponse,
+    )
+    def rerun_transcription_comparison(
+        request: Request,
+        comparison_id: str,
+        csrf_token: str = Form(""),
+        kotoba_chunk_length_seconds: str = Form("15"),
+        whisperx_chunk_length_seconds: str = Form("30"),
+        anime_max_group_duration_seconds: str = Form("2.0"),
+        qwen_max_group_duration_seconds: str = Form("3.0"),
+    ) -> Any:
+        if not is_authenticated(request):
+            return login_redirect()
+        validate_csrf(request, csrf_token)
+        service = orchestrator(request)
+        comparison_jobs = transcription_comparison_jobs(
+            service,
+            comparison_id,
+        )
+
+        def positive_chunk_seconds(value: str, label: str) -> int:
+            try:
+                normalized = int(value)
+            except ValueError as error:
+                raise ValueError(
+                    f"{label} 청크는 정수로 입력하세요."
+                ) from error
+            if normalized < 1:
+                raise ValueError(f"{label} 청크는 1초 이상이어야 합니다.")
+            if (
+                label == "WhisperX"
+                and normalized > WHISPERX_MAX_CHUNK_LENGTH_SECONDS
+            ):
+                raise ValueError(
+                    "WhisperX 청크는 "
+                    f"{WHISPERX_MAX_CHUNK_LENGTH_SECONDS}초 이하여야 합니다."
+                )
+            return normalized
+
+        def bounded_group_seconds(value: str, label: str) -> float:
+            try:
+                normalized = float(value)
+            except ValueError as error:
+                raise ValueError(f"{label}은 숫자로 입력하세요.") from error
+            if not MIN_MAX_GROUP_SECONDS <= normalized <= MAX_MAX_GROUP_SECONDS:
+                raise ValueError(
+                    f"{label}: "
+                    f"{MIN_MAX_GROUP_SECONDS}초 이상 "
+                    f"{MAX_MAX_GROUP_SECONDS}초 이하여야 합니다."
+                )
+            return normalized
+
+        try:
+            kotoba_chunk = positive_chunk_seconds(
+                kotoba_chunk_length_seconds,
+                "Kotoba",
+            )
+            whisperx_chunk = positive_chunk_seconds(
+                whisperx_chunk_length_seconds,
+                "WhisperX",
+            )
+            anime_max_group = bounded_group_seconds(
+                anime_max_group_duration_seconds,
+                "WhisperJAV 1차 그룹 길이",
+            )
+            qwen_max_group = bounded_group_seconds(
+                qwen_max_group_duration_seconds,
+                "WhisperJAV 2차 그룹 길이",
+            )
+            options = transcription_comparison_rerun_options(
+                comparison_jobs,
+                kotoba_chunk_length_seconds=kotoba_chunk,
+                whisperx_chunk_length_seconds=whisperx_chunk,
+                anime_max_group_duration_seconds=anime_max_group,
+                qwen_max_group_duration_seconds=qwen_max_group,
+            )
+            source_rels = list(
+                dict.fromkeys(job.source_rel for job in comparison_jobs)
+            )
+            new_comparison_id, new_jobs = (
+                service.create_transcription_comparison(
+                    source_rels,
+                    options=options,
+                    reuse_audio_from=comparison_jobs,
+                    parent_comparison_id=comparison_id,
+                )
+            )
+        except (OSError, ValueError) as error:
+            return TEMPLATES.TemplateResponse(
+                request,
+                "comparison.html",
+                transcription_comparison_context(
+                    request,
+                    comparison_id,
+                    error=str(error),
+                    chunk_values={
+                        "kotoba_chunk_length_seconds": (
+                            kotoba_chunk_length_seconds
+                        ),
+                        "whisperx_chunk_length_seconds": (
+                            whisperx_chunk_length_seconds
+                        ),
+                        "anime_max_group_duration_seconds": (
+                            anime_max_group_duration_seconds
+                        ),
+                        "qwen_max_group_duration_seconds": (
+                            qwen_max_group_duration_seconds
+                        ),
+                    },
+                ),
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+        reused_audio_count = len(
+            {
+                job.source_rel
+                for job in new_jobs
+                if COMPARISON_AUDIO_SOURCE_JOB_ID_OPTION in job.options
+            }
+        )
+        return RedirectResponse(
+            f"/comparisons/{new_comparison_id}?"
+            f"{urlencode({'rerun': 'true', 'reused_audio': reused_audio_count})}",
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+
+    @app.post(
+        "/comparisons/{comparison_id}/translate",
+        response_class=HTMLResponse,
+    )
+    def translate_transcription_comparison_results(
+        request: Request,
+        comparison_id: str,
+        job_ids: list[str] | None = Form(None),
+        prompt_category_id: str = Form(""),
+        csrf_token: str = Form(""),
+    ) -> Any:
+        if not is_authenticated(request):
+            return login_redirect()
+        validate_csrf(request, csrf_token)
+        service = orchestrator(request)
+        try:
+            if not prompt_category_id.strip():
+                raise ValueError("번역 프롬프트 카테고리를 선택하세요.")
+            created = service.create_comparison_translation_jobs(
+                comparison_id,
+                job_ids or [],
+                prompt_category_id=prompt_category_id,
+            )
+        except (OSError, UnicodeError, ValueError) as error:
+            return TEMPLATES.TemplateResponse(
+                request,
+                "comparison.html",
+                transcription_comparison_context(
+                    request,
+                    comparison_id,
+                    error=str(error),
+                    selected_translation_job_ids=job_ids or [],
+                    translation_prompt_category_id=prompt_category_id,
+                ),
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+        return RedirectResponse(
+            f"/jobs?{urlencode({'translations_queued': len(created)})}",
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+
+    @app.get("/jobs/{job_id}", response_class=HTMLResponse)
+    def job_page(
+        request: Request,
+        job_id: str,
+        return_status_group: str = "",
+        return_stage_filter: str = "",
+        return_jobs_page: int = 1,
+    ) -> Any:
+        if not is_authenticated(request):
+            return login_redirect()
+        try:
+            job_return_url = job_list_action_location(
+                return_folder="",
+                return_status_group=return_status_group,
+                return_stage_filter=return_stage_filter,
+                return_jobs_page=return_jobs_page,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
         service = orchestrator(request)
         job = service.store.get(job_id)
         if job is None:
@@ -1781,6 +2692,10 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             "job.html",
             {
                 "job": job,
+                "job_return_url": job_return_url,
+                "return_status_group": return_status_group,
+                "return_stage_filter": return_stage_filter,
+                "return_jobs_page": max(1, return_jobs_page),
                 "events": [
                     event
                     for event in service.store.events(job_id)
@@ -1805,9 +2720,24 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         )
 
     @app.get("/jobs/{job_id}/panel", response_class=HTMLResponse)
-    def job_panel(request: Request, job_id: str) -> Any:
+    def job_panel(
+        request: Request,
+        job_id: str,
+        return_status_group: str = "",
+        return_stage_filter: str = "",
+        return_jobs_page: int = 1,
+    ) -> Any:
         if not is_authenticated(request):
             raise HTTPException(status_code=401, detail="authentication required")
+        try:
+            job_list_action_location(
+                return_folder="",
+                return_status_group=return_status_group,
+                return_stage_filter=return_stage_filter,
+                return_jobs_page=return_jobs_page,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
         service = orchestrator(request)
         job = service.store.get(job_id)
         if job is None:
@@ -1817,6 +2747,9 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             "_job_panel.html",
             {
                 "job": job,
+                "return_status_group": return_status_group,
+                "return_stage_filter": return_stage_filter,
+                "return_jobs_page": max(1, return_jobs_page),
                 "events": [
                     event
                     for event in service.store.events(job_id)
@@ -1889,16 +2822,25 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         job_id: str,
         csrf_token: str = Form(""),
         return_folder: str | None = Form(None),
+        return_status_group: str = Form(""),
+        return_stage_filter: str = Form(""),
+        return_jobs_page: int = Form(1),
     ) -> Any:
         if not is_authenticated(request):
             return login_redirect()
         validate_csrf(request, csrf_token)
         try:
+            return_location = job_list_action_location(
+                return_folder=return_folder or "",
+                return_status_group=return_status_group,
+                return_stage_filter=return_stage_filter,
+                return_jobs_page=return_jobs_page,
+            )
             orchestrator(request).delete_job_record(job_id)
         except ValueError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
         return RedirectResponse(
-            dashboard_location(return_folder or ""),
+            return_location,
             status_code=status.HTTP_303_SEE_OTHER,
         )
 
@@ -1985,6 +2927,15 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                         else None
                     ),
                 ),
+                **job_stage_filter_context(
+                    service,
+                    status_group=(
+                        return_status_group
+                        if return_status_group in JOB_STATUS_GROUPS
+                        else None
+                    ),
+                    stage_filter=None,
+                ),
                 "status_groups": JOB_STATUS_GROUP_LABELS,
                 "csrf_token": request.session.get("csrf_token", ""),
                 "prompt_categories": service.active_prompt_categories(),
@@ -2000,8 +2951,14 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         return RedirectResponse(
             job_list_action_location(
                 return_folder=return_folder,
-                return_status_group=return_status_group,
-                return_jobs_page=return_jobs_page,
+                return_status_group=(
+                    ""
+                    if return_status_group == "completed"
+                    else return_status_group
+                ),
+                return_jobs_page=(
+                    1 if return_status_group == "completed" else return_jobs_page
+                ),
                 translations_queued=len(created),
             ),
             status_code=status.HTTP_303_SEE_OTHER,
@@ -2037,6 +2994,40 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         stopped_count = orchestrator(request).stop_all_jobs()
         return RedirectResponse(
             dashboard_location(return_folder, jobs_stopped=stopped_count),
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+
+    @app.post("/jobs/stop-selected")
+    def stop_selected_jobs(
+        request: Request,
+        job_ids: list[str] | None = Form(None),
+        csrf_token: str = Form(""),
+        return_folder: str = Form(""),
+        return_status_group: str = Form(""),
+        return_stage_filter: str = Form(""),
+        return_jobs_page: int = Form(1),
+    ) -> Any:
+        if not is_authenticated(request):
+            return login_redirect()
+        validate_csrf(request, csrf_token)
+        redirect_page = (
+            1
+            if return_status_group or return_stage_filter
+            else return_jobs_page
+        )
+        try:
+            return_location = job_list_action_location(
+                return_folder=return_folder,
+                return_status_group=return_status_group,
+                return_stage_filter=return_stage_filter,
+                return_jobs_page=redirect_page,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        stopped_count = orchestrator(request).stop_jobs(job_ids or [])
+        separator = "&" if "?" in return_location else "?"
+        return RedirectResponse(
+            f"{return_location}{separator}jobs_stopped={stopped_count}",
             status_code=status.HTTP_303_SEE_OTHER,
         )
 

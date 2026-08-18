@@ -10,9 +10,15 @@ from math import isfinite
 from typing import Any
 
 from .stt_quality import normalize_transcript, repetition_diagnostics
+from .whisperx_worker import WHISPERX_MAX_CHUNK_LENGTH_SECONDS
 
 HYBRID_POLICY_VERSION = "hybrid-rescue-v1"
 MIN_SPEAKER_MAPPING_CONFIDENCE = 0.5
+# "full" decodes the whole file with Kotoba; "windows" decodes only the
+# padded rescue spans. Window scope diarizes each span in isolation, so
+# speaker labels are local to the window. Keep "full" as an explicit
+# compatibility option, but prefer the faster window-scoped rescue.
+RESCUE_SCOPES = {"full", "windows"}
 FATAL_ISSUE_CODES = {
     "INVALID_WORD_TIMESTAMP",
     "LONG_WORD_ALIGNMENT",
@@ -34,6 +40,7 @@ class HybridRescueOptions:
     speaker_debounce_sec: float = 0.1
     kotoba_chunk_length_seconds: int = 15
     whisperx_chunk_length_seconds: int = 30
+    rescue_scope: str = "windows"
 
     @classmethod
     def from_options(cls, options: Mapping[str, Any]) -> HybridRescueOptions:
@@ -49,6 +56,7 @@ class HybridRescueOptions:
             "speaker_debounce_sec",
             "kotoba_chunk_length_seconds",
             "whisperx_chunk_length_seconds",
+            "rescue_scope",
         }
         unknown = set(raw) - allowed
         if unknown:
@@ -69,7 +77,7 @@ class HybridRescueOptions:
             return value
 
         defaults = cls()
-        return cls(
+        options = cls(
             window_padding_sec=positive_float(
                 "window_padding_sec", defaults.window_padding_sec
             ),
@@ -100,7 +108,22 @@ class HybridRescueOptions:
                 "whisperx_chunk_length_seconds",
                 defaults.whisperx_chunk_length_seconds,
             ),
+            rescue_scope=str(raw.get("rescue_scope", defaults.rescue_scope)),
         )
+        if options.rescue_scope not in RESCUE_SCOPES:
+            raise ValueError(
+                "rescue_scope must be one of "
+                f"{sorted(RESCUE_SCOPES)}"
+            )
+        if (
+            options.whisperx_chunk_length_seconds
+            > WHISPERX_MAX_CHUNK_LENGTH_SECONDS
+        ):
+            raise ValueError(
+                "whisperx_chunk_length_seconds must be at most "
+                f"{WHISPERX_MAX_CHUNK_LENGTH_SECONDS}"
+            )
+        return options
 
 
 def _timestamp(value: Any) -> float | None:
@@ -942,6 +965,7 @@ def fuse_hybrid_segments(
     fallback_issues: Sequence[Mapping[str, Any]] = (),
     audio_duration: float | None = None,
     primary_words: Sequence[Mapping[str, Any]] = (),
+    fallback_speakers_preassigned: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Replace only structurally failed primary windows with safe Kotoba spans."""
     snapped = _snap_windows_to_primary(
@@ -949,9 +973,31 @@ def fuse_hybrid_segments(
         primary_segments,
         audio_duration=audio_duration,
     )
-    speaker_mapping, speaker_mapping_diagnostics = (
-        _speaker_mapping_with_diagnostics(primary_segments, fallback_segments)
-    )
+    if fallback_speakers_preassigned:
+        fallback_speakers = sorted(
+            {
+                str(segment.get("speaker", "UNKNOWN"))
+                for segment in fallback_segments
+            }
+        )
+        speaker_mapping = {
+            speaker: speaker for speaker in fallback_speakers
+        }
+        speaker_mapping_diagnostics = [
+            {
+                "fallback_speaker": speaker,
+                "mapped_speaker": speaker,
+                "status": "preassigned_per_window",
+            }
+            for speaker in fallback_speakers
+        ]
+    else:
+        speaker_mapping, speaker_mapping_diagnostics = (
+            _speaker_mapping_with_diagnostics(
+                primary_segments,
+                fallback_segments,
+            )
+        )
     words_by_id = {
         str(word["word_id"]): word
         for word in primary_words

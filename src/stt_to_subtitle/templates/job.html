@@ -14,11 +14,11 @@
         <p class="job-source-path">{{ job.source_rel|parent_path }}</p>
       {% endif %}
     </div>
-    <a href="/jobs" class="button secondary">{{ icons.chevron_left(16) }}작업 목록으로</a>
+    <a href="{{ job_return_url }}" class="button secondary">{{ icons.chevron_left(16) }}작업 목록으로</a>
   </div>
   <div
     {% if job.status not in ["audio_completed", "transcription_completed", "completed", "translation_paused", "blocked", "failed"] %}
-      data-update-url="/jobs/{{ job.id }}/panel"
+      data-update-url="/jobs/{{ job.id }}/panel{% if return_status_group or return_stage_filter or return_jobs_page > 1 %}?return_status_group={{ return_status_group or '' }}&amp;return_stage_filter={{ return_stage_filter or '' }}&amp;return_jobs_page={{ return_jobs_page or 1 }}{% endif %}"
     {% endif %}
   >
     {% include "_job_panel.html" %}

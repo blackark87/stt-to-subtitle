@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "stt-to-subtitle"
-version = "3.4.0"
+version = "4.0.0"
 description = "Distributed local transcription, translation, and styled subtitle pipeline"
 readme = "README.md"
 requires-python = ">=3.11,<3.12"
@@ -20,3 +20,5 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 stt_to_subtitle = ["templates/*.html", "static/*.css", "static/*.js"]
+"stt_to_subtitle.vendor.whisperjav" = ["LICENSE", "NOTICES", "VENDOR.md"]
+"stt_to_subtitle.vendor.whisperjav.data.hallucination_filters" = ["*.json"]

@@ -18,6 +18,7 @@ Compose 프로젝트로 빌드하고 실행합니다. 애플리케이션 이미�
                                   ├──▶ stt:8100
                                   │      Kotoba + Pyannote
                                   │      WhisperX + Pyannote
+                                  │      WhisperJAV + Qwen alignment + Pyannote
                                   │
                                   └──▶ 외부 OpenAI 호환 번역 API
 ```
@@ -25,16 +26,25 @@ Compose 프로젝트로 빌드하고 실행합니다. 애플리케이션 이미�
 Compose 프로젝트에는 두 컨테이너가 있습니다.
 
 - `web`: 미디어 탐색, 작업 상태, FFmpeg 추출, 번역, SRT·ASS 렌더링
-- `stt`: Kotoba, WhisperX, 하이브리드 전사를 제공하는 CUDA FastAPI 서버
+- `stt`: WhisperJAV, Kotoba, WhisperX, 하이브리드 전사를 제공하는 CUDA
+  FastAPI 서버
 
 두 서비스는 Compose 내부 네트워크의 `http://stt:8100`으로 연결됩니다.
 전사 API와 웹 포트는 호스트에 직접 게시하지 않습니다. 웹 서비스만 기존
 Traefik 외부 네트워크에 연결되고 HTTPS 라우터를 통해 제공됩니다.
 
-Kotoba와 WhisperX는 요구하는 PyTorch·Pyannote 버전이 다르므로 STT 이미지
-안에서도 각각 `/opt/venvs/kotoba`와 `/opt/venvs/whisperx`에 설치됩니다.
-HTTP 서버는 Kotoba 환경에서 실행하고 WhisperX 요청만 격리된 Python 작업
-프로세스로 처리합니다.
+Kotoba, WhisperX, WhisperJAV는 요구하는 PyTorch·모델 의존성이 다르므로
+STT 이미지 안에서도 각각 `/opt/venvs/kotoba`, `/opt/venvs/whisperx`,
+`/opt/venvs/whisperjav`에 설치됩니다. HTTP 서버는 Kotoba 환경에서 실행하고
+WhisperX와 WhisperJAV 요청은 격리된 Python 작업 프로세스로 처리합니다.
+
+WhisperJAV 앙상블 코드는 `src/stt_to_subtitle/vendor/whisperjav/`에 상류
+커밋을 고정해 포함되어 있으며, 워커 프로세스 안에서 직접 실행됩니다.
+이전에는 워커가 상류 CLI를 다시 실행하고 그 CLI가 패스마다 자식 프로세스를
+띄워 인터프리터가 4단으로 중첩됐고, 두 패스가 같은 오디오를 각각 디코드하고
+같은 씬 분할을 두 번 계산했습니다. 지금은 씬 분할을 한 번만 수행해 두 패스가
+공유하고, 파일 디코드도 잡당 1회입니다. 상류 출처와 로컬 수정 내역은
+`src/stt_to_subtitle/vendor/whisperjav/VENDOR.md`에 있습니다.
 
 ## 요구 사항
 
@@ -77,9 +87,10 @@ test -w /data/stt-to-subtitle/stt-state
 test -w /data/stt-to-subtitle/model
 ```
 
-고정 STT 실행 환경 이미지를 최초 한 번 빌드합니다. 이 이미지는 Python,
-CUDA 라이브러리, Kotoba, WhisperX 의존성만 포함하며 애플리케이션 소스와
-모델 가중치는 포함하지 않습니다.
+고정 STT 실행 환경 이미지는 Python, CUDA 라이브러리와 서로 격리된 Kotoba,
+WhisperX, WhisperJAV 환경을 포함합니다. 애플리케이션 `stt` 이미지는 이 기반
+이미지 위에 애플리케이션 wheel만 설치합니다. 모델 가중치는 두 이미지에
+포함하지 않습니다. 기반 런타임 이미지를 준비하려면 다음 명령을 사용합니다.
 
 ```bash
 ./scripts/compose.sh --env-file .env.compose --profile build build stt-runtime
@@ -98,7 +109,7 @@ CUDA 라이브러리, Kotoba, WhisperX 의존성만 포함하며 애플리케이
 root 실행은 거부합니다. 따라서 `.env.compose`에 UID/GID를 설정할 필요가
 없고, 마운트 경로를 소유한 일반 사용자로 실행해야 합니다.
 
-`stt-runtime` 이미지는 두 ML 환경을 모두 설치하므로 최초 빌드 시간이 길고
+`stt-runtime` 이미지는 세 ML 환경을 모두 설치하므로 최초 빌드 시간이 길고
 이미지가 클 수 있습니다. 일반 `build`는 이 고정 이미지를 재사용하고
 애플리케이션 코드만 설치합니다. 요구사항 파일이나 Python/CUDA 기반 환경을
 변경할 때만 `STT_RUNTIME_IMAGE` 태그를 올리고 `stt-runtime`을 다시
@@ -147,6 +158,7 @@ SSE에 전달합니다. 번역도 배치 저장 시 같은 경로로 즉시 반�
 | `WEB_ADMIN_PASSWORD` | 빈 값 | 웹 로그인 비밀번호 |
 | `WEB_SESSION_SECRET` | 빈 값 | 로그인 사용 시 필요한 32자 이상 세션 키 |
 | `WEB_SECURE_COOKIE` | `true` | HTTPS에서만 세션 쿠키 전송 |
+| `WEB_AUDIO_WORKERS` | `1` | 동시에 실행할 오디오 추출 작업 수, 자막 렌더는 별도 실행기에서 병행 |
 | `GPU_PROMETHEUS_URL` | 빈 값 | STT 대시보드가 직접 조회할 Prometheus URL |
 | `GPU_PROMETHEUS_TOKEN` | 빈 값 | 외부 Prometheus 프록시가 요구할 때만 사용하는 Bearer 토큰 |
 | `GPU_METRICS_REFRESH_SECONDS` | `10` | STT 화면의 GPU 메트릭 갱신 및 서버 캐시 간격 |
@@ -165,10 +177,12 @@ python3 -c 'import secrets; print(secrets.token_urlsafe(48))'
 | 변수 | 기본값 | 용도 |
 | --- | --- | --- |
 | `STT_STATE_PATH` | `/data/stt-to-subtitle/stt-state` | 전사 작업 DB와 결과 |
-| `MODEL_CACHE_PATH` | `/data/stt-to-subtitle/model` | Hugging Face·PyTorch·WhisperX 캐시 |
+| `MODEL_CACHE_PATH` | `/data/stt-to-subtitle/model` | Hugging Face·PyTorch·WhisperX·WhisperJAV 캐시 |
 | `STT_DEVICE` | `cuda` | `cuda` 또는 `cuda:<index>` |
 | `STT_DIARIZATION_DEVICE` | `cuda` | 화자 분리 장치, VRAM 절약 시 `cpu` |
-| `STT_BATCH_SIZE` | `1` | 모델 배치 크기 |
+| `STT_BATCH_SIZE` | `8` | Kotoba 파이프라인 배치 크기, 로드 시점에 고정 |
+| `STT_THREADS` | `8` | Torch와 WhisperX 워커의 CPU 스레드 수 |
+| `WHISPERX_BATCH_SIZE` | `8` | `whisperx`·`hybrid` 백엔드 배치 크기, 요청별 `batch_size`(1~64)로 재정의 가능 |
 | `STT_CHUNK_PROGRESS_EVERY` | `10` | 청크 진행 로그 묶음 기준, `10` 또는 `100` (SSE 변경 알림은 매 변경 시 전송) |
 | `WHISPERX_MODEL` | `large-v3` | WhisperX 모델 |
 | `WHISPERX_LANGUAGE` | `ja` | WhisperX 언어 |
@@ -178,6 +192,12 @@ python3 -c 'import secrets; print(secrets.token_urlsafe(48))'
 요청한 CUDA 장치가 없거나 GPU 인덱스가 범위를 벗어나면 CPU로 자동
 전환하지 않고 STT 준비 상태가 실패합니다. VRAM이 부족한 경우 먼저
 `STT_DIARIZATION_DEVICE=cpu`를 사용합니다.
+
+`WHISPERX_BATCH_SIZE`는 `whisperx`와 `hybrid` 백엔드에만 적용됩니다. Kotoba
+파이프라인은 로드 시점에 배치 크기를 고정하므로 요청별 `batch_size`를 보내면
+거부되며, `STT_BATCH_SIZE`로만 조정합니다. WhisperX 전사 중 CUDA 메모리가
+부족하면 워커가 배치 크기를 절반씩 줄여 자동으로 재시도하고, 실제로 사용한
+값을 결과의 `runtime.effective_batch_size`에 기록합니다.
 
 `STT_DEBUG_ARTIFACTS=true`는 단계별 JSON에 민감한 전사문을 저장할 수
 있으므로 기본적으로 꺼져 있습니다. 토큰은 이미지, 로그, 결과 메타데이터에
@@ -210,15 +230,44 @@ Prometheus와 DCGM Exporter는 호스트 포트를 공개하지 않으며 두 �
 
 웹의 작업 생성 화면에서 다음 백엔드를 요청별로 선택합니다.
 
-- `kotoba`: 기본값. Kotoba Whisper와 Pyannote를 사용합니다.
+- `auto`: JAV 번역 프롬프트면 WhisperJAV, 그 외에는 하이브리드를 선택합니다.
+  명시적으로 선택한 백엔드는 자동 선택보다 우선합니다.
+- `whisperjav`: anime-whisper/WhisperSeg 1차 패스와 일본어 Qwen3-ASR/TEN
+  2차 패스를 직렬 실행해 병합하고, 최종 결과를 Qwen 강제 정렬한 뒤
+  Pyannote 화자를 배정합니다.
+- `kotoba`: Kotoba Whisper와 Pyannote를 사용합니다.
 - `whisperx`: WhisperX VAD, alignment, diarization을 사용합니다.
-- `hybrid`: 두 모델의 전체 결과를 비교해 구조적으로 실패한 WhisperX
-  구간을 Kotoba 결과로 교체합니다.
+- `hybrid`: WhisperX를 먼저 실행하고, 구조적으로 실패한 구간이 있을 때만
+  Kotoba를 추가로 실행해 해당 구간을 교체합니다.
 
-WhisperX와 하이브리드는 자체 VAD를 사용하므로 소음 필터를 끈 요청을
-거부합니다. 단독 WhisperX 요청은 상주 중인 Kotoba 모델을 해제한 뒤
-격리된 작업 프로세스를 실행합니다. 하이브리드는 Kotoba와 WhisperX가
-동시에 GPU 메모리를 사용할 수 있으므로 더 많은 VRAM이 필요합니다.
+WhisperJAV, WhisperX와 하이브리드는 자체 VAD를 사용하므로 소음 필터를 끈
+요청을 거부합니다. WhisperJAV는 두 ASR 패스, 강제 정렬, 화자 배정을 서로
+분리된 단계로 직렬 실행해 모델의 동시 GPU 상주를 피합니다. 두 번째 패스가
+실패해도 잡을 중단하지 않고 첫 번째 패스 결과로 진행하며, 이때 결과의
+`quality.ensemble_status`가 `degraded`가 됩니다. 단계별 소요 시간은
+`runtime.stage_elapsed`에 기록됩니다. 하이브리드도
+Kotoba를 WhisperX가 끝난 뒤에 적재하므로 두 모델이 동시에 GPU에 상주하지
+않습니다.
+
+하이브리드에서 WhisperX 결과에 구조적 문제가 없으면 Kotoba 패스를 아예
+실행하지 않습니다. 이때 결과에는 `runtime.kotoba_skipped=true`,
+`runtime.rescue.skipped=true`, `runtime.rescue.elapsed_seconds=0.0`이
+기록되고 최종 세그먼트는 WhisperX 결과와 동일합니다.
+
+교체할 구간이 있을 때 Kotoba가 다루는 범위는 `hybrid_rescue.rescue_scope`로
+정합니다. 기본값 `windows`는 패딩을 적용한 교체 구간만 잘라 디코딩하므로
+문제 구간이 짧을수록 빠릅니다. 구간 단위로 화자 분리를 다시 수행한 뒤
+정규화 경계에서 전역 라벨과 대응시키며, 전체 파일 재디코딩이 필요한 경우에는
+`full`을 명시할 수 있습니다. `windows`로 실행하면 결과에
+`runtime.rescue.scope="windows"`와
+`noise_filter.rescue.window_count`, `noise_filter.rescue.decoded_seconds`가
+기록됩니다.
+
+전사 비교는 새 비교부터 WhisperJAV, 하이브리드, WhisperX, Kotoba 네 엔진을
+실행합니다. 기존 3엔진 비교 이력은 저장 당시 엔진 구성 그대로 표시됩니다.
+WhisperJAV의 모델과 상류 코드 리비전은 이미지·결과 메타데이터에 고정되며,
+상용 사용 전에는 각 상류 모델의 라이선스를 별도로 확인해야 합니다. 번역은
+기존 OpenAI 호환 번역 모델 설정을 그대로 사용하며 Qwen으로 바뀌지 않습니다.
 
 WhisperX는 alignment 이후 word 시각, 화자, score를 보존하고 화자 변경을
 기준으로 자막 세그먼트를 재구성합니다. 하이브리드는 반복 폭주, 잘못된

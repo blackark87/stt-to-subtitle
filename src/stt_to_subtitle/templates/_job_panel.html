@@ -1,4 +1,5 @@
 {% import "_icons.html" as icons %}
+{% set pipeline = job|job_progress %}
 <section
   class="card job-overview-card"
   {% if job.status in ["audio_completed", "transcription_completed", "completed", "translation_paused", "blocked", "failed"] %}data-update-stop{% endif %}
@@ -20,6 +21,58 @@
       </time>
     </p>
   </div>
+  <div class="job-progress-overview">
+    <div class="job-progress-heading">
+      <span>전체 진행률</span>
+      <strong>{{ pipeline.percent }}%</strong>
+      {% if pipeline.complete %}
+        <span class="job-progress-current">모든 단계 완료</span>
+      {% elif pipeline.current %}
+        <span class="job-progress-current">
+          현재 {{ pipeline.current.label }} · {{ pipeline.current.state_label }}
+          {% if pipeline.current.total %}
+            · {{ pipeline.current.completed }}/{% if pipeline.current.total_is_estimate %}약 {% endif %}{{ pipeline.current.total }} 청크
+          {% endif %}
+        </span>
+      {% endif %}
+    </div>
+    <progress
+      value="{{ pipeline.percent }}"
+      max="100"
+      aria-label="전체 진행률 {{ pipeline.percent }}%"
+    ></progress>
+  </div>
+  <ol class="job-stage-strip job-detail-stage-strip" aria-label="단계별 진행 상황">
+    {% for stage in pipeline.stages %}
+      <li
+        class="job-stage is-{{ stage.state }}"
+        {% if stage.state in ['blocked', 'failed'] and job.error %}title="error: {{ job.error }}"{% endif %}
+      >
+        <span class="job-stage-icon" aria-hidden="true">
+          {%- if stage.state == 'done' %}{{ icons.check(13) }}
+          {%- elif stage.state == 'running' %}{{ icons.activity(13) }}
+          {%- elif stage.state == 'blocked' %}{{ icons.pause(13) }}
+          {%- elif stage.state == 'failed' %}{{ icons.alert_triangle(13) }}
+          {%- elif stage.state == 'paused' %}{{ icons.pause(13) }}
+          {%- else %}{{ icons.clock(13) }}{% endif -%}
+        </span>
+        <span class="job-stage-label">{{ stage.label }}</span>
+        {% if stage.key == 'render' and stage.state == 'done' %}
+          <span class="job-stage-count" aria-hidden="true"></span>
+        {% elif stage.total %}
+          <span class="job-stage-count">{{ stage.completed }}/{% if stage.total_is_estimate %}≈{% endif %}{{ stage.total }}</span>
+        {% else %}
+          <span class="job-stage-count">{{ stage.state_label }}</span>
+        {% endif %}
+        <progress
+          class="job-stage-progress"
+          value="{{ stage.percent }}"
+          max="100"
+          aria-label="{{ stage.label }} 진행률 {{ stage.percent }}%"
+        ></progress>
+      </li>
+    {% endfor %}
+  </ol>
   <dl class="details">
     <dt>작업 ID</dt><dd><code>{{ job.id }}</code></dd>
     <dt>생성 시각</dt>
@@ -45,7 +98,7 @@
   </dl>
   <div class="actions">
     {% if job.options.comparison_id %}
-      <a class="button secondary" href="/comparisons/{{ job.options.comparison_id }}">세 엔진 전사 비교</a>
+      <a class="button secondary" href="/comparisons/{{ job.options.comparison_id }}">전사 엔진 비교</a>
     {% endif %}
     {% set editable = job.status in ["transcription_completed", "completed", "blocked", "failed"] %}
     {% if job.transcript_path and editable %}
@@ -96,9 +149,12 @@
       <form
         method="post"
         action="/jobs/{{ job.id }}/delete"
-        data-confirm-message="{% if job.status == 'audio_completed' %}완료된 오디오 추출 기록을 삭제하시겠습니까? 원본 영상과 생성된 WAV는 삭제하지 않습니다.{% else %}원격 전사 서버에서 사라진 작업 기록을 삭제하시겠습니까? 원본 영상과 생성·중간 파일은 삭제하지 않습니다.{% endif %}"
+        data-confirm-message="{% if job.status == 'audio_completed' %}완료된 오디오 추출 기록을 삭제하시겠습니까? 원본 영상과 생성된 WAV는 삭제하지 않습니다.{% else %}이 작업 기록을 삭제하시겠습니까? 원본 영상과 생성·중간 파일은 삭제하지 않습니다.{% endif %}"
       >
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="return_status_group" value="{{ return_status_group or '' }}">
+        <input type="hidden" name="return_stage_filter" value="{{ return_stage_filter or '' }}">
+        <input type="hidden" name="return_jobs_page" value="{{ return_jobs_page or 1 }}">
         <button type="submit" class="danger">{{ icons.trash(16) }}{% if job.status == 'audio_completed' %}기록 삭제{% else %}작업 삭제{% endif %}</button>
       </form>
     {% endif %}
@@ -107,7 +163,6 @@
     <div class="reprocess-actions">
       <div>
         <strong>새 작업으로 다시 처리</strong>
-        <span class="muted">현재 결과와 히스토리는 보존됩니다.</span>
       </div>
       <div class="actions">
         <form method="post" action="/jobs/{{ job.id }}/reprocess" class="reprocess-form">
@@ -236,15 +291,6 @@
         <a class="button secondary" href="{{ url_for('job_subtitle_file', job_id=job.id, subtitle_format='ass') }}" download>{{ icons.download(16) }}스타일 ASS 다운로드</a>
       {% endif %}
     </div>
-    <p class="muted preview-note">
-      전사·번역 결과를 화자별 색상 WebVTT로 렌더링해 미리보기에 표시합니다.
-      실제 동시 발화는 한 cue의 여러 줄로 표시되며, 외부 플레이어에서는
-      <code>.ko.ass</code>가 색상과 글꼴을 가장 안정적으로 보존합니다.
-      180° 미리보기는 SBS의 좌안 영상을 투영해 마우스·터치 드래그로 둘러봅니다.
-      HTTPS에서 WebXR 헤드셋을 연결하면 좌안에는 SBS 왼쪽 절반, 우안에는
-      오른쪽 절반을 각각 출력하고 헤드 트래킹을 적용합니다.
-      지원하지 않는 MIME 형식은 요청하지 않으며, 코덱 오류가 발생해도 자동 재시도하지 않습니다.
-    </p>
   </section>
 {% endif %}
 <section class="card job-history-card">
