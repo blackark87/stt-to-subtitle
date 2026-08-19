@@ -14,7 +14,7 @@
         Docker를 재시작할 필요가 없습니다.
       </p>
     </div>
-    <a class="button" href="/media">{{ icons.folder(16) }}새 작업 만들기</a>
+    <a class="button secondary" href="/media">{{ icons.folder(16) }}새 작업 만들기</a>
   </div>
   {% if error %}<p class="alert">{{ error }}</p>{% endif %}
   {% if notice %}<p class="notice">{{ notice }}</p>{% endif %}
@@ -29,7 +29,11 @@
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
 
     <section class="card settings-card">
-      <h2>전사 서버</h2>
+      <div class="section-heading">
+        <div>
+          <h2>전사 서버</h2>
+        </div>
+      </div>
       <label>전사 API 주소
         <input
           name="stt_base_url"
@@ -57,11 +61,15 @@
     </section>
 
     <section class="card settings-card">
-      <h2>번역 서버</h2>
-      <p class="muted settings-description">
-        OpenAI 호환 API의 <code>/models</code>와
-        <code>/chat/completions</code>를 사용합니다.
-      </p>
+      <div class="section-heading">
+        <div>
+          <h2>번역 서버</h2>
+          <p class="muted settings-description">
+            OpenAI 호환 API의 <code>/models</code>와
+            <code>/chat/completions</code>를 사용합니다.
+          </p>
+        </div>
+      </div>
       <label>OpenAI 호환 API 주소
         <input
           name="lm_base_url"

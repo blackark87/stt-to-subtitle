@@ -41,7 +41,7 @@
             {% if request.app.state.authentication_enabled and request.session.get("authenticated") %}
               <form method="post" action="/logout">
                 <input type="hidden" name="csrf_token" value="{{ request.session.get('csrf_token') }}">
-                <button type="submit" class="sidebar-logout">{{ icons.log_out(16) }}로그아웃</button>
+                <button type="submit" class="sidebar-logout" aria-label="로그아웃">{{ icons.log_out(16) }}<span>로그아웃</span></button>
               </form>
             {% endif %}
           </div>

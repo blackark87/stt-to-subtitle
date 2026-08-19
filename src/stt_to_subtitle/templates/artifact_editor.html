@@ -5,13 +5,13 @@
   <script defer src="{{ url_for('static', path='/json-editor.js') }}"></script>
 {% endblock %}
 {% block content %}
-  <p><a href="/jobs/{{ job.id }}">{{ icons.chevron_left(14) }}작업 상세</a></p>
-  <div class="editor-heading">
+  <div class="page-heading editor-heading">
     <div>
-      <p class="editor-kicker">{{ label }}</p>
+      <p class="page-kicker">{{ label }}</p>
       <h1>{{ filename }}</h1>
+      <p class="job-source-path"><span class="status status-{{ job.status }}">{{ job.status|job_status }}</span></p>
     </div>
-    <span class="status status-{{ job.status }}">{{ job.status }}</span>
+    <a href="/jobs/{{ job.id }}" class="button secondary">{{ icons.chevron_left(16) }}작업 상세로</a>
   </div>
 
   {% if error %}<p class="alert" role="alert">{{ error }}</p>{% endif %}

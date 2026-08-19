@@ -69,7 +69,7 @@
         <form method="post" action="/comparisons/{{ comparison_id }}/retry">
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
           <button type="submit" class="secondary"{% if not retriable_count %} disabled{% endif %}>
-            {{ icons.refresh(15) }}실패 작업 재시도 ({{ retriable_count }})
+            {{ icons.refresh(16) }}실패 작업 재시도 ({{ retriable_count }})
           </button>
         </form>
       </div>
@@ -129,7 +129,7 @@
               >
             </label>
           </div>
-          <button type="submit">{{ icons.play(15) }}새 비교 실행</button>
+          <button type="submit">{{ icons.play(16) }}새 비교 실행</button>
         </form>
       </div>
     </div>
