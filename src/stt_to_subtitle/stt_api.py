@@ -142,6 +142,7 @@ class STTAPISettings:
     max_upload_bytes: int = 2 * 1024 * 1024 * 1024
     progress_interval: float = 30.0
     chunk_progress_every: int = 10
+    model_idle_timeout_seconds: float = 900.0
     noise_filter_trigger_level: float = DEFAULT_NOISE_FILTER_TRIGGER_LEVEL
     whisperx_python: Path = Path(".venv-whisperx/bin/python")
     whisperjav_python: Path = Path(".venv-whisperjav/bin/python")
@@ -181,6 +182,9 @@ class STTAPISettings:
             ),
             chunk_progress_every=int(
                 os.environ.get("STT_CHUNK_PROGRESS_EVERY", "10")
+            ),
+            model_idle_timeout_seconds=float(
+                os.environ.get("STT_MODEL_IDLE_TIMEOUT_SECONDS", "900")
             ),
             noise_filter_trigger_level=float(
                 os.environ.get(
@@ -606,9 +610,19 @@ class TranscriptionService:
         self.store = TranscriptionStore(self.settings.state_dir / "jobs.sqlite3")
         self._queue: queue.Queue[str | None] = queue.Queue()
         self._pipeline: SpeechPipeline | None = None
+        # Held for the whole of a job so the idle reaper can never unload the
+        # pipeline out from under a running transcription.
+        self._pipeline_lock = threading.RLock()
+        self._pipeline_idle_since = time.monotonic()
+        self._stopping = threading.Event()
         self._worker = threading.Thread(
             target=self._worker_loop,
             name="stt-api-worker",
+            daemon=True,
+        )
+        self._idle_reaper = threading.Thread(
+            target=self._idle_reaper_loop,
+            name="stt-api-idle-reaper",
             daemon=True,
         )
         self._started_at = time.time()
@@ -618,12 +632,17 @@ class TranscriptionService:
         if interrupted:
             LOGGER.warning("marked %d interrupted transcription job(s) failed", interrupted)
         self._worker.start()
+        if self.settings.model_idle_timeout_seconds >= 0:
+            self._idle_reaper.start()
         for job_id in self.store.queued_ids():
             self._queue.put(job_id)
 
     def stop(self) -> None:
+        self._stopping.set()
         self._queue.put(None)
         self._worker.join(timeout=5)
+        if self._idle_reaper.is_alive():
+            self._idle_reaper.join(timeout=5)
 
     def health(self) -> dict[str, Any]:
         return {
@@ -631,6 +650,14 @@ class TranscriptionService:
             "uptime_seconds": round(time.time() - self._started_at, 3),
             "queued_jobs": self._queue.qsize(),
             "loaded_backend": "kotoba" if self._pipeline is not None else None,
+            "model_idle_timeout_seconds": (
+                self.settings.model_idle_timeout_seconds
+            ),
+            "model_idle_seconds": (
+                round(time.monotonic() - self._pipeline_idle_since, 1)
+                if self._pipeline is not None
+                else None
+            ),
         }
 
     def readiness(self) -> tuple[bool, dict[str, Any]]:
@@ -764,6 +791,7 @@ class TranscriptionService:
                 threads=self.settings.threads,
             )
             LOGGER.info("transcription model loaded")
+        self._pipeline_idle_since = time.monotonic()
         return self._pipeline
 
     def _run_kotoba_rescue_windows(
@@ -914,10 +942,10 @@ class TranscriptionService:
             result["encoding_warning"] = dict(encoding_warning)
         return segments, result
 
-    def _release_pipeline(self) -> None:
+    def _release_pipeline(self, reason: str = "before backend switch") -> None:
         if self._pipeline is None:
             return
-        LOGGER.info("unloading Kotoba transcription model before backend switch")
+        LOGGER.info("unloading Kotoba transcription model %s", reason)
         self._pipeline = None
         gc.collect()
         try:
@@ -1123,9 +1151,45 @@ class TranscriptionService:
             try:
                 if job_id is None:
                     return
-                self._run_job(job_id)
+                with self._pipeline_lock:
+                    self._run_job(job_id)
             finally:
+                self._pipeline_idle_since = time.monotonic()
                 self._queue.task_done()
+
+    def _idle_reaper_loop(self) -> None:
+        timeout = self.settings.model_idle_timeout_seconds
+        interval = 5.0 if timeout <= 60 else 30.0
+        while not self._stopping.wait(interval):
+            try:
+                self._release_idle_pipeline()
+            except Exception:  # never let the reaper kill its own thread
+                LOGGER.exception("idle model release failed")
+
+    def _release_idle_pipeline(self) -> None:
+        """Drop the resident Kotoba pipeline once nothing has needed it.
+
+        WhisperX and WhisperJAV run as subprocesses and hand their VRAM back
+        when they exit; only this in-process pipeline stays resident, so it is
+        the one that has to be reaped.
+        """
+        timeout = self.settings.model_idle_timeout_seconds
+        if timeout < 0 or self._pipeline is None or not self._queue.empty():
+            return
+        # A job holds the lock for its whole run; skip this tick rather than wait.
+        if not self._pipeline_lock.acquire(blocking=False):
+            return
+        try:
+            if self._pipeline is None or not self._queue.empty():
+                return
+            idle_for = time.monotonic() - self._pipeline_idle_since
+            if idle_for < timeout:
+                return
+            self._release_pipeline(
+                reason=f"after {idle_for:.0f}s idle (limit {timeout:.0f}s)"
+            )
+        finally:
+            self._pipeline_lock.release()
 
     def _run_job(self, job_id: str) -> None:
         job = self.store.get(job_id)

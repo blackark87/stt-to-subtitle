@@ -184,6 +184,7 @@ python3 -c 'import secrets; print(secrets.token_urlsafe(48))'
 | `STT_THREADS` | `8` | Torch와 WhisperX 워커의 CPU 스레드 수 |
 | `WHISPERX_BATCH_SIZE` | `8` | `whisperx`·`hybrid` 백엔드 배치 크기, 요청별 `batch_size`(1~64)로 재정의 가능 |
 | `STT_CHUNK_PROGRESS_EVERY` | `10` | 청크 진행 로그 묶음 기준, `10` 또는 `100` (SSE 변경 알림은 매 변경 시 전송) |
+| `STT_MODEL_IDLE_TIMEOUT_SECONDS` | `900` | 상주 중인 Kotoba 모델을 이만큼 유휴 상태가 지속되면 VRAM에서 내림. `0`은 큐가 비는 즉시, 음수는 계속 상주 |
 | `WHISPERX_MODEL` | `large-v3` | WhisperX 모델 |
 | `WHISPERX_LANGUAGE` | `ja` | WhisperX 언어 |
 | `WHISPERX_COMPUTE_TYPE` | `float16` | WhisperX 연산 형식 |
