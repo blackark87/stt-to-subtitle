@@ -19,8 +19,10 @@
     >
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <section class="card comparison-translation-toolbar">
-        <div>
-          <h2>선택한 전사 결과로 번역</h2>
+        <div class="section-heading">
+          <div>
+            <h2>선택한 전사 결과로 번역</h2>
+          </div>
         </div>
         <div class="comparison-translation-actions">
           <label>번역 프롬프트
@@ -31,7 +33,7 @@
               {% endfor %}
             </select>
           </label>
-          <button type="submit" data-translate-comparison{% if not prompt_categories %} disabled{% endif %}>{{ icons.play(15) }}선택 결과 번역하기</button>
+          <button type="submit" data-translate-comparison{% if not prompt_categories %} disabled{% endif %}>{{ icons.play(16) }}선택 결과 번역하기</button>
         </div>
       </section>
   {% endif %}

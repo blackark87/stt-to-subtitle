@@ -1,0 +1,510 @@
+<!doctype html>
+<html lang="ko" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>파이프라인 · 3D</title>
+<link rel="stylesheet" href="/static/app.css">
+<style>
+  html, body { height: 100%; overflow: hidden; }
+  #scene { position: fixed; inset: 0; display: block; }
+
+  .hud { position: fixed; inset: 0; pointer-events: none; display: grid;
+         grid-template-columns: 1fr 348px; grid-template-rows: auto 1fr auto; gap: 16px; padding: 16px; }
+  .hud > * { pointer-events: auto; }
+  .glass {
+    border: 1px solid color-mix(in srgb, var(--line) 70%, transparent);
+    border-radius: var(--r-lg);
+    background: color-mix(in srgb, var(--card) 72%, transparent);
+    backdrop-filter: blur(14px) saturate(1.2);
+    box-shadow: 0 10px 40px rgba(0,0,0,.45);
+  }
+
+  .topbar-hud { grid-column: 1 / -1; display: flex; align-items: center; gap: 12px; padding: 0 14px; min-height: 50px; }
+  .topbar-hud h1 { margin: 0; font-size: 1rem; font-weight: 750; }
+
+  .side { grid-column: 2; grid-row: 2 / 4; display: grid; gap: 12px; align-content: start;
+          overflow: auto; max-height: calc(100vh - 84px); scrollbar-width: thin; }
+
+  .foot { grid-column: 1; grid-row: 3; display: flex; align-items: center; gap: 10px;
+          padding: 0 12px; min-height: 42px; width: max-content; }
+
+  .layers { grid-column: 1; grid-row: 2; align-self: start; width: max-content; padding: 10px 12px; display: grid; gap: 8px; }
+  .layer { display: flex; align-items: center; gap: 9px; font-size: .82rem; font-weight: 650; cursor: pointer; }
+  .layer input { accent-color: var(--accent); width: 15px; height: 15px; }
+  .layer .sw { width: 10px; height: 10px; border-radius: 3px; }
+
+  .hint { color: var(--muted); font-size: .74rem; }
+  .sel-empty { color: var(--muted); font-size: .82rem; text-align: center; padding: 22px 12px; }
+  .kbd { border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; font-size: .7rem; font-family: var(--mono); color: var(--muted); }
+</style>
+</head>
+<body>
+<canvas id="scene"></canvas>
+
+<div class="hud">
+  <header class="glass topbar-hud">
+    <h1>파이프라인</h1>
+    <span class="btns" style="gap: 5px">
+      <span class="b run dot">실행 {{ job_stats.running }}</span>
+      <span class="b wait dot">대기 {{ job_stats.waiting }}</span>
+      <span class="b hold dot">멈춤 {{ job_stats.blocked }}</span>
+      <span class="b bad dot">실패 {{ job_stats.failed }}</span>
+      <span class="b ok dot">완료 {{ job_stats.completed }}</span>
+    </span>
+    <span id="backend" class="b hold dot" style="margin-left: auto">확인 중</span>
+    <a class="btn sec sm" href="/option-B">2D 대시보드</a>
+  </header>
+
+  <aside class="glass layers">
+    <label class="layer"><input type="checkbox" data-layer="stations" checked><span class="sw" style="background: var(--accent)"></span>파이프라인</label>
+    <label class="layer"><input type="checkbox" data-layer="queue" checked><span class="sw" style="background: var(--warn-strong)"></span>대기 큐</label>
+    <label class="layer"><input type="checkbox" data-layer="gpu" checked><span class="sw" style="background: #7dd3fc"></span>GPU</label>
+    <label class="layer"><input type="checkbox" data-layer="stopped" checked><span class="sw" style="background: var(--bad)"></span>멈춤·실패</label>
+    <label class="layer"><input type="checkbox" data-layer="done" checked><span class="sw" style="background: var(--ok)"></span>완료</label>
+  </aside>
+
+  <div class="side">
+    <section class="glass" id="detail">
+      <div class="card-head"><h2>선택</h2><span id="detail-badge" class="b">없음</span></div>
+      <div class="card-body" id="detail-body">
+        <p class="sel-empty">씬에서 오브젝트를 클릭하면 여기에 나옵니다</p>
+      </div>
+    </section>
+
+    <section class="glass">
+      <div class="card-head"><h2>GPU 0</h2><span class="sub code">{{ gpu.display_name }}</span></div>
+      <div class="card-body">
+        <div class="pn inset" style="padding: 11px">
+          <span class="pn-l">사용률</span>
+          <span class="pn-v" style="font-size: 1.5rem">{{ gpu.utilization_percent }}<small>%</small></span>
+          <div class="bar" style="margin-top: 7px"><i style="width: {{ gpu.utilization_percent }}%"></i></div>
+        </div>
+        <div class="pn inset" style="padding: 11px; margin-top: 8px">
+          <span class="pn-l">메모리</span>
+          <span class="pn-v" style="font-size: 1.5rem">{{ gpu.memory_percent }}<small>%</small></span>
+          <span class="pn-d">{{ "%.1f"|format(gpu.memory_used_gib) }} / {{ "%.1f"|format(gpu.memory_total_gib) }} GiB</span>
+          <div class="bar" style="margin-top: 7px"><i style="width: {{ gpu.memory_percent }}%"></i></div>
+        </div>
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 8px">
+          <div class="pn inset"><span class="pn-l">온도</span><span class="pn-v" style="font-size: 1.1rem">{{ gpu.temperature_celsius }}<small>°C</small></span></div>
+          <div class="pn inset"><span class="pn-l">전력</span><span class="pn-v" style="font-size: 1.1rem">{{ gpu.power_watts }}<small>W</small></span></div>
+        </div>
+        <div class="pn" style="margin-top: 8px; display: grid; gap: 5px">
+          <span class="pn-l" style="margin: 0">로드된 모델</span>
+          {% for m in gpu.loaded %}
+            <div class="kv"><span>{{ m.name }}</span><span{% if m.active %} style="color: var(--accent)"{% else %} class="muted"{% endif %}>{{ m.state }}</span></div>
+          {% endfor %}
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <footer class="glass foot">
+    <span class="hint"><span class="kbd">드래그</span> 회전 · <span class="kbd">휠</span> 줌 · <span class="kbd">우클릭 드래그</span> 이동 · <span class="kbd">클릭</span> 선택</span>
+    <span style="width: 1px; height: 20px; background: var(--line)"></span>
+    <button type="button" class="btn sec sm" id="reset">시점 초기화</button>
+    <span id="fps" class="code" style="font-size: .74rem; color: var(--muted)">—</span>
+  </footer>
+</div>
+
+<script type="importmap">
+{ "imports": { "three": "/static/vendor/three.webgpu.min.js" } }
+</script>
+
+<script type="module">
+import * as THREE from "three";
+import { OrbitControls } from "/static/vendor/OrbitControls.js";
+
+const DATA = {{ scene_data | tojson }};
+
+const C = {
+  bg:      0x0b0e14,
+  floor:   0x141824,
+  grid:    0x232b3f,
+  accent:  0x6c7ae5,
+  ok:      0x40a35c,
+  wait:    0xbb8b00,
+  bad:     0xc4453c,
+  gpu:     0x7dd3fc,
+  slab:    0x2a3145,
+  ink:     0xe7e9ee,
+};
+
+const canvas = document.getElementById("scene");
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(C.bg);
+scene.fog = new THREE.Fog(C.bg, 26, 62);
+
+const camera = new THREE.PerspectiveCamera(42, innerWidth / innerHeight, 0.1, 200);
+const HOME = new THREE.Vector3(15, 12.5, 17);
+camera.position.copy(HOME);
+
+const renderer = new THREE.WebGPURenderer({ canvas, antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+await renderer.init();
+
+const controls = new OrbitControls(camera, canvas);
+controls.enableDamping = true;
+controls.dampingFactor = 0.07;
+controls.target.set(0, 1.2, 0);
+controls.minDistance = 8;
+controls.maxDistance = 46;
+controls.maxPolarAngle = Math.PI * 0.48;
+
+document.getElementById("reset").onclick = () => {
+  camera.position.copy(HOME);
+  controls.target.set(0, 1.2, 0);
+};
+
+/* ── 조명 ─────────────────────────────────────────────────────────── */
+scene.add(new THREE.HemisphereLight(0x8ea2ff, 0x0a0d14, 0.55));
+const key = new THREE.DirectionalLight(0xffffff, 1.5);
+key.position.set(9, 16, 8);
+scene.add(key);
+const rim = new THREE.DirectionalLight(0x6c7ae5, 0.7);
+rim.position.set(-10, 6, -9);
+scene.add(rim);
+
+/* ── 바닥 ─────────────────────────────────────────────────────────── */
+const floor = new THREE.Mesh(
+  new THREE.PlaneGeometry(90, 90),
+  new THREE.MeshStandardMaterial({ color: C.floor, roughness: .96, metalness: .05 })
+);
+floor.rotation.x = -Math.PI / 2;
+floor.position.y = -0.02;
+scene.add(floor);
+const grid = new THREE.GridHelper(90, 60, C.grid, C.grid);
+grid.material.transparent = true;
+grid.material.opacity = 0.42;
+scene.add(grid);
+
+/* ── 라벨 (캔버스 텍스처 스프라이트) ───────────────────────────────── */
+function label(text, { size = 46, color = "#e7e9ee", weight = 700, scale = 1 } = {}) {
+  const pad = 16, c = document.createElement("canvas"), g = c.getContext("2d");
+  const font = `${weight} ${size}px ui-sans-serif, system-ui, "Malgun Gothic", sans-serif`;
+  g.font = font;
+  c.width = Math.ceil(g.measureText(text).width) + pad * 2;
+  c.height = size + pad * 2;
+  const g2 = c.getContext("2d");
+  g2.font = font;
+  g2.fillStyle = color;
+  g2.textBaseline = "middle";
+  g2.fillText(text, pad, c.height / 2);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = 4;
+  const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true, depthWrite: false }));
+  sp.scale.set((c.width / c.height) * scale, scale, 1);
+  return sp;
+}
+
+/* ── 레이어 그룹 ──────────────────────────────────────────────────── */
+const layers = {
+  stations: new THREE.Group(),
+  queue: new THREE.Group(),
+  gpu: new THREE.Group(),
+  stopped: new THREE.Group(),
+  done: new THREE.Group(),
+};
+Object.values(layers).forEach((g) => scene.add(g));
+
+const pickable = [];
+const animated = [];
+
+const slabGeo = new THREE.BoxGeometry(2.1, 0.32, 1.35);
+
+function slab(color, emissive = 0) {
+  const m = new THREE.Mesh(
+    slabGeo,
+    new THREE.MeshStandardMaterial({
+      color, roughness: .42, metalness: .25,
+      emissive: new THREE.Color(color), emissiveIntensity: emissive,
+    })
+  );
+  return m;
+}
+
+/* ── 스테이션: 추출 → 전사 → 번역 (자막은 즉시라 게이트로) ────────── */
+const STATION_X = { 추출: -7.5, 전사: 0, 번역: 7.5 };
+
+DATA.slots.forEach((slot) => {
+  const x = STATION_X[slot.stage] ?? 0;
+  const base = new THREE.Mesh(
+    new THREE.CylinderGeometry(2.6, 2.9, 0.5, 6),
+    new THREE.MeshStandardMaterial({ color: 0x1a2032, roughness: .8, metalness: .3 })
+  );
+  base.position.set(x, 0.25, 0);
+  layers.stations.add(base);
+
+  const name = label(slot.stage, { size: 44, scale: 0.9 });
+  name.position.set(x, 0.95, 2.3);
+  layers.stations.add(name);
+
+  if (slot.job) {
+    const s = slab(C.accent, 0.55);
+    s.position.set(x, 0.92, 0);
+    s.userData = { kind: "job", stage: slot.stage, title: slot.job, detail: slot.detail, percent: slot.percent };
+    layers.stations.add(s);
+    pickable.push(s);
+    animated.push({ mesh: s, base: 0.92, phase: Math.random() * 6.28 });
+
+    // 진행률 링
+    const ring = new THREE.Mesh(
+      new THREE.RingGeometry(1.75, 2.05, 64, 1, Math.PI / 2, -Math.PI * 2 * (slot.percent / 100)),
+      new THREE.MeshBasicMaterial({ color: C.accent, side: THREE.DoubleSide, transparent: true, opacity: .95 })
+    );
+    ring.rotation.x = -Math.PI / 2;
+    ring.position.set(x, 0.53, 0);
+    layers.stations.add(ring);
+
+    const pct = label(slot.percent + "%", { size: 40, color: "#a5b4fc", scale: 0.75 });
+    pct.position.set(x, 1.75, 0);
+    layers.stations.add(pct);
+  } else {
+    const idle = label("유휴", { size: 38, color: "#5b6472", weight: 650, scale: 0.7 });
+    idle.position.set(x, 1.0, 0);
+    layers.stations.add(idle);
+  }
+});
+
+/* ── 대기 큐: 첫 스테이션 앞에 쌓인다 ─────────────────────────────── */
+DATA.queue.forEach((item, i) => {
+  const s = slab(C.slab);
+  s.material.emissive = new THREE.Color(C.wait);
+  s.material.emissiveIntensity = 0.16;
+  s.position.set(STATION_X["추출"] - 3.6 - i * 1.7, 0.2, 0);
+  s.rotation.y = 0.03 * (i % 2 ? 1 : -1);
+  s.userData = { kind: "queue", title: item.title, detail: item.stage + " 대기", position: item.position };
+  layers.queue.add(s);
+  pickable.push(s);
+});
+if (DATA.queue_rest) {
+  const more = label("외 " + DATA.queue_rest + "건", { size: 36, color: "#8b93a7", weight: 650, scale: 0.68 });
+  more.position.set(STATION_X["추출"] - 3.6 - DATA.queue.length * 1.7 - 1.4, 0.75, 0);
+  layers.queue.add(more);
+}
+
+/* ── 완료: 오른쪽에 쌓인다 ────────────────────────────────────────── */
+DATA.completed.forEach((job, i) => {
+  const s = slab(0x1e3a2c);
+  s.material.emissive = new THREE.Color(C.ok);
+  s.material.emissiveIntensity = 0.2;
+  s.position.set(STATION_X["번역"] + 4.6, 0.2 + i * 0.36, 0);
+  s.userData = { kind: "done", title: job.source_rel.split("/").pop(), detail: job.meta + " · " + job.total };
+  layers.done.add(s);
+  pickable.push(s);
+});
+const doneCount = label(DATA.completed_total + "건 완료", { size: 40, color: "#7fd6a3", scale: 0.8 });
+doneCount.position.set(STATION_X["번역"] + 4.6, 0.2 + DATA.completed.length * 0.36 + 0.9, 0);
+layers.done.add(doneCount);
+
+/* ── 멈춤·실패: 옆 레일로 빠진다 ──────────────────────────────────── */
+DATA.stopped.forEach((job, i) => {
+  const s = slab(0x2a1b1b);
+  const isFail = job.status === "failed";
+  s.material.emissive = new THREE.Color(isFail ? C.bad : 0x6b7280);
+  s.material.emissiveIntensity = isFail ? 0.5 : 0.22;
+  s.position.set(-2 + i * 2.6, 0.2, -5.4);
+  s.rotation.y = -0.18;
+  s.userData = { kind: "stopped", title: job.source_rel.split("/").pop(), detail: job.reason, status: job.status_label };
+  layers.stopped.add(s);
+  pickable.push(s);
+  if (isFail) animated.push({ mesh: s, base: 0.2, phase: i * 2, pulse: true });
+});
+if (DATA.stopped.length) {
+  const l = label("멈춤 · 실패", { size: 38, color: "#f2a49c", weight: 650, scale: 0.72 });
+  l.position.set(-2 + (DATA.stopped.length - 1) * 1.3, 0.95, -6.6);
+  layers.stopped.add(l);
+}
+
+/* ── GPU: 스테이션 아래를 관통하는 블록 + VRAM 기둥 ───────────────── */
+const gpuBlock = new THREE.Mesh(
+  new THREE.BoxGeometry(17, 0.7, 2.2),
+  new THREE.MeshStandardMaterial({
+    color: 0x101827, roughness: .5, metalness: .6,
+    emissive: new THREE.Color(C.gpu), emissiveIntensity: 0.12,
+  })
+);
+gpuBlock.position.set(0, -0.42, -2.6);
+layers.gpu.add(gpuBlock);
+
+const util = DATA.gpu.utilization_percent / 100;
+const utilBar = new THREE.Mesh(
+  new THREE.BoxGeometry(17 * util, 0.14, 2.3),
+  new THREE.MeshBasicMaterial({ color: C.gpu, transparent: true, opacity: .9 })
+);
+utilBar.position.set(-17 / 2 + (17 * util) / 2, -0.03, -2.6);
+layers.gpu.add(utilBar);
+animated.push({ mesh: utilBar, glow: true });
+
+const vramH = 4.2 * (DATA.gpu.memory_percent / 100);
+const vram = new THREE.Mesh(
+  new THREE.BoxGeometry(0.85, vramH, 0.85),
+  new THREE.MeshStandardMaterial({
+    color: 0x16324a, roughness: .35, metalness: .5,
+    emissive: new THREE.Color(C.gpu), emissiveIntensity: .35,
+  })
+);
+vram.position.set(-10.6, vramH / 2, -2.6);
+layers.gpu.add(vram);
+const vramShell = new THREE.Mesh(
+  new THREE.BoxGeometry(0.95, 4.2, 0.95),
+  new THREE.MeshBasicMaterial({ color: C.gpu, wireframe: true, transparent: true, opacity: .22 })
+);
+vramShell.position.set(-10.6, 2.1, -2.6);
+layers.gpu.add(vramShell);
+
+const gpuLabel = label("GPU " + DATA.gpu.utilization_percent + "%", { size: 40, color: "#9fdcf7", scale: 0.78 });
+gpuLabel.position.set(0, 0.55, -4.3);
+layers.gpu.add(gpuLabel);
+
+const vramLabel = label("VRAM " + DATA.gpu.memory_percent + "%", { size: 34, color: "#9fdcf7", weight: 650, scale: 0.62 });
+vramLabel.position.set(-10.6, 4.7, -2.6);
+layers.gpu.add(vramLabel);
+
+/* ── 흐름 입자: 큐 → 스테이션 → 완료 ─────────────────────────────── */
+const flowCount = 90;
+const flowGeo = new THREE.BufferGeometry();
+const flowPos = new Float32Array(flowCount * 3);
+const flowSeed = new Float32Array(flowCount);
+for (let i = 0; i < flowCount; i++) {
+  flowSeed[i] = Math.random();
+  flowPos[i * 3 + 1] = 0.55 + Math.random() * 0.5;
+  flowPos[i * 3 + 2] = (Math.random() - 0.5) * 1.1;
+}
+flowGeo.setAttribute("position", new THREE.BufferAttribute(flowPos, 3));
+const flow = new THREE.Points(flowGeo, new THREE.PointsMaterial({
+  color: C.accent, size: 0.11, transparent: true, opacity: .75, depthWrite: false,
+}));
+layers.stations.add(flow);
+
+const X0 = STATION_X["추출"] - 9, X1 = STATION_X["번역"] + 5;
+
+/* ── 선택 ─────────────────────────────────────────────────────────── */
+const ray = new THREE.Raycaster();
+const ptr = new THREE.Vector2();
+let selected = null;
+let hovered = null;
+
+function setDetail(u) {
+  const body = document.getElementById("detail-body");
+  const badge = document.getElementById("detail-badge");
+  if (!u) {
+    body.innerHTML = '<p class="sel-empty">씬에서 오브젝트를 클릭하면 여기에 나옵니다</p>';
+    badge.className = "b"; badge.textContent = "없음";
+    return;
+  }
+  const cls = { job: "b run dot", queue: "b wait dot", done: "b ok dot", stopped: "b bad dot" }[u.kind] || "b";
+  const name = { job: "실행 중", queue: "대기", done: "완료", stopped: u.status || "멈춤" }[u.kind];
+  badge.className = cls; badge.textContent = name;
+  body.innerHTML = `
+    <div class="t-name" style="margin-bottom: 10px"><b style="font-size: .95rem">${u.title}</b></div>
+    <div class="kv"><span>상태</span><span>${name}</span></div>
+    ${u.stage ? `<div class="kv"><span>단계</span><span>${u.stage}</span></div>` : ""}
+    ${u.percent !== undefined ? `<div class="kv"><span>진행</span><span>${u.percent}%</span></div>` : ""}
+    ${u.position ? `<div class="kv"><span>큐 순번</span><span>${u.position}번</span></div>` : ""}
+    ${u.detail ? `<p class="muted" style="margin: 10px 0 0; font-size: .8rem; line-height: 1.5">${u.detail}</p>` : ""}`;
+}
+
+function mark(mesh, on) {
+  if (!mesh) return;
+  mesh.material.emissiveIntensity = on
+    ? (mesh.userData._e ?? mesh.material.emissiveIntensity) * 2.6
+    : (mesh.userData._e ?? mesh.material.emissiveIntensity);
+  if (on && mesh.userData._e === undefined) mesh.userData._e = mesh.material.emissiveIntensity / 2.6;
+  mesh.scale.setScalar(on ? 1.06 : 1);
+}
+
+function pick(ev) {
+  ptr.x = (ev.clientX / innerWidth) * 2 - 1;
+  ptr.y = -(ev.clientY / innerHeight) * 2 + 1;
+  ray.setFromCamera(ptr, camera);
+  const hit = ray.intersectObjects(pickable.filter((m) => m.parent && m.parent.visible), false)[0];
+  return hit ? hit.object : null;
+}
+
+canvas.addEventListener("pointermove", (ev) => {
+  const m = pick(ev);
+  if (m !== hovered) {
+    if (hovered !== selected) mark(hovered, false);
+    hovered = m;
+    if (hovered && hovered !== selected) mark(hovered, true);
+    canvas.style.cursor = m ? "pointer" : "grab";
+  }
+});
+
+canvas.addEventListener("click", (ev) => {
+  const m = pick(ev);
+  if (selected && selected !== m) mark(selected, false);
+  selected = m;
+  if (selected) mark(selected, true);
+  setDetail(selected ? selected.userData : null);
+});
+
+/* ── 레이어 토글 ──────────────────────────────────────────────────── */
+document.querySelectorAll("[data-layer]").forEach((cb) => {
+  cb.addEventListener("change", () => { layers[cb.dataset.layer].visible = cb.checked; });
+});
+
+/* ── 루프 ─────────────────────────────────────────────────────────── */
+addEventListener("resize", () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+let frames = 0, fpsLast = performance.now();
+const clock = new THREE.Clock();
+
+function loop() {
+  const t = clock.getElapsedTime();
+  const dt = clock.getDelta();
+
+  for (const a of animated) {
+    if (a.glow) {
+      a.mesh.material.opacity = 0.62 + Math.sin(t * 2.4) * 0.22;
+    } else if (a.pulse) {
+      a.mesh.material.emissiveIntensity = 0.35 + Math.sin(t * 3 + a.phase) * 0.25;
+    } else {
+      a.mesh.position.y = a.base + Math.sin(t * 1.5 + a.phase) * 0.07;
+      a.mesh.rotation.y = Math.sin(t * 0.5 + a.phase) * 0.05;
+    }
+  }
+
+  const speed = 1.4 + (DATA.gpu.utilization_percent / 100) * 4.2;
+  const pos = flowGeo.attributes.position;
+  for (let i = 0; i < flowCount; i++) {
+    let x = pos.getX(i) + dt * speed * (0.5 + flowSeed[i]);
+    if (x > X1 || x === 0) x = X0 + Math.random() * 2;
+    pos.setX(i, x);
+  }
+  pos.needsUpdate = true;
+
+  controls.update();
+  renderer.render(scene, camera);
+
+  frames++;
+  const now = performance.now();
+  if (now - fpsLast >= 1000) {
+    document.getElementById("fps").textContent = frames + " fps";
+    frames = 0; fpsLast = now;
+  }
+  requestAnimationFrame(loop);
+}
+
+const badge = document.getElementById("backend");
+const isWebGPU = renderer.backend?.isWebGPUBackend === true;
+badge.textContent = isWebGPU ? "WebGPU" : "WebGL2 폴백";
+badge.className = "b dot " + (isWebGPU ? "run" : "wait");
+if (!isWebGPU) badge.title = window.isSecureContext
+  ? "이 브라우저/기기에서 WebGPU를 쓸 수 없습니다"
+  : "secure context 아님 — localhost 또는 https 로 접속해야 WebGPU가 열립니다";
+
+setDetail(null);
+renderer.render(scene, camera);   // rAF 이전에 첫 프레임을 보장
+loop();
+</script>
+</body>
+</html>

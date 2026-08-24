@@ -1,6 +1,8 @@
 import asyncio
 import os
 import json
+import threading
+import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -1189,3 +1191,146 @@ class STTAPIRouteTests(unittest.TestCase):
             )
             self.assertEqual(response.status_code, 503)
             self.assertIn("WhisperX Python was not found", response.text)
+
+
+class IdleModelReleaseTests(unittest.TestCase):
+    """The Kotoba pipeline is the only model that stays resident in-process,
+    so it is the one that has to be handed back when nothing is using it."""
+
+    def _service(self, root: Path, **overrides: object) -> TranscriptionService:
+        settings = STTAPISettings(
+            state_dir=root / "state",
+            api_token="",
+            hf_token="secret-hf-token",
+            device="cpu",
+            diarization_device="cpu",
+            **overrides,
+        )
+        return TranscriptionService(settings)
+
+    def test_releases_the_pipeline_once_it_has_been_idle_past_the_limit(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            service = self._service(
+                Path(directory), model_idle_timeout_seconds=60.0
+            )
+            service._pipeline = SimpleNamespace()
+            service._pipeline_idle_since = time.monotonic() - 61.0
+
+            service._release_idle_pipeline()
+
+            self.assertIsNone(service._pipeline)
+
+    def test_keeps_the_pipeline_warm_before_the_limit(self) -> None:
+        with TemporaryDirectory() as directory:
+            service = self._service(
+                Path(directory), model_idle_timeout_seconds=60.0
+            )
+            pipeline = SimpleNamespace()
+            service._pipeline = pipeline
+            service._pipeline_idle_since = time.monotonic() - 59.0
+
+            service._release_idle_pipeline()
+
+            self.assertIs(service._pipeline, pipeline)
+
+    def test_zero_timeout_releases_as_soon_as_the_queue_drains(self) -> None:
+        with TemporaryDirectory() as directory:
+            service = self._service(
+                Path(directory), model_idle_timeout_seconds=0.0
+            )
+            service._pipeline = SimpleNamespace()
+
+            service._release_idle_pipeline()
+
+            self.assertIsNone(service._pipeline)
+
+    def test_negative_timeout_disables_the_reaper(self) -> None:
+        with TemporaryDirectory() as directory:
+            service = self._service(
+                Path(directory), model_idle_timeout_seconds=-1.0
+            )
+            pipeline = SimpleNamespace()
+            service._pipeline = pipeline
+            service._pipeline_idle_since = time.monotonic() - 100000.0
+
+            service._release_idle_pipeline()
+
+            self.assertIs(service._pipeline, pipeline)
+
+    def test_keeps_the_pipeline_while_work_is_still_queued(self) -> None:
+        with TemporaryDirectory() as directory:
+            service = self._service(
+                Path(directory), model_idle_timeout_seconds=0.0
+            )
+            pipeline = SimpleNamespace()
+            service._pipeline = pipeline
+            service._queue.put("pending-job")
+
+            service._release_idle_pipeline()
+
+            self.assertIs(service._pipeline, pipeline)
+
+    def test_never_unloads_underneath_a_running_job(self) -> None:
+        with TemporaryDirectory() as directory:
+            service = self._service(
+                Path(directory), model_idle_timeout_seconds=0.0
+            )
+            pipeline = SimpleNamespace()
+            service._pipeline = pipeline
+            service._pipeline_idle_since = time.monotonic() - 100000.0
+            held = threading.Event()
+            release = threading.Event()
+
+            def hold_the_job_lock() -> None:
+                with service._pipeline_lock:
+                    held.set()
+                    release.wait(5)
+
+            worker = threading.Thread(target=hold_the_job_lock)
+            worker.start()
+            try:
+                self.assertTrue(held.wait(5))
+                service._release_idle_pipeline()
+                self.assertIs(service._pipeline, pipeline)
+            finally:
+                release.set()
+                worker.join(5)
+
+            service._release_idle_pipeline()
+            self.assertIsNone(service._pipeline)
+
+    def test_health_reports_the_idle_budget(self) -> None:
+        with TemporaryDirectory() as directory:
+            service = self._service(
+                Path(directory), model_idle_timeout_seconds=120.0
+            )
+
+            self.assertEqual(
+                service.health()["model_idle_timeout_seconds"], 120.0
+            )
+            self.assertIsNone(service.health()["model_idle_seconds"])
+
+            service._pipeline = SimpleNamespace()
+            service._pipeline_idle_since = time.monotonic() - 30.0
+
+            self.assertAlmostEqual(
+                service.health()["model_idle_seconds"], 30.0, delta=1.0
+            )
+
+    def test_reads_the_idle_limit_from_the_environment(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"HF_TOKEN": "x", "STT_MODEL_IDLE_TIMEOUT_SECONDS": "45"},
+        ):
+            self.assertEqual(
+                STTAPISettings.from_env().model_idle_timeout_seconds, 45.0
+            )
+
+    def test_defaults_to_a_fifteen_minute_idle_limit(self) -> None:
+        with patch.dict(os.environ, {"HF_TOKEN": "x"}, clear=False):
+            os.environ.pop("STT_MODEL_IDLE_TIMEOUT_SECONDS", None)
+            self.assertEqual(
+                STTAPISettings.from_env().model_idle_timeout_seconds, 900.0
+            )

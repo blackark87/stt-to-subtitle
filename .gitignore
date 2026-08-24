@@ -1363,3 +1363,6 @@ tags
 # Recorded WhisperJAV payloads hold transcribed dialogue; keep them local.
 /tests/golden/whisperjav/*_baseline*.json
 /tests/golden/whisperjav/*_candidate*.json
+
+# 대시보드 개편 초안 (design/) — 루트의 "ignore everything" 규칙에서 예외 처리
+!design/**

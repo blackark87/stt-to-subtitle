@@ -1402,9 +1402,18 @@ class SubtitleOrchestrator:
         return retried
 
     def retry_all_jobs(self) -> int:
+        return self.retry_jobs(
+            [job.id for job in self.store.list_open_jobs()]
+        )
+
+    def retry_jobs(self, job_ids: Sequence[str]) -> int:
         retried_count = 0
-        for listed in self.store.list_open_jobs():
-            if not listed.can_retry:
+        unique_job_ids = tuple(
+            dict.fromkeys(job_id.strip() for job_id in job_ids if job_id.strip())
+        )
+        for job_id in unique_job_ids:
+            listed = self.store.get(job_id)
+            if listed is None or not listed.can_retry:
                 continue
             try:
                 self.retry(listed.id)

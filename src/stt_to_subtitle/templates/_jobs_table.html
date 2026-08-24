@@ -6,6 +6,7 @@
   {% set is_failed = job.status == 'failed' %}
   {% set is_completed = job.status in ['audio_completed', 'transcription_completed', 'completed'] %}
   {% set can_translate = job.id in translatable_job_ids %}
+  {% set can_retry = job.id in retriable_job_ids %}
   {% set can_stop = job.id in stoppable_job_ids %}
   {% set status_group = 'running' if is_running else ('blocked' if is_blocked else ('failed' if is_failed else ('completed' if is_completed else 'waiting'))) %}
   <article class="recent-job-item recent-job-{{ job.status }}{% if is_completed %} is-completed{% endif %}">
@@ -19,6 +20,14 @@
             form="selected-translation-form"
             data-translation-job-checkbox
             aria-label="{{ job.source_rel|filename }} 번역 선택"
+          >
+        {% elif can_retry %}
+          <input
+            type="checkbox"
+            value="{{ job.id }}"
+            form="selected-retry-form"
+            data-retry-job-checkbox
+            aria-label="{{ job.source_rel|filename }} 재시도 선택"
           >
         {% elif can_stop %}
           <input
@@ -127,7 +136,7 @@
         <form method="post" action="/jobs/{{ job.id }}/resume-translation">
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
           <input type="hidden" name="return_folder" value="{{ current_folder }}">
-          <button type="submit" class="compact">{{ icons.play(14) }}번역 이어 하기</button>
+          <button type="submit" class="secondary compact">{{ icons.play(14) }}번역 이어 하기</button>
         </form>
       {% endif %}
       {% if job.status == "completed" and job.transcript_path %}
@@ -158,10 +167,11 @@
 
 <section class="job-list-section">
   <div class="section-heading compact-heading job-list-heading">
-    <div>
-      <h3>{{ job_list_title|default("전체 작업") }}</h3>
+    <div class="job-list-heading-copy">
+      <h2>{{ job_list_title|default("전체 작업") }}</h2>
+      <span class="job-list-scope">현재 목록 {{ job_count }}개{% if retriable_selection_count %} · 재시도 가능 {{ retriable_selection_count }}개{% endif %}</span>
     </div>
-    {% if translatable_job_count or stoppable_selection_count or show_bulk_actions|default(true) %}
+    {% if translatable_job_count or retriable_selection_count or stoppable_selection_count or show_bulk_actions|default(true) %}
     <div class="job-bulk-actions">
       {% if translatable_job_count %}
       <form
@@ -186,6 +196,30 @@
           {% endfor %}
         </select>
         <button type="submit" class="compact" data-translate-selected disabled>{{ icons.play(14) }}선택 번역 하기</button>
+      </form>
+      {% endif %}
+      {% if retriable_selection_count %}
+      <form
+        id="selected-retry-form"
+        method="post"
+        action="/jobs/retry-selected"
+        class="job-translation-actions job-retry-actions"
+        data-job-retry-form
+        data-confirm-message="선택한 중단·실패 작업을 마지막으로 저장된 단계부터 재시도하시겠습니까?"
+      >
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="return_folder" value="{{ current_folder }}">
+        <input type="hidden" name="return_status_group" value="{{ selected_status_group or '' }}">
+        <input type="hidden" name="return_stage_filter" value="{{ selected_stage_filter or '' }}">
+        <input type="hidden" name="return_jobs_page" value="{{ jobs_page }}">
+        {% for job_id in retriable_job_ids %}
+          <input type="hidden" value="{{ job_id }}" data-retry-job-candidate>
+        {% endfor %}
+        <span data-retry-selected-inputs></span>
+        <span class="job-selection-count"><strong data-retry-selection-count>0</strong>개 선택</span>
+        <button type="button" class="secondary compact" data-select-retry-jobs>목록 전체 선택</button>
+        <button type="button" class="secondary compact" data-clear-retry-jobs>선택 해제</button>
+        <button type="submit" class="compact" data-retry-selected disabled>{{ icons.refresh(14) }}선택 재시도</button>
       </form>
       {% endif %}
       {% if stoppable_selection_count %}
@@ -213,19 +247,28 @@
       </form>
       {% endif %}
       {% if show_bulk_actions|default(true) %}
-      <form method="post" action="/jobs/retry-all" data-confirm-message="중단 또는 실패한 모든 작업을 마지막으로 저장된 단계부터 재시도하시겠습니까?">
+      <form class="job-global-action" method="post" action="/jobs/retry-all" data-confirm-message="필터와 관계없이 중단 또는 실패한 모든 작업을 마지막으로 저장된 단계부터 재시도하시겠습니까?">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <input type="hidden" name="return_folder" value="{{ current_folder }}">
-        <button type="submit" class="compact"{% if not retriable_job_count %} disabled{% endif %}>{{ icons.refresh(14) }}전체 재시도 ({{ retriable_job_count }})</button>
+        <input type="hidden" name="return_status_group" value="{{ selected_status_group or '' }}">
+        <input type="hidden" name="return_stage_filter" value="{{ selected_stage_filter or '' }}">
+        <input type="hidden" name="return_jobs_page" value="{{ jobs_page }}">
+        <button type="submit" class="secondary compact"{% if not retriable_job_count %} disabled{% endif %}>{{ icons.refresh(14) }}중단·실패 전체 재시도 ({{ retriable_job_count }})</button>
       </form>
-      <form method="post" action="/jobs/pause-all-translations" data-confirm-message="대기·실행 중인 모든 번역을 중단하시겠습니까? 오디오 추출과 전사는 계속 진행됩니다.">
+      <form class="job-global-action" method="post" action="/jobs/pause-all-translations" data-confirm-message="대기·실행 중인 모든 번역을 중단하시겠습니까? 오디오 추출과 전사는 계속 진행됩니다.">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <input type="hidden" name="return_folder" value="{{ current_folder }}">
+        <input type="hidden" name="return_status_group" value="{{ selected_status_group or '' }}">
+        <input type="hidden" name="return_stage_filter" value="{{ selected_stage_filter or '' }}">
+        <input type="hidden" name="return_jobs_page" value="{{ jobs_page }}">
         <button type="submit" class="secondary compact"{% if not pausable_translation_count %} disabled{% endif %}>{{ icons.pause(14) }}전체 번역 중단 ({{ pausable_translation_count }})</button>
       </form>
-      <form method="post" action="/jobs/stop-all" data-confirm-message="진행·대기 중인 모든 작업을 중단하시겠습니까? 완료된 작업과 결과 파일은 유지됩니다.">
+      <form class="job-global-action" method="post" action="/jobs/stop-all" data-confirm-message="진행·대기 중인 모든 작업을 중단하시겠습니까? 완료된 작업과 결과 파일은 유지됩니다.">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <input type="hidden" name="return_folder" value="{{ current_folder }}">
+        <input type="hidden" name="return_status_group" value="{{ selected_status_group or '' }}">
+        <input type="hidden" name="return_stage_filter" value="{{ selected_stage_filter or '' }}">
+        <input type="hidden" name="return_jobs_page" value="{{ jobs_page }}">
         <button type="submit" class="danger compact"{% if not stoppable_job_count %} disabled{% endif %}>{{ icons.alert_triangle(14) }}전체 작업 중단 ({{ stoppable_job_count }})</button>
       </form>
       {% endif %}

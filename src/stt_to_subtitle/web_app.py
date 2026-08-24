@@ -765,6 +765,16 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             if paginated
             else set()
         )
+        retriable_job_ids = (
+            {
+                job.id
+                for job in all_visible_jobs
+                if job.can_retry
+                and (statuses is None or job.status in statuses)
+            }
+            if paginated
+            else set()
+        )
 
         def page_location(page: int) -> str:
             if folder:
@@ -792,6 +802,8 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             "translatable_job_count": len(translatable_job_ids),
             "stoppable_job_ids": stoppable_job_ids,
             "stoppable_selection_count": len(stoppable_job_ids),
+            "retriable_job_ids": retriable_job_ids,
+            "retriable_selection_count": len(retriable_job_ids),
             "stoppable_job_count": sum(job.can_stop for job in open_jobs),
             "retriable_job_count": sum(job.can_retry for job in open_jobs),
             "pausable_translation_count": sum(
@@ -819,7 +831,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                 if filtered
                 else "등록된 작업이 없습니다."
             ),
-            "show_bulk_actions": not filtered,
+            "show_bulk_actions": paginated,
             "selected_status_group": status_group,
             "selected_stage_filter": stage_filter,
             "selected_stage_group": (
@@ -1680,6 +1692,9 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         stage_filter: str = "",
         jobs_page: int = 1,
         translations_queued: int | None = None,
+        translations_paused: int | None = None,
+        jobs_stopped: int | None = None,
+        jobs_retried: int | None = None,
     ) -> Any:
         if not is_authenticated(request):
             return login_redirect()
@@ -1706,7 +1721,22 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                     f"선택한 전사 작업 {translations_queued}개를 번역으로 "
                     "전환했습니다."
                     if translations_queued is not None
-                    else None
+                    else (
+                        f"번역 작업 {translations_paused}개에 중단을 "
+                        "요청했습니다."
+                        if translations_paused is not None
+                        else (
+                            f"진행 중인 작업 {jobs_stopped}개에 중단을 "
+                            "요청했습니다."
+                            if jobs_stopped is not None
+                            else (
+                                f"작업 {jobs_retried}개를 "
+                                "재시도했습니다."
+                                if jobs_retried is not None
+                                else None
+                            )
+                        )
+                    )
                 ),
                 "error": None,
             }
@@ -2047,6 +2077,8 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                         "translatable_job_count": 0,
                         "stoppable_job_ids": set(),
                         "stoppable_selection_count": 0,
+                        "retriable_job_ids": set(),
+                        "retriable_selection_count": 0,
                     }
                 )
         except ValueError as error:
@@ -2969,16 +3001,26 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         request: Request,
         csrf_token: str = Form(""),
         return_folder: str = Form(""),
+        return_status_group: str = Form(""),
+        return_stage_filter: str = Form(""),
+        return_jobs_page: int = Form(1),
     ) -> Any:
         if not is_authenticated(request):
             return login_redirect()
         validate_csrf(request, csrf_token)
+        try:
+            return_location = job_list_action_location(
+                return_folder=return_folder,
+                return_status_group=return_status_group,
+                return_stage_filter=return_stage_filter,
+                return_jobs_page=return_jobs_page,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
         paused_count = orchestrator(request).pause_all_translations()
+        separator = "&" if "?" in return_location else "?"
         return RedirectResponse(
-            dashboard_location(
-                return_folder,
-                translations_paused=paused_count,
-            ),
+            f"{return_location}{separator}translations_paused={paused_count}",
             status_code=status.HTTP_303_SEE_OTHER,
         )
 
@@ -2987,13 +3029,26 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         request: Request,
         csrf_token: str = Form(""),
         return_folder: str = Form(""),
+        return_status_group: str = Form(""),
+        return_stage_filter: str = Form(""),
+        return_jobs_page: int = Form(1),
     ) -> Any:
         if not is_authenticated(request):
             return login_redirect()
         validate_csrf(request, csrf_token)
+        try:
+            return_location = job_list_action_location(
+                return_folder=return_folder,
+                return_status_group=return_status_group,
+                return_stage_filter=return_stage_filter,
+                return_jobs_page=return_jobs_page,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
         stopped_count = orchestrator(request).stop_all_jobs()
+        separator = "&" if "?" in return_location else "?"
         return RedirectResponse(
-            dashboard_location(return_folder, jobs_stopped=stopped_count),
+            f"{return_location}{separator}jobs_stopped={stopped_count}",
             status_code=status.HTTP_303_SEE_OTHER,
         )
 
@@ -3036,13 +3091,64 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         request: Request,
         csrf_token: str = Form(""),
         return_folder: str = Form(""),
+        return_status_group: str = Form(""),
+        return_stage_filter: str = Form(""),
+        return_jobs_page: int = Form(1),
     ) -> Any:
         if not is_authenticated(request):
             return login_redirect()
         validate_csrf(request, csrf_token)
+        try:
+            return_location = job_list_action_location(
+                return_folder=return_folder,
+                return_status_group=return_status_group,
+                return_stage_filter=return_stage_filter,
+                return_jobs_page=(
+                    1
+                    if return_status_group or return_stage_filter
+                    else return_jobs_page
+                ),
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
         retried_count = orchestrator(request).retry_all_jobs()
+        separator = "&" if "?" in return_location else "?"
         return RedirectResponse(
-            dashboard_location(return_folder, jobs_retried=retried_count),
+            f"{return_location}{separator}jobs_retried={retried_count}",
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+
+    @app.post("/jobs/retry-selected")
+    def retry_selected_jobs(
+        request: Request,
+        job_ids: list[str] | None = Form(None),
+        csrf_token: str = Form(""),
+        return_folder: str = Form(""),
+        return_status_group: str = Form(""),
+        return_stage_filter: str = Form(""),
+        return_jobs_page: int = Form(1),
+    ) -> Any:
+        if not is_authenticated(request):
+            return login_redirect()
+        validate_csrf(request, csrf_token)
+        redirect_page = (
+            1
+            if return_status_group or return_stage_filter
+            else return_jobs_page
+        )
+        try:
+            return_location = job_list_action_location(
+                return_folder=return_folder,
+                return_status_group=return_status_group,
+                return_stage_filter=return_stage_filter,
+                return_jobs_page=redirect_page,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        retried_count = orchestrator(request).retry_jobs(job_ids or [])
+        separator = "&" if "?" in return_location else "?"
+        return RedirectResponse(
+            f"{return_location}{separator}jobs_retried={retried_count}",
             status_code=status.HTTP_303_SEE_OTHER,
         )
 

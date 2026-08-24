@@ -1,0 +1,82 @@
+{% import "_icons.html" as icons %}
+{#
+  사용률은 시간에 따라 변하는 값이라 미터(막대)가 아니라 스파크라인으로 그린다.
+  메모리는 총량 대비 비율이므로 미터가 맞다. 온도·전력은 순간값이라 한계값만 옆에 적는다.
+#}
+<section class="card">
+  <div class="card-head">
+    <h2>GPU {{ gpu.index }}</h2>
+    <span class="sub code">{{ gpu.display_name }}</span>
+  </div>
+
+  {% if not gpu.available %}
+    <div class="card-body">
+      <div class="pn" style="border-style: dashed; text-align: center; color: var(--muted); font-size: .84rem">
+        GPU 지표를 불러오지 못했습니다
+      </div>
+    </div>
+  {% else %}
+    <div class="card-body">
+      <div class="pn inset" style="padding: 12px">
+        <div style="display: flex; align-items: baseline; gap: 8px">
+          <span class="pn-l" style="margin: 0">사용률</span>
+          {% if gpu.utilization_percent >= 90 %}
+            <span class="b wait dot" style="margin-left: auto">{{ icons.activity(12) }}높음</span>
+          {% endif %}
+        </div>
+        <div style="display: flex; align-items: flex-end; gap: 12px; margin-top: 2px">
+          <span class="pn-v" style="font-size: 1.7rem">{{ gpu.utilization_percent }}<small>%</small></span>
+          {% if gpu.utilization_history %}
+            {% set pts = gpu.utilization_history | sparkline %}
+            {% set recent = gpu.utilization_history[-3:] | sparkline %}
+            <svg viewBox="0 0 240 36" preserveAspectRatio="none" style="flex: 1; min-width: 0; height: 36px"
+                 role="img" aria-label="최근 5분 사용률 최저 {{ gpu.utilization_min }}% 평균 {{ gpu.utilization_avg }}% 현재 {{ gpu.utilization_percent }}%">
+              <polyline points="{{ pts }}" fill="none" stroke="var(--muted)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" vector-effect="non-scaling-stroke" opacity=".45"/>
+              <polyline points="{{ recent }}" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" vector-effect="non-scaling-stroke" transform="translate({{ (240 * (gpu.utilization_history | length - 3) / (gpu.utilization_history | length - 1)) | round(1) }} 0)"/>
+              <circle cx="236" cy="{{ (34 - gpu.utilization_percent / 100 * 30) | round(1) }}" r="3" fill="var(--accent)"/>
+            </svg>
+          {% endif %}
+        </div>
+        <span class="pn-d" style="margin-top: 5px">최근 5분 · 최저 {{ gpu.utilization_min }}% · 평균 {{ gpu.utilization_avg }}%</span>
+      </div>
+
+      <div class="pn inset" style="padding: 12px; margin-top: 8px">
+        <div style="display: flex; align-items: baseline; gap: 8px">
+          <span class="pn-l" style="margin: 0">메모리</span>
+          <span class="code" style="margin-left: auto; font-size: .72rem; color: var(--muted)">
+            {{ "%.1f"|format(gpu.memory_used_gib) }} / {{ "%.1f"|format(gpu.memory_total_gib) }} GiB
+          </span>
+        </div>
+        <span class="pn-v" style="font-size: 1.7rem">{{ gpu.memory_percent }}<small>%</small></span>
+        <div class="bar{% if gpu.memory_percent >= 95 %} crit{% elif gpu.memory_percent >= 85 %} warn{% endif %}" style="height: 8px; margin-top: 8px">
+          <i style="width: {{ gpu.memory_percent }}%"></i>
+        </div>
+      </div>
+
+      <div style="display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 8px">
+        <div class="pn inset">
+          <span class="pn-l">온도</span>
+          <span class="pn-v">{{ gpu.temperature_celsius }}<small>°C</small></span>
+          <span class="pn-d">한계 {{ gpu.temperature_limit }}°C</span>
+        </div>
+        <div class="pn inset">
+          <span class="pn-l">전력</span>
+          <span class="pn-v">{{ gpu.power_watts }}<small>W</small></span>
+          <span class="pn-d">한계 {{ gpu.power_limit }}W</span>
+        </div>
+      </div>
+
+      {% if gpu.loaded %}
+        <div class="pn" style="margin-top: 10px; display: grid; gap: 6px">
+          <span class="pn-l" style="margin: 0">로드된 모델</span>
+          {% for model in gpu.loaded %}
+            <div class="kv">
+              <span>{{ model.name }}</span>
+              <span{% if model.active %} style="color: var(--accent)"{% else %} class="muted m"{% endif %}>{{ model.state }}</span>
+            </div>
+          {% endfor %}
+        </div>
+      {% endif %}
+    </div>
+  {% endif %}
+</section>

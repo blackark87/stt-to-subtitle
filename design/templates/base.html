@@ -1,0 +1,57 @@
+{% import "_icons.html" as icons %}
+<!doctype html>
+<html lang="ko"{% if theme %} data-theme="{{ theme }}"{% endif %}>
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{% block title %}STT to Subtitle{% endblock %}</title>
+    {% if preview %}
+      <link rel="stylesheet" href="app.css">
+    {% else %}
+      <link rel="stylesheet" href="{{ url_for('static', path='/app.css') }}">
+    {% endif %}
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+    {% block head %}{% endblock %}
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <a class="brand" href="/">
+          <span class="brand-mark" aria-hidden="true">{{ icons.captions(16) }}</span>
+          <span class="brand-copy"><strong>STT</strong><small>to Subtitle</small></span>
+        </a>
+        <nav class="primary-nav" aria-label="주요 메뉴">
+          {% set nav = [
+            ('dashboard', '/', icons.dashboard, '대시보드', none),
+            ('media', '/media', icons.folder, '미디어', none),
+            ('jobs', '/jobs', icons.activity, '작업 목록', jobs_badge),
+            ('comparisons', '/comparisons', icons.compare, '전사 비교', none),
+            ('settings', '/settings', icons.settings, '설정', none),
+          ] %}
+          {% for key, href, icon, label, badge in nav %}
+            <a href="{{ href }}"{% if key == active_nav %} class="is-active" aria-current="page"{% endif %}>
+              {{ icon(17) }}<span>{{ label }}</span>{% if badge %}<span class="n">{{ badge }}</span>{% endif %}
+            </a>
+          {% endfor %}
+        </nav>
+        <div class="sidebar-foot">
+          <form method="post" action="/logout">
+            <button type="submit" class="btn sec sm" style="width: 100%; justify-content: flex-start; border-color: transparent; background: transparent; color: var(--muted)">
+              {{ icons.log_out(15) }}<span>로그아웃</span>
+            </button>
+          </form>
+        </div>
+      </aside>
+
+      <div class="frame">
+        <header class="topbar">
+          {% block topbar %}<h1>{{ self.title() }}</h1>{% endblock %}
+        </header>
+        <main class="content">
+          {% block content %}{% endblock %}
+        </main>
+      </div>
+    </div>
+  </body>
+</html>

@@ -1,0 +1,21 @@
+{# 배우 아바타. 사진은 라이브러리의 .actors/<이름>.jpg 를 전용 라우트로 내려준다.
+   사진이 없으면 실루엣으로 대체한다 — 이름 이니셜은 쓰지 않는다. #}
+{% macro avatar(actor, size=24) %}
+<span class="av{% if size != 24 %} s{{ size }}{% endif %}">
+  {%- if actor and actor.image_url -%}
+    <img src="{{ actor.image_url }}" alt="{{ actor.name }}" loading="lazy">
+  {%- else -%}
+    <svg viewBox="0 0 40 40" aria-hidden="true">
+      <rect width="40" height="40" fill="var(--well)"/>
+      <circle cx="20" cy="15.4" r="6.6" fill="var(--line-strong)"/>
+      <path d="M6.4 40c1.7-7.7 7.1-11.7 13.6-11.7S32 32.3 33.6 40Z" fill="var(--line-strong)"/>
+    </svg>
+  {%- endif -%}
+</span>
+{% endmacro %}
+
+{% macro chip(actor) %}
+  {%- if actor -%}
+    <span class="chip">{{ avatar(actor) }}{{ actor.name }}</span>
+  {%- endif -%}
+{% endmacro %}
