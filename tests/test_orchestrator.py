@@ -1031,6 +1031,73 @@ class SubtitleOrchestratorTests(unittest.TestCase):
             self.assertIsNone(failed.error)
             self.assertEqual(queued.status, "queued")
 
+    def test_retries_only_selected_blocked_and_failed_jobs(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            orchestrator = self.make_orchestrator(root, media_root)
+            try:
+                blocked = orchestrator.store.create(
+                    job_id="selected-blocked",
+                    source_rel="selected-blocked.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                orchestrator.store.update(
+                    blocked.id,
+                    status="blocked",
+                    blocked_stage="audio extraction",
+                    error="stopped",
+                )
+                failed = orchestrator.store.create(
+                    job_id="selected-failed",
+                    source_rel="selected-failed.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                orchestrator.store.update(
+                    failed.id,
+                    status="failed",
+                    blocked_stage="translation",
+                    error="failed",
+                )
+                untouched = orchestrator.store.create(
+                    job_id="untouched-blocked",
+                    source_rel="untouched-blocked.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                orchestrator.store.update(untouched.id, status="blocked")
+                queued = orchestrator.store.create(
+                    job_id="already-queued",
+                    source_rel="already-queued.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+
+                retried_count = orchestrator.retry_jobs(
+                    [
+                        blocked.id,
+                        failed.id,
+                        blocked.id,
+                        queued.id,
+                        "missing",
+                    ]
+                )
+                blocked = orchestrator.store.get(blocked.id)
+                failed = orchestrator.store.get(failed.id)
+                untouched = orchestrator.store.get(untouched.id)
+                queued = orchestrator.store.get(queued.id)
+            finally:
+                orchestrator.stop()
+
+            self.assertEqual(retried_count, 2)
+            self.assertEqual(blocked.status, "queued")
+            self.assertEqual(failed.status, "queued")
+            self.assertEqual(untouched.status, "blocked")
+            self.assertEqual(queued.status, "queued")
+
     def test_retry_reduces_legacy_whisperx_chunk_to_native_window(
         self,
     ) -> None:

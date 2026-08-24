@@ -846,7 +846,17 @@ th, td { border-bottom: 1px solid var(--line); padding: 10px 8px; text-align: le
 .job-list-section { display: grid; gap: 12px; margin-top: 0; }
 .dashboard-jobs-card .job-list-section { margin-top: 16px; }
 .job-list-section > h2, .compact-heading h2, .compact-heading h3 { margin: 0; }
-.job-list-heading { align-items: flex-end; }
+.job-list-heading {
+  align-items: center;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-card);
+  padding: 10px 12px;
+  background: color-mix(in srgb, var(--card) 94%, transparent);
+  box-shadow: var(--shadow-sm);
+  backdrop-filter: blur(12px);
+}
+.job-list-heading-copy { display: grid; gap: 2px; min-width: max-content; }
+.job-list-scope { color: var(--muted); font-size: .76rem; white-space: nowrap; }
 .job-bulk-actions { display: flex; justify-content: flex-end; gap: 7px; flex-wrap: wrap; }
 .job-bulk-actions form { margin: 0; }
 .job-translation-actions {
@@ -957,6 +967,9 @@ th, td { border-bottom: 1px solid var(--line); padding: 10px 8px; text-align: le
 .editor-status { min-height: 1.5em; margin: 0; }
 .editor-note { font-size: .88rem; }
 code { overflow-wrap: anywhere; }
+@media (min-width: 761px) {
+  .job-list-heading { position: sticky; top: 12px; z-index: 12; }
+}
 @media (max-width: 1100px) {
   .app-shell { grid-template-columns: 210px minmax(0, 1fr); }
   .container { padding-right: 24px; padding-left: 24px; }
@@ -1155,12 +1168,15 @@ code { overflow-wrap: anywhere; }
   .job-list-heading { display: grid; grid-template-columns: minmax(0, 1fr); width: 100%; }
   .job-bulk-actions {
     display: grid;
-    grid-template-columns: minmax(0, 1fr);
+    grid-template-columns: repeat(2, minmax(0, 1fr));
     width: 100%;
     min-width: 0;
   }
   .job-bulk-actions > form { width: 100%; min-width: 0; }
   .job-bulk-actions > form > button { width: 100%; }
+  .job-bulk-actions > .job-translation-actions { grid-column: 1 / -1; }
+  .job-list-heading-copy { min-width: 0; }
+  .job-list-scope { white-space: normal; }
   .job-translation-actions {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1170,7 +1186,8 @@ code { overflow-wrap: anywhere; }
   .job-translation-actions .job-selection-count,
   .job-translation-actions select,
   .job-translation-actions [data-translate-selected],
-  .job-translation-actions [data-stop-selected] {
+  .job-translation-actions [data-stop-selected],
+  .job-translation-actions [data-retry-selected] {
     grid-column: 1 / -1;
     width: 100%;
     max-width: none;

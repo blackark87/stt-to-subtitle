@@ -2177,6 +2177,120 @@ class WebAppTests(unittest.TestCase):
             self.assertEqual(failed.status, "queued")
             self.assertEqual(queued.status, "queued")
 
+    def test_filtered_job_list_retries_selected_jobs_across_pages(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+
+            with TestClient(create_app(self.settings(root, media_root))) as client:
+                service = client.app.state.orchestrator
+                service.stop()
+                blocked_jobs = []
+                for index in range(25):
+                    job = service.store.create(
+                        job_id=f"blocked-{index:02d}",
+                        source_rel=f"blocked-{index:02d}.mkv",
+                        force_overwrite=False,
+                        options={},
+                    )
+                    service.store.update(
+                        job.id,
+                        status="blocked",
+                        blocked_stage="transcription",
+                        error="stopped",
+                    )
+                    blocked_jobs.append(job)
+                failed = service.store.create(
+                    job_id="failed-not-selected",
+                    source_rel="failed-not-selected.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                service.store.update(failed.id, status="failed")
+
+                blocked_page = client.get(
+                    "/jobs?status_group=blocked&jobs_page=1"
+                )
+                failed_page = client.get("/jobs?status_group=failed")
+                response = client.post(
+                    "/jobs/retry-selected",
+                    data={
+                        "job_ids": [
+                            blocked_jobs[0].id,
+                            blocked_jobs[-1].id,
+                        ],
+                        "return_status_group": "blocked",
+                        "return_jobs_page": "2",
+                    },
+                    follow_redirects=False,
+                )
+                notice = client.get(response.headers["location"])
+                selected = [
+                    service.store.get(blocked_jobs[0].id),
+                    service.store.get(blocked_jobs[-1].id),
+                ]
+                untouched = service.store.get(blocked_jobs[1].id)
+                failed = service.store.get(failed.id)
+                global_response = client.post(
+                    "/jobs/retry-all",
+                    data={
+                        "return_status_group": "blocked",
+                        "return_jobs_page": "2",
+                    },
+                    follow_redirects=False,
+                )
+                global_notice = client.get(
+                    global_response.headers["location"]
+                )
+                remaining_blocked = service.store.get(blocked_jobs[1].id)
+                remaining_failed = service.store.get(failed.id)
+
+            self.assertEqual(blocked_page.status_code, 200)
+            self.assertEqual(
+                blocked_page.text.count("data-retry-job-checkbox"),
+                20,
+            )
+            self.assertEqual(
+                blocked_page.text.count("data-retry-job-candidate"),
+                25,
+            )
+            self.assertIn(
+                'action="/jobs/retry-selected"',
+                blocked_page.text,
+            )
+            self.assertIn("목록 전체 선택", blocked_page.text)
+            self.assertIn("선택 재시도", blocked_page.text)
+            self.assertIn("중단·실패 전체 재시도 (26)", blocked_page.text)
+            self.assertEqual(
+                failed_page.text.count("data-retry-job-checkbox"),
+                1,
+            )
+            self.assertEqual(
+                failed_page.text.count("data-retry-job-candidate"),
+                1,
+            )
+            self.assertEqual(response.status_code, 303)
+            self.assertEqual(
+                response.headers["location"],
+                "/jobs?status_group=blocked&jobs_page=1&jobs_retried=2",
+            )
+            self.assertIn(
+                "작업 2개를 재시도했습니다.",
+                notice.text,
+            )
+            self.assertTrue(all(job.status == "queued" for job in selected))
+            self.assertEqual(untouched.status, "blocked")
+            self.assertEqual(failed.status, "failed")
+            self.assertEqual(global_response.status_code, 303)
+            self.assertEqual(
+                global_response.headers["location"],
+                "/jobs?status_group=blocked&jobs_page=1&jobs_retried=24",
+            )
+            self.assertIn("작업 24개를 재시도했습니다.", global_notice.text)
+            self.assertEqual(remaining_blocked.status, "queued")
+            self.assertEqual(remaining_failed.status, "queued")
+
     def test_all_jobs_are_merged_and_paginated_by_creation_time(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
