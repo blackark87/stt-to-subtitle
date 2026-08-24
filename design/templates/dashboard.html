@@ -1,0 +1,226 @@
+{% extends "base.html" %}
+{% import "_icons.html" as icons %}
+{% import "_actor.html" as actor_ui %}
+{% block title %}대시보드{% endblock %}
+
+{% block topbar %}
+  <h1>대시보드</h1>
+  <span class="btns" style="gap: 5px">
+    <a class="b run dot" href="/jobs?group=running">실행 {{ job_stats.running }}</a>
+    <a class="b wait dot" href="/jobs?group=waiting">대기 {{ job_stats.waiting }}</a>
+    <a class="b hold dot" href="/jobs?group=stopped&amp;state=blocked">중단 {{ job_stats.blocked }}</a>
+    <a class="b bad dot" href="/jobs?group=stopped&amp;state=failed">실패 {{ job_stats.failed }}</a>
+    <a class="b ok dot" href="/jobs?group=completed">완료 {{ job_stats.completed }}</a>
+  </span>
+  <span class="topbar-meta m" style="margin-left: auto">{{ updated_at }} 갱신</span>
+  <button type="button" class="btn sec sm" data-refresh>{{ icons.refresh(14) }}새로고침</button>
+  <a class="btn sm" href="/media">{{ icons.folder(14) }}새 작업</a>
+{% endblock %}
+
+{% block content %}
+
+<section class="card">
+  <div class="card-head">
+    <h2>파이프라인</h2>
+    <span class="sub m">{{ pipeline_slots | selectattr('job') | list | length }} / {{ pipeline_slots | length }} 슬롯</span>
+  </div>
+  <div class="card-body">
+    <div style="display: grid; grid-template-columns: repeat({{ pipeline_slots | length }}, minmax(0, 1fr)); gap: 10px">
+      {% for slot in pipeline_slots %}
+        <div class="pn{% if not slot.job %} is-idle{% endif %}"
+             {% if slot.job %}style="border-color: var(--accent-line-soft); background: var(--accent-08)"
+             {% else %}style="border-style: dashed; background: transparent"{% endif %}>
+          <div style="display: flex; align-items: center; gap: 7px; margin-bottom: 7px">
+            <span class="b line">{{ slot.stage }}</span>
+            {% if slot.job %}<span class="b run dot">실행</span>{% else %}<span class="b">유휴</span>{% endif %}
+          </div>
+          <div class="t-name">
+            <b{% if not slot.job %} style="color: var(--muted); font-weight: 650"{% endif %}>{{ slot.job or "비어 있음" }}</b>
+            <span class="m">{{ slot.detail or "&nbsp;" | safe }}</span>
+          </div>
+          {% if slot.job %}
+            <div style="display: flex; align-items: center; gap: 8px; margin-top: 8px">
+              <div class="bar"><i style="width: {{ slot.percent }}%"></i></div>
+              <span class="m" style="font-size: .74rem; font-weight: 600">{{ slot.percent }}%</span>
+            </div>
+          {% else %}
+            <div style="height: 14px"></div>
+          {% endif %}
+        </div>
+      {% endfor %}
+    </div>
+  </div>
+</section>
+
+<div style="display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 14px; align-items: start">
+  <div style="display: grid; gap: 14px">
+
+    <section class="card">
+      <div class="card-head">
+        <h2>실행 중</h2>
+        <span class="btns">
+          <form method="post" action="/jobs/pause-running"><button type="submit" class="btn sec sm">{{ icons.pause(13) }}전체 일시중지</button></form>
+          <form method="post" action="/jobs/stop-running"><button type="submit" class="btn dgr sm">{{ icons.alert_triangle(13) }}전체 중단</button></form>
+        </span>
+      </div>
+      <div class="card-body flush">
+        <div class="tbl">
+          <div class="tr head" style="grid-template-columns: minmax(0, 1fr) 368px 88px 116px">
+            <span>작업</span><span>단계</span><span class="r">진행</span><span class="r">남은 시간</span>
+          </div>
+          {% for job in running_jobs %}
+            <div class="tr tall on-run" style="grid-template-columns: minmax(0, 1fr) 368px 88px 116px">
+              <div class="t-name">
+                <b><a href="/jobs/{{ job.id }}">{{ job.source_rel | filename }}</a></b>
+                <span>{{ job.source_rel | parent_path }} · {{ job.backend_label }} · {{ job.prompt_label }}</span>
+              </div>
+              <ol class="stages" aria-label="{{ job.source_rel | filename }} 단계">
+                {% for stage in job.stages %}
+                  <li class="st {{ {'done':'done','running':'run','failed':'fail','blocked':'hold','waiting':'wait'}.get(stage.state, 'idle') }}">
+                    <span class="st-i" aria-hidden="true">
+                      {%- if stage.state == 'done' %}{{ icons.check(11) }}
+                      {%- elif stage.state == 'running' %}{{ icons.activity(11) }}
+                      {%- elif stage.state == 'failed' %}{{ icons.alert_triangle(11) }}
+                      {%- else %}{{ icons.clock(11) }}{% endif -%}
+                    </span>
+                    <span class="st-l">{{ stage.label }}</span>
+                    <span class="st-c">
+                      {%- if stage.total -%}
+                        {{ stage.completed }}/{% if stage.total_is_estimate %}≈{% endif %}{{ stage.total }}
+                      {%- elif stage.state == 'done' -%}완료
+                      {%- elif stage.state == 'running' -%}{{ stage.percent }}%
+                      {%- else -%}대기{% endif -%}
+                    </span>
+                    <div class="bar"><i style="width: {{ stage.percent }}%"></i></div>
+                  </li>
+                {% endfor %}
+              </ol>
+              <span class="r m" style="font-size: .95rem; font-weight: 600; color: var(--accent)">{{ job.percent }}%</span>
+              <span class="r m" style="font-size: .8rem; color: var(--muted)">{{ job.eta_seconds | approx_minutes }}</span>
+            </div>
+          {% else %}
+            <div class="tr empty" style="grid-template-columns: minmax(0, 1fr)">실행 중인 작업이 없습니다</div>
+          {% endfor %}
+        </div>
+      </div>
+    </section>
+
+    {% if stopped_jobs %}
+      <section class="card" style="border-color: var(--bad-line)">
+        <div class="card-head" style="background: var(--bad-14); border-radius: var(--r-lg) var(--r-lg) 0 0; border-bottom-color: var(--bad-line)">
+          <h2 style="color: var(--bad)">멈춤<span class="n" style="margin-left: 7px; background: rgba(0,0,0,.08)">{{ stopped_jobs | length }}</span></h2>
+          <span class="btns">
+            <form method="post" action="/jobs/retry-stopped"><button type="submit" class="btn sec sm">{{ icons.refresh(13) }}전체 재시도</button></form>
+            <form method="post" action="/jobs/delete-stopped"><button type="submit" class="btn sec sm">{{ icons.trash(13) }}전체 삭제</button></form>
+          </span>
+        </div>
+        <div class="card-body flush">
+          <div class="tbl">
+            <div class="tr head" style="grid-template-columns: 92px minmax(0, 1fr) 250px 168px">
+              <span>상태</span><span>작업</span><span>사유</span><span class="r">동작</span>
+            </div>
+            {% for job in stopped_jobs %}
+              <div class="tr {{ 'on-bad' if job.status == 'failed' else 'on-hold' }}" style="grid-template-columns: 92px minmax(0, 1fr) 250px 168px">
+                <span class="b {{ 'bad' if job.status == 'failed' else 'hold' }} dot">{{ job.status_label }}</span>
+                <div class="t-name">
+                  <b><a href="/jobs/{{ job.id }}">{{ job.source_rel | filename }}</a></b>
+                  <span class="m">{{ job.stage_label }} · {{ job.changed_at }}</span>
+                </div>
+                <span class="m" style="font-size: .76rem; color: var({{ '--bad' if job.status == 'failed' else '--muted' }}); overflow: hidden; text-overflow: ellipsis; white-space: nowrap" title="{{ job.reason }}">{{ job.reason }}</span>
+                <span class="btns" style="justify-content: flex-end">
+                  <form method="post" action="/jobs/{{ job.id }}/{{ 'resume' if job.resume else 'retry' }}">
+                    <button type="submit" class="btn sec sm">{% if job.resume %}{{ icons.play(13) }}재개{% else %}{{ icons.refresh(13) }}재시도{% endif %}</button>
+                  </form>
+                  <form method="post" action="/jobs/{{ job.id }}/delete">
+                    <button type="submit" class="btn dgr sm">{{ icons.trash(13) }}삭제</button>
+                  </form>
+                </span>
+              </div>
+            {% endfor %}
+          </div>
+        </div>
+      </section>
+    {% endif %}
+
+    <section class="card">
+      <div class="card-head">
+        <h2>최근 완료</h2>
+        <a class="btn sec sm" href="/jobs?group=completed">전체 보기{{ icons.chevron_right(13) }}</a>
+      </div>
+      <div class="card-body flush">
+        <div class="tbl">
+          <div class="tr head" style="grid-template-columns: minmax(0, 1fr) 120px 120px 100px">
+            <span>작업</span><span class="r">전사</span><span class="r">번역</span><span class="r">총 소요</span>
+          </div>
+          {% for job in completed_jobs %}
+            <div class="tr on-ok" style="grid-template-columns: minmax(0, 1fr) 120px 120px 100px">
+              <div class="t-name"><b>{{ job.source_rel | filename }}</b><span>{{ job.meta }}</span></div>
+              <span class="r m" style="font-size: .78rem">{{ job.transcription }}</span>
+              <span class="r m" style="font-size: .78rem">{{ job.translation }}</span>
+              <span class="r m" style="font-size: .78rem; font-weight: 600">{{ job.total }}</span>
+            </div>
+          {% endfor %}
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <div style="display: grid; gap: 14px">
+    {% include "_gpu_panel.html" %}
+
+    <section class="card">
+      <div class="card-head">
+        <h2>대기 큐</h2>
+        <span class="sub m">{{ queue | length + queue_rest }}건 · {{ queue_eta }}</span>
+      </div>
+      <div class="card-body flush">
+        <div class="tbl">
+          {% for item in queue %}
+            <div class="tr" style="grid-template-columns: 20px minmax(0, 1fr) 62px">
+              <span class="m r" style="font-size: .72rem; color: var(--muted)">{{ item.position }}</span>
+              <span class="t-name"><b>{{ item.title }}</b></span>
+              <span class="r"><span class="b wait">{{ item.stage }}</span></span>
+            </div>
+          {% endfor %}
+          {% if queue_rest %}
+            <div class="tr empty" style="grid-template-columns: minmax(0, 1fr)">나머지 {{ queue_rest }}건</div>
+          {% endif %}
+        </div>
+      </div>
+    </section>
+
+    {% if actor_progress %}
+      <section class="card">
+        <div class="card-head">
+          <h2>라이브러리 진척</h2>
+          <span class="seg"><span class="on">남은 편수</span><span>이름</span></span>
+        </div>
+        <div class="card-body">
+          <div style="display: grid; gap: 10px">
+            {% for row in actor_progress %}
+              <div style="display: grid; gap: 5px">
+                <div style="display: flex; align-items: center; gap: 9px">
+                  {{ actor_ui.avatar(row) }}
+                  <b style="font-size: .84rem; font-weight: 700{% if not row.name %}; color: var(--muted){% endif %}">{{ row.name or "배우 정보 없음" }}</b>
+                  <span class="m" style="margin-left: auto; font-size: .74rem; color: var(--muted)">{{ row.done }} / {{ row.total }}</span>
+                </div>
+                <div class="segbar" role="img" aria-label="{{ row.name or '배우 정보 없음' }} 완료 {{ row.done }} / {{ row.total }}">
+                  {% for cls, pct in [('s-ok', row.seg[0]), ('s-run', row.seg[1]), ('s-wait', row.seg[2]), ('s-bad', row.seg[3])] %}
+                    {% if pct %}<i class="{{ cls }}" style="width: {{ pct }}%"></i>{% endif %}
+                  {% endfor %}
+                </div>
+              </div>
+            {% endfor %}
+          </div>
+          <div class="lg-key" style="margin-top: 11px">
+            <span><i style="background: var(--ok)"></i>완료</span>
+            <span><i style="background: var(--accent)"></i>실행</span>
+            <span><i style="background: var(--warn-strong)"></i>대기</span>
+            <span><i style="background: var(--bad)"></i>실패</span>
+          </div>
+        </div>
+      </section>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}
