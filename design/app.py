@@ -68,6 +68,11 @@ def webgpu(request: Request) -> HTMLResponse:
         "completed": CONTEXT["completed_jobs"],
         "completed_total": CONTEXT["job_stats"]["completed"],
         "gpu": CONTEXT["gpu"],
+        # 상층 미디어 창고가 쓴다. media_tree 는 운영 사이트에서 직접 확인한
+        # 실제 디렉터리 구조다 (fixtures.MEDIA_TREE 주석 참고).
+        "actors": CONTEXT["actor_progress"],
+        "media_tree": CONTEXT["media_tree"],
+        "stopped_rest": CONTEXT["stopped_rest"],
     }
     return templates.TemplateResponse(
         request, "webgpu.html", {**CONTEXT, "scene_data": scene_data}

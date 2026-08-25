@@ -108,7 +108,7 @@
     {% if stopped_jobs %}
       <section class="card" style="border-color: var(--bad-line)">
         <div class="card-head" style="background: var(--bad-14); border-radius: var(--r-lg) var(--r-lg) 0 0; border-bottom-color: var(--bad-line)">
-          <h2 style="color: var(--bad)">멈춤<span class="n" style="margin-left: 7px; background: rgba(0,0,0,.08)">{{ stopped_jobs | length }}</span></h2>
+          <h2 style="color: var(--bad)">멈춤<span class="n" style="margin-left: 7px; background: rgba(0,0,0,.08)">{{ stopped_jobs | length + stopped_rest }}</span></h2>
           <span class="btns">
             <form method="post" action="/jobs/retry-stopped"><button type="submit" class="btn sec sm">{{ icons.refresh(13) }}전체 재시도</button></form>
             <form method="post" action="/jobs/delete-stopped"><button type="submit" class="btn sec sm">{{ icons.trash(13) }}전체 삭제</button></form>
@@ -137,6 +137,12 @@
                 </span>
               </div>
             {% endfor %}
+            {% if stopped_rest %}
+              <div class="tr" style="grid-template-columns: 1fr auto">
+                <span class="muted" style="font-size: .82rem">외 {{ stopped_rest }}건이 더 멈춰 있습니다</span>
+                <a class="btn sec sm" href="/jobs?status_group=blocked">전체 보기{{ icons.chevron_right(13) }}</a>
+              </div>
+            {% endif %}
           </div>
         </div>
       </section>

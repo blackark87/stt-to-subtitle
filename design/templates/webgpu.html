@@ -7,7 +7,29 @@
 <link rel="stylesheet" href="/static/app.css">
 <style>
   html, body { height: 100%; overflow: hidden; }
-  #scene { position: fixed; inset: 0; display: block; }
+
+  /* 레퍼런스와 같은 구성 — 캔버스는 alpha:true 로 투명하고 하늘은 그 뒤 CSS 그라디언트다.
+     씬에 fog·background 를 두지 않으므로 원경이 탁해지지 않는다. */
+  #sky { position: fixed; inset: 0; z-index: 0;
+         background: linear-gradient(#8e9db8 0%, #b9c5d8 38%, #dbe3ee 72%, #e8edf4 100%); }
+  #scene { position: fixed; inset: 0; display: block; z-index: 1; }
+  #pins  { position: fixed; inset: 0; z-index: 2; pointer-events: none; overflow: hidden; }
+  .hud   { z-index: 3; }
+
+  /* 라벨은 three 스프라이트가 아니라 DOM 이다 — 한글이 캔버스 텍스처보다 훨씬 또렷하고
+     기기 폰트를 그대로 쓴다. 매 프레임 월드 좌표를 투영해 위치만 갱신한다. */
+  .pin { position: absolute; left: 0; top: 0; transform-origin: 50% 100%;
+         display: inline-flex; align-items: center; gap: 6px; white-space: nowrap;
+         padding: 4px 9px; border-radius: 999px;
+         font-size: .72rem; font-weight: 700; line-height: 1.25; color: #eaeef7;
+         background: rgba(12, 16, 25, .86); border: 1px solid rgba(255,255,255,.16);
+         box-shadow: 0 4px 14px rgba(0,0,0,.38);
+         transition: opacity .16s linear; }
+  .pin i { width: 7px; height: 7px; border-radius: 50%; flex: none; }
+  .pin .n { color: var(--muted); font-weight: 650; }
+  .pin.sm { font-size: .66rem; padding: 3px 8px; }
+  .pin.off { opacity: 0; }
+  body.lbl-far .pin.sm { opacity: 0; }
 
   .hud { position: fixed; inset: 0; pointer-events: none; display: grid;
          grid-template-columns: 1fr 348px; grid-template-rows: auto 1fr auto; gap: 16px; padding: 16px; }
@@ -40,7 +62,9 @@
 </style>
 </head>
 <body>
+<div id="sky"></div>
 <canvas id="scene"></canvas>
+<div id="pins"></div>
 
 <div class="hud">
   <header class="glass topbar-hud">
@@ -57,6 +81,7 @@
   </header>
 
   <aside class="glass layers">
+    <label class="layer"><input type="checkbox" data-layer="media" checked><span class="sw" style="background: #c9a98a"></span>미디어</label>
     <label class="layer"><input type="checkbox" data-layer="stations" checked><span class="sw" style="background: var(--accent)"></span>파이프라인</label>
     <label class="layer"><input type="checkbox" data-layer="queue" checked><span class="sw" style="background: var(--warn-strong)"></span>대기 큐</label>
     <label class="layer"><input type="checkbox" data-layer="gpu" checked><span class="sw" style="background: #7dd3fc"></span>GPU</label>
@@ -114,279 +139,990 @@
 
 <script type="module">
 import * as THREE from "three";
-import { OrbitControls } from "/static/vendor/OrbitControls.js";
 
 const DATA = {{ scene_data | tojson }};
 
+/* ── 팔레트 ───────────────────────────────────────────────────────────
+   구역 러그는 장식이라 레퍼런스의 탁한 파스텔을 그대로 쓴다.
+   상태색(대기·완료·실패·실행)은 HANDOFF §7 에서 확정한 토큰 값을 벗어나지 않는다. */
 const C = {
-  bg:      0x0b0e14,
-  floor:   0x141824,
-  grid:    0x232b3f,
-  accent:  0x6c7ae5,
+  ground:  0x9aa5b7,
+  plat:    0xe3e7ee,
+  platLip: 0xc7ccd4,
+  wall:    0xf2f4f7,
+  rug: { media: 0xc9a98a, queue: 0xd6c98a, audio: 0x7fa8e0, stt: 0x8f9bdc,
+         mt: 0x9d8fdc, done: 0x8fc79a, gpu: 0x8fa8bd, stop: 0xd98a84 },
+  metal:   0xd9dee8,
+  dark:    0x1a2233,
+  crate:   0xc9a98a,
+  crateHi: 0xe0b568,
   ok:      0x40a35c,
-  wait:    0xbb8b00,
+  accent:  0x6c7ae5,
+  warn:    0xbb8b00,
   bad:     0xc4453c,
   gpu:     0x7dd3fc,
-  slab:    0x2a3145,
-  ink:     0xe7e9ee,
 };
+const CSS = { ok: "#40A35C", accent: "#6C7AE5", warn: "#BB8B00", bad: "#C4453C",
+              gpu: "#7dd3fc", media: "#c9a98a", mute: "#8b93a7" };
 
+/* ── 렌더러 ─────────────────────────────────────────────────────────── */
 const canvas = document.getElementById("scene");
-const scene = new THREE.Scene();
-scene.background = new THREE.Color(C.bg);
-scene.fog = new THREE.Fog(C.bg, 26, 62);
-
-const camera = new THREE.PerspectiveCamera(42, innerWidth / innerHeight, 0.1, 200);
-const HOME = new THREE.Vector3(15, 12.5, 17);
-camera.position.copy(HOME);
-
-const renderer = new THREE.WebGPURenderer({ canvas, antialias: true });
+// ?webgl 을 붙이면 WebGL2 폴백 경로를 강제한다 — 평문 http + LAN IP 로 접속했을 때
+// 실제로 타는 경로다. 그림자·직교 카메라 모두 같은 그림이 나오는지 확인할 때 쓴다.
+const FORCE_WEBGL = new URLSearchParams(location.search).has("webgl");
+const renderer = new THREE.WebGPURenderer({ canvas, antialias: true, alpha: true, forceWebGL: FORCE_WEBGL });
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 renderer.setSize(innerWidth, innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.0;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
 await renderer.init();
 
-const controls = new OrbitControls(camera, canvas);
-controls.enableDamping = true;
-controls.dampingFactor = 0.07;
-controls.target.set(0, 1.2, 0);
-controls.minDistance = 8;
-controls.maxDistance = 46;
-controls.maxPolarAngle = Math.PI * 0.48;
+const scene = new THREE.Scene();   // background 없음 — #sky 가 비쳐야 한다
 
-document.getElementById("reset").onclick = () => {
-  camera.position.copy(HOME);
-  controls.target.set(0, 1.2, 0);
-};
+/* ── 조명: 따뜻한 키 + 차가운 하늘/따뜻한 지면 반사 ──────────────────
+   깊이는 전부 여기서 나온다. 후처리는 쓰지 않는다. */
+scene.add(new THREE.HemisphereLight(0xdfe8ff, 0x8a795c, 0.62));
 
-/* ── 조명 ─────────────────────────────────────────────────────────── */
-scene.add(new THREE.HemisphereLight(0x8ea2ff, 0x0a0d14, 0.55));
-const key = new THREE.DirectionalLight(0xffffff, 1.5);
-key.position.set(9, 16, 8);
+const key = new THREE.DirectionalLight(0xfff2dd, 1.55);
+key.position.set(13, 19, 9);
+key.castShadow = true;
+key.shadow.mapSize.set(2048, 2048);
+key.shadow.camera.left = -24; key.shadow.camera.right = 24;
+key.shadow.camera.top = 24;   key.shadow.camera.bottom = -24;
+key.shadow.camera.near = 1;   key.shadow.camera.far = 70;
+key.shadow.bias = -0.0004;
+key.shadow.normalBias = 0.02;
+key.shadow.radius = 3.2;
 scene.add(key);
-const rim = new THREE.DirectionalLight(0x6c7ae5, 0.7);
-rim.position.set(-10, 6, -9);
-scene.add(rim);
 
-/* ── 바닥 ─────────────────────────────────────────────────────────── */
-const floor = new THREE.Mesh(
-  new THREE.PlaneGeometry(90, 90),
-  new THREE.MeshStandardMaterial({ color: C.floor, roughness: .96, metalness: .05 })
-);
-floor.rotation.x = -Math.PI / 2;
-floor.position.y = -0.02;
-scene.add(floor);
-const grid = new THREE.GridHelper(90, 60, C.grid, C.grid);
-grid.material.transparent = true;
-grid.material.opacity = 0.42;
-scene.add(grid);
+const fill = new THREE.DirectionalLight(0xbcd0ff, 0.28);
+fill.position.set(-12, 8, -10);
+scene.add(fill);
 
-/* ── 라벨 (캔버스 텍스처 스프라이트) ───────────────────────────────── */
-function label(text, { size = 46, color = "#e7e9ee", weight = 700, scale = 1 } = {}) {
-  const pad = 16, c = document.createElement("canvas"), g = c.getContext("2d");
-  const font = `${weight} ${size}px ui-sans-serif, system-ui, "Malgun Gothic", sans-serif`;
-  g.font = font;
-  c.width = Math.ceil(g.measureText(text).width) + pad * 2;
-  c.height = size + pad * 2;
-  const g2 = c.getContext("2d");
-  g2.font = font;
-  g2.fillStyle = color;
-  g2.textBaseline = "middle";
-  g2.fillText(text, pad, c.height / 2);
-  const tex = new THREE.CanvasTexture(c);
-  tex.colorSpace = THREE.SRGBColorSpace;
-  tex.anisotropy = 4;
-  const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true, depthWrite: false }));
-  sp.scale.set((c.width / c.height) * scale, scale, 1);
-  return sp;
+/* ── 지오메트리 도우미 ──────────────────────────────────────────────── */
+function roundedRect(w, d, r) {
+  const s = new THREE.Shape(), x = -w / 2, y = -d / 2;
+  s.moveTo(x + r, y);
+  s.lineTo(x + w - r, y); s.quadraticCurveTo(x + w, y, x + w, y + r);
+  s.lineTo(x + w, y + d - r); s.quadraticCurveTo(x + w, y + d, x + w - r, y + d);
+  s.lineTo(x + r, y + d); s.quadraticCurveTo(x, y + d, x, y + d - r);
+  s.lineTo(x, y + r); s.quadraticCurveTo(x, y, x + r, y);
+  return s;
 }
-
-/* ── 레이어 그룹 ──────────────────────────────────────────────────── */
-const layers = {
-  stations: new THREE.Group(),
-  queue: new THREE.Group(),
-  gpu: new THREE.Group(),
-  stopped: new THREE.Group(),
-  done: new THREE.Group(),
-};
-Object.values(layers).forEach((g) => scene.add(g));
-
-const pickable = [];
-const animated = [];
-
-const slabGeo = new THREE.BoxGeometry(2.1, 0.32, 1.35);
-
-function slab(color, emissive = 0) {
-  const m = new THREE.Mesh(
-    slabGeo,
-    new THREE.MeshStandardMaterial({
-      color, roughness: .42, metalness: .25,
-      emissive: new THREE.Color(color), emissiveIntensity: emissive,
-    })
+function bevelBox(w, h, d, r = 0.1, b = 0.03) {
+  const dep = Math.max(0.02, h - b * 2);
+  const g = new THREE.ExtrudeGeometry(
+    roundedRect(Math.max(0.04, w - b * 2), Math.max(0.04, d - b * 2), Math.max(0.02, r - b)),
+    { depth: dep, bevelEnabled: true, bevelThickness: b, bevelSize: b, bevelSegments: 2, curveSegments: 6, steps: 1 }
   );
+  g.rotateX(-Math.PI / 2);
+  g.translate(0, -dep / 2, 0);
+  g.computeVertexNormals();
+  return g;
+}
+const M = (col, rough = 0.72, metal = 0.03, extra = {}) =>
+  new THREE.MeshStandardMaterial({ color: col, roughness: rough, metalness: metal, ...extra });
+
+function solid(geo, mat, cast = true, receive = true) {
+  const m = new THREE.Mesh(geo, mat);
+  m.castShadow = cast; m.receiveShadow = receive;
   return m;
 }
 
-/* ── 스테이션: 추출 → 전사 → 번역 (자막은 즉시라 게이트로) ────────── */
-const STATION_X = { 추출: -7.5, 전사: 0, 번역: 7.5 };
-
-DATA.slots.forEach((slot) => {
-  const x = STATION_X[slot.stage] ?? 0;
-  const base = new THREE.Mesh(
-    new THREE.CylinderGeometry(2.6, 2.9, 0.5, 6),
-    new THREE.MeshStandardMaterial({ color: 0x1a2032, roughness: .8, metalness: .3 })
+/* 숫자만 띄우는 발광 패널. 한글은 DOM 핀이 맡으므로 여기는 ASCII 만 쓴다
+   (이 머신에 한글 폰트가 없어도 화면이 깨지지 않는다). */
+function screenTex(lines, w = 256, h = 128, tint = "#8fe3ff") {
+  const c = document.createElement("canvas");
+  c.width = w; c.height = h;
+  const g = c.getContext("2d");
+  g.fillStyle = "#0b1220"; g.fillRect(0, 0, w, h);
+  g.strokeStyle = "rgba(255,255,255,.07)";
+  for (let y = 0; y < h; y += 4) { g.beginPath(); g.moveTo(0, y); g.lineTo(w, y); g.stroke(); }
+  lines.forEach((ln, i) => {
+    g.fillStyle = ln.dim ? "rgba(255,255,255,.45)" : (ln.color || tint);
+    g.font = `${ln.big ? 700 : 600} ${ln.big ? 46 : 22}px ui-monospace, "IBM Plex Mono", monospace`;
+    g.fillText(ln.t, 14, 34 + i * (ln.big ? 52 : 30));
+  });
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  t.anisotropy = 4;
+  return t;
+}
+function panelScreen(lines, w, h, opts = {}) {
+  const tex = screenTex(lines, opts.tw || 256, opts.th || 128, opts.tint);
+  return new THREE.Mesh(
+    new THREE.PlaneGeometry(w, h),
+    new THREE.MeshStandardMaterial({
+      map: tex, emissiveMap: tex, emissive: 0xffffff,
+      emissiveIntensity: opts.glow ?? 0.45, roughness: 0.6, metalness: 0,
+    })
   );
-  base.position.set(x, 0.25, 0);
-  layers.stations.add(base);
+}
 
-  const name = label(slot.stage, { size: 44, scale: 0.9 });
-  name.position.set(x, 0.95, 2.3);
-  layers.stations.add(name);
+/* ── DOM 라벨 핀 ────────────────────────────────────────────────────── */
+const pinRoot = document.getElementById("pins");
+const pins = [];
+function pin(html, obj, y, cls = "", layer = null) {
+  const el = document.createElement("span");
+  el.className = "pin " + cls;
+  el.innerHTML = html;
+  pinRoot.appendChild(el);
+  const p = { el, obj, y, layer };
+  pins.push(p);
+  return p;
+}
+const dot = (css) => `<i style="background:${css}"></i>`;
 
-  if (slot.job) {
-    const s = slab(C.accent, 0.55);
-    s.position.set(x, 0.92, 0);
-    s.userData = { kind: "job", stage: slot.stage, title: slot.job, detail: slot.detail, percent: slot.percent };
-    layers.stations.add(s);
-    pickable.push(s);
-    animated.push({ mesh: s, base: 0.92, phase: Math.random() * 6.28 });
+/* ── 레이어 ─────────────────────────────────────────────────────────── */
+const layers = {
+  media: new THREE.Group(), stations: new THREE.Group(), queue: new THREE.Group(),
+  gpu: new THREE.Group(), stopped: new THREE.Group(), done: new THREE.Group(),
+};
+Object.values(layers).forEach((g) => scene.add(g));
+const world = new THREE.Group();
+scene.add(world);
 
-    // 진행률 링
-    const ring = new THREE.Mesh(
-      new THREE.RingGeometry(1.75, 2.05, 64, 1, Math.PI / 2, -Math.PI * 2 * (slot.percent / 100)),
-      new THREE.MeshBasicMaterial({ color: C.accent, side: THREE.DoubleSide, transparent: true, opacity: .95 })
-    );
-    ring.rotation.x = -Math.PI / 2;
-    ring.position.set(x, 0.53, 0);
-    layers.stations.add(ring);
+const pickable = [];
 
-    const pct = label(slot.percent + "%", { size: 40, color: "#a5b4fc", scale: 0.75 });
-    pct.position.set(x, 1.75, 0);
-    layers.stations.add(pct);
-  } else {
-    const idle = label("유휴", { size: 38, color: "#5b6472", weight: 650, scale: 0.7 });
-    idle.position.set(x, 1.0, 0);
-    layers.stations.add(idle);
+/* ── 배치 ───────────────────────────────────────────────────────────── */
+const ROOM_Z0 = -4.2, ROOM_Z1 = 2.0;                 // 생산 라인 방
+const ROOM_CZ = (ROOM_Z0 + ROOM_Z1) / 2, ROOM_D = ROOM_Z1 - ROOM_Z0;
+const WALK_Z = 3.3;                                   // 운반 통로
+const BACK_Z = 4.6;                                   // 빈손 복귀 레인
+const DOCK_Z = ROOM_Z1 - 0.9;                         // 방 앞 하역 지점
+const FRONT_Z0 = 5.8, FRONT_Z1 = 10.4;                // 앞줄 방 (GPU / 격리)
+const FRONT_CZ = (FRONT_Z0 + FRONT_Z1) / 2, FRONT_D = FRONT_Z1 - FRONT_Z0;
+
+const RW = 5.4;                                       // 방 폭
+const ROOMS = {
+  queue: { cx: -16.0, key: "queue", rug: C.rug.queue },
+  추출:  { cx: -10.0, key: "audio", rug: C.rug.audio },
+  전사:  { cx:  -4.0, key: "stt",   rug: C.rug.stt },
+  번역:  { cx:   2.0, key: "mt",    rug: C.rug.mt },
+  done:  { cx:   8.0, key: "done",  rug: C.rug.done },
+};
+
+/* 미디어는 1층 라인에 없다. 창고라서 위층에 따로 있다 (아래 "상층 미디어 창고"). */
+const DECK_Y = 3.2;
+const DECK_X0 = -25.0, DECK_X1 = 7.0, DECK_Z0 = -19.6, DECK_Z1 = -8.0;
+const DECK_CX = (DECK_X0 + DECK_X1) / 2, DECK_W = DECK_X1 - DECK_X0;
+const DECK_CZ = (DECK_Z0 + DECK_Z1) / 2, DECK_D = DECK_Z1 - DECK_Z0;
+const RAMP_X = -23.6, RAMP_Z1 = 0.6;              // 램프가 1층에 닿는 지점
+const AISLE_Z0 = -18.6, AISLE_Z1 = -10.6;         // 통로는 z 방향으로 길게 깐다
+const PLAT_X0 = -26.2, PLAT_X1 = 11.4;
+const PLAT_CX = (PLAT_X0 + PLAT_X1) / 2, PLAT_W = PLAT_X1 - PLAT_X0;
+const PLAT_Z0 = -20.8, PLAT_Z1 = 11.6;
+const PLAT_CZ = (PLAT_Z0 + PLAT_Z1) / 2, PLAT_D = PLAT_Z1 - PLAT_Z0;
+
+/* 지면 + 플랫폼 */
+const ground = solid(new THREE.PlaneGeometry(140, 140), M(C.ground, 1.0), false, true);
+ground.rotation.x = -Math.PI / 2;
+ground.position.y = -0.22;
+world.add(ground);
+
+const plat = solid(bevelBox(PLAT_W + 1.0, 0.22, PLAT_D + 1.0, 0.5, 0.06), M(C.plat, 0.88));
+plat.position.set(PLAT_CX, -0.11, PLAT_CZ);
+world.add(plat);
+
+const platLip = solid(bevelBox(PLAT_W + 1.6, 0.1, PLAT_D + 1.6, 0.6, 0.04), M(C.platLip, 0.92));
+platLip.position.set(PLAT_CX, -0.19, PLAT_CZ);
+world.add(platLip);
+
+/* 바닥 타일 — ExtrudeGeometry 의 uv 는 셰이프 좌표(=월드 단위)라 repeat 이 그대로 맞는다 */
+(function tileFloor() {
+  const c = document.createElement("canvas");
+  c.width = c.height = 128;
+  const g = c.getContext("2d");
+  g.fillStyle = "#eef1f6"; g.fillRect(0, 0, 128, 128);
+  g.strokeStyle = "rgba(122,134,158,.20)"; g.lineWidth = 3;
+  g.strokeRect(1.5, 1.5, 125, 125);
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  t.repeat.set(0.5, 0.5);
+  t.anisotropy = 8;
+  plat.material.map = t;
+  plat.material.needsUpdate = true;
+})();
+
+/* 통로 표시 — 운반원이 도는 길이 눈에 보여야 동선이 읽힌다 */
+for (const z of [WALK_Z - 0.75, BACK_Z + 0.75]) {
+  const line = solid(bevelBox(PLAT_W - 1.2, 0.02, 0.1, 0.01, 0.005), M(0xd9a441, 0.9), false, true);
+  line.position.set(PLAT_CX, 0.005, z);
+  world.add(line);
+}
+
+/* 화분 — 크기 감각과 여백을 준다 (레퍼런스의 가로수 역할) */
+function plant(x, z, scale = 1) {
+  const g = new THREE.Group();
+  const pot = solid(new THREE.CylinderGeometry(0.22, 0.17, 0.3, 12), M(0xb5714f, 0.85));
+  pot.position.y = 0.15;
+  g.add(pot);
+  const leaves = [[0, 0.62, 0, 0.32], [0.16, 0.5, 0.08, 0.2], [-0.14, 0.52, -0.07, 0.18]];
+  for (const [lx, ly, lz, r] of leaves) {
+    const s = solid(new THREE.SphereGeometry(r, 12, 10), M(0x6ea866, 0.9));
+    s.position.set(lx, ly, lz);
+    g.add(s);
+  }
+  g.position.set(x, 0, z);
+  g.scale.setScalar(scale);
+  world.add(g);
+}
+for (let x = PLAT_X0 + 1.2; x <= PLAT_X1 - 1.2; x += 4.4) {
+  plant(x, PLAT_Z1 - 0.7, 0.95 + (x % 2) * 0.12);
+}
+for (const x of [PLAT_X0 + 0.7, PLAT_X1 - 0.7]) {
+  for (let z = -4.6; z <= PLAT_Z1 - 2.0; z += 4.6) plant(x, z, 0.9);
+}
+
+/* 방 하나 = 러그 + 낮은 뒷벽·옆벽 */
+function room(cx, cz, w, d, rugCol, group, wallH = 1.15) {
+  const g = new THREE.Group();
+  const rug = solid(bevelBox(w, 0.04, d, 0.24, 0.015), M(rugCol, 0.94), false, true);
+  rug.position.set(cx, 0.02, cz);
+  g.add(rug);
+  const wallMat = M(C.wall, 0.9);
+  const back = solid(bevelBox(w, wallH, 0.16, 0.05, 0.03), wallMat);
+  back.position.set(cx, wallH / 2, cz - d / 2);
+  g.add(back);
+  for (const s of [-1, 1]) {
+    const side = solid(bevelBox(0.16, wallH, d * 0.62, 0.05, 0.03), wallMat);
+    side.position.set(cx + s * (w / 2), wallH / 2, cz - d * 0.19);
+    g.add(side);
+  }
+  group.add(g);
+  return g;
+}
+
+/* ── 사람 ───────────────────────────────────────────────────────────
+   레퍼런스처럼 다리·팔에 피벗 그룹을 두고 사인파로 걷게 한다. */
+const SKIN = 0xe8c9a8;
+function person(coat, pants = 0x3a4358) {
+  const g = new THREE.Group();
+  const legGeo = bevelBox(0.11, 0.36, 0.13, 0.04, 0.02);
+  const armGeo = bevelBox(0.09, 0.32, 0.1, 0.035, 0.02);
+  const legs = [], arms = [];
+  for (const s of [-1, 1]) {
+    const hip = new THREE.Group();
+    hip.position.set(s * 0.085, 0.36, 0);
+    const leg = solid(legGeo, M(pants, 0.85));
+    leg.position.y = -0.18;
+    hip.add(leg); g.add(hip); legs.push(hip);
+
+    const sh = new THREE.Group();
+    sh.position.set(s * 0.2, 0.72, 0);
+    const arm = solid(armGeo, M(coat, 0.8));
+    arm.position.y = -0.16;
+    sh.add(arm); g.add(sh); arms.push(sh);
+  }
+  const body = solid(bevelBox(0.36, 0.42, 0.24, 0.1, 0.04), M(coat, 0.8));
+  body.position.y = 0.57;
+  g.add(body);
+  const head = solid(new THREE.SphereGeometry(0.135, 18, 14), M(SKIN, 0.85));
+  head.position.y = 0.9;
+  g.add(head);
+  const hair = solid(new THREE.SphereGeometry(0.142, 18, 14, 0, Math.PI * 2, 0, Math.PI * 0.58), M(0x2c2f3a, 0.9));
+  hair.position.y = 0.9;
+  g.add(hair);
+  g.userData.rig = { legs, arms, body };
+  return g;
+}
+
+/* 손수레 — 미디어를 여러 개 골라 한 번에 시작하면 그것은 "여러 번"이 아니라
+   "한 묶음"이다. 큐 삽입은 한 번에 끝나므로 왕복을 늘리지 않고 짐을 키운다. */
+function cart(n = 3) {
+  const g = new THREE.Group();
+  const bed = solid(bevelBox(0.66, 0.08, 0.54, 0.04, 0.02), M(0x8d96a4, 0.8, 0.15));
+  bed.position.y = 0.17;
+  g.add(bed);
+  for (const sx of [-0.28, 0.28]) {
+    const w = solid(new THREE.CylinderGeometry(0.1, 0.1, 0.06, 12), M(0x3a4048, 0.85));
+    w.position.set(sx, 0.1, -0.16);
+    w.rotation.z = Math.PI / 2;
+    g.add(w);
+  }
+  const handle = solid(bevelBox(0.06, 0.62, 0.06, 0.02, 0.015), M(0x8d96a4, 0.8, 0.15));
+  handle.position.set(0, 0.48, -0.22);
+  g.add(handle);
+  for (let i = 0; i < n; i++) {
+    const c = crate(C.crateHi);
+    c.scale.setScalar(0.62);
+    c.position.set(0, 0.21 + i * 0.23, 0.02);
+    g.add(c);
+  }
+  return g;
+}
+
+function crate(tint = C.crate) {
+  const g = new THREE.Group();
+  const box = solid(bevelBox(0.52, 0.36, 0.42, 0.05, 0.02), M(tint, 0.8));
+  box.position.y = 0.18;
+  g.add(box);
+  const band = solid(bevelBox(0.55, 0.05, 0.06, 0.02, 0.01), M(C.crateHi, 0.7));
+  band.position.y = 0.24;
+  g.add(band);
+  return g;
+}
+
+/* ── 작업 기계 (스테이션마다 하나 — max_workers=1 이라 실제로 하나다) ── */
+function machine(cx, cz, tint, pctText, subText) {
+  const g = new THREE.Group();
+  const base = solid(bevelBox(2.1, 0.9, 1.2, 0.12, 0.05), M(C.metal, 0.62, 0.08));
+  base.position.set(0, 0.45, 0);
+  g.add(base);
+  const hood = solid(bevelBox(1.9, 0.34, 1.0, 0.1, 0.04), M(tint, 0.7));
+  hood.position.set(0, 1.05, 0);
+  g.add(hood);
+  const scr = panelScreen([{ t: pctText, big: true }, { t: subText, dim: true }], 1.36, 0.62, { glow: 0.5 });
+  scr.position.set(0, 0.62, 0.615);
+  g.add(scr);
+  const feet = solid(bevelBox(2.3, 0.08, 1.4, 0.08, 0.03), M(0x9aa5b5, 0.9));
+  feet.position.set(0, 0.04, 0);
+  g.add(feet);
+  g.position.set(cx, 0, cz);
+  return { group: g, body: base };
+}
+
+/* 반출 선반 — 완료분이 여기 쌓인다 */
+function shelf(cx, cz) {
+  const g = new THREE.Group();
+  for (let i = 0; i < 2; i++) {
+    const board = solid(bevelBox(2.6, 0.08, 1.0, 0.06, 0.03), M(0xd8cfbe, 0.85));
+    board.position.set(0, 0.42 + i * 0.62, 0);
+    g.add(board);
+  }
+  for (const sx of [-1.2, 1.2]) for (const sz of [-0.42, 0.42]) {
+    const post = solid(bevelBox(0.12, 1.1, 0.12, 0.04, 0.02), M(0xa9b0bd, 0.85));
+    post.position.set(sx, 0.55, sz);
+    g.add(post);
+  }
+  g.position.set(cx, 0, cz);
+  return g;
+}
+
+/* ── 방 짓기 ────────────────────────────────────────────────────────── */
+const stageOps = [];     // 스테이션 작업자 (일하는 애니메이션)
+const slotByStage = {};
+DATA.slots.forEach((s) => { slotByStage[s.stage] = s; });
+
+/* ── 상층 미디어 창고 ────────────────────────────────────────────────
+   미디어는 방 하나가 아니라 창고다. 2026-08-25 운영 사이트에서 직접 확인한
+   실제 트리를 그대로 옮긴다 (fixtures.MEDIA_TREE):
+
+       /media/AV/japan          배우 디렉터리 449개 → 타이틀 폴더 → 파일
+       /media/AV/west, unclassified
+       /media/Drama, ETC, Movie, Sports
+       /media/Variety           타이틀 폴더 3개 + 폴더 없이 놓인 파일 12개
+
+   카테고리마다 깊이가 다르다. AV/japan 이 압도적으로 커서 창고의 대부분을
+   차지하고, 나머지는 오른쪽 소형 베이로 간다.
+   자막 보유율(초록/갈색)은 actor_progress 가 있는 AV/japan 에만 칠한다.
+   나머지 구역은 집계값이 없으므로 중립 회색으로 두고 칠하지 않는다. */
+const ACTORS = (DATA.actors || []).filter((a) => a.total);
+const libDone = ACTORS.reduce((n, a) => n + a.done, 0);
+const libTotal = ACTORS.reduce((n, a) => n + a.total, 0);
+const TREE = DATA.media_tree || [];
+const AV_JAPAN = TREE.find((t) => t.path === "AV/japan") || { path: "AV/japan", dirs: null };
+const OTHER_ZONES = TREE.filter((t) => t.path !== "AV/japan");
+
+const DECK_WALK = -9.0, PICK_X = -21.3, PICK_Z = -9.9;
+
+/* 공유 지오메트리 — 랙이 수백 개라 매번 만들면 낭비다 */
+const BIN_GEO = bevelBox(0.4, 0.34, 0.44, 0.04, 0.02);
+const POST_GEO = bevelBox(0.1, 1.5, 0.1, 0.03, 0.02);
+const MAT_BIN_DONE = M(0x9ec3a4, 0.8);
+const MAT_BIN_TODO = M(0xd8c39b, 0.8);
+const MAT_BIN_NA = M(0xb9c0cc, 0.82);
+const MAT_RACK = M(0xaeb6c2, 0.85);
+const MAT_POST = M(0x8d96a4, 0.8, 0.15);
+const MAT_BOARD = M(0xc6ccd6, 0.85);
+
+/* 데크 바닥 + 기둥 + 난간 */
+const deck = solid(bevelBox(DECK_W, 0.26, DECK_D, 0.4, 0.06), M(0xdfe3ea, 0.86));
+deck.position.set(DECK_CX, DECK_Y - 0.13, DECK_CZ);
+layers.media.add(deck);
+
+for (let cx = DECK_X0 + 1.1; cx <= DECK_X1 - 1.0; cx += 6.2) {
+  for (const cz of [DECK_Z0 + 1.1, DECK_Z1 - 1.1]) {
+    const col = solid(bevelBox(0.36, DECK_Y - 0.26, 0.36, 0.06, 0.03), M(0xb7c1cf, 0.8, 0.1));
+    col.position.set(cx, (DECK_Y - 0.26) / 2, cz);
+    layers.media.add(col);
+  }
+}
+for (const seg of [[DECK_X0, RAMP_X - 1.4], [RAMP_X + 1.4, DECK_X1]]) {
+  if (seg[1] - seg[0] <= 0.2) continue;
+  const rail = solid(bevelBox(seg[1] - seg[0], 0.07, 0.09, 0.03, 0.02), M(0x9aa5b5, 0.7, 0.2));
+  rail.position.set((seg[0] + seg[1]) / 2, DECK_Y + 0.52, DECK_Z1);
+  layers.media.add(rail);
+  for (let x = seg[0] + 0.6; x < seg[1]; x += 2.1) {
+    const post = solid(bevelBox(0.07, 0.55, 0.07, 0.02, 0.015), M(0x9aa5b5, 0.7, 0.2));
+    post.position.set(x, DECK_Y + 0.27, DECK_Z1);
+    layers.media.add(post);
+  }
+}
+
+/* 램프 */
+const rampLen = Math.hypot(RAMP_Z1 - DECK_Z1, DECK_Y);
+const ramp = solid(bevelBox(2.4, 0.16, rampLen, 0.06, 0.03), M(0xcdd4de, 0.88));
+ramp.position.set(RAMP_X, DECK_Y / 2, (DECK_Z1 + RAMP_Z1) / 2);
+ramp.rotation.x = Math.atan2(DECK_Y, RAMP_Z1 - DECK_Z1);
+layers.media.add(ramp);
+
+/* z 방향으로 긴 랙 하나 */
+function rackZ(x, z0, z1, { levels = 2, bins = 8, ratio = null, group }) {
+  const g = new THREE.Group();
+  const len = z1 - z0, cz = (z0 + z1) / 2;
+  const base = new THREE.Mesh(bevelBox(0.9, 0.09, len, 0.05, 0.025), MAT_RACK);
+  base.position.set(x, 0.05, cz); base.castShadow = base.receiveShadow = true;
+  g.add(base);
+  for (let z = z0; z <= z1 + 0.01; z += len / 3) {
+    for (const sx of [-0.38, 0.38]) {
+      const post = new THREE.Mesh(POST_GEO, MAT_POST);
+      post.position.set(x + sx, 0.75, z); post.castShadow = post.receiveShadow = true;
+      g.add(post);
+    }
+  }
+  for (let lv = 0; lv < levels; lv++) {
+    const board = new THREE.Mesh(bevelBox(0.82, 0.07, len, 0.04, 0.02), MAT_BOARD);
+    board.position.set(x, 0.6 + lv * 0.6, cz); board.castShadow = board.receiveShadow = true;
+    g.add(board);
+  }
+  const total = bins * levels;
+  const filled = ratio === null ? -1 : Math.round(total * ratio);
+  for (let i = 0; i < total; i++) {
+    const lv = Math.floor(i / bins), k = i % bins;
+    const mat = ratio === null ? MAT_BIN_NA : (i < filled ? MAT_BIN_DONE : MAT_BIN_TODO);
+    const b = new THREE.Mesh(BIN_GEO, mat);
+    b.position.set(x, 0.81 + lv * 0.6, z0 + 0.45 + k * ((len - 0.9) / (bins - 1)));
+    b.castShadow = b.receiveShadow = true;
+    g.add(b);
+  }
+  g.position.set(0, DECK_Y, 0);
+  group.add(g);
+  return g;
+}
+
+/* AV/japan 동 — 창고의 대부분 */
+const AV_X0 = -19.6, AV_X1 = -7.6, AV_AISLES = 9;
+const avRatio = libTotal ? libDone / libTotal : null;
+const avWing = new THREE.Group();
+layers.media.add(avWing);
+for (let i = 0; i < AV_AISLES; i++) {
+  const x = AV_X0 + i * ((AV_X1 - AV_X0) / (AV_AISLES - 1));
+  rackZ(x, AISLE_Z0, AISLE_Z1, { levels: 2, bins: 8, ratio: avRatio, group: avWing });
+}
+avWing.traverse((o) => { if (o.isMesh) o.userData.pickRoot = avWing; });
+avWing.userData = {
+  kind: "dir", title: "/media/AV/japan",
+  detail: `배우 디렉터리 ${AV_JAPAN.dirs ?? "?"}개. 배우 → 타이틀 → 파일 순으로 세 겹이다. `
+        + `자막 ${libDone}/${libTotal} 은 actor_progress 집계 — 아직 백엔드가 주지 않는 값이다.`,
+  percent: libTotal ? Math.round((libDone / libTotal) * 100) : undefined,
+};
+pickable.push(avWing);
+pin(`${dot(CSS.media)}/media/AV/japan <span class="n">배우 ${AV_JAPAN.dirs ?? "?"}</span>`,
+    { x: (AV_X0 + AV_X1) / 2, y: DECK_Y, z: AISLE_Z0 - 0.9 }, 2.4, "", "media");
+pin(`${dot(CSS.ok)}<span class="n">자막 ${libDone} / ${libTotal}</span>`,
+    { x: (AV_X0 + AV_X1) / 2, y: DECK_Y, z: AISLE_Z1 + 0.7 }, 1.9, "sm", "media");
+
+/* 나머지 카테고리 — 오른쪽 소형 베이 */
+const BAY_X0 = -5.4, BAY_COLS = 4, BAY_DX = 3.1;
+OTHER_ZONES.forEach((zone, i) => {
+  const col = i % BAY_COLS, row = Math.floor(i / BAY_COLS);
+  const x = BAY_X0 + col * BAY_DX;
+  const z0 = AISLE_Z0 + row * 4.4, z1 = z0 + 3.4;
+  const mixed = zone.shape === "mixed";
+  const g = rackZ(x, z0, z1, { levels: mixed ? 1 : 2, bins: 4, ratio: null, group: layers.media });
+  if (mixed && zone.files) {
+    // 폴더 없이 바닥에 놓인 낱개 파일 — Variety 가 이렇다
+    for (let k = 0; k < Math.min(6, zone.files); k++) {
+      const b = new THREE.Mesh(BIN_GEO, MAT_BIN_NA);
+      b.position.set(x + 0.85, DECK_Y + 0.17 + Math.floor(k / 3) * 0.36, z0 + 0.5 + (k % 3) * 0.5);
+      b.castShadow = b.receiveShadow = true;
+      layers.media.add(b);
+    }
+  }
+  g.traverse((o) => { if (o.isMesh) o.userData.pickRoot = g; });
+  g.userData = {
+    kind: "dir", title: "/media/" + zone.path,
+    detail: [zone.dirs != null ? `하위 폴더 ${zone.dirs}개` : "하위 폴더 수 미확인",
+             zone.files != null ? `낱개 파일 ${zone.files}개` : null,
+             zone.note].filter(Boolean).join(" · "),
+  };
+  pickable.push(g);
+  pin(`${dot(mixed ? CSS.warn : CSS.mute)}<span class="n">${zone.path}</span>`,
+      { x, y: DECK_Y, z: z0 - 0.5 }, 1.9, "sm", "media");
+});
+
+/* 선택·시작 스테이션 */
+const startConsole = (() => {
+  const g = new THREE.Group();
+  const desk = solid(bevelBox(1.8, 0.72, 0.9, 0.08, 0.035), M(C.metal, 0.68, 0.06));
+  desk.position.y = 0.36;
+  g.add(desk);
+  const scr = panelScreen([{ t: libDone + "/" + libTotal, big: true }, { t: "SELECT > START", dim: true }],
+                          1.2, 0.54, { glow: 0.55 });
+  scr.position.set(0, 0.95, 0.18);
+  scr.rotation.x = -0.34;
+  g.add(scr);
+  const btn = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.14, 0.14, 0.08, 16),
+    new THREE.MeshStandardMaterial({ color: 0x1c3a26, emissive: new THREE.Color(C.ok), emissiveIntensity: 1.0, roughness: 0.5 })
+  );
+  btn.position.set(0.64, 0.76, 0.24);
+  g.add(btn);
+  g.position.set(PICK_X, DECK_Y, PICK_Z);
+  g.traverse((o) => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; o.userData.pickRoot = g; } });
+  g.userData = {
+    kind: "start", title: "작업 시작",
+    detail: "여러 개를 골라 시작하면 한 묶음으로 큐에 들어간다 — 왕복이 늘지 않고 짐이 커진다. 큐 삽입은 한 번에 끝나지만 처리는 한 건씩이다(단계마다 실행기가 하나). 선택은 묶음, 처리는 한 건씩.",
+  };
+  layers.media.add(g);
+  pickable.push(g);
+  return { group: g, btn };
+})();
+
+pin(`${dot(CSS.media)}미디어 창고 <span class="n">/media</span>`,
+    { x: DECK_CX, y: DECK_Y, z: DECK_Z1 }, 1.5, "", "media");
+pin(`${dot(CSS.ok)}작업 시작`, startConsole.group, 1.35, "sm", "media");
+
+// 대기 큐
+room(ROOMS.queue.cx, ROOM_CZ, RW, ROOM_D, ROOMS.queue.rug, layers.queue);
+pin(`${dot(CSS.warn)}대기 큐 <span class="n">${DATA.queue.length + (DATA.queue_rest || 0)}건</span>`,
+    { x: ROOMS.queue.cx, y: 0, z: ROOM_Z0 + 0.4 }, 1.7, "", "queue");
+
+DATA.queue.forEach((item, i) => {
+  const col = i % 3, rowI = Math.floor(i / 3);
+  const c = crate(i === 0 ? C.crateHi : C.crate);
+  c.position.set(ROOMS.queue.cx - 1.4 + col * 1.35, 0.04 + rowI * 0.38, ROOM_CZ + 0.5 - rowI * 0.6);
+  c.traverse((o) => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; o.userData.pickRoot = c; } });
+  c.userData = { kind: "queue", title: item.title, detail: item.stage + " 대기", position: item.position };
+  layers.queue.add(c);
+  pickable.push(c);
+});
+if (DATA.queue_rest) {
+  const stack = solid(bevelBox(1.5, 0.9, 1.0, 0.06, 0.03), M(0xb9ae94, 0.86));
+  stack.position.set(ROOMS.queue.cx + 1.5, 0.45, ROOM_CZ - 1.3);
+  layers.queue.add(stack);
+  pin(`외 ${DATA.queue_rest}건`, { x: ROOMS.queue.cx + 1.5, y: 0.9, z: ROOM_CZ - 1.3 }, 0.35, "sm", "queue");
+}
+
+// 추출 / 전사 / 번역
+["추출", "전사", "번역"].forEach((stage) => {
+  const R = ROOMS[stage], slot = slotByStage[stage];
+  room(R.cx, ROOM_CZ, RW, ROOM_D, R.rug, layers.stations);
+
+  const busy = !!(slot && slot.job);
+  const pct = busy ? slot.percent : 0;
+  const m = machine(R.cx, ROOM_CZ - 0.9, R.rug,
+                    busy ? pct + "%" : "IDLE",
+                    busy ? (slot.detail || "").replace(/[^\x20-\x7E]/g, "").trim() || "-" : "no job");
+  m.group.traverse((o) => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; o.userData.pickRoot = m.group; } });
+  m.group.userData = busy
+    ? { kind: "job", stage, title: slot.job, detail: slot.detail, percent: pct }
+    : { kind: "idle", stage, title: stage + " 유휴", detail: "이 단계 실행기가 비어 있습니다" };
+  layers.stations.add(m.group);
+  pickable.push(m.group);
+
+  pin(`${dot(busy ? CSS.accent : CSS.mute)}${stage}${busy ? ` <span class="n">${pct}%</span>` : ' <span class="n">유휴</span>'}`,
+      { x: R.cx, y: 0, z: ROOM_Z0 + 0.4 }, 1.7, "", "stations");
+
+  if (busy) {
+    const op = person(R.rug);
+    op.position.set(R.cx + 1.45, 0, ROOM_CZ - 0.5);
+    op.rotation.y = -0.5;
+    op.traverse((o) => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; } });
+    layers.stations.add(op);
+    stageOps.push({ rig: op.userData.rig, group: op, phase: Math.random() * 6.28 });
+    pin(`${dot(CSS.accent)}<span class="n">${slot.job.split("/").pop().slice(0, 22)}</span>`,
+        { x: R.cx + 1.45, y: 0, z: ROOM_CZ - 0.5 }, 1.35, "sm", "stations");
   }
 });
 
-/* ── 대기 큐: 첫 스테이션 앞에 쌓인다 ─────────────────────────────── */
-DATA.queue.forEach((item, i) => {
-  const s = slab(C.slab);
-  s.material.emissive = new THREE.Color(C.wait);
-  s.material.emissiveIntensity = 0.16;
-  s.position.set(STATION_X["추출"] - 3.6 - i * 1.7, 0.2, 0);
-  s.rotation.y = 0.03 * (i % 2 ? 1 : -1);
-  s.userData = { kind: "queue", title: item.title, detail: item.stage + " 대기", position: item.position };
-  layers.queue.add(s);
-  pickable.push(s);
-});
-if (DATA.queue_rest) {
-  const more = label("외 " + DATA.queue_rest + "건", { size: 36, color: "#8b93a7", weight: 650, scale: 0.68 });
-  more.position.set(STATION_X["추출"] - 3.6 - DATA.queue.length * 1.7 - 1.4, 0.75, 0);
-  layers.queue.add(more);
-}
+// 반출 (최근 완료)
+room(ROOMS.done.cx, ROOM_CZ, RW, ROOM_D, ROOMS.done.rug, layers.done);
+const outShelf = shelf(ROOMS.done.cx, ROOM_CZ - 1.0);
+outShelf.traverse((o) => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; } });
+layers.done.add(outShelf);
+pin(`${dot(CSS.ok)}반출 <span class="n">${DATA.completed_total}건 완료</span>`,
+    { x: ROOMS.done.cx, y: 0, z: ROOM_Z0 + 0.4 }, 1.7, "", "done");
 
-/* ── 완료: 오른쪽에 쌓인다 ────────────────────────────────────────── */
 DATA.completed.forEach((job, i) => {
-  const s = slab(0x1e3a2c);
-  s.material.emissive = new THREE.Color(C.ok);
-  s.material.emissiveIntensity = 0.2;
-  s.position.set(STATION_X["번역"] + 4.6, 0.2 + i * 0.36, 0);
-  s.userData = { kind: "done", title: job.source_rel.split("/").pop(), detail: job.meta + " · " + job.total };
-  layers.done.add(s);
-  pickable.push(s);
+  const c = crate(0x9ec3a4);
+  const shelfI = i < 2 ? 0 : 1;
+  c.position.set(ROOMS.done.cx - 0.85 + (i % 2) * 0.85, 0.46 + shelfI * 0.62, ROOM_CZ - 1.0);
+  c.traverse((o) => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; o.userData.pickRoot = c; } });
+  c.userData = { kind: "done", title: job.source_rel.split("/").pop(), detail: job.meta + " · " + job.total };
+  layers.done.add(c);
+  pickable.push(c);
 });
-const doneCount = label(DATA.completed_total + "건 완료", { size: 40, color: "#7fd6a3", scale: 0.8 });
-doneCount.position.set(STATION_X["번역"] + 4.6, 0.2 + DATA.completed.length * 0.36 + 0.9, 0);
-layers.done.add(doneCount);
 
-/* ── 멈춤·실패: 옆 레일로 빠진다 ──────────────────────────────────── */
+/* 운반원이 내려놓는 자리 — 여기 쌓였다가 가득 차면 비운다 */
+const DROP_BASE = new THREE.Vector3(ROOMS.done.cx + 1.7, 0, ROOM_CZ + 0.5);
+const dropped = [];
+
+// GPU 서버실
+const GPU_CX = -9.4;
+room(GPU_CX, FRONT_CZ, 11.6, FRONT_D, C.rug.gpu, layers.gpu, 1.35);
+pin(`${dot(CSS.gpu)}GPU 서버실 <span class="n">${DATA.gpu.display_name}</span>`,
+    { x: GPU_CX, y: 0, z: FRONT_Z0 + 0.35 }, 1.9, "", "gpu");
+
+const gpuWall = panelScreen(
+  [{ t: "UTIL  " + DATA.gpu.utilization_percent + "%", big: false },
+   { t: "VRAM  " + DATA.gpu.memory_percent + "%  " + DATA.gpu.memory_used_gib.toFixed(1) + "/" + DATA.gpu.memory_total_gib.toFixed(1) + "G" },
+   { t: "TEMP  " + DATA.gpu.temperature_celsius + "C" },
+   { t: "PWR   " + DATA.gpu.power_watts + "W" }],
+  3.2, 1.5, { tw: 320, th: 150, glow: 0.5 }
+);
+gpuWall.position.set(GPU_CX + 3.4, 0.92, FRONT_Z0 + 0.1);
+layers.gpu.add(gpuWall);
+
+/* ── 모델 타워: 상주 모델 하나당 하나 ────────────────────────────────
+   HANDOFF §4 — "하이브리드" 라는 모델은 없다. VRAM 에 실제로 올라오는
+   WhisperX / Kotoba 만 세운다. 유휴로 해제되면 타워도 사라져야 한다. */
+const towers = [];
+const loaded = DATA.gpu.loaded || [];
+loaded.forEach((m, i) => {
+  const g = new THREE.Group();
+  const x = GPU_CX - 3.9 + i * 2.5, z = FRONT_CZ + 0.5;
+  const UNITS = 7, UH = 0.3;
+  const frame = solid(bevelBox(1.25, UNITS * UH + 0.34, 1.05, 0.08, 0.035), M(0x2b303b, 0.7, 0.12));
+  frame.position.y = (UNITS * UH + 0.34) / 2;
+  g.add(frame);
+  const strips = [];
+  for (let u = 0; u < UNITS; u++) {
+    const s = new THREE.Mesh(
+      new THREE.PlaneGeometry(0.86, 0.11),
+      new THREE.MeshStandardMaterial({
+        color: 0x0c1626, emissive: new THREE.Color(m.active ? C.gpu : 0x55606f),
+        emissiveIntensity: m.active ? 1.0 : 0.25, roughness: 0.6,
+      })
+    );
+    s.position.set(0, 0.3 + u * UH, 0.53);
+    g.add(s); strips.push(s);
+  }
+  const cap = solid(bevelBox(1.4, 0.12, 1.2, 0.06, 0.03), M(0x9aa5b5, 0.8));
+  cap.position.y = UNITS * UH + 0.4;
+  g.add(cap);
+  g.position.set(x, 0, z);
+  g.traverse((o) => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; o.userData.pickRoot = g; } });
+  g.userData = { kind: "model", title: m.name, detail: m.state, active: m.active };
+  layers.gpu.add(g);
+  pickable.push(g);
+  towers.push({ strips, active: m.active, phase: i * 1.7 });
+  pin(`${dot(m.active ? CSS.accent : CSS.mute)}${m.name} <span class="n">${m.state}</span>`,
+      { x, y: UNITS * UH + 0.5, z }, 0.35, "sm", "gpu");
+});
+
+// 격리 (멈춤·실패)
+const STOP_CX = 5.6;
+room(STOP_CX, FRONT_CZ, 7.6, FRONT_D, C.rug.stop, layers.stopped, 1.35);
+const stoppedTotal = DATA.stopped.length + (DATA.stopped_rest || 0);
+pin(`${dot(CSS.bad)}격리 <span class="n">멈춤·실패 ${stoppedTotal}건</span>`,
+    { x: STOP_CX, y: 0, z: FRONT_Z0 + 0.35 }, 1.9, "", "stopped");
+
+/* 상세로 세워 둔 3건 말고 나머지는 팔레트로 쌓는다.
+   운영 실측이 중단 66건이라 한 건씩 늘어놓을 수 있는 규모가 아니다. */
+if (DATA.stopped_rest) {
+  const rows = Math.min(4, Math.ceil(DATA.stopped_rest / 16));
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < 2; c++) {
+      const pallet = solid(bevelBox(1.5, 0.86, 1.1, 0.06, 0.03), M(0xb08a86, 0.86));
+      pallet.position.set(STOP_CX + 1.5 + c * 1.7, 0.43, FRONT_CZ + 2.0 - r * 1.25);
+      layers.stopped.add(pallet);
+    }
+  }
+  pin(`외 ${DATA.stopped_rest}건`, { x: STOP_CX + 2.4, y: 0.9, z: FRONT_CZ + 2.0 }, 0.4, "sm", "stopped");
+}
+
+const stopPulse = [];
 DATA.stopped.forEach((job, i) => {
-  const s = slab(0x2a1b1b);
   const isFail = job.status === "failed";
-  s.material.emissive = new THREE.Color(isFail ? C.bad : 0x6b7280);
-  s.material.emissiveIntensity = isFail ? 0.5 : 0.22;
-  s.position.set(-2 + i * 2.6, 0.2, -5.4);
-  s.rotation.y = -0.18;
-  s.userData = { kind: "stopped", title: job.source_rel.split("/").pop(), detail: job.reason, status: job.status_label };
-  layers.stopped.add(s);
-  pickable.push(s);
-  if (isFail) animated.push({ mesh: s, base: 0.2, phase: i * 2, pulse: true });
+  const c = crate(isFail ? 0xc98a84 : 0xa9adb8);
+  c.position.set(STOP_CX - 2.3 + i * 1.6, 0.04, FRONT_CZ + 0.3);
+  c.rotation.y = -0.2 + i * 0.14;
+  c.traverse((o) => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; o.userData.pickRoot = c; } });
+  c.userData = { kind: "stopped", title: job.source_rel.split("/").pop(), detail: job.reason, status: job.status_label };
+  layers.stopped.add(c);
+  pickable.push(c);
+
+  const beacon = new THREE.Mesh(
+    new THREE.SphereGeometry(0.09, 12, 10),
+    new THREE.MeshStandardMaterial({ color: 0x2a1416, emissive: new THREE.Color(isFail ? C.bad : C.warn), emissiveIntensity: 1.2, roughness: 0.5 })
+  );
+  beacon.position.set(c.position.x, 0.48, c.position.z);
+  layers.stopped.add(beacon);
+  if (isFail) stopPulse.push({ mesh: beacon, phase: i * 2.1 });
+  pin(`${dot(isFail ? CSS.bad : CSS.mute)}<span class="n">${job.status_label}</span>`,
+      { x: c.position.x, y: 0.6, z: c.position.z }, 0.3, "sm", "stopped");
 });
-if (DATA.stopped.length) {
-  const l = label("멈춤 · 실패", { size: 38, color: "#f2a49c", weight: 650, scale: 0.72 });
-  l.position.set(-2 + (DATA.stopped.length - 1) * 1.3, 0.95, -6.6);
-  layers.stopped.add(l);
+
+/* ── 운반원 ──────────────────────────────────────────────────────────
+   파이프라인이 직렬이라(orchestrator 의 executor 가 전부 max_workers=1)
+   라인 위를 도는 운반원은 둘뿐이다. 여러 파일이 동시에 흐르는 것처럼
+   보이게 하지 않는다. */
+const DOCK = ROOM_Z1 - 0.9;
+const via = (x, wait = 0.75) => [{ x, z: WALK_Z }, { x, z: DOCK, wait }, { x, z: WALK_Z }];
+
+/* 운반원 둘은 하는 일이 다르다.
+   하나는 미디어에서 골라 큐에 넣는 "작업 시작" 담당,
+   하나는 큐에서 꺼내 추출→전사→번역을 거쳐 반출까지 가는 라인 담당이다.
+   executor 가 단계마다 하나뿐이라(max_workers=1) 라인에 도는 사람도 하나다 —
+   여러 파일이 동시에 흐르는 것처럼 보이게 하지 않는다. */
+const ROUTE_START = [
+  { x: PICK_X, y: DECK_Y, z: DECK_WALK },
+  { x: PICK_X, y: DECK_Y, z: PICK_Z, wait: 1.0, act: "pick" },
+  { x: PICK_X, y: DECK_Y, z: DECK_WALK },
+  { x: RAMP_X, y: DECK_Y, z: DECK_WALK },
+  { x: RAMP_X, y: DECK_Y, z: DECK_Z1 },        // 램프 입구
+  { x: RAMP_X, y: 0, z: RAMP_Z1 },             // 1층으로 내려온다
+  { x: RAMP_X, y: 0, z: WALK_Z },
+  { x: ROOMS.queue.cx, z: WALK_Z },
+  { x: ROOMS.queue.cx, z: DOCK, wait: 0.9, act: "queue" },
+  { x: ROOMS.queue.cx, z: BACK_Z },
+  { x: RAMP_X, z: BACK_Z },
+  { x: RAMP_X, y: 0, z: RAMP_Z1 },
+  { x: RAMP_X, y: DECK_Y, z: DECK_Z1 },        // 다시 올라간다
+  { x: RAMP_X, y: DECK_Y, z: DECK_WALK },
+];
+
+const ROUTE_LINE = [
+  { x: ROOMS.queue.cx, z: WALK_Z },
+  { x: ROOMS.queue.cx, z: DOCK, wait: 0.8, act: "pick" },
+  { x: ROOMS.queue.cx, z: WALK_Z },
+  ...via(ROOMS["추출"].cx), ...via(ROOMS["전사"].cx), ...via(ROOMS["번역"].cx),
+  { x: ROOMS.done.cx, z: WALK_Z },
+  { x: DROP_BASE.x, z: DROP_BASE.z, wait: 0.9, act: "drop" },
+  { x: ROOMS.done.cx, z: BACK_Z },
+  { x: ROOMS.queue.cx, z: BACK_Z },
+];
+
+const BATCH = 3;          // 한 번 시작할 때 큐에 함께 들어가는 건수
+const carriers = [];
+function addCarrier(route, coat, startIdx, carrying, crateTint, batch = 0) {
+  const g = person(coat, 0x30384a);
+  g.traverse((o) => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; } });
+  g.position.set(route[startIdx].x, 0, route[startIdx].z);
+  layers.stations.add(g);
+  const held = batch ? cart(batch) : crate(crateTint);
+  if (!batch) held.scale.setScalar(0.78);
+  held.position.set(0, batch ? 0 : 0.34, batch ? 0.52 : 0.3);
+  held.visible = carrying;
+  held.traverse((o) => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = false; } });
+  g.add(held);
+  carriers.push({ g, route, rig: g.userData.rig, held, i: startIdx, wait: 0, yaw: 0, carrying, phase: 0 });
+}
+addCarrier(ROUTE_START, 0xe0a58f, 0, false, C.crateHi, BATCH);
+addCarrier(ROUTE_LINE, 0xb7c1cf, Math.floor(ROUTE_LINE.length * 0.45), true, C.crate);
+
+function stepCarrier(c, dt) {
+  const rig = c.rig;
+  if (c.wait > 0) {
+    c.wait -= dt;
+    rig.legs.forEach((l) => (l.rotation.x *= 0.85));
+    rig.arms.forEach((a) => (a.rotation.x *= 0.85));
+    rig.body.position.y = 0.57;
+    return 0;
+  }
+  const wp = c.route[c.i];
+  const dx = wp.x - c.g.position.x, dz = wp.z - c.g.position.z;
+  const dist = Math.hypot(dx, dz);
+  const SPEED = 1.55;
+  if (dist < 0.06) {
+    c.g.position.y = wp.y || 0;
+    if (wp.act === "pick") { c.carrying = true; c.held.visible = true; }
+    if (wp.act === "drop") { c.carrying = false; c.held.visible = false; dropCrate(); }
+    if (wp.act === "queue") { c.carrying = false; c.held.visible = false; dropQueue(); }
+    c.wait = wp.wait || 0;
+    c.i = (c.i + 1) % c.route.length;
+    return 0;
+  }
+  const step = Math.min(dist, SPEED * dt);
+  const f = step / dist;
+  c.g.position.x += dx * f;
+  c.g.position.z += dz * f;
+  c.g.position.y += ((wp.y || 0) - c.g.position.y) * f;   // 램프 경사
+
+  const want = Math.atan2(dx, dz);
+  let d = ((want - c.yaw + Math.PI * 3) % (Math.PI * 2)) - Math.PI;
+  c.yaw += d * Math.min(1, dt * 9);
+  c.g.rotation.y = c.yaw;
+  return step;
 }
 
-/* ── GPU: 스테이션 아래를 관통하는 블록 + VRAM 기둥 ───────────────── */
-const gpuBlock = new THREE.Mesh(
-  new THREE.BoxGeometry(17, 0.7, 2.2),
-  new THREE.MeshStandardMaterial({
-    color: 0x101827, roughness: .5, metalness: .6,
-    emissive: new THREE.Color(C.gpu), emissiveIntensity: 0.12,
-  })
-);
-gpuBlock.position.set(0, -0.42, -2.6);
-layers.gpu.add(gpuBlock);
-
-const util = DATA.gpu.utilization_percent / 100;
-const utilBar = new THREE.Mesh(
-  new THREE.BoxGeometry(17 * util, 0.14, 2.3),
-  new THREE.MeshBasicMaterial({ color: C.gpu, transparent: true, opacity: .9 })
-);
-utilBar.position.set(-17 / 2 + (17 * util) / 2, -0.03, -2.6);
-layers.gpu.add(utilBar);
-animated.push({ mesh: utilBar, glow: true });
-
-const vramH = 4.2 * (DATA.gpu.memory_percent / 100);
-const vram = new THREE.Mesh(
-  new THREE.BoxGeometry(0.85, vramH, 0.85),
-  new THREE.MeshStandardMaterial({
-    color: 0x16324a, roughness: .35, metalness: .5,
-    emissive: new THREE.Color(C.gpu), emissiveIntensity: .35,
-  })
-);
-vram.position.set(-10.6, vramH / 2, -2.6);
-layers.gpu.add(vram);
-const vramShell = new THREE.Mesh(
-  new THREE.BoxGeometry(0.95, 4.2, 0.95),
-  new THREE.MeshBasicMaterial({ color: C.gpu, wireframe: true, transparent: true, opacity: .22 })
-);
-vramShell.position.set(-10.6, 2.1, -2.6);
-layers.gpu.add(vramShell);
-
-const gpuLabel = label("GPU " + DATA.gpu.utilization_percent + "%", { size: 40, color: "#9fdcf7", scale: 0.78 });
-gpuLabel.position.set(0, 0.55, -4.3);
-layers.gpu.add(gpuLabel);
-
-const vramLabel = label("VRAM " + DATA.gpu.memory_percent + "%", { size: 34, color: "#9fdcf7", weight: 650, scale: 0.62 });
-vramLabel.position.set(-10.6, 4.7, -2.6);
-layers.gpu.add(vramLabel);
-
-/* ── 흐름 입자: 큐 → 스테이션 → 완료 ─────────────────────────────── */
-const flowCount = 90;
-const flowGeo = new THREE.BufferGeometry();
-const flowPos = new Float32Array(flowCount * 3);
-const flowSeed = new Float32Array(flowCount);
-for (let i = 0; i < flowCount; i++) {
-  flowSeed[i] = Math.random();
-  flowPos[i * 3 + 1] = 0.55 + Math.random() * 0.5;
-  flowPos[i * 3 + 2] = (Math.random() - 0.5) * 1.1;
+/* 시작 담당이 큐에 넣은 것.
+   묶음 하나가 통째로 들어간다 — 큐 삽입은 원자적이라 한 건씩 흘러 들어오지 않는다.
+   여기서 NPC 수를 늘리면 없는 병렬성을 그리게 되므로, 늘리는 것은 짐뿐이다. */
+const queueDropped = [];
+function dropQueue() {
+  if (queueDropped.length >= BATCH * 2) queueDropped.splice(0).forEach((m) => layers.queue.remove(m));
+  const base = queueDropped.length;
+  for (let i = 0; i < BATCH; i++) {
+    const n = base + i;
+    const c = crate(C.crateHi);
+    c.position.set(ROOMS.queue.cx + 1.9 - (n % 3) * 0.62, 0.04 + Math.floor(n / 3) * 0.32, ROOM_CZ + 1.15);
+    c.scale.setScalar(0.82);
+    c.traverse((o) => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; } });
+    layers.queue.add(c);
+    queueDropped.push(c);
+  }
 }
-flowGeo.setAttribute("position", new THREE.BufferAttribute(flowPos, 3));
-const flow = new THREE.Points(flowGeo, new THREE.PointsMaterial({
-  color: C.accent, size: 0.11, transparent: true, opacity: .75, depthWrite: false,
-}));
-layers.stations.add(flow);
 
-const X0 = STATION_X["추출"] - 9, X1 = STATION_X["번역"] + 5;
+function dropCrate() {
+  if (dropped.length >= 6) {
+    dropped.splice(0).forEach((m) => layers.done.remove(m));
+  }
+  const n = dropped.length;
+  const c = crate(0x9ec3a4);
+  c.position.set(DROP_BASE.x - 0.3 + (n % 2) * 0.6, Math.floor(n / 2) * 0.38, DROP_BASE.z);
+  c.traverse((o) => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; } });
+  layers.done.add(c);
+  dropped.push(c);
+}
 
-/* ── 선택 ─────────────────────────────────────────────────────────── */
+/* ── 카메라: 직교 아이소메트릭 (레퍼런스와 같은 리그) ────────────────── */
+const EL = 0.62;                 // 고도각 rad ≈ 35°
+const CAM_D = 60;                // 직교라 거리는 클리핑에만 영향
+const TARGET = new THREE.Vector3(PLAT_CX, 0, PLAT_CZ);
+const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 200);
+let yaw = 0.72, zoom = 1, panX = 0, panZ = 0;
+const VIEW = 11.5;               // zoom=1 일 때 화면 절반 높이(월드 단위)
+
+function frameCamera() {
+  // 오른쪽 HUD 패널(348px)이 씬을 가리므로 그만큼 프러스텀을 옆으로 민다.
+  // 좁은 창에서는 패널이 씬 위에 겹치므로 오프셋을 줄인다.
+  // 좁은 창에서 패널 폭을 통째로 비우면 남는 자리가 없어 부지가 우표만 해진다.
+  // 창이 넓어질수록 비우는 폭을 늘린다 (최대 364 = 패널 348 + 여백).
+  const panelW = Math.round(Math.min(364, Math.max(0, innerWidth - 700)));
+  const w = innerWidth + panelW, h = innerHeight, aspect = w / h;
+  const availW = Math.max(260, innerWidth - panelW);
+
+  // 직교 + 고정 고도각이라 플랫폼의 화면 실루엣을 계산으로 구할 수 있다.
+  // zoom=1 에서 부지 전체가 들어오도록 반높이를 역산한다 — 창 크기·yaw 와 무관하게 맞는다.
+  const sw = Math.abs(PLAT_W * Math.cos(yaw)) + Math.abs(PLAT_D * Math.sin(yaw));
+  const sd = Math.abs(PLAT_W * Math.sin(yaw)) + Math.abs(PLAT_D * Math.cos(yaw));
+  const sh = sd * Math.sin(EL) + 4.2 + DECK_Y + 2.6;   // 건물·타워·상층 랙 + DOM 핀 머리공간
+  // 뷰 오프셋을 주면 실제로 보이는 가로폭이 availW 로 줄어든다. 그 폭에 맞춰 역산한다.
+  const fit = Math.max(sh / 2, (sw / 2) * h / availW) * 1.06;
+
+  const vh = fit / zoom, vw = vh * aspect;
+  camera.left = -vw; camera.right = vw; camera.top = vh; camera.bottom = -vh;
+  camera.setViewOffset(w, h, panelW, 0, innerWidth, innerHeight);
+  camera.updateProjectionMatrix();
+  document.body.classList.toggle("lbl-far", zoom < 0.9);
+}
+function placeCam() {
+  const tx = TARGET.x + panX, tz = TARGET.z + panZ;
+  camera.position.set(
+    tx + CAM_D * Math.cos(EL) * Math.sin(yaw),
+    CAM_D * Math.sin(EL),
+    tz + CAM_D * Math.cos(EL) * Math.cos(yaw)
+  );
+  camera.lookAt(tx, 0, tz);
+}
+frameCamera(); placeCam();
+
+/* 키 라이트가 씬 중심을 따라다녀야 그림자 프러스텀이 어긋나지 않는다 */
+key.target.position.set(TARGET.x, 0, TARGET.z);
+scene.add(key.target);
+
+let drag = null;
+canvas.addEventListener("pointerdown", (e) => {
+  drag = { x: e.clientX, y: e.clientY, btn: e.button, moved: 0 };
+  try { canvas.setPointerCapture(e.pointerId); } catch { /* 합성 포인터 등 캡처 불가 */ }
+});
+canvas.addEventListener("pointermove", (e) => {
+  if (drag) {
+    const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+    drag.moved += Math.abs(dx) + Math.abs(dy);
+    if (drag.btn === 2 || e.shiftKey) {
+      const k = (VIEW / zoom) / innerHeight * 2;
+      panX -= (dx * Math.cos(yaw) - dy * Math.sin(yaw)) * k;
+      panZ += (dx * Math.sin(yaw) + dy * Math.cos(yaw)) * k;
+      panX = Math.max(-16, Math.min(16, panX));
+      panZ = Math.max(-14, Math.min(14, panZ));
+    } else {
+      yaw -= dx * 0.007;
+      frameCamera();
+    }
+    drag.x = e.clientX; drag.y = e.clientY;
+    placeCam();
+    canvas.style.cursor = "grabbing";
+    return;
+  }
+  hoverAt(e);
+});
+addEventListener("pointerup", (e) => {
+  if (drag && drag.moved < 6) clickAt(e);
+  drag = null;
+  canvas.style.cursor = "grab";
+});
+canvas.addEventListener("contextmenu", (e) => e.preventDefault());
+canvas.addEventListener("wheel", (e) => {
+  e.preventDefault();
+  zoom = Math.max(0.55, Math.min(3.6, zoom * (e.deltaY > 0 ? 0.9 : 1.1)));
+  frameCamera();
+}, { passive: false });
+
+document.getElementById("reset").onclick = () => {
+  yaw = 0.72; zoom = 1; panX = 0; panZ = 0;
+  frameCamera(); placeCam();
+};
+
+/* ── 선택 ───────────────────────────────────────────────────────────── */
 const ray = new THREE.Raycaster();
 const ptr = new THREE.Vector2();
-let selected = null;
-let hovered = null;
+let selected = null, hovered = null;
+
+const selRing = new THREE.Mesh(
+  new THREE.RingGeometry(0.62, 0.78, 40),
+  new THREE.MeshBasicMaterial({ color: 0x2f3a63, transparent: true, opacity: 0.85, side: THREE.DoubleSide, toneMapped: false })
+);
+selRing.rotation.x = -Math.PI / 2;
+selRing.position.y = 0.05;
+selRing.visible = false;
+scene.add(selRing);
+
+function pickAt(ev) {
+  ptr.x = (ev.clientX / innerWidth) * 2 - 1;
+  ptr.y = -(ev.clientY / innerHeight) * 2 + 1;
+  ray.setFromCamera(ptr, camera);
+  const hits = ray.intersectObjects(pickable.filter((o) => o.parent && o.parent.visible), true);
+  for (const h of hits) {
+    let o = h.object;
+    while (o && !o.userData.kind) o = o.parent;
+    if (o && o.userData.kind) return o;
+  }
+  return null;
+}
+function lift(obj, on) {
+  if (!obj) return;
+  obj.position.y = (obj.userData._y ?? (obj.userData._y = obj.position.y)) + (on ? 0.12 : 0);
+}
+function hoverAt(ev) {
+  const o = pickAt(ev);
+  if (o === hovered) return;
+  if (hovered && hovered !== selected) lift(hovered, false);
+  hovered = o;
+  if (hovered && hovered !== selected) lift(hovered, true);
+  canvas.style.cursor = o ? "pointer" : "grab";
+}
+function clickAt(ev) {
+  const o = pickAt(ev);
+  if (selected && selected !== o) lift(selected, false);
+  selected = o;
+  if (selected) {
+    lift(selected, true);
+    const b = new THREE.Box3().setFromObject(selected);
+    selRing.position.set((b.min.x + b.max.x) / 2, 0.05, (b.min.z + b.max.z) / 2);
+    const r = Math.max(b.max.x - b.min.x, b.max.z - b.min.z) * 0.72 + 0.25;
+    selRing.scale.setScalar(r);
+    selRing.visible = true;
+  } else selRing.visible = false;
+  setDetail(selected ? selected.userData : null);
+}
 
 function setDetail(u) {
   const body = document.getElementById("detail-body");
@@ -396,8 +1132,12 @@ function setDetail(u) {
     badge.className = "b"; badge.textContent = "없음";
     return;
   }
-  const cls = { job: "b run dot", queue: "b wait dot", done: "b ok dot", stopped: "b bad dot" }[u.kind] || "b";
-  const name = { job: "실행 중", queue: "대기", done: "완료", stopped: u.status || "멈춤" }[u.kind];
+  const cls = { job: "b run dot", queue: "b wait dot", done: "b ok dot",
+                stopped: "b bad dot", model: "b run dot", idle: "b hold dot",
+                start: "b ok dot", dir: "b" }[u.kind] || "b";
+  const name = { job: "실행 중", queue: "대기", done: "완료", stopped: u.status || "멈춤",
+                 model: u.active ? "활성 모델" : "상주 모델", idle: "유휴",
+                 start: "시작 지점", dir: "디렉터리" }[u.kind];
   badge.className = cls; badge.textContent = name;
   body.innerHTML = `
     <div class="t-name" style="margin-bottom: 10px"><b style="font-size: .95rem">${u.title}</b></div>
@@ -408,85 +1148,81 @@ function setDetail(u) {
     ${u.detail ? `<p class="muted" style="margin: 10px 0 0; font-size: .8rem; line-height: 1.5">${u.detail}</p>` : ""}`;
 }
 
-function mark(mesh, on) {
-  if (!mesh) return;
-  mesh.material.emissiveIntensity = on
-    ? (mesh.userData._e ?? mesh.material.emissiveIntensity) * 2.6
-    : (mesh.userData._e ?? mesh.material.emissiveIntensity);
-  if (on && mesh.userData._e === undefined) mesh.userData._e = mesh.material.emissiveIntensity / 2.6;
-  mesh.scale.setScalar(on ? 1.06 : 1);
-}
-
-function pick(ev) {
-  ptr.x = (ev.clientX / innerWidth) * 2 - 1;
-  ptr.y = -(ev.clientY / innerHeight) * 2 + 1;
-  ray.setFromCamera(ptr, camera);
-  const hit = ray.intersectObjects(pickable.filter((m) => m.parent && m.parent.visible), false)[0];
-  return hit ? hit.object : null;
-}
-
-canvas.addEventListener("pointermove", (ev) => {
-  const m = pick(ev);
-  if (m !== hovered) {
-    if (hovered !== selected) mark(hovered, false);
-    hovered = m;
-    if (hovered && hovered !== selected) mark(hovered, true);
-    canvas.style.cursor = m ? "pointer" : "grab";
-  }
-});
-
-canvas.addEventListener("click", (ev) => {
-  const m = pick(ev);
-  if (selected && selected !== m) mark(selected, false);
-  selected = m;
-  if (selected) mark(selected, true);
-  setDetail(selected ? selected.userData : null);
-});
-
-/* ── 레이어 토글 ──────────────────────────────────────────────────── */
 document.querySelectorAll("[data-layer]").forEach((cb) => {
-  cb.addEventListener("change", () => { layers[cb.dataset.layer].visible = cb.checked; });
+  cb.addEventListener("change", () => {
+    layers[cb.dataset.layer].visible = cb.checked;
+    for (const p of pins) if (p.layer === cb.dataset.layer) p.el.style.display = cb.checked ? "" : "none";
+  });
 });
 
-/* ── 루프 ─────────────────────────────────────────────────────────── */
+/* ── 루프 ───────────────────────────────────────────────────────────── */
 addEventListener("resize", () => {
-  camera.aspect = innerWidth / innerHeight;
-  camera.updateProjectionMatrix();
   renderer.setSize(innerWidth, innerHeight);
+  frameCamera();
 });
 
-let frames = 0, fpsLast = performance.now();
-const clock = new THREE.Clock();
+const _v = new THREE.Vector3();
+function updatePins() {
+  for (const p of pins) {
+    const o = p.obj;
+    if (o.isObject3D) o.getWorldPosition(_v); else _v.set(o.x, o.y, o.z);
+    _v.y += p.y;
+    _v.project(camera);
+    const x = (_v.x * 0.5 + 0.5) * innerWidth;
+    const y = (-_v.y * 0.5 + 0.5) * innerHeight;
+    const off = _v.z > 1 || x < -120 || x > innerWidth + 120 || y < -60 || y > innerHeight + 60;
+    p.el.classList.toggle("off", off);
+    if (!off) p.el.style.transform = `translate(${Math.round(x)}px, ${Math.round(y)}px) translate(-50%, -100%)`;
+  }
+}
 
+let frames = 0, fpsLast = performance.now(), last = performance.now();
 function loop() {
-  const t = clock.getElapsedTime();
-  const dt = clock.getDelta();
+  const now = performance.now();
+  const dt = Math.min((now - last) / 1000, 0.1);
+  last = now;
+  const t = now / 1000;
 
-  for (const a of animated) {
-    if (a.glow) {
-      a.mesh.material.opacity = 0.62 + Math.sin(t * 2.4) * 0.22;
-    } else if (a.pulse) {
-      a.mesh.material.emissiveIntensity = 0.35 + Math.sin(t * 3 + a.phase) * 0.25;
-    } else {
-      a.mesh.position.y = a.base + Math.sin(t * 1.5 + a.phase) * 0.07;
-      a.mesh.rotation.y = Math.sin(t * 0.5 + a.phase) * 0.05;
+  for (const c of carriers) {
+    const moved = stepCarrier(c, dt);
+    const rig = c.rig;
+    if (moved > 0) {
+      c.phase = (c.phase || 0) + moved * 4.2;
+      const sw = Math.sin(c.phase);
+      rig.legs[0].rotation.x = sw * 0.62;
+      rig.legs[1].rotation.x = -sw * 0.62;
+      rig.arms[0].rotation.x = (c.carrying ? -0.95 : -sw * 0.5);
+      rig.arms[1].rotation.x = (c.carrying ? -0.95 : sw * 0.5);
+      rig.body.position.y = 0.57 + Math.abs(Math.cos(c.phase)) * 0.022;
     }
   }
 
-  const speed = 1.4 + (DATA.gpu.utilization_percent / 100) * 4.2;
-  const pos = flowGeo.attributes.position;
-  for (let i = 0; i < flowCount; i++) {
-    let x = pos.getX(i) + dt * speed * (0.5 + flowSeed[i]);
-    if (x > X1 || x === 0) x = X0 + Math.random() * 2;
-    pos.setX(i, x);
+  for (const op of stageOps) {
+    const s = Math.sin(t * 2.1 + op.phase);
+    op.rig.arms[0].rotation.x = -1.1 + s * 0.22;
+    op.rig.arms[1].rotation.x = -1.1 - s * 0.22;
+    op.rig.body.position.y = 0.57 + Math.sin(t * 1.4 + op.phase) * 0.012;
   }
-  pos.needsUpdate = true;
 
-  controls.update();
+  for (const tw of towers) {
+    if (!tw.active) continue;
+    const n = tw.strips.length;
+    for (let u = 0; u < n; u++) {
+      const wave = Math.sin(t * 3.2 - u * 0.55 + tw.phase) * 0.5 + 0.5;
+      tw.strips[u].material.emissiveIntensity = 0.45 + wave * 1.35;
+    }
+  }
+
+  startConsole.btn.material.emissiveIntensity = 0.55 + (Math.sin(t * 2.6) * 0.5 + 0.5) * 0.9;
+
+  for (const b of stopPulse) {
+    b.mesh.material.emissiveIntensity = 0.7 + (Math.sin(t * 3 + b.phase) * 0.5 + 0.5) * 1.1;
+  }
+
+  updatePins();
   renderer.render(scene, camera);
 
   frames++;
-  const now = performance.now();
   if (now - fpsLast >= 1000) {
     document.getElementById("fps").textContent = frames + " fps";
     frames = 0; fpsLast = now;
@@ -503,7 +1239,7 @@ if (!isWebGPU) badge.title = window.isSecureContext
   : "secure context 아님 — localhost 또는 https 로 접속해야 WebGPU가 열립니다";
 
 setDetail(null);
-renderer.render(scene, camera);   // rAF 이전에 첫 프레임을 보장
+renderer.render(scene, camera);
 loop();
 </script>
 </body>

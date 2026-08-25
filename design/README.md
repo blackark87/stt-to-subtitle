@@ -12,6 +12,11 @@ python3 design/preview/render.py     # design/preview/out/*.html 생성
 앱을 띄우지 않고 `design/preview/out/dashboard.html` 을 브라우저로 열면 됩니다.
 샘플 데이터는 `design/preview/fixtures.py` 에 있습니다.
 
+3D 파이프라인 화면(`/webgpu`)은 정적 렌더 대상이 아니라 앱을 띄워야 합니다.
+레퍼런스와 설계 근거는 `HANDOFF.md` §1 에 있습니다 — **고치기 전에 먼저 읽으세요.**
+깊이를 만드는 것은 그림자이지 발광이 아니고, 미디어 트리는 카테고리마다 깊이가 다릅니다.
+`localhost` 로 접속해야 WebGPU 가 열립니다 (secure context). 자세한 것은 `HANDOFF.md`.
+
 ## 파일이 어디로 갈 것인가
 
 | 초안 | 대상 |
@@ -50,7 +55,8 @@ python3 design/preview/render.py     # design/preview/out/*.html 생성
 | `job.eta_seconds` | 청크 처리 속도 × 남은 청크 |
 | `job.queue_position` | 대기 큐 순번 |
 | `job.actor` | `web_config` 의 NFO `actor` + `.actors/<이름>.jpg` 라우트 |
-| `actor_progress` | 배우별 자막 보유율 집계 |
+| `actor_progress` | 배우별 자막 보유율 집계 (AV/japan 에만 성립) |
+| 미디어 구역별 집계 | AV/japan 밖 카테고리의 자막 보유율. 없어서 3D 창고에서 회색으로 둡니다 |
 | `gpu.utilization_history` | Prometheus range query (지금은 순간값만 읽음) |
 | `stage_totals` | 단계별 소요 시간 누계 |
 
