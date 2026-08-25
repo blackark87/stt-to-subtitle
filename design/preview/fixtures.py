@@ -19,6 +19,27 @@ NEEDS_BACKEND = {
 #  - GPU 전력/온도 한계: gpu_monitoring 이 쿼리하지 않는다 (POWER_MGMT_LIMIT, SLOWDOWN_TEMP 미수집).
 #  - "하이브리드" 라는 모델: WhisperX 1차 + Kotoba 재디코딩 교체 구조라 그런 모델은 없다.
 
+# 2026-08-25 운영 중인 stt.blackark.xyz 에서 직접 확인한 실제 미디어 트리다.
+# 개수는 눈으로 센 것만 적는다 — 확인하지 못한 칸은 None 으로 둔다.
+#   /media
+#     ├ AV/japan          배우 디렉터리 449개 → 그 아래 타이틀 폴더 → 파일
+#     ├ AV/west, AV/unclassified
+#     ├ Drama, ETC, Movie, Sports
+#     └ Variety           타이틀 폴더 3개 + 폴더 없이 놓인 파일 12개
+# 카테고리마다 깊이가 다르다는 것이 핵심이다. 균일한 트리로 가정하면 안 된다.
+MEDIA_TREE = [
+    {"path": "AV/japan", "shape": "actor", "dirs": 449,
+     "note": "배우 → 타이틀 → 파일. 미디어 루트에서 가장 큰 구역이다."},
+    {"path": "AV/west", "shape": "actor", "dirs": None},
+    {"path": "AV/unclassified", "shape": "flat", "dirs": None},
+    {"path": "Drama", "shape": "title", "dirs": None},
+    {"path": "ETC", "shape": "title", "dirs": None},
+    {"path": "Movie", "shape": "title", "dirs": None},
+    {"path": "Sports", "shape": "title", "dirs": None},
+    {"path": "Variety", "shape": "mixed", "dirs": 3, "files": 12,
+     "note": "타이틀 폴더와 낱개 파일이 같은 자리에 섞여 있다."},
+]
+
 REMOTE_SERVERS = {
     "configured": True,
     "stt_base_url": "http://192.168.1.20:8100",
@@ -26,7 +47,10 @@ REMOTE_SERVERS = {
     "lm_model": "qwen3-30b-a3b-instruct",
 }
 
-JOB_STATS = {"running": 3, "waiting": 12, "blocked": 1, "failed": 2, "completed": 148}
+# 2026-08-25 운영 실측: 진행 0 · 중단 66 · 실패 0 · 대기 3 · 완료 247.
+# 멈춤이 압도적이라는 것이 이 시스템의 실제 모습이다 — 화면에서 격리 구역이 가장 커야 한다.
+JOB_STATS = {"running": 3, "waiting": 12, "blocked": 63, "failed": 3, "completed": 247}
+STOPPED_REST = 63   # 상세로 보여주는 3건 말고 나머지
 
 
 def _stages(*specs):
@@ -50,7 +74,7 @@ def _stages(*specs):
 RUNNING_JOBS = [
     {
         "id": "7f21ac03-4b9e-4d21-9c60-2a8f11e0b7d3",
-        "source_rel": "media/2026-08/사쿠라이 미유/SMP-014 밤의 인터뷰.mkv",
+        "source_rel": "AV/japan/사쿠라이 미유/SMP-014 밤의 인터뷰/SMP-014 밤의 인터뷰.mkv",
         "actor": {"name": "사쿠라이 미유", "image": "a"},
         "backend_label": "WhisperJAV",
         "prompt_label": "JAV",
@@ -66,7 +90,7 @@ RUNNING_JOBS = [
     },
     {
         "id": "5d19be40-1c22-4a0e-bb31-77c0d2e19a55",
-        "source_rel": "media/2026-08/하야시 노아/KRD-077 조용한 방.mp4",
+        "source_rel": "AV/japan/하야시 노아/KRD-077 조용한 방/KRD-077 조용한 방.mp4",
         "actor": {"name": "하야시 노아", "image": "b"},
         "backend_label": "하이브리드",
         "prompt_label": "JAV",
@@ -82,7 +106,7 @@ RUNNING_JOBS = [
     },
     {
         "id": "0b31aa77-5e10-4f92-9c00-1d5b9a3e77c1",
-        "source_rel": "media/2026-08/버라이어티/NKT-660 비 오는 날.mkv",
+        "source_rel": "AV/japan/모리 유이/NKT-660 비 오는 날/NKT-660 비 오는 날.mkv",
         "actor": None,
         "backend_label": "Kotoba",
         "prompt_label": "버라이어티",
@@ -101,7 +125,7 @@ RUNNING_JOBS = [
 STOPPED_JOBS = [
     {
         "id": "a44e91b2-3f77-4c10-8e21-9b0c4d55e300",
-        "source_rel": "media/2026-07/아오키 리코/TKR-108 늦은 오후.mkv",
+        "source_rel": "AV/japan/아오키 리코/TKR-108 늦은 오후/TKR-108 늦은 오후.mkv",
         "status": "failed",
         "status_label": "실패",
         "stage_label": "전사 92/≈195",
@@ -111,7 +135,7 @@ STOPPED_JOBS = [
     },
     {
         "id": "c0731d55-88a1-4e60-a2f0-6d3e1b9a0f42",
-        "source_rel": "media/2026-07/사쿠라이 미유/MSK-402 흐린 날 [파트 3].mkv",
+        "source_rel": "AV/japan/사쿠라이 미유/MSK-402 흐린 날/MSK-402 흐린 날 [파트 3].mkv",
         "status": "failed",
         "status_label": "실패",
         "stage_label": "전사 33/≈287",
@@ -121,7 +145,7 @@ STOPPED_JOBS = [
     },
     {
         "id": "3e90cc71-9d02-4b71-90a3-5c11e7f2b8aa",
-        "source_rel": "media/2026-08/HRB-519 첫 촬영.mp4",
+        "source_rel": "variety/HRB-519 첫 촬영.mp4",
         "status": "blocked",
         "status_label": "멈춤",
         "stage_label": "번역 88/210",
@@ -133,21 +157,21 @@ STOPPED_JOBS = [
 
 COMPLETED_JOBS = [
     {
-        "source_rel": "media/2026-07/사쿠라이 미유/MSK-402 흐린 날.mkv",
+        "source_rel": "AV/japan/사쿠라이 미유/MSK-402 흐린 날/MSK-402 흐린 날.mkv",
         "meta": "사쿠라이 미유 · WhisperJAV · JAV",
         "transcription": "21분 04초",
         "translation": "44분 18초",
         "total": "1:12:33",
     },
     {
-        "source_rel": "media/2026-08/버라이어티 2026-08-19.mp4",
+        "source_rel": "variety/버라이어티 2026-08-19.mp4",
         "meta": "Kotoba · 버라이어티",
         "transcription": "17분 51초",
         "translation": "36분 02초",
         "total": "58:14",
     },
     {
-        "source_rel": "media/2026-08/하야시 노아/DMO-233 여름의 기록 [파트 1].mp4",
+        "source_rel": "variety/DMO-233 여름의 기록/DMO-233 여름의 기록 [파트 1].mp4",
         "meta": "하야시 노아 · 하이브리드 · JAV",
         "transcription": "28분 40초",
         "translation": "51분 09초",
@@ -168,6 +192,7 @@ QUEUE = [
     {"position": 4, "title": "SMP-015 아침의 대화", "stage": "추출"},
 ]
 QUEUE_REST = 8
+
 QUEUE_ETA = "약 4:20:00"
 
 GPU = {
@@ -195,6 +220,7 @@ ACTOR_PROGRESS = [
     {"name": "아오키 리코", "image": "c", "done": 2, "total": 6, "seg": (33, 17, 50, 0)},
     {"name": "하야시 노아", "image": "b", "done": 7, "total": 9, "seg": (78, 11, 11, 0)},
     {"name": "모리 유이", "image": "d", "done": 4, "total": 4, "seg": (100, 0, 0, 0)},
+    # variety 아래에는 배우 디렉터리가 없다 (NFO actor 도 대개 비어 있다).
     {"name": None, "image": None, "done": 26, "total": 31, "seg": (84, 0, 16, 0)},
 ]
 
@@ -207,6 +233,8 @@ CONTEXT = {
     "pipeline_slots": PIPELINE_SLOTS,
     "queue": QUEUE,
     "queue_rest": QUEUE_REST,
+    "stopped_rest": STOPPED_REST,
+    "media_tree": MEDIA_TREE,
     "queue_eta": QUEUE_ETA,
     "gpu": GPU,
     "actor_progress": ACTOR_PROGRESS,

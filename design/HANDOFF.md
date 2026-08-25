@@ -1,49 +1,127 @@
 # 대시보드 개편 — 인수인계
 
-작성 2026-08-25 · 브랜치 `agent/whisperjav-comparison-workflow`
+작성 2026-08-25 · 3D 화면 레퍼런스 기반 재작업 2026-08-25 · 브랜치 `claude/design-handoff-b9ebcc`
 
 `src/` 는 이 작업으로 바뀐 것이 없다. 전부 `design/` 안에서만 만들었다.
 
 ---
 
-## 1. 지금 하던 일 (중단 지점)
+## 1. `/webgpu` 3D 화면 — 레퍼런스 기반으로 다시 지음
 
-`/webgpu` 3D 화면이 **동작은 하는데 볼품이 없다.** 사용자 확인 결과 WebGPU 백엔드로
-정상 기동한다(상단 배지 `WebGPU`). 문제는 렌더링 품질이다 — 후처리가 하나도 없어서
-회색 상자를 격자에 올려둔 수준이다.
+### 레퍼런스가 무엇인지 먼저 적어 둔다
 
-**직전까지 한 것**: bloom 후처리를 붙이려고 의존성만 받아 둠
+이전 인수인계에 이 항목이 없어서 후처리 체크리스트(bloom·톤매핑·env map·반사·베벨·
+입자·카메라)만 보고 만들었고, 일곱 개를 다 넣고도 화면이 납작했다. **기법 목록은
+레퍼런스가 아니다.**
+
+    레퍼런스: https://twin.quantlabnote.com/guest  (three.js r149, `twin3d.js`)
+
+거기서 실제로 뽑아낸 값이다. 추측이 아니라 소스를 읽었다.
+
+| 항목 | 레퍼런스 | 이전 우리 화면 |
+|---|---|---|
+| 카메라 | **직교(Orthographic)**, 고도각 0.6rad ≈ 34°, yaw 회전, zoom | 원근 40° |
+| 그림자 | **PCFSoftShadowMap 2048**, ortho ±11, radius 3.2, bias −0.0004 | 아예 없음 |
+| 조명 | Hemisphere(`0xdfe8ff`/`0x8a795c`, .65) + Directional(`0xfff2dd`, 1.0) | hemi .35 + 방향광 2개, 그림자 없음 |
+| 재질 | 전부 Standard, roughness .55–.9, **metalness 0–0.1** | metalness .6–.9 |
+| 후처리 | **없다.** bloom·SSAO·아웃라인 전부 없음 | bloom + reflector + 비네트 |
+| 안개 | 없음 | Fog(30, 82) |
+| 바닥 | 지면 → 플랫폼 슬래브 → 방마다 색 러그 | 무한 그리드, 빛 안 받는 바닥 |
+| 라벨 | **DOM div 를 매 프레임 투영**, 거리별 LOD | 캔버스 텍스처 스프라이트 |
+
+**깊이는 그림자가 만든다. 발광이 아니다.** 매트한 비금속 표면에 그림자 있는 따뜻한
+키 라이트 하나면 충분하고, 어두운 금속에 bloom 을 아무리 올려도 납작한 건 그대로다.
+그래서 bloom·reflector·TSL 경로는 **전부 걷어냈다**. `three.tsl.min.js` 와
+`BloomNode.js` 는 지우지 않고 벤더 폴더에 남겨 뒀지만 import map 에서 뺐다 —
+다시 쓸 일이 있으면 §1 의 이 문단부터 다시 읽을 것.
+
+렌더러는 `WebGPURenderer` 그대로다(상단 배지도 그대로). WebGPU 에서 그림자 맵과
+직교 카메라가 도는 것은 별도 페이지로 먼저 확인하고 옮겼다.
+
+### 지금 씬에 있는 것
+
+**2층 구조다.** 1층은 생산 라인, 위층은 미디어 창고이고 램프로만 이어진다.
+
+| 구역 | 내용 |
+|---|---|
+| 상층 창고 | `/media` 트리 전체. AV/japan 통로 9줄 + 카테고리별 소형 베이 7개 |
+| 1층 라인 | 대기 큐 → 추출 → 전사 → 번역 → 반출. 방마다 기계 하나, 작업자 하나 |
+| GPU 서버실 | 벽 패널(UTIL/VRAM/TEMP/PWR) + 상주 모델 타워 |
+| 격리 | 멈춤·실패. 상세 3건 + 나머지는 팔레트로 |
+
+**운반원(NPC) 둘은 하는 일이 다르다.**
+- 하나는 창고에서 골라 램프로 내려와 대기 큐에 넣는다 (작업 시작).
+- 하나는 큐에서 꺼내 추출→전사→번역을 거쳐 반출 선반에 쌓는다.
+
+라인에 도는 사람이 하나인 것은 그림이 아니라 사실이다 — executor 가 단계마다
+하나씩(`max_workers=1`, §4)이라 파일이 동시에 흐르지 않는다. 사람을 늘리면
+없는 병렬성을 그리게 된다.
+
+**여러 개를 골라 시작하면 NPC 를 늘리지 않는다. 짐을 키운다.**
+미디어를 30개 골라 시작해도 답은 둘 다 아니다:
+
+- *NPC 를 30명 띄우는 것* — 처리량에 대한 거짓말이다. 화면은 "30건이 처리 중"이라고
+  말하지만 실제로는 29건이 멈춰 서 있다.
+- *한 사람이 30번 왕복하는 것* — 큐 삽입이 한 건씩 들어오는 것처럼 보인다.
+  실제로는 한 번에 삽입되는 원자적 동작이다.
+
+그래서 시작 담당은 **손수레 한 대에 묶음을 싣고 한 번 간다**(`BATCH`, `cart()`).
+**선택은 묶음, 처리는 한 건씩** — 이 대비가 이 시스템의 실제 모습이고,
+멈춤이 66건까지 쌓인 이유다. 여기를 고칠 때 NPC 수를 작업 수에 연동하지 말 것.
+
+**모델 타워는 상주 모델 하나당 하나다.** `gpu.loaded` 를 그대로 세운다.
+활성이면 랙 조명이 위로 훑고, 유휴면 어둡다. 유휴로 해제되면(커밋 `a64f1ec`)
+타워도 사라져야 한다. "하이브리드"라는 타워는 없다 — §4 참고.
+
+### 미디어 트리는 실제를 확인하고 넣었다
+
+처음에 `media/2026-08/<배우>/…` 같은 균일한 트리로 가정했는데 **틀렸다.**
+2026-08-25 운영 사이트(`stt.blackark.xyz`)에서 직접 확인한 실제 구조다:
 
 ```
-design/static/vendor/three.tsl.min.js    23 KB   (TSL 노드 재수출)
-design/static/vendor/BloomNode.js        16 KB   (three/tsl, three/webgpu, three/addons 를 import)
+/media
+  ├ AV/japan          배우 디렉터리 449개 → 타이틀 폴더 → 파일   (세 겹)
+  ├ AV/west, AV/unclassified
+  ├ Drama, ETC, Movie, Sports
+  └ Variety           타이틀 폴더 3개 + 폴더 없이 놓인 파일 12개  (섞임)
 ```
 
-**아직 안 한 것**: 위 두 파일을 import map 에 연결하고 실제로 적용하는 일. 필요한 import map:
+**카테고리마다 깊이가 다르다.** Variety 는 타이틀 폴더와 낱개 파일이 같은 자리에
+있다. 균일한 트리로 가정하는 UI 를 만들면 안 된다. `fixtures.MEDIA_TREE` 에
+같은 내용을 주석과 함께 넣어 뒀고, `source_rel` 샘플도 실제 모양으로 고쳤다.
 
-```json
-{ "imports": {
-  "three":         "/static/vendor/three.webgpu.min.js",
-  "three/webgpu":  "/static/vendor/three.webgpu.min.js",
-  "three/tsl":     "/static/vendor/three.tsl.min.js",
-  "three/addons/tsl/display/BloomNode.js": "/static/vendor/BloomNode.js"
-} }
-```
+자막 보유율(초록/갈색)은 `actor_progress` 가 있는 AV/japan 에만 칠한다.
+나머지 구역은 집계값이 없으므로 **중립 회색으로 두고 칠하지 않는다.**
 
-### 화려함을 위해 남은 작업 (효과 큰 순서)
+### 운영 실측 (2026-08-25)
 
-1. **Bloom** — emissive 요소(진행률 링, GPU 바, 실패 슬래브)가 지금은 그냥 밝은 색일 뿐
-   빛나지 않는다. 가장 큰 차이를 만든다.
-2. **톤 매핑 + 색 관리** — `renderer.toneMapping = THREE.ACESFilmicToneMapping`,
-   `outputColorSpace = SRGBColorSpace`.
-3. **환경광(env map)** — 절차적 그라디언트 큐브맵. 금속 재질에 반사가 생겨야 입체가 산다.
-4. **바닥 반사** — 어두운 광택 바닥에 스테이션이 비치게.
-5. **형태 개선** — 맨 `BoxGeometry`/`CylinderGeometry` 대신 베벨. 스테이션을 끊어진 원기둥이
-   아니라 **하나로 이어진 발광 레일**로 보는 것도 검토할 것.
-6. **입자** — additive 블렌딩 + 트레일.
-7. **카메라** — 미세한 드리프트, 선택 시 부드러운 이징.
+`stt.blackark.xyz`: 진행 0 · **중단 66** · 실패 0 · 대기 3 · 완료 247.
 
----
+**멈춤이 압도적이다.** §7 의 "멈춤 섹션을 전면에" 는 취향이 아니라 데이터가
+시키는 것이다. 격리 구역을 한 건씩 늘어놓을 수 있는 규모가 아니라서
+상세 3건 + 나머지 팔레트로 바꿨다. `JOB_STATS` 도 이 비율에 맞췄다
+(라인이 도는 그림은 봐야 하므로 실행 중만 3 으로 남겨 뒀다).
+
+### 이 화면을 고칠 때 알아야 할 것
+
+**프레이밍은 계산으로 맞춘다** (`frameCamera()`). 직교 + 고정 고도각이라
+부지의 화면 실루엣을 닫힌 식으로 구할 수 있다. zoom=1 에서 부지 전체가 들어오도록
+반높이를 역산하므로 창 크기와 yaw 가 바뀌어도 잘리지 않는다. 오른쪽 HUD 패널 자리는
+`setViewOffset` 으로 비우되, **좁은 창에서 패널 폭을 통째로 비우면 남는 자리가 없어
+부지가 우표만 해진다** — 그래서 비우는 폭을 창 너비에 따라 늘린다. 처음에
+`innerWidth >= 900` 로 껐다 켰다 했더니 800px 창에서 창고가 통째로 잘렸다.
+
+**DOM 핀은 머리공간이 따로 필요하다.** 핀은 오브젝트 위로 `translate(-50%,-100%)`
+되므로 월드 기준 fit 만으로는 위가 잘린다. `sh` 에 여유를 더해 둔 이유다.
+
+**구역 러그 색이 플랫폼 색과 가까우면 방이 통째로 안 보인다.** GPU 서버실을
+`0xa8b6c2` 로 뒀다가 회색 플랫폼에 묻혀서 방이 없는 것처럼 보였다. `0x8fa8bd` 로 바꿨다.
+
+**`THREE.Points` 에 `map` 을 물리면 입자가 통째로 사라진다.** 점에는 uv 어트리뷰트가
+없어 샘플링이 실패한다. 지금 씬에는 입자가 없지만 다시 넣을 거면 알아 둘 것.
+
+**레이캐스팅은 `setViewOffset` 을 자동으로 반영한다** — 투영행렬을 그대로 쓰기 때문이다.
+호버 그리드로 훑어 픽 가능한 오브젝트가 실제로 잡히는 것을 확인했다.
 
 ## 2. 실행
 
@@ -54,11 +132,18 @@ design/static/vendor/BloomNode.js        16 KB   (three/tsl, three/webgpu, three
 | 경로 | 내용 |
 |---|---|
 | `/option-B` | 2D 대시보드 (검토·수정 반영본) |
-| `/webgpu` | 3D 파이프라인 |
+| `/webgpu` | 3D 파이프라인 (`?webgl` 로 WebGL2 폴백 강제) |
 | `/static/...` | CSS, 벤더 JS |
 
-FastAPI·uvicorn 은 `~/.pyenv/versions/3.12.13` 에 설치되어 있다. 시스템 python3 에는 pip 가
-없고 `python3-venv` 도 깨져 있다.
+FastAPI·uvicorn 은 (원래 작업하던 리눅스 머신 기준) `~/.pyenv/versions/3.12.13` 에 설치되어
+있다. 그 머신의 시스템 python3 에는 pip 가 없고 `python3-venv` 도 깨져 있다.
+
+다른 머신이라면 venv 를 따로 파면 된다. 의존성은 셋뿐이다.
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install fastapi uvicorn jinja2
+.venv/bin/python -m uvicorn design.app:app --host 127.0.0.1 --port 8099 --reload
+```
 
 **WebGPU 는 secure context 에서만 열린다.** LAN IP + 평문 http 로 접속하면
 `navigator.gpu` 가 `undefined` 라 WebGL2 로 폴백한다. `localhost` 는 secure context 이므로
@@ -84,7 +169,11 @@ design/
   README.md                 폴더 설명·매핑표
   HANDOFF.md                이 문서
   static/app.css            src/.../static/app.css 전체 교체 후보
-  static/vendor/            Three.js 0.185.1 (CDN 미사용)
+  static/vendor/            Three.js (CDN 미사용)
+                            three.webgpu.min.js, three.core.min.js  — 쓰는 것
+                            three.tsl.min.js, BloomNode.js          — 지금은 안 씀 (§1)
+                            OrbitControls.js                        — 지금은 안 씀,
+                                                                      직교 리그를 직접 굴린다
   templates/base.html       ← src/.../templates/base.html
            dashboard.html   ← src/.../templates/dashboard.html
            _gpu_panel.html  ← _gpu_stats.html 대체
@@ -161,6 +250,10 @@ design/
 - GPU 전력 한계 320W / 온도 한계 83°C — 수집하지 않는 값
 - "하이브리드" 라는 상주 모델 — 존재하지 않음
 - 자막 단계 슬롯 — 순간에 끝나서 슬롯이 될 수 없음
+- `media/<연월>/<배우>/…` 라는 균일한 미디어 트리 — 실제로는 카테고리마다 깊이가
+  다르다. 운영 사이트에서 확인하고 `MEDIA_TREE` 로 교체했다 (§1)
+- AV/japan 밖 구역의 자막 보유율 — 집계값이 없다. 색칠하지 않고 회색으로 둔다
+- 라인 위를 도는 운반원을 여럿 두는 것 — 없는 병렬성을 그리게 된다
 
 ---
 
@@ -205,16 +298,19 @@ design/
 
 ## 9. 검증 방법과 한계
 
-- Jinja 렌더 → 헤드리스 크롬 스크린샷 → 육안 확인까지 가능하다.
-  크롬은 `~/.cache/puppeteer/chrome/linux-152.0.7977.42/chrome-linux64/chrome`.
-- **이 머신에서는 3D 씬을 볼 수 없다.** RTX 3080 이 있어도 헤드리스 크롬이 GPU 를 못 잡고
-  swiftshader 로 떨어지며, 그 상태에서 렌더 루프가 프레임을 내지 않는다.
-  2D 화면은 검증 가능하고 실제로 이 방식으로 레이아웃 깨짐(가로 오버플로 22px,
-  세로 잘림 361px)을 잡았다.
-- **한글 폰트가 이 머신에 없다.** 스크린샷의 한글이 네모로 나오는 것은 환경 문제이지
-  디자인 문제가 아니다.
-
----
+- **이번에는 3D 씬을 실제로 보면서 만들었다.** 이 작업을 한 머신은 macOS 이고
+  브라우저에 WebGPU 가 있어(`navigator.gpu` 존재, secure context) 스크린샷으로
+  매 단계 확인했다. 이전 인수인계의 "이 머신에서는 3D 씬을 볼 수 없다"는
+  그 리눅스 머신 이야기다 — 헤드리스 크롬이 GPU 를 못 잡고 swiftshader 로 떨어졌다.
+- 확인한 것: 그림자·직교 카메라가 WebGPU 백엔드에서 실제로 도는 것(별도 페이지로 먼저 검증),
+  창 크기별 프레이밍, 픽 가능한 오브젝트가 실제로 잡히는 것(호버 그리드로 훑음),
+  선택 시 상세 패널 내용.
+- **프레임률은 이 환경에서 못 믿는다.** 브라우저 패널이 숨겨져 있으면 rAF 가
+  0.1fps 까지 스로틀된다. 패널이 보일 때는 120fps 가 나왔지만, 실제 성능은
+  대상 기기에서 다시 봐야 한다.
+- **한글 폰트는 이 머신에 있다.** DOM 핀으로 라벨을 옮긴 뒤로는 캔버스 텍스처에
+  한글을 그리지 않으므로 폰트 없는 머신에서도 라벨이 깨지지 않는다. 벽 패널은
+  ASCII 숫자만 쓴다.
 
 ## 10. 이 커밋에 함께 들어간 기존 변경
 
