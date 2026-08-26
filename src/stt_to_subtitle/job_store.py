@@ -90,6 +90,8 @@ class PromptCategory:
     name: str
     translation_prompt: str
     review_prompt: str
+    prompt_revision_id: str
+    prompt_revision_number: int
     archived: bool
     created_at: float
     updated_at: float
@@ -465,9 +467,22 @@ class JobStore:
                     name TEXT NOT NULL COLLATE NOCASE UNIQUE,
                     translation_prompt TEXT NOT NULL,
                     review_prompt TEXT NOT NULL,
+                    active_revision_id TEXT,
                     archived INTEGER NOT NULL DEFAULT 0,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS prompt_revisions (
+                    id TEXT PRIMARY KEY,
+                    category_id TEXT NOT NULL,
+                    revision_number INTEGER NOT NULL,
+                    translation_prompt TEXT NOT NULL,
+                    review_prompt TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    FOREIGN KEY (category_id) REFERENCES prompt_categories(id),
+                    UNIQUE (category_id, revision_number)
                 );
 
                 CREATE TABLE IF NOT EXISTS path_display_rules (
@@ -532,6 +547,7 @@ class JobStore:
                     transcript_revision_id TEXT,
                     transcript_hash TEXT NOT NULL,
                     prompt_hash TEXT NOT NULL,
+                    prompt_revision_id TEXT,
                     endpoint_key TEXT NOT NULL,
                     model TEXT NOT NULL,
                     config_hash TEXT NOT NULL,
@@ -545,6 +561,10 @@ class JobStore:
                     updated_at REAL NOT NULL,
                     completed_at REAL,
                     FOREIGN KEY (job_id) REFERENCES jobs(id),
+                    FOREIGN KEY (transcript_revision_id)
+                        REFERENCES transcript_revisions(id),
+                    FOREIGN KEY (prompt_revision_id)
+                        REFERENCES prompt_revisions(id),
                     FOREIGN KEY (supersedes_generation_id)
                         REFERENCES translation_generations(id),
                     UNIQUE (job_id, generation_number)
@@ -632,6 +652,8 @@ class JobStore:
                     );
                 CREATE INDEX IF NOT EXISTS transcript_revisions_job_idx
                     ON transcript_revisions(created_by_job_id, created_at DESC);
+                CREATE INDEX IF NOT EXISTS prompt_revisions_category_idx
+                    ON prompt_revisions(category_id, revision_number DESC);
                 CREATE INDEX IF NOT EXISTS translation_generations_job_idx
                     ON translation_generations(job_id, generation_number DESC);
                 CREATE INDEX IF NOT EXISTS translation_items_generation_idx
@@ -727,6 +749,22 @@ class JobStore:
                 connection.execute(
                     "ALTER TABLE translation_generations "
                     "ADD COLUMN transcript_revision_id TEXT"
+                )
+            if "prompt_revision_id" not in translation_columns:
+                connection.execute(
+                    "ALTER TABLE translation_generations "
+                    "ADD COLUMN prompt_revision_id TEXT"
+                )
+            prompt_columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(prompt_categories)"
+                ).fetchall()
+            }
+            if "active_revision_id" not in prompt_columns:
+                connection.execute(
+                    "ALTER TABLE prompt_categories "
+                    "ADD COLUMN active_revision_id TEXT"
                 )
             if "status_updated_at" not in columns:
                 connection.execute(
@@ -839,6 +877,47 @@ class JobStore:
                     ),
                 ),
             )
+            prompt_rows = connection.execute(
+                """
+                SELECT id, translation_prompt, review_prompt
+                FROM prompt_categories
+                WHERE active_revision_id IS NULL
+                """
+            ).fetchall()
+            for row in prompt_rows:
+                revision_id = uuid4().hex
+                translation_prompt = str(row["translation_prompt"])
+                review_prompt = str(row["review_prompt"])
+                connection.execute(
+                    """
+                    INSERT INTO prompt_revisions (
+                        id, category_id, revision_number,
+                        translation_prompt, review_prompt,
+                        content_hash, created_at
+                    ) VALUES (?, ?, 1, ?, ?, ?, ?)
+                    """,
+                    (
+                        revision_id,
+                        str(row["id"]),
+                        translation_prompt,
+                        review_prompt,
+                        _canonical_json_hash(
+                            {
+                                "translation_prompt": translation_prompt,
+                                "review_prompt": review_prompt,
+                            }
+                        ),
+                        now,
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE prompt_categories
+                    SET active_revision_id = ?
+                    WHERE id = ?
+                    """,
+                    (revision_id, str(row["id"])),
+                )
             default_rule_migration = "default_path_display_rule_v1"
             default_rule_seeded = connection.execute(
                 "SELECT 1 FROM schema_migrations WHERE name = ?",
@@ -927,6 +1006,8 @@ class JobStore:
             name=str(row["name"]),
             translation_prompt=str(row["translation_prompt"]),
             review_prompt=str(row["review_prompt"]),
+            prompt_revision_id=str(row["active_revision_id"]),
+            prompt_revision_number=int(row["revision_number"]),
             archived=bool(row["archived"]),
             created_at=float(row["created_at"]),
             updated_at=float(row["updated_at"]),
@@ -961,11 +1042,16 @@ class JobStore:
         *,
         include_archived: bool = False,
     ) -> list[PromptCategory]:
-        where = "" if include_archived else "WHERE archived = 0"
+        where = "" if include_archived else "WHERE category.archived = 0"
         with self._connect() as connection:
             rows = connection.execute(
-                f"SELECT * FROM prompt_categories {where} "
-                "ORDER BY archived, name COLLATE NOCASE, created_at"
+                "SELECT category.*, revision.revision_number "
+                "FROM prompt_categories AS category "
+                "JOIN prompt_revisions AS revision "
+                "ON revision.id = category.active_revision_id "
+                f"{where} "
+                "ORDER BY category.archived, category.name COLLATE NOCASE, "
+                "category.created_at"
             ).fetchall()
         return [
             category
@@ -976,7 +1062,13 @@ class JobStore:
     def get_prompt_category(self, category_id: str) -> PromptCategory | None:
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT * FROM prompt_categories WHERE id = ?",
+                """
+                SELECT category.*, revision.revision_number
+                FROM prompt_categories AS category
+                JOIN prompt_revisions AS revision
+                  ON revision.id = category.active_revision_id
+                WHERE category.id = ?
+                """,
                 (category_id,),
             ).fetchone()
         return self._prompt_category_from_row(row)
@@ -994,6 +1086,7 @@ class JobStore:
             review_prompt,
         )
         category_id = uuid4().hex
+        revision_id = uuid4().hex
         now = time.time()
         try:
             with self._connect() as connection:
@@ -1001,10 +1094,32 @@ class JobStore:
                     """
                     INSERT INTO prompt_categories (
                         id, name, translation_prompt, review_prompt,
-                        archived, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, 0, ?, ?)
+                        active_revision_id, archived, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, 0, ?, ?)
                     """,
-                    (category_id, *values, now, now),
+                    (category_id, *values, revision_id, now, now),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO prompt_revisions (
+                        id, category_id, revision_number,
+                        translation_prompt, review_prompt,
+                        content_hash, created_at
+                    ) VALUES (?, ?, 1, ?, ?, ?, ?)
+                    """,
+                    (
+                        revision_id,
+                        category_id,
+                        values[1],
+                        values[2],
+                        _canonical_json_hash(
+                            {
+                                "translation_prompt": values[1],
+                                "review_prompt": values[2],
+                            }
+                        ),
+                        now,
+                    ),
                 )
         except sqlite3.IntegrityError as error:
             raise ValueError("같은 이름의 프롬프트 카테고리가 있습니다.") from error
@@ -1026,16 +1141,62 @@ class JobStore:
             translation_prompt,
             review_prompt,
         )
+        now = time.time()
         try:
             with self._connect() as connection:
+                current = connection.execute(
+                    "SELECT * FROM prompt_categories WHERE id = ?",
+                    (category_id,),
+                ).fetchone()
+                if current is None:
+                    raise ValueError("프롬프트 카테고리를 찾을 수 없습니다.")
+                revision_id = str(current["active_revision_id"])
+                prompts_changed = (
+                    str(current["translation_prompt"]) != values[1]
+                    or str(current["review_prompt"]) != values[2]
+                )
+                if prompts_changed:
+                    latest = connection.execute(
+                        """
+                        SELECT COALESCE(MAX(revision_number), 0) AS latest
+                        FROM prompt_revisions
+                        WHERE category_id = ?
+                        """,
+                        (category_id,),
+                    ).fetchone()
+                    revision_number = int(latest["latest"]) + 1
+                    revision_id = uuid4().hex
+                    connection.execute(
+                        """
+                        INSERT INTO prompt_revisions (
+                            id, category_id, revision_number,
+                            translation_prompt, review_prompt,
+                            content_hash, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            revision_id,
+                            category_id,
+                            revision_number,
+                            values[1],
+                            values[2],
+                            _canonical_json_hash(
+                                {
+                                    "translation_prompt": values[1],
+                                    "review_prompt": values[2],
+                                }
+                            ),
+                            now,
+                        ),
+                    )
                 result = connection.execute(
                     """
                     UPDATE prompt_categories
                     SET name = ?, translation_prompt = ?, review_prompt = ?,
-                        updated_at = ?
+                        active_revision_id = ?, updated_at = ?
                     WHERE id = ?
                     """,
-                    (*values, time.time(), category_id),
+                    (*values, revision_id, now, category_id),
                 )
         except sqlite3.IntegrityError as error:
             raise ValueError("같은 이름의 프롬프트 카테고리가 있습니다.") from error
@@ -1045,6 +1206,29 @@ class JobStore:
         if updated is None:
             raise RuntimeError("updated prompt category could not be read")
         return updated
+
+    def list_prompt_revisions(self, category_id: str) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM prompt_revisions
+                WHERE category_id = ?
+                ORDER BY revision_number
+                """,
+                (category_id,),
+            ).fetchall()
+        return [
+            {
+                "id": str(row["id"]),
+                "category_id": str(row["category_id"]),
+                "revision_number": int(row["revision_number"]),
+                "translation_prompt": str(row["translation_prompt"]),
+                "review_prompt": str(row["review_prompt"]),
+                "content_hash": str(row["content_hash"]),
+                "created_at": float(row["created_at"]),
+            }
+            for row in rows
+        ]
 
     def set_prompt_category_archived(
         self,
@@ -2369,6 +2553,7 @@ class JobStore:
         artifact_path: str,
         origin: str,
         transcript_revision_id: str | None = None,
+        prompt_revision_id: str | None = None,
         force_new: bool = False,
     ) -> dict[str, Any]:
         if origin not in {"automatic", "legacy", "restart", "manual"}:
@@ -2407,13 +2592,13 @@ class JobStore:
                 INSERT INTO translation_generations (
                     id, job_id, generation_number,
                     transcript_job_id, transcript_revision_id,
-                    transcript_hash, prompt_hash,
+                    transcript_hash, prompt_hash, prompt_revision_id,
                     endpoint_key, model, config_hash,
                     state, attempt, origin, supersedes_generation_id,
                     artifact_path, last_error,
                     created_at, updated_at, completed_at
                 ) VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'partial', 0, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'partial', 0, ?, ?, ?,
                     NULL, ?, ?, NULL
                 )
                 """,
@@ -2425,6 +2610,7 @@ class JobStore:
                     transcript_revision_id,
                     transcript_hash,
                     prompt_hash,
+                    prompt_revision_id,
                     endpoint_key,
                     model,
                     config_hash,
@@ -3238,6 +3424,11 @@ class JobStore:
             ),
             "transcript_hash": str(row["transcript_hash"]),
             "prompt_hash": str(row["prompt_hash"]),
+            "prompt_revision_id": (
+                str(row["prompt_revision_id"])
+                if row["prompt_revision_id"]
+                else None
+            ),
             "endpoint_key": str(row["endpoint_key"]),
             "model": str(row["model"]),
             "config_hash": str(row["config_hash"]),

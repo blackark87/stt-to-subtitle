@@ -481,6 +481,13 @@ class JobStoreTests(unittest.TestCase):
                 translation_prompt="translate v2",
                 review_prompt="review v2",
             )
+            renamed = store.update_prompt_category(
+                created.id,
+                name="드라마 신작",
+                translation_prompt="translate v2",
+                review_prompt="review v2",
+            )
+            revisions = store.list_prompt_revisions(created.id)
             archived = store.set_prompt_category_archived(
                 created.id,
                 archived=True,
@@ -488,6 +495,17 @@ class JobStoreTests(unittest.TestCase):
 
             self.assertEqual(updated.name, "드라마")
             self.assertEqual(updated.translation_prompt, "translate v2")
+            self.assertEqual(created.prompt_revision_number, 1)
+            self.assertEqual(updated.prompt_revision_number, 2)
+            self.assertEqual(renamed.prompt_revision_number, 2)
+            self.assertNotEqual(
+                created.prompt_revision_id,
+                updated.prompt_revision_id,
+            )
+            self.assertEqual(
+                [revision["translation_prompt"] for revision in revisions],
+                ["translate", "translate v2"],
+            )
             self.assertTrue(archived.archived)
             self.assertNotIn(
                 created.id,
@@ -970,6 +988,9 @@ class JobStoreTests(unittest.TestCase):
                 force_overwrite=False,
                 options={},
             )
+            prompt_revision_id = store.get_prompt_category(
+                "jav"
+            ).prompt_revision_id
             first = store.create_translation_generation(
                 generation_id="generation-1",
                 job_id="job-1",
@@ -981,6 +1002,7 @@ class JobStoreTests(unittest.TestCase):
                 config_hash="config-v1",
                 artifact_path="generation-1.json",
                 origin="automatic",
+                prompt_revision_id=prompt_revision_id,
             )
             self.assertEqual(
                 store.begin_translation_generation_attempt(first["id"]),
@@ -1070,6 +1092,7 @@ class JobStoreTests(unittest.TestCase):
             )
             self.assertEqual(second["generation_number"], 2)
             self.assertEqual(second["supersedes_generation_id"], first["id"])
+            self.assertEqual(first["prompt_revision_id"], prompt_revision_id)
             self.assertEqual(
                 [
                     item["state"]

@@ -659,6 +659,8 @@ class SubtitleOrchestrator:
         return {
             "category_id": category.id,
             "category_name": category.name,
+            "revision_id": category.prompt_revision_id,
+            "revision_number": category.prompt_revision_number,
             "translation_prompt": category.translation_prompt,
             "review_prompt": category.review_prompt,
             "review_rounds": TRANSLATION_REVIEW_ROUNDS,
@@ -669,6 +671,8 @@ class SubtitleOrchestrator:
         return {
             "category_id": "jav",
             "category_name": "JAV (기존 작업)",
+            "revision_id": None,
+            "revision_number": None,
             "translation_prompt": KOREAN_JAV_SYSTEM_PROMPT,
             "review_prompt": KOREAN_TRANSLATION_REVIEW_PROMPT,
             "review_rounds": 0,
@@ -3199,6 +3203,11 @@ class SubtitleOrchestrator:
             "transcript_job_id": transcript_job_id,
             "transcript_hash": transcript_hash,
             "prompt_hash": prompt_hash,
+            "prompt_revision_id": (
+                str(prompt_snapshot["revision_id"])
+                if prompt_snapshot.get("revision_id")
+                else None
+            ),
             "endpoint_key": selected_endpoint,
             "model": selected_model,
             "config_hash": config_hash,
