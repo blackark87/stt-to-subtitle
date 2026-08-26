@@ -559,6 +559,80 @@ class JobStoreTests(unittest.TestCase):
                 },
             )
 
+    def test_persists_subtitle_validator_settings(self) -> None:
+        with TemporaryDirectory() as directory:
+            database_path = Path(directory) / "jobs.sqlite3"
+            store = JobStore(database_path)
+
+            store.save_subtitle_validator_settings(
+                base_url="https://validator.test/v1",
+                token="paid-token",
+                model="paid-model",
+            )
+
+            self.assertEqual(
+                JobStore(database_path).get_subtitle_validator_settings(),
+                {
+                    "base_url": "https://validator.test/v1",
+                    "token": "paid-token",
+                    "model": "paid-model",
+                },
+            )
+
+    def test_versions_and_updates_subtitle_validation(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = JobStore(Path(directory) / "jobs.sqlite3")
+            store.create(
+                job_id="job-1",
+                source_rel="movie.mkv",
+                force_overwrite=False,
+                options={},
+            )
+            validation = store.save_subtitle_validation(
+                job_id="job-1",
+                source_rel="movie.mkv",
+                external_path="movie.srt",
+                external_hash="external-v1",
+                candidate_path="movie.ko.srt",
+                candidate_hash="candidate-v1",
+                metrics={"summary": {"time_coverage": 1.0}},
+            )
+            updated = store.save_subtitle_llm_validation(
+                validation["id"],
+                result={"severity": "pass", "summary": "통과", "findings": []},
+                model="paid-model",
+                input_hash="input-v1",
+            )
+
+            self.assertEqual(updated["llm"]["severity"], "pass")
+            self.assertEqual(
+                store.get_subtitle_validation(
+                    job_id="job-1",
+                    external_hash="external-v1",
+                    candidate_hash="candidate-v1",
+                )["validator_input_hash"],
+                "input-v1",
+            )
+            self.assertEqual(
+                store.get_subtitle_validation_by_id(validation["id"])["id"],
+                validation["id"],
+            )
+
+            newer = store.save_subtitle_validation(
+                job_id="job-1",
+                source_rel="movie.mkv",
+                external_path="movie.srt",
+                external_hash="external-v1",
+                candidate_path="movie.ko.srt",
+                candidate_hash="candidate-v2",
+                metrics={"summary": {"time_coverage": 0.5}},
+            )
+            self.assertNotEqual(newer["id"], validation["id"])
+            self.assertTrue(store.delete("job-1"))
+            self.assertIsNone(
+                store.get_subtitle_validation_by_id(validation["id"])
+            )
+
     def test_recovers_running_stage_as_manually_retryable(self) -> None:
         with TemporaryDirectory() as directory:
             store = JobStore(Path(directory) / "jobs.sqlite3")

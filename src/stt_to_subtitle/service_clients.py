@@ -573,6 +573,151 @@ def list_openai_compatible_models(
     return sorted(model_ids, key=str.casefold)
 
 
+class SubtitleValidationClient(RetryingJSONClient):
+    """Run one explicit structured subtitle review against a paid LLM."""
+
+    def __init__(self, base_url: str, token: str, model: str) -> None:
+        super().__init__(token=token, read_timeout=180.0, attempts=1)
+        if not model.strip():
+            raise ValueError("subtitle validator model name is required")
+        self.base_url = base_url.rstrip("/")
+        self.model = model.strip()
+
+    def validate(self, comparison: Mapping[str, Any]) -> dict[str, Any]:
+        finding_schema = {
+            "type": "object",
+            "properties": {
+                "reference_index": {"type": "integer", "minimum": 0},
+                "category": {
+                    "type": "string",
+                    "enum": [
+                        "omission",
+                        "meaning",
+                        "naturalness",
+                        "timing",
+                        "other",
+                    ],
+                },
+                "message": {"type": "string"},
+            },
+            "required": ["reference_index", "category", "message"],
+            "additionalProperties": False,
+        }
+        schema = {
+            "type": "object",
+            "properties": {
+                "severity": {
+                    "type": "string",
+                    "enum": ["pass", "review", "fail"],
+                },
+                "summary": {"type": "string"},
+                "findings": {
+                    "type": "array",
+                    "items": finding_schema,
+                    "maxItems": 100,
+                },
+            },
+            "required": ["severity", "summary", "findings"],
+            "additionalProperties": False,
+        }
+        payload = {
+            "model": self.model,
+            "temperature": 0,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "외부 자막을 한국어 기준 자막으로 보고 생성 자막을 검수하라. "
+                        "의미 누락, 오역, 부자연스러운 표현, 타이밍 문제만 지적하고 "
+                        "문체 차이만으로 실패 판정하지 마라. 결과는 한국어로 작성하라."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(comparison, ensure_ascii=False),
+                },
+            ],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "subtitle_validation",
+                    "strict": True,
+                    "schema": schema,
+                },
+            },
+        }
+        response = self.request(
+            "POST",
+            f"{self.base_url}/chat/completions",
+            headers={**self.headers, "Content-Type": "application/json"},
+            json=payload,
+        )
+        if response.status_code != 200:
+            raise ExternalServiceError(
+                "OpenAI-compatible subtitle validation failed: "
+                f"HTTP {response.status_code}: {_safe_error(response)}"
+            )
+        try:
+            content = response.json()["choices"][0]["message"]["content"]
+            result = json.loads(content) if isinstance(content, str) else content
+        except (KeyError, IndexError, TypeError, ValueError) as error:
+            raise ExternalServiceError(
+                "OpenAI-compatible subtitle validator returned invalid JSON"
+            ) from error
+        return _normalize_subtitle_validation(result)
+
+
+def _normalize_subtitle_validation(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ExternalServiceError("subtitle validation result must be an object")
+    severity = str(value.get("severity", ""))
+    summary = str(value.get("summary", "")).strip()
+    findings = value.get("findings")
+    if severity not in {"pass", "review", "fail"} or not summary:
+        raise ExternalServiceError("subtitle validation summary is invalid")
+    if not isinstance(findings, list) or len(findings) > 100:
+        raise ExternalServiceError("subtitle validation findings are invalid")
+    normalized: list[dict[str, Any]] = []
+    for item in findings:
+        if not isinstance(item, Mapping):
+            raise ExternalServiceError("subtitle validation finding is invalid")
+        reference_index = item.get("reference_index")
+        category = str(item.get("category", ""))
+        message = str(item.get("message", "")).strip()
+        if (
+            not isinstance(reference_index, int)
+            or reference_index < 0
+            or category
+            not in {"omission", "meaning", "naturalness", "timing", "other"}
+            or not message
+        ):
+            raise ExternalServiceError("subtitle validation finding is invalid")
+        normalized.append(
+            {
+                "reference_index": reference_index,
+                "category": category,
+                "category_label": {
+                    "omission": "누락",
+                    "meaning": "의미 차이",
+                    "naturalness": "자연스러움",
+                    "timing": "타이밍",
+                    "other": "기타",
+                }[category],
+                "message": message[:2000],
+            }
+        )
+    return {
+        "severity": severity,
+        "severity_label": {
+            "pass": "통과",
+            "review": "검토 필요",
+            "fail": "실패",
+        }[severity],
+        "summary": summary[:4000],
+        "findings": normalized,
+    }
+
+
 class OpenAICompatibleClient(RetryingJSONClient):
     def __init__(
         self,

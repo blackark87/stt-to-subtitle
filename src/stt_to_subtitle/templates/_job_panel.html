@@ -192,9 +192,15 @@
     </div>
   {% endif %}
 </section>
-{% if job.status == "completed" and job.srt_path %}
+{% if external_subtitle or (job.status == "completed" and job.srt_path) %}
   <section class="card result-preview">
     <h2>결과 미리보기</h2>
+    {% if external_subtitle %}
+      <p class="muted">
+        <strong>외부 자막</strong> · {{ external_subtitle.path }} ·
+        {{ external_subtitle.formats|join(', ')|upper }}
+      </p>
+    {% endif %}
     <div
       class="result-player-shell"
       data-result-player-shell
@@ -295,11 +301,80 @@
     </noscript>
     <div class="actions">
       <a class="button secondary" href="{{ url_for('job_video', job_id=job.id) }}" download>{{ icons.download(16) }}원본 영상 다운로드</a>
-      <a class="button secondary" href="{{ url_for('job_subtitle_file', job_id=job.id, subtitle_format='srt') }}" download>{{ icons.download(16) }}SRT 다운로드</a>
+      {% if job.srt_path %}
+        <a class="button secondary" href="{{ url_for('job_subtitle_file', job_id=job.id, subtitle_format='srt') }}" download>{{ icons.download(16) }}SRT 다운로드</a>
+      {% endif %}
       {% if job.ass_path %}
         <a class="button secondary" href="{{ url_for('job_subtitle_file', job_id=job.id, subtitle_format='ass') }}" download>{{ icons.download(16) }}스타일 ASS 다운로드</a>
       {% endif %}
     </div>
+  </section>
+{% endif %}
+{% if external_subtitle %}
+  <section class="card">
+    <div class="section-heading">
+      <div><h2>외부 자막 비교</h2></div>
+      {% if job.srt_path or job.ass_path %}
+        <form method="post" action="/jobs/{{ job.id }}/validate-external-subtitle">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button type="submit">비교 검증</button>
+        </form>
+      {% endif %}
+    </div>
+    {% if subtitle_validation %}
+      {% set summary = subtitle_validation.metrics.summary %}
+      <dl class="metadata-grid">
+        <div><dt>시간 일치율</dt><dd>{{ (summary.time_coverage * 100)|round(1) }}%</dd></div>
+        <div><dt>문장 유사도</dt><dd>{{ (summary.average_text_similarity * 100)|round(1) }}%</dd></div>
+        <div><dt>외부 자막 구간</dt><dd>{{ summary.reference_cues }}</dd></div>
+        <div><dt>미대응 구간</dt><dd>{{ summary.unmatched_reference_cues }}</dd></div>
+        <div><dt>시작/종료 오차</dt><dd>{{ summary.average_start_delta_seconds }}초 / {{ summary.average_end_delta_seconds }}초</dd></div>
+        <div><dt>검토 필요</dt><dd>{{ summary.issue_count }}</dd></div>
+      </dl>
+      {% if subtitle_validation.metrics.issues %}
+        <details>
+          <summary>확인 항목 {{ summary.issue_count }}건</summary>
+          <ol class="job-timeline">
+            {% for issue in subtitle_validation.metrics.issues[:20] %}
+              <li class="timeline-item event-warning">
+                <div class="timeline-content">
+                  <strong>{{ issue.label }}</strong>
+                  <span>{{ issue.start }}–{{ issue.end }}초 · {{ issue.message }}</span>
+                </div>
+              </li>
+            {% endfor %}
+          </ol>
+        </details>
+      {% endif %}
+      {% if subtitle_validation.llm %}
+        <div class="notice">
+          <strong>상용 LLM · {{ subtitle_validation.llm.severity_label }}</strong>
+          <span>{{ subtitle_validation.llm.summary }}</span>
+        </div>
+        {% if subtitle_validation.llm.findings %}
+          <details>
+            <summary>LLM 확인 항목 {{ subtitle_validation.llm.findings|length }}건</summary>
+            <ol class="job-timeline">
+              {% for finding in subtitle_validation.llm.findings %}
+                <li class="timeline-item event-warning">
+                  <div class="timeline-content">
+                    <strong>#{{ finding.reference_index }} · {{ finding.category_label }}</strong>
+                    <span>{{ finding.message }}</span>
+                  </div>
+                </li>
+              {% endfor %}
+            </ol>
+          </details>
+        {% endif %}
+      {% elif subtitle_validator.configured %}
+        <form method="post" action="/jobs/{{ job.id }}/validate-external-subtitle/llm">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button type="submit" class="secondary">상용 LLM으로 검증</button>
+        </form>
+      {% endif %}
+    {% elif not (job.srt_path or job.ass_path) %}
+      <p class="muted">비교할 시스템 생성 자막이 없습니다.</p>
+    {% endif %}
   </section>
 {% endif %}
 <section class="card job-history-card">

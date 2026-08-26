@@ -4,6 +4,20 @@
 - 분석 범위: 웹 오케스트레이터, STT API, 작업 저장소, 외부 서비스 연동, 산출물 처리, 2D/3D 대시보드용 상태 집계
 - 기준 버전: 현재 작업 트리의 `4.0.0`
 
+### 구현 진행 상태
+
+이번 작업 트리에는 계획의 첫 수직 슬라이스가 반영됐다.
+
+| 항목 | 반영 상태 | 남은 범위 |
+|---|---|---|
+| 번역 LLM 수동 gate | 사용자가 시작할 때 `/models` 1회 확인, 연결 실패 시 gate 차단, 번역 중단 작업 수동 재개 | dependency state 영속화·reason code·재시작 복원 |
+| 외부 자막 | 같은 stem의 SRT/VTT/ASS 탐지, `외부 자막` 표시, 기본 WebVTT 재생 | 증분 asset/revision catalog·사용자별 재생 선택 |
+| 로컬 비교 | 시간 중첩 정렬, coverage·문장 유사도·경계 오차, 파일 해시별 SQLite 결과 | generation/publication FK·검증 알고리즘 version migration |
+| 상용 LLM 검증 | 번역 LLM과 분리된 설정, 명시적 1회 호출, 구조화 결과, 입력·모델 cache | provider별 adapter·비용/사용량 관측 |
+
+이하의 `현재 구조`와 문제 분석은 첫 수직 슬라이스 이전 구조를 기준으로 하며,
+위 표에 반영된 항목은 후속 영속 도메인 설계를 설명하는 목표 모델로 읽는다.
+
 ## 1. 결론 요약
 
 현재 코드는 오디오 추출, 원격 전사, 번역, 자막 렌더링이라는 파이프라인 경계를 대체로 지키고 있으며, 번역 체크포인트·전사 요청 멱등성·원자적 JSON 저장·SSE 진행률 수집 등 운영에 필요한 기반도 갖추고 있다.
@@ -11,15 +25,25 @@
 그러나 작업이 많거나 외부 서비스가 내려간 상황에서 안정적으로 운영하려면 다음 문제를 우선 해결해야 한다.
 
 1. `작업 상태`, `파이프라인 단계`, `외부 서비스 상태`, `사용자 명령`이 하나의 `status`와 자유 형식 오류 문자열에 섞여 있다.
-2. 언어 모델 장애가 발생하면 요청 단위 3회 재시도 후 다음 대기 작업을 계속 실행하므로, 대기열 전체가 차례로 `blocked`가 될 수 있다.
+2. 언어 모델 수동 gate로 대기열 연쇄 실패는 차단했지만 gate가 프로세스 메모리에만 있어 재시작 복원과 구조화된 장애 사유가 없다.
 3. 웹 프로세스 재시작 시 실행 중이던 모든 작업을 일괄 `blocked`로 바꾸며, 단계별 자동 복구나 원격 STT 작업 재연결이 없다.
 4. 사용자 정지를 독립 상태가 아니라 `blocked + 특정 한국어 오류 문구`로 저장한다. UI와 필터가 문구 일치에 의존한다.
 5. 2D 대시보드, 3D 대시보드, 작업 목록이 동일한 원천 상태를 각자 다시 분류해 상태 수와 필터 의미가 달라질 수 있다.
 6. 전사 중지 요청은 웹의 대기 루프만 중지하고 원격 STT 작업을 취소하지 않아 GPU 작업이 계속될 수 있다.
 7. 번역 청크의 실제 결과는 DB가 아니라 하나의 부분 번역 JSON에 누적되며, DB에는 청크 총량과 완료량만 저장된다. generation·batch·segment별 재시도와 호환성을 DB에서 추적할 수 없다.
 8. 프롬프트를 바꿔 재번역하면 기존 전사본은 유지하지만 번역 JSON과 배포된 SRT/ASS는 같은 경로에서 덮어쓴다. 이전 번역과 자막을 비교·복구·재게시할 revision 계약이 없다.
+9. 미디어 옆의 `<filename>.srt/.vtt/.ass` 외부 자막 탐지·재생·로컬 비교는 추가됐지만 asset/revision/publication 관계와 증분 catalog는 아직 없다.
 
-가장 먼저 해야 할 일은 UI 확장이 아니라 상태 모델과 스케줄러 제어의 정리다. `phase`, `state`, `reason_code`, `attempt`, `next_retry_at`을 분리하고, 외부 서비스별 회로 차단기와 단계별 복구 정책을 추가해야 한다. 반복 번역·자막 재생성을 제품의 기본 사용 방식으로 보고 transcript revision, translation generation, subtitle publication도 영속 도메인으로 관리해야 한다.
+가장 먼저 해야 할 일은 UI 확장이 아니라 상태 모델과 스케줄러 제어의 정리다. `phase`, `state`, `reason_code`, `attempt`을 분리하고, 의존성별 수동·자동 복구 정책과 단계별 복구 정책을 추가해야 한다. 반복 번역·자막 재생성을 제품의 기본 사용 방식으로 보고 transcript revision, translation generation, subtitle asset/publication/validation도 영속 도메인으로 관리해야 한다.
+
+### 1.1 확정된 운영 전제
+
+- 번역용 LLM은 고사양 Windows PC에서 실행되며 평소에는 꺼져 있다. LLM offline은 장애가 아니라 정상 운영 상태다.
+- LLM에 대한 주기적 `next_probe_at` 호출은 사용하지 않는다. 연결 확인과 번역 재개는 사용자가 명시적으로 시작한다.
+- 미디어 `<filename>.*`에 대응하는 `<filename>.srt`, `<filename>.vtt`, `<filename>.ass`는 모두 한국어 `외부 자막`이다.
+- 외부 자막은 비교 기준이면서 영상 재생에 사용하는 기본 자막이다. 시스템 생성 자막과 별도 자산으로 보존한다.
+- 시스템은 내부망 전용이며 웹 로그인·사용자별 권한 같은 별도 애플리케이션 인증은 요구하지 않는다.
+- 상용 LLM을 이용한 자막 검증은 선택 기능이며 자동 실행하지 않는다.
 
 ## 2. 현재 구조
 
@@ -120,7 +144,7 @@ stateDiagram-v2
 | 사용자 중지 | `blocked`와 고정 오류 문구로 표현 | 명시적 `stopped`, 요청 시각·확인 시각·요청자 기록 | P0 |
 | 번역 일시정지 | 논리 배치 체크포인트 후 정지 | 체크포인트 호환성 지문, 일시정지 작업의 중지 지원 | P0–P1 |
 | 요청 재시도 | HTTP 요청마다 기본 3회 | 작업 단위 시도 이력, 영속 백오프, 오류 유형별 정책 | P0 |
-| 외부 서비스 장애 | 작업별로 재시도 후 `blocked` | STT/LM별 회로 차단기, 대기열 dispatch gate, half-open probe | P0 |
+| 외부 서비스 제어 | 작업별로 재시도 후 `blocked` | 의존성별 recovery mode, LM 수동 dispatch gate, STT 자동 회복 정책 분리 | P0 |
 | 재시작 복구 | 웹 실행 중 상태를 일괄 `blocked` | 단계별 복구·원격 상태 재조회·산출물 검증·자동 재개 | P0 |
 | 원격 STT 제어 | 제출·조회·SSE 진행률 | 원격 취소 API, 취소 멱등성, 취소 완료 확인 | P0 |
 | 번역 체크포인트 | DB에는 청크 수만 저장하고 실제 결과는 동일 JSON 전체를 배치마다 원자 교체 | translation generation·batch·segment 영속화, 모델·프롬프트·원문·배치 설정 지문 검증 | P0–P1 |
@@ -128,10 +152,11 @@ stateDiagram-v2
 | 종료 처리 | 짧은 join 후 executor 취소 | graceful drain, lease 만료, 종료 체크포인트, 재시작 소유권 회수 | P1 |
 | 오디오·전사 산출물 | 작업 디렉터리에 지속되지만 같은 작업 재시도 시 같은 경로를 재사용 | immutable revision과 retention 정책, 임시 WAV 검증·원자 교체 | P1 |
 | 자막 산출물 | SRT/ASS 각각 임시 저장하며 재번역 시 기존 배포 파일을 덮어씀 | versioned generation, publication pointer, rollback, 한 manifest로 파일 쌍 검증 | P0–P1 |
+| 외부 자막 | `<filename>.ko.srt/.ko.ass`만 생성 자막처럼 탐지하고 VTT·출처·비교 관계가 없음 | `<filename>.srt/.vtt/.ass`를 `외부 자막`으로 등록, 기본 재생, 로컬 비교 검증, 선택적 상용 LLM 평가 | P0–P1 |
 | 화면 집계 | 화면별 상태 재분류 | 공통 projection DTO, 동일한 phase/state 필터 계약 | P0 |
 | 이벤트·관측성 | 자유 형식 이벤트와 기본 진행률 | 이벤트 코드, attempt/correlation ID, 단계 시간·대기 시간·회로 상태 메트릭 | P1 |
 | DB 스키마 | 코드 내부 수동 컬럼 추가 | 버전 마이그레이션, 제약 조건, 인덱스, 외래키 활성화 | P1 |
-| 보안 설정 | 원격 API 토큰을 SQLite에 평문 저장 | 토큰 참조/마운트 secret, 현재 토큰 기준 로그 마스킹, 설정 변경 감사 | P0–P2 |
+| 내부망 운영 | 비밀번호가 비어 있으면 인증이 비활성화되지만 보고서·설정 계약이 불명확 | 무인증 운영을 명시적 지원 계약으로 고정하고 경로·입력·로그 안전성만 유지 | P1 |
 | 미디어 라이브러리 | 파일시스템 중심 조회·집계 | 증분 카탈로그, 변경 감지, 배우 없는 콘텐츠 분류 | P2 |
 | 테스트 | 단위 테스트 중심, 주요 정상·부분 실패 검증 | 장애 연쇄·복구·취소 경합·projection 일관성·fault injection 테스트 | P0–P1 |
 
@@ -159,22 +184,39 @@ sequenceDiagram
 
 이는 “대기 중인 작업은 그대로 대기한다”는 운영 기대와 맞지 않는다. 요청 재시도와 서비스 장애 제어는 별도 계층이어야 한다.
 
-### 5.2 권장 회로 차단기
+### 5.2 의존성별 복구 모드
 
-외부 의존성의 `endpoint + model` 조합별로 회로 상태를 관리한다.
+모든 외부 의존성에 같은 회로 차단 정책을 적용하면 안 된다. 다음 설정을 의존성 단위로 둔다.
 
-1. 현재 작업의 요청 단위 재시도 3회가 소진되면 해당 작업을 `blocked(reason=lm_unavailable)`로 저장한다.
-2. 번역 회로를 `open`으로 전환하고 새 번역 작업 할당을 중지한다.
-3. 나머지 작업은 `waiting`을 유지한다.
-4. `next_probe_at`에 한 건만 시험하는 `half_open` 상태로 전환한다.
-5. 성공하면 차단된 작업부터 체크포인트로 재개한 뒤 대기열을 처리한다.
-6. 실패하면 지수 백오프와 jitter를 적용해 다시 `open`으로 전환한다.
+```text
+recovery_mode: manual | automatic
+availability:  offline | checking | ready | lost
+```
 
-인증 실패, 모델명 오류, 잘못된 URL처럼 설정 변경 없이는 해결되지 않는 오류는 자동 probe 대상과 구분해 `blocked(reason=auth_required/configuration_invalid)`로 유지해야 한다. 설정 변경 이벤트가 발생하면 즉시 재검증할 수 있다.
+번역 LLM은 `recovery_mode=manual`로 고정한다.
 
-회로 상태와 `next_probe_at`은 프로세스 재시작 후에도 유지되도록 DB에 저장한다. 메모리 전용 회로 차단기는 재시작 직후 장애 요청 폭주를 다시 발생시킨다.
+1. Windows LLM PC가 꺼진 평상시에는 `offline`이며 번역 작업은 `waiting(reason=lm_offline)`에 둔다.
+2. 이 상태에서는 health check, `/models`, 번역 요청을 포함한 어떤 주기적 호출도 하지 않는다.
+3. 사용자가 `연결 확인` 또는 `번역 시작/재개`를 누를 때만 한 번의 preflight를 수행한다.
+4. 사용자가 명시적으로 시작한 세션에서는 제한된 요청 단위 재시도를 허용할 수 있다. 연결 거부처럼 PC가 꺼진 것이 명확한 오류는 즉시 중단한다.
+5. preflight가 성공하면 `ready`로 전환하고 번역 dispatch를 연다.
+6. 번역 중 연결이 끊기면 현재 generation의 확정 배치를 보존하고 현재 작업만 `blocked(reason=lm_disconnected)`로 전환한다. 나머지 작업은 `waiting`을 유지한다.
+7. 이후 자동 probe하지 않으며 다음 사용자 명령에서 중단 작업부터 재개한다.
 
-`next_probe_at`은 고정 주기로 모든 실패 작업을 계속 재시도한다는 뜻이 아니다. 회로가 열려 있고 해당 의존성을 기다리는 작업이 있을 때, 의존성별로 단 하나의 가벼운 probe만 예약하는 시각이다. 예를 들어 `30초 → 1분 → 2분 → 5분 → 10분`처럼 지수 백오프와 jitter를 적용하고 상한을 둔다. probe가 성공한 경우에만 실제 작업을 한 건 재개한다. 인증·잘못된 모델명·잘못된 URL처럼 설정 변경이 필요한 오류에는 `next_probe_at`을 두지 않고, 설정 저장이나 운영자의 명시적 재확인을 트리거로 사용한다.
+선택적으로 Wake-on-LAN을 붙이더라도 사용자가 누른 시작 동작 안에서만 수행한다. 부팅 확인은 제한 시간·제한 횟수로 끝내며 background polling으로 남기지 않는다.
+
+STT처럼 상시 가동을 전제로 하는 의존성은 필요할 때만 `recovery_mode=automatic`과 `next_probe_at`을 사용할 수 있다. 즉 `next_probe_at`은 공통 jobs 필수 필드가 아니라 자동 복구를 선택한 dependency 상태에만 존재하는 선택 필드다.
+
+```mermaid
+stateDiagram-v2
+    [*] --> offline
+    offline --> checking: 사용자 연결 확인
+    checking --> ready: preflight 성공
+    checking --> offline: 실패·시간 초과
+    ready --> lost: 실행 중 연결 단절
+    lost --> checking: 사용자 재개
+    ready --> offline: 사용자 사용 중지
+```
 
 ## 6. 재시작·장애 복구 전략
 
@@ -381,6 +423,68 @@ flowchart LR
 - retention 정책은 `published`, `referenced`, `draft`, `orphan`을 구분하고 참조 중인 WAV·전사본은 삭제하지 않는다.
 - WAV staged write와 artifact garbage collector를 추가해 부분 파일과 DB 삭제 후 orphan을 안전하게 정리한다.
 
+### 9.5 외부 자막 등록·재생·비교 검증
+
+외부 자막은 미디어와 같은 stem을 가진 다음 파일로 정의한다.
+
+```text
+movie.mp4
+movie.srt    # 외부 자막, 한국어
+movie.vtt    # 외부 자막, 한국어
+movie.ass    # 외부 자막, 한국어
+```
+
+표시 용어는 `외부 기준 자막`이 아니라 `외부 자막`으로 고정한다. 시스템 생성 파일인 `movie.ko.srt/.ko.ass`와 충돌시키거나 자동 덮어쓰지 않는다. 같은 stem에 여러 형식이 있으면 하나의 외부 자막 자산이 가진 format variant로 묶고 재생 우선순위는 `VTT → SRT를 VTT로 변환 → ASS를 WebVTT/overlay로 변환`으로 둔다.
+
+현재 미디어 탐색은 `.ko.srt/.ko.ass` 존재 여부만 확인하고, 재생 API도 job ID와 생성 자막 경로에 종속된다. 목표 모델은 job과 독립된 자막 자산이어야 한다.
+
+```sql
+subtitle_assets(
+  id, media_id, origin, role, language,
+  content_hash, active_for_playback, created_at, updated_at
+)
+
+subtitle_asset_files(
+  subtitle_asset_id, format, path, content_hash,
+  PRIMARY KEY(subtitle_asset_id, format)
+)
+
+subtitle_validations(
+  id, media_id, external_subtitle_asset_id,
+  candidate_translation_generation_id,
+  validator_type, validator_model, validator_prompt_version,
+  input_hash, metrics_json, findings_json, created_at
+)
+```
+
+- 외부 자막은 `origin=external`, `role=reference`, `language=ko`, `active_for_playback=true`로 등록한다.
+- 외부 자막 존재는 파이프라인 job의 `done`으로 집계하지 않는다. 미디어에는 `외부 자막` badge를 별도로 표시한다.
+- 플레이어는 job이 없어도 media/subtitle asset ID로 외부 자막을 제공해야 한다.
+- 외부 파일 hash가 바뀌면 기존 validation을 덮어쓰지 않고 새 external subtitle revision과 validation을 만든다.
+- 시스템 생성 자막을 게시해도 외부 자막의 기본 재생 상태를 자동 변경하지 않는다. 사용자가 명시적으로 재생 자막을 선택할 때만 전환한다.
+
+로컬 비교 검증은 외부 자막과 시스템 생성 한국어 자막을 공통 cue 모델로 정규화한 뒤 수행한다.
+
+| 검증 영역 | 기준 |
+|---|---|
+| cue 매칭 | 시간 중첩률과 시작·종료 거리로 정렬 |
+| 시간 검증 | 누락 구간, 초과 구간, 평균 경계 오차, 겹침 충돌 |
+| 분할 검증 | 외부 cue 대비 과분할·미분할·매칭 실패 수 |
+| 한국어 번역 검증 | 정렬된 cue의 텍스트 유사도, 숫자·고유 토큰 누락, 빈 번역 |
+| 전체 coverage | 외부 자막 시간·cue 중 후보가 설명하는 비율 |
+
+외부 자막은 한국어이므로 일본어 음성 인식 문장의 문자 정확도를 직접 평가하는 ground truth는 아니다. 전사 단계에서는 시간 구간과 segmentation 품질을 검증하고, 번역 단계에서는 한국어 내용 품질을 검증한다.
+
+상용 LLM 검증은 로컬 지표를 대체하지 않는 선택적 2차 평가로 둔다.
+
+- 로컬 번역 LLM 설정과 분리된 `commercial_validator` endpoint/token/model을 사용한다.
+- 사용자가 특정 외부 자막과 candidate generation을 선택하고 `상용 LLM 검증`을 눌렀을 때만 호출한다.
+- background validation과 주기적 연결 확인은 하지 않는다.
+- 입력은 정렬된 외부/후보 cue와 로컬 지표이며, 응답은 누락·의미 왜곡·호칭·문맥 문제를 고정 JSON schema로 반환하게 한다.
+- `input_hash + model + validator_prompt_version`이 같으면 기존 결과를 재사용한다.
+- 결과에는 provider/model/prompt version을 남기되 API token은 저장하지 않는다.
+- 상용 LLM 평가는 비결정적 참고 결과이므로 pass/fail의 단독 원장으로 사용하지 않고 로컬 지표와 사람이 함께 확인한다.
+
 ## 10. 2D·3D 대시보드와 작업 목록 Projection
 
 백엔드는 화면별 문구나 배치에 맞춘 상태 재분류 대신 공통 projection을 제공해야 한다.
@@ -408,6 +512,7 @@ flowchart LR
 
 - 단계 통계와 전체 작업 통계를 구분한다. `추출 완료 3`은 작업 완료가 아니라 추출 단계 완료이므로 단계 문맥 안에서만 표시한다.
 - `완료`는 사용자가 요청한 operation의 종점에 도달한 전체 작업 수다.
+- 외부 자막 존재는 전체 작업의 `완료`나 번역 단계 `done`에 합산하지 않는다. 미디어 자산 상태에 `external_subtitle=true`로 별도 노출한다.
 - 선택하지 않은 번역 단계는 추출 전용 작업에 노출하지 않는다.
 - 목록 필터는 `operation`, `phase`, `state`, `reason_code`를 독립 query parameter로 처리한다.
 - 2D, 3D, 작업 목록은 같은 projection service와 filter parser를 사용한다.
@@ -420,6 +525,7 @@ flowchart LR
 DashboardProjection
 ├── job_counts[state]
 ├── phase_counts[phase][state]
+├── media_asset_counts[external_subtitle|generated_subtitle]
 ├── active_jobs[]
 ├── state_bays[state]
 │   ├── count
@@ -475,30 +581,36 @@ jobs(
 - 단계별 대기 시간과 처리 시간
 - 상태별 작업 수 및 가장 오래된 대기 작업 나이
 - 외부 API 요청·재시도·소진 횟수
-- STT/LM 회로 상태, 마지막 성공 시각, 다음 probe 시각
+- STT 회로 상태와 다음 자동 probe 시각, LLM 수동 gate 상태와 마지막 사용자 확인 결과
 - 작업별 attempt 수와 reason code 분포
 - lease 만료·복구·중복 실행 방지 횟수
 - 원격 STT 큐 길이, 실행 작업 ID, 취소 대기 수
 - 번역 체크포인트 재사용·무효화 횟수
 - 산출물 manifest 검증 실패 수
+- 외부 자막 revision 수, 로컬 비교 coverage, 상용 LLM 검증 호출·cache hit·실패 수
 
 로그는 사용자용 메시지와 별개로 구조화한다. 토큰 마스킹은 초기 환경설정 값뿐 아니라 관리 화면에서 변경된 현재 런타임 토큰 전체에 적용해야 한다. 원격 서버 URL, job ID, attempt ID는 추적에 필요하지만 인증 헤더·토큰·원문 전체는 기록하지 않는다.
 
-## 13. 보안·설정 관리
+## 13. 내부망 무인증 운영과 안전 경계
 
-현재 컨테이너의 read-only 실행, 권한 제한, 런타임 환경 변수 사용은 유지할 가치가 있다. 추가 개선은 다음 순서가 적절하다.
+이 시스템은 내부망 전용이므로 웹 로그인, 사용자별 역할, 관리자 승인 같은 애플리케이션 인증은 리팩터링 범위에서 제외한다. 현재 코드도 `WEB_ADMIN_PASSWORD`가 비어 있으면 인증과 CSRF 검사를 비활성화하므로 이 동작을 공식 운영 계약과 테스트로 고정하면 된다.
 
-1. 오류 정제 함수가 현재 활성 토큰을 항상 마스킹하도록 수정한다.
-2. 원격 설정 변경 이력을 actor·시각·변경 필드 단위로 기록한다. 토큰 값 자체는 기록하지 않는다.
-3. SQLite에 원격 토큰을 직접 저장하는 대신 환경 변수명, Docker secret 경로, 외부 secret reference를 저장한다.
-4. 내부망 URL 접근이 가능한 관리 기능은 관리자 인증·허용 대상 정책과 함께 운영한다.
-5. 산출물 metadata와 체크포인트에 provider credential이 포함되지 않는지 계약 테스트를 추가한다.
+인증이 없더라도 다음 안전 경계는 유지한다.
 
-저장 토큰 암호화는 키를 같은 DB나 같은 설정 파일에 두면 효과가 제한적이다. 운영 환경의 키 관리 방식이 정해진 뒤 적용해야 한다.
+1. media root와 work root를 벗어나는 경로를 거부한다.
+2. 업로드·JSON·자막 형식과 상태 전이를 검증한다.
+3. 컨테이너 read-only 실행, 최소 권한, volume 경계를 유지한다.
+4. STT/로컬 LLM/상용 검증 provider token이 로그·이벤트·산출물 metadata에 노출되지 않게 한다.
+5. 삭제·게시·rollback은 참조 무결성과 원자 교체를 보장한다.
+6. 상용 LLM 검증은 사용자의 명시적 실행에서만 외부 호출하며 provider/model과 호출 시각을 남긴다.
+
+웹 로그인 UI, session 기반 권한 분기, 사용자 actor 감사는 추가하지 않는다. 상용 LLM API token은 애플리케이션 사용자 인증과 별개인 provider credential이며, 운영 환경에서 환경 변수·mounted secret 또는 별도 설정 중 한 방식으로 주입한다. 저장 암호화는 키 관리 방식이 정해진 경우에만 도입한다.
 
 ## 14. 미디어 라이브러리
 
 파일시스템을 직접 스캔하는 현재 방식은 중간 규모까지 단순하고 신뢰할 수 있다. 배우 약 400명과 미디어 증가를 고려하면 다음 기능은 P2로 준비할 수 있다.
+
+외부 자막은 증분 카탈로그 전체보다 먼저 P0–P1로 반영한다. 미디어 스캔 시 같은 stem의 `.srt/.vtt/.ass`를 찾아 hash 기반 subtitle asset/revision으로 등록하고, 삭제·변경·format variant를 reconcile한다. 표시는 `외부 자막`으로 고정하며 미디어 재생과 비교 화면에서 같은 asset ID를 사용한다.
 
 - 파일 경로, 크기, 수정 시각, content ID, 배우, 썸네일을 저장하는 증분 카탈로그
 - `.actors` 프로필 이미지와 배우 디렉터리의 명시적 매핑
@@ -521,15 +633,18 @@ src/stt_to_subtitle/
 ├── application/
 │   ├── job_service.py        # 사용자 명령
 │   ├── scheduler.py          # 할당·공정성·dispatch gate
-│   └── recovery.py           # 재시작 reconcile
+│   ├── recovery.py           # 재시작 reconcile
+│   └── subtitle_validation.py # 외부 자막 정렬·로컬 지표
 ├── infrastructure/
 │   ├── job_repository.py     # SQLite 영속화
 │   ├── migrations/           # 버전별 스키마 변경
-│   └── artifact_store.py     # generation·manifest
+│   ├── artifact_store.py     # generation·manifest
+│   └── subtitle_repository.py # 외부 자막·검증 결과
 ├── integrations/
 │   ├── stt_client.py
 │   ├── lm_client.py
-│   └── circuit_breaker.py
+│   ├── dependency_gate.py    # manual/automatic 복구 모드
+│   └── commercial_validator.py
 ├── projections/
 │   └── job_projection.py     # 목록·2D·3D 공통 집계
 └── web/
@@ -558,13 +673,26 @@ src/stt_to_subtitle/
 ### 2단계 — 장애 전파 차단(P0)
 
 - 오류를 transient/auth/config/input/internal로 분류
-- STT·LM별 영속 회로 차단기 추가
-- `attempt/next_retry_at` 기반 자동 재개
+- dependency별 `manual/automatic` recovery mode와 영속 dispatch gate 추가
+- 번역 LLM은 `manual`로 고정하고 `offline`에서 어떤 자동 호출도 하지 않음
+- 사용자 `연결 확인`, `번역 시작/재개`, `사용 중지` 명령 추가
+- STT에만 필요 시 `attempt/next_retry_at` 기반 자동 복구 적용
 - 10건 이상 대기열에서 의존성 장애가 나도 현재 작업만 중단되고 나머지는 대기로 남도록 보장
 
-완료 기준: LM이 내려간 동안 10개 작업 중 한 작업만 외부 서비스 중단으로 전환되고 나머지 9개는 대기한다. LM 복구 후 중단 작업부터 자동 재개된다.
+완료 기준: LLM PC가 꺼져 있는 동안 번역 관련 네트워크 호출은 0건이며 모든 작업이 대기를 유지한다. 사용자가 재개를 요청해 preflight가 성공한 경우에만 중단 generation부터 처리한다.
 
-### 3단계 — 복구·취소(P0–P1)
+### 3단계 — 외부 자막·비교 검증(P0–P1)
+
+- `<filename>.srt/.vtt/.ass` 탐지와 hash 기반 external subtitle revision
+- media 기반 자막 재생 API와 `외부 자막` 표시
+- VTT/SRT/ASS 공통 cue normalization과 시간 기반 정렬
+- segmentation·coverage·한국어 번역 로컬 비교 지표
+- 선택적 OpenAI 호환 상용 LLM validator와 결과 cache
+- 외부 자막을 유지한 채 생성 자막 비교·선택·게시
+
+완료 기준: job이 없는 미디어도 외부 자막을 재생하고, 선택한 생성 자막과 재현 가능한 로컬 검증 결과를 만든다. 상용 LLM은 사용자가 버튼을 누른 경우에만 한 번 호출하고 동일 입력은 cache를 재사용한다.
+
+### 4단계 — 복구·취소(P0–P1)
 
 - 단계별 startup reconcile
 - 원격 STT 취소 API와 웹 연동
@@ -574,7 +702,7 @@ src/stt_to_subtitle/
 
 완료 기준: 각 단계에서 프로세스를 강제 종료해도 중복 산출물·유실 없이 정의된 지점에서 자동 복구한다.
 
-### 4단계 — 산출물·관측성(P1)
+### 5단계 — 산출물·관측성(P1)
 
 - WAV staged write
 - SRT/ASS generation manifest
@@ -584,7 +712,7 @@ src/stt_to_subtitle/
 
 완료 기준: 파일 교체와 DB 갱신 사이에 fault를 주입해도 재시작 reconcile 후 파일 세트와 DB 상태가 일치한다.
 
-### 5단계 — 확장 기능(P2)
+### 6단계 — 확장 기능(P2)
 
 - 증분 미디어 카탈로그
 - 대기열 우선순위·공정성 정책
@@ -592,9 +720,9 @@ src/stt_to_subtitle/
 
 ## 17. 필수 테스트 시나리오
 
-1. LM 장애 상태에서 번역 10건을 넣었을 때 첫 작업만 `blocked`, 나머지는 `waiting`인지 확인
-2. LM 복구 후 체크포인트부터 자동 재개되고 대기열 순서가 보존되는지 확인
-3. 인증 오류는 반복 probe하지 않고 설정 변경 후에만 재검증하는지 확인
+1. LM gate가 `offline`인 동안 번역 10건을 넣고 충분히 기다려도 네트워크 요청이 0건이며 모두 `waiting`인지 확인
+2. 사용자가 `번역 시작/재개`를 요청한 경우에만 preflight 후 체크포인트부터 재개되고 대기열 순서가 보존되는지 확인
+3. preflight 실패와 실행 중 연결 단절 후 자동 probe가 발생하지 않고 다음 사용자 명령까지 대기하는지 확인
 4. 전사 실행 중 웹만 재시작해 원격 작업에 재연결하는지 확인
 5. STT 서비스 재시작으로 원격 작업이 유실될 때 동일 멱등 키로 안전하게 재처리하는지 확인
 6. 실행 중·대기 중·일시정지 작업을 각각 중지했을 때 모두 `stopped`로 일관되게 끝나는지 확인
@@ -613,6 +741,13 @@ src/stt_to_subtitle/
 19. Kotoba 취소 요청이 정의된 청크 경계에서 종료되고 해당 작업만 `stopped`가 되는지 확인
 20. segment 계약 오류가 `failed/model_output_invalid`, 서버 단절이 `blocked/stt_unavailable`로 일관되게 전달되는지 확인
 21. 재전사 시 기존 transcript revision과 이를 참조하는 과거 번역·자막 generation이 보존되는지 확인
+22. `<filename>.srt/.vtt/.ass`를 모두 한국어 `외부 자막`으로 탐지하고 `.ko.srt/.ko.ass` 생성 자막과 구분하는지 확인
+23. job이 없는 미디어에서 외부 자막이 기본 재생되고 format 우선순위와 변환 결과가 일관되는지 확인
+24. 외부 자막과 생성 자막의 cue 경계가 달라도 시간 중첩 정렬과 coverage가 재현되는지 확인
+25. 외부 자막 hash 변경 시 새 revision·validation이 생성되고 과거 결과가 보존되는지 확인
+26. 상용 LLM 검증은 명시적 요청에서만 호출되며 동일 input/model/prompt version은 cache를 재사용하는지 확인
+27. 상용 LLM 오류가 기존 외부 자막 재생과 로컬 비교 결과에 영향을 주지 않는지 확인
+28. `WEB_ADMIN_PASSWORD`가 없는 내부망 모드에서 로그인 없이 모든 지원 기능을 사용하고 별도 권한 분기가 생기지 않는지 확인
 
 ## 18. 피해야 할 변경
 
@@ -621,9 +756,13 @@ src/stt_to_subtitle/
 - 사용자 정지를 지역화된 오류 문구로 판별하지 않는다.
 - 화면마다 상태를 별도로 재분류하지 않는다.
 - 외부 서비스 장애 중 대기 작업을 하나씩 실행해 동일 실패를 반복하지 않는다.
+- 평소 꺼져 있는 번역 LLM에 `next_probe_at`이나 background health polling을 적용하지 않는다.
 - prompt가 달라진 재번역을 동일 generation의 단순 retry로 처리하지 않는다.
 - 부분 JSON과 DB translation item을 서로 독립적인 원장으로 운영하지 않는다.
 - 새 재번역이 완료되기 전에 현재 게시 중인 SRT/ASS를 비우거나 덮어쓰지 않는다.
+- `<filename>.srt/.vtt/.ass` 외부 자막을 job 완료나 시스템 생성 자막으로 분류하지 않고, 생성 과정에서 덮어쓰지 않는다.
+- 상용 LLM 평가만으로 자막 검증 결과를 pass/fail 처리하지 않는다.
+- 내부망 운영 요구에 불필요한 로그인·역할·사용자 감사 체계를 추가하지 않는다.
 - 현재 단일 인스턴스 요구만으로 PostgreSQL·Redis·메시지 브로커 전환부터 시작하지 않는다.
 - 기존 transcript/translation ID와 자막 overlap 규칙을 상태 리팩터링 과정에서 변경하지 않는다.
 
@@ -634,12 +773,14 @@ src/stt_to_subtitle/
 | 번역 청크 DB 저장이 없어도 되는가 | 안 된다. 현재 DB에는 진행률 숫자만 있고 실제 부분 결과는 하나의 JSON 전체 교체로 관리된다. 단순 재개는 가능하지만 배치 시도·generation·호환성·crash reconcile을 설명하지 못한다. | translation generation/batch/item을 DB에 저장하고 JSON은 versioned snapshot으로 생성한다. |
 | 이미 요청된 Whisper/Kotoba/WhisperJAV를 취소할 수 있는가 | 현재는 취소 API와 실행 핸들이 없어 불가능하다. 대기 작업은 즉시 취소 가능하고, WhisperX/JAV는 subprocess 종료, Kotoba는 cooperative hook 또는 subprocess 격리로 구현할 수 있다. | backend별 취소 adapter와 멱등 cancel API를 만든다. 취소와 사전 segmentation은 별도 요구다. |
 | 자막이 있는 상태에서 prompt 변경 재시도는 어떻게 되는가 | transcript는 유지되지만 translation JSON과 SRT/ASS가 기존 경로에서 덮어써지고 이력·rollback은 없다. | 새 prompt revision과 translation/subtitle generation을 만든 후 검증된 결과만 publish한다. 실패 시 기존 자막을 유지한다. |
-| `next_probe_at`은 계속 재시도한다는 뜻인가 | 자동 확인은 맞지만 모든 job의 고정 주기 재시도는 아니다. | 의존성별 단일 half-open probe만 지수 백오프로 실행한다. auth/config 오류는 자동 probe하지 않는다. |
+| `next_probe_at`은 계속 재시도한다는 뜻인가 | 번역 LLM이 평소 꺼져 있는 운영 환경에서는 호출 자체가 불필요하다. | LM은 manual gate로 두고 `next_probe_at`을 사용하지 않는다. STT처럼 자동 복구를 선택한 의존성에만 제한적으로 사용한다. |
 | 중단과 실패는 어떻게 구분하는가 | 현재 STT `failed`가 웹에서 `blocked`가 될 수 있어 일관되지 않다. | 외부 조건이 회복되면 그대로 재개 가능한 경우 `blocked`, 입력·모델 출력·코드 계약 오류처럼 변경이 필요한 경우 `failed`다. segment 구조 오류는 기본적으로 `failed/model_output_invalid`다. |
 | WAV와 transcript는 영속 데이터인가 | persistent volume에는 남지만 immutable revision은 아니다. 같은 job을 재사용하는 재전사·재추출에서는 같은 경로가 덮어써질 수 있고 DB 레코드 삭제 후 orphan도 남을 수 있다. | audio/transcript를 immutable revision으로 만들고 hash 기반 재사용, 참조 무결성, retention, garbage collection을 적용한다. |
+| 외부 자막은 어떻게 다루는가 | 현재 `<filename>.srt/.vtt/.ass`를 독립 자산으로 탐지·재생·비교하는 계약이 없다. | 모두 한국어 `외부 자막`으로 등록해 기본 재생하며, 생성 자막과 시간 기반 로컬 비교 및 선택적 상용 LLM 검증을 수행한다. |
+| 내부망에서도 인증이 필요한가 | 현재도 비밀번호가 비어 있으면 인증이 꺼지지만 공식 운영 계약으로 강조되지 않았다. | 별도 웹 인증은 추가하지 않는다. 무인증 모드를 테스트로 고정하고 경로·입력·로그·파일 무결성만 보호한다. |
 
 ## 20. 최종 권고
 
-이 프로젝트의 다음 리팩터링 단위는 “화면별 상태 라벨 수정”이 아니라 “작업 실행 및 산출물 revision 계약의 재정의”여야 한다. 먼저 명시적 상태 모델과 공통 projection을 도입하고, 외부 서비스 장애를 작업 큐 전체로 전파하지 않는 회로 차단기, 단계별 재시작 복구, backend별 STT 취소를 구현해야 한다.
+이 프로젝트의 다음 리팩터링 단위는 “화면별 상태 라벨 수정”이 아니라 “작업 실행 및 산출물 revision 계약의 재정의”여야 한다. 먼저 명시적 상태 모델과 공통 projection을 도입하고, 번역 LLM의 수동 dispatch gate, 단계별 재시작 복구, backend별 STT 취소를 구현해야 한다. 자동 회복은 상시 가동 의존성에만 선택적으로 적용한다.
 
-동시에 transcript revision, translation generation/batch/item, subtitle publication을 영속 모델로 추가해야 한다. 그래야 프롬프트 수정 재번역, 부분 번역 재개, 자막 비교·게시·rollback, WAV·전사본 재사용을 데이터 손실 없이 반복할 수 있다. 이 기반이 갖춰지면 2D와 3D도 동일한 수치와 용어를 안정적으로 표현하고, 대기 작업이 많은 운영 환경에서 재시작·모델 교체·외부 서비스 장애를 수동 정리 없이 처리할 수 있다.
+동시에 transcript revision, translation generation/batch/item, external/generated subtitle asset, publication, validation을 영속 모델로 추가해야 한다. 그래야 프롬프트 수정 재번역, 부분 번역 재개, 외부 자막 재생·비교, 선택적 상용 LLM 평가, 자막 게시·rollback, WAV·전사본 재사용을 데이터 손실 없이 반복할 수 있다. 내부망 무인증 운영은 그대로 유지하고 인증보다 실행·파일·참조 무결성에 구현 역량을 집중한다.

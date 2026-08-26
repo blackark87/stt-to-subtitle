@@ -4,7 +4,11 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import Mock, patch
 
-from stt_to_subtitle.web_config import WebSettings, RemoteServerSettings
+from stt_to_subtitle.web_config import (
+    RemoteServerSettings,
+    SubtitleValidatorSettings,
+    WebSettings,
+)
 from stt_to_subtitle.orchestrator import (
     SubtitleOrchestrator,
     estimate_transcription_chunks,
@@ -108,6 +112,112 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                 lm_model="model",
             )
         )
+
+    def test_manual_lm_gate_dispatches_only_after_explicit_preflight(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            (media_root / "movie.mkv").write_bytes(b"media")
+            orchestrator = SubtitleOrchestrator(
+                WebSettings(
+                    state_dir=root / "state",
+                    media_root=media_root,
+                    admin_password="",
+                    session_secret="",
+                    stt_base_url="http://stt.test",
+                    stt_token="",
+                    lm_base_url="http://lm.test/v1",
+                    lm_token="secret",
+                    lm_model="model",
+                    lm_manual_start=True,
+                )
+            )
+            try:
+                job = orchestrator.create_job(
+                    "movie.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                orchestrator.store.update(job.id, status="transcribed")
+                orchestrator._translation_executor.submit = Mock()
+
+                self.assertEqual(orchestrator._dispatch_translations(), 0)
+                with patch(
+                    "stt_to_subtitle.orchestrator.list_openai_compatible_models",
+                    return_value=["model"],
+                ) as models:
+                    resumed = orchestrator.activate_translation_lm()
+                dispatched = orchestrator._dispatch_translations()
+            finally:
+                orchestrator.stop()
+
+            self.assertEqual(resumed, 0)
+            self.assertEqual(dispatched, 1)
+            self.assertEqual(orchestrator.lm_gate_state, "ready")
+            models.assert_called_once_with(
+                "http://lm.test/v1",
+                "secret",
+                attempts=1,
+            )
+
+    def test_paid_subtitle_validation_is_cached_by_payload_and_model(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            orchestrator = self.make_orchestrator(root, media_root)
+            try:
+                orchestrator.store.create(
+                    job_id="job-1",
+                    source_rel="movie.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                validation = orchestrator.store.save_subtitle_validation(
+                    job_id="job-1",
+                    source_rel="movie.mkv",
+                    external_path="movie.srt",
+                    external_hash="external",
+                    candidate_path="movie.ko.srt",
+                    candidate_hash="candidate",
+                    metrics={
+                        "summary": {"time_coverage": 1.0},
+                        "issues": [],
+                        "alignments": [],
+                    },
+                )
+                orchestrator.update_subtitle_validator(
+                    SubtitleValidatorSettings(
+                        base_url="https://validator.test/v1",
+                        token="paid-token",
+                        model="paid-model",
+                    )
+                )
+                result = {
+                    "severity": "pass",
+                    "severity_label": "통과",
+                    "summary": "통과",
+                    "findings": [],
+                }
+                with patch(
+                    "stt_to_subtitle.orchestrator.SubtitleValidationClient"
+                ) as client:
+                    client.return_value.validate.return_value = result
+                    first, first_cached = orchestrator.validate_subtitles_with_llm(
+                        validation["id"]
+                    )
+                    second, second_cached = orchestrator.validate_subtitles_with_llm(
+                        validation["id"]
+                    )
+            finally:
+                orchestrator.stop()
+
+            self.assertFalse(first_cached)
+            self.assertTrue(second_cached)
+            self.assertEqual(first["llm"], result)
+            self.assertEqual(second["llm"], result)
+            client.return_value.validate.assert_called_once()
 
     def test_zero_duration_means_process_to_end(self) -> None:
         with TemporaryDirectory() as directory:

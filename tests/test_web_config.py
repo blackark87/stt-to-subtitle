@@ -8,13 +8,33 @@ from unittest.mock import patch
 from stt_to_subtitle.web_config import (
     group_multipart_media,
     MediaLibrary,
-    WebSettings,
     RemoteServerSettings,
+    SubtitleValidatorSettings,
+    WebSettings,
     probe_media_duration,
 )
 
 
 class MediaLibraryTests(unittest.TestCase):
+    def test_describes_and_resolves_external_subtitles(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media = root / "movie.mp4"
+            media.write_bytes(b"media")
+            subtitle = root / "movie.srt"
+            subtitle.write_text(
+                "1\n00:00:00,000 --> 00:00:01,000\n한국어\n",
+                encoding="utf-8",
+            )
+            (root / "movie.ko.srt").write_text("generated", encoding="utf-8")
+            library = MediaLibrary(root)
+
+            entry = library.browse()["files"][0]
+
+            self.assertTrue(entry["has_external_subtitle"])
+            self.assertEqual(entry["external_subtitle_formats"], ["srt"])
+            self.assertEqual(library.external_subtitles("movie.mp4"), (subtitle,))
+
     def test_recursively_lists_selected_folders_without_metadata_or_links(
         self,
     ) -> None:
@@ -638,10 +658,14 @@ class MediaLibraryTests(unittest.TestCase):
                     {
                         "path": "AV/japan/Actor/TITLE-001/done.mp4",
                         "has_subtitle": True,
+                        "has_external_subtitle": False,
+                        "external_subtitle_formats": [],
                     },
                     {
                         "path": "AV/japan/Actor/TITLE-001/pending.mkv",
                         "has_subtitle": False,
+                        "has_external_subtitle": False,
+                        "external_subtitle_formats": [],
                     },
                 ],
             )
@@ -670,10 +694,14 @@ class MediaLibraryTests(unittest.TestCase):
                     {
                         "path": "Variety/Show/done.mp4",
                         "has_subtitle": True,
+                        "has_external_subtitle": False,
+                        "external_subtitle_formats": [],
                     },
                     {
                         "path": "Variety/Show/pending.mkv",
                         "has_subtitle": False,
+                        "has_external_subtitle": False,
+                        "external_subtitle_formats": [],
                     },
                 ],
             )
@@ -773,6 +801,7 @@ class WebSettingsTests(unittest.TestCase):
             Path("/var/lib/stt"),
         )
         self.assertEqual(settings.jobs_dir, Path("/var/lib/stt/jobs"))
+        self.assertTrue(settings.lm_manual_start)
 
     def test_reads_a_separate_web_work_directory(self) -> None:
         with patch.dict(
@@ -925,3 +954,15 @@ class WebSettingsTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "between 1 and 8"):
                 settings.normalized()
+
+    def test_normalizes_subtitle_validator_settings(self) -> None:
+        settings = SubtitleValidatorSettings(
+            base_url=" https://validator.test/v1/ ",
+            token="secret",
+            model=" paid-model ",
+        )
+
+        normalized = settings.normalized()
+
+        self.assertEqual(normalized.base_url, "https://validator.test/v1")
+        self.assertEqual(normalized.model, "paid-model")

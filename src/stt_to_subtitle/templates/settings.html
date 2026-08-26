@@ -70,6 +70,35 @@
           </p>
         </div>
       </div>
+      {% if remote_servers.lm_manual_start %}
+        <div class="notice">
+          <strong>
+            {% if remote_servers.lm_gate_state == "ready" %}사용 중
+            {% elif remote_servers.lm_gate_state == "checking" %}연결 확인 중
+            {% elif remote_servers.lm_gate_state == "lost" %}연결 끊김
+            {% else %}사용 중지{% endif %}
+          </strong>
+          <span>{{ remote_servers.lm_gate_message }}</span>
+          <div class="submit-row">
+            {% if remote_servers.lm_gate_state != "ready" %}
+              <button
+                type="submit"
+                formaction="/settings/translation/start"
+                formmethod="post"
+                formnovalidate
+              >번역 시작/재개</button>
+            {% else %}
+              <button
+                type="submit"
+                class="secondary"
+                formaction="/settings/translation/stop"
+                formmethod="post"
+                formnovalidate
+              >번역 서버 사용 중지</button>
+            {% endif %}
+          </div>
+        </div>
+      {% endif %}
       <label>OpenAI 호환 API 주소
         <input
           name="lm_base_url"
@@ -139,6 +168,55 @@
       </span>
     </div>
   </form>
+
+  <section class="card settings-card">
+    <div class="section-heading">
+      <div>
+        <h2>상용 LLM 자막 검증</h2>
+        <p class="muted settings-description">
+          작업 화면에서 요청한 경우에만 외부·생성 자막 일부를 전송합니다.
+        </p>
+      </div>
+    </div>
+    <form method="post" action="/settings/subtitle-validator" class="stack">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <label>OpenAI 호환 API 주소
+        <input
+          name="validator_base_url"
+          type="url"
+          value="{{ subtitle_validator.base_url }}"
+          placeholder="https://api.example.com/v1"
+          required
+        >
+      </label>
+      <label>API 토큰
+        <input
+          name="validator_token"
+          type="password"
+          value=""
+          placeholder="{% if subtitle_validator.token_configured %}저장된 토큰 유지{% else %}API 토큰{% endif %}"
+          autocomplete="new-password"
+        >
+      </label>
+      {% if subtitle_validator.token_configured %}
+        <label class="check">
+          <input name="clear_validator_token" type="checkbox" value="true">
+          <span>저장된 검증 API 토큰 삭제</span>
+        </label>
+      {% endif %}
+      <label>검증 모델
+        <input
+          name="validator_model"
+          value="{{ subtitle_validator.model }}"
+          placeholder="검증에 사용할 모델 ID"
+          required
+        >
+      </label>
+      <div class="submit-row">
+        <button type="submit">검증 설정 저장</button>
+      </div>
+    </form>
+  </section>
 
   <section class="stack path-display-settings" id="path-display-rules">
     <div class="section-heading">

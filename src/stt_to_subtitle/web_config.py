@@ -12,6 +12,8 @@ import subprocess
 from urllib.parse import urlsplit
 from xml.etree import ElementTree
 
+from .subtitle_validation import discover_external_subtitles
+
 MEDIA_EXTENSIONS = {
     ".aac",
     ".avi",
@@ -164,6 +166,9 @@ def group_multipart_media(
                 "has_subtitle": all(
                     bool(item.get("has_subtitle")) for item in members
                 ),
+                "has_external_subtitle": all(
+                    bool(item.get("has_external_subtitle")) for item in members
+                ),
                 "has_nfo": any(bool(item.get("has_nfo")) for item in members),
                 "poster_path": poster_path,
                 "actors": list(
@@ -298,6 +303,40 @@ class RemoteServerSettings:
 
 
 @dataclass(frozen=True)
+class SubtitleValidatorSettings:
+    base_url: str = ""
+    token: str = ""
+    model: str = ""
+
+    @property
+    def is_complete(self) -> bool:
+        return all(value.strip() for value in (self.base_url, self.model))
+
+    def normalized(self) -> SubtitleValidatorSettings:
+        missing = [
+            name
+            for name, value in (
+                ("SUBTITLE_VALIDATOR_BASE_URL", self.base_url),
+                ("SUBTITLE_VALIDATOR_MODEL", self.model),
+            )
+            if not value.strip()
+        ]
+        if missing:
+            raise ValueError(
+                "required subtitle validator settings are missing: "
+                f"{', '.join(missing)}"
+            )
+        return SubtitleValidatorSettings(
+            base_url=normalize_server_url(
+                self.base_url,
+                "SUBTITLE_VALIDATOR_BASE_URL",
+            ),
+            token=self.token,
+            model=self.model.strip(),
+        )
+
+
+@dataclass(frozen=True)
 class WebSettings:
     state_dir: Path
     media_root: Path
@@ -318,6 +357,7 @@ class WebSettings:
     translation_batch_characters: int = 6000
     audio_workers: int = 1
     work_dir: Path | None = None
+    lm_manual_start: bool = False
 
     @classmethod
     def from_env(cls) -> WebSettings:
@@ -374,6 +414,7 @@ class WebSettings:
                 os.environ.get("TRANSLATION_BATCH_CHARACTERS", "6000")
             ),
             audio_workers=int(os.environ.get("WEB_AUDIO_WORKERS", "1")),
+            lm_manual_start=_env_bool("LM_MANUAL_START", True),
         )
 
     @property
@@ -502,6 +543,11 @@ class MediaLibrary:
             return None
         return profile.relative_to(self.root).as_posix()
 
+    def external_subtitles(self, relative_media_path: str) -> tuple[Path, ...]:
+        """Return safe plain sidecars for one media file."""
+        media_path = self.resolve_file(relative_media_path)
+        return discover_external_subtitles(media_path)
+
     def actor_library_entries(
         self,
         relative_directory: str = "av/japan",
@@ -593,6 +639,7 @@ class MediaLibrary:
                 ):
                     continue
                 source = Path(child.path)
+                external_subtitles = discover_external_subtitles(source)
                 media.append(
                     {
                         "path": source.relative_to(self.root).as_posix(),
@@ -600,6 +647,11 @@ class MediaLibrary:
                             f"{source.stem}.ko.srt".casefold() in names
                             or f"{source.stem}.ko.ass".casefold() in names
                         ),
+                        "has_external_subtitle": bool(external_subtitles),
+                        "external_subtitle_formats": [
+                            path.suffix.lower().lstrip(".")
+                            for path in external_subtitles
+                        ],
                     }
                 )
         media.sort(key=lambda item: str(item["path"]).casefold())
@@ -851,6 +903,7 @@ class MediaLibrary:
         file_stat = path.stat()
         srt_subtitle = path.with_name(f"{path.stem}.ko.srt")
         ass_subtitle = path.with_name(f"{path.stem}.ko.ass")
+        external_subtitles = discover_external_subtitles(path)
         nfo_path = self._find_nfo(path)
         title: str | None = None
         poster_path: str | None = None
@@ -866,6 +919,16 @@ class MediaLibrary:
             "size": file_stat.st_size,
             "duration_seconds": self._media_duration(path, file_stat),
             "has_subtitle": srt_subtitle.is_file() or ass_subtitle.is_file(),
+            "has_external_subtitle": bool(external_subtitles),
+            "external_subtitle_formats": [
+                subtitle.suffix.lower().lstrip(".")
+                for subtitle in external_subtitles
+            ],
+            "external_subtitle_path": (
+                external_subtitles[0].relative_to(self.root).as_posix()
+                if external_subtitles
+                else None
+            ),
             "has_nfo": nfo_path is not None,
             "title": title or path.stem,
             "poster_path": poster_path,

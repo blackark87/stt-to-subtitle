@@ -14,6 +14,7 @@ from stt_to_subtitle.service_clients import (
     RequestConcurrencyLimiter,
     RetryingJSONClient,
     STTAPIClient,
+    SubtitleValidationClient,
     TranslationPaused,
     TranslationResponseIDError,
     batch_segments,
@@ -110,6 +111,80 @@ class OpenAICompatibleModelTests(unittest.TestCase):
 
     def test_legacy_client_name_is_a_backward_compatible_alias(self) -> None:
         self.assertIs(LMStudioClient, OpenAICompatibleClient)
+
+
+class SubtitleValidationClientTests(unittest.TestCase):
+    def test_requests_one_structured_validation(self) -> None:
+        response = Mock(status_code=200)
+        response.json.return_value = {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "severity": "review",
+                                "summary": "한 문장을 확인하세요.",
+                                "findings": [
+                                    {
+                                        "reference_index": 2,
+                                        "category": "meaning",
+                                        "message": "의미가 다릅니다.",
+                                    }
+                                ],
+                            },
+                            ensure_ascii=False,
+                        )
+                    }
+                }
+            ]
+        }
+        client = SubtitleValidationClient(
+            "https://validator.test/v1/",
+            "secret",
+            "paid-model",
+        )
+
+        with patch.object(client, "request", return_value=response) as request:
+            result = client.validate({"segments": []})
+
+        self.assertEqual(result["severity"], "review")
+        self.assertEqual(result["findings"][0]["reference_index"], 2)
+        self.assertEqual(request.call_count, 1)
+        args, kwargs = request.call_args
+        self.assertEqual(args, ("POST", "https://validator.test/v1/chat/completions"))
+        self.assertEqual(kwargs["json"]["model"], "paid-model")
+        self.assertEqual(
+            kwargs["json"]["response_format"]["type"],
+            "json_schema",
+        )
+
+    def test_rejects_an_invalid_structured_validation(self) -> None:
+        response = Mock(status_code=200)
+        response.json.return_value = {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "severity": "unknown",
+                                "summary": "invalid",
+                                "findings": [],
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+        client = SubtitleValidationClient(
+            "https://validator.test/v1",
+            "",
+            "paid-model",
+        )
+
+        with patch.object(client, "request", return_value=response), self.assertRaises(
+            ExternalServiceError
+        ):
+            client.validate({"segments": []})
 
 
 class STTAPIClientProgressTests(unittest.TestCase):

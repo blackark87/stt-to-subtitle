@@ -197,6 +197,9 @@
                         data-processing-stage="{{ file.processing_status }}"
                       >{{ file.processing_label }}</span>
                     {% endif %}
+                    {% if file.has_external_subtitle %}
+                      <span class="metadata-label">외부 자막</span>
+                    {% endif %}
                   </span>
                 {% elif file.has_nfo %}
                   <span class="poster-frame">
@@ -229,6 +232,9 @@
                         data-processing-stage="{{ file.processing_status }}"
                       >{{ file.processing_label }}</span>
                     {% endif %}
+                    {% if file.has_external_subtitle %}
+                      <span class="metadata-label">외부 자막</span>
+                    {% endif %}
                   </span>
                 {% else %}
                   <span class="video-placeholder" aria-hidden="true">
@@ -251,6 +257,9 @@
                         class="subtitle-state is-{{ file.subtitle_state }}"
                         data-processing-stage="{{ file.processing_status }}"
                       >{{ file.processing_label }}</span>
+                    {% endif %}
+                    {% if file.has_external_subtitle %}
+                      <span class="metadata-label">외부 자막</span>
                     {% endif %}
                   </span>
                 {% endif %}

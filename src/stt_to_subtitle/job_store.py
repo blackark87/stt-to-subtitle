@@ -332,6 +332,14 @@ class JobStore:
                     updated_at REAL NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS subtitle_validator_settings (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    base_url TEXT NOT NULL,
+                    token TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    updated_at REAL NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS prompt_categories (
                     id TEXT PRIMARY KEY,
                     name TEXT NOT NULL COLLATE NOCASE UNIQUE,
@@ -350,6 +358,24 @@ class JobStore:
                     updated_at REAL NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS subtitle_validations (
+                    id TEXT PRIMARY KEY,
+                    job_id TEXT NOT NULL,
+                    source_rel TEXT NOT NULL,
+                    external_path TEXT NOT NULL,
+                    external_hash TEXT NOT NULL,
+                    candidate_path TEXT NOT NULL,
+                    candidate_hash TEXT NOT NULL,
+                    metrics_json TEXT NOT NULL,
+                    llm_json TEXT,
+                    validator_model TEXT,
+                    validator_input_hash TEXT,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    FOREIGN KEY (job_id) REFERENCES jobs(id),
+                    UNIQUE (job_id, external_hash, candidate_hash)
+                );
+
                 CREATE TABLE IF NOT EXISTS schema_migrations (
                     name TEXT PRIMARY KEY,
                     applied_at REAL NOT NULL
@@ -359,6 +385,8 @@ class JobStore:
                     ON jobs(status, created_at);
                 CREATE INDEX IF NOT EXISTS job_events_job_idx
                     ON job_events(job_id, id);
+                CREATE INDEX IF NOT EXISTS subtitle_validations_job_idx
+                    ON subtitle_validations(job_id, updated_at DESC);
                 """
             )
             columns = {
@@ -872,6 +900,45 @@ class JobStore:
                 ),
             )
 
+    def get_subtitle_validator_settings(self) -> dict[str, str] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT base_url, token, model
+                FROM subtitle_validator_settings
+                WHERE id = 1
+                """
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "base_url": str(row["base_url"]),
+            "token": str(row["token"]),
+            "model": str(row["model"]),
+        }
+
+    def save_subtitle_validator_settings(
+        self,
+        *,
+        base_url: str,
+        token: str,
+        model: str,
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO subtitle_validator_settings (
+                    id, base_url, token, model, updated_at
+                ) VALUES (1, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    base_url = excluded.base_url,
+                    token = excluded.token,
+                    model = excluded.model,
+                    updated_at = excluded.updated_at
+                """,
+                (base_url, token, model, time.time()),
+            )
+
     @staticmethod
     def _from_row(row: sqlite3.Row | None) -> PipelineJob | None:
         if row is None:
@@ -1214,6 +1281,10 @@ class JobStore:
     def delete(self, job_id: str) -> bool:
         with self._connect() as connection:
             connection.execute(
+                "DELETE FROM subtitle_validations WHERE job_id = ?",
+                (job_id,),
+            )
+            connection.execute(
                 "DELETE FROM job_events WHERE job_id = ?",
                 (job_id,),
             )
@@ -1225,6 +1296,170 @@ class JobStore:
         if deleted:
             self._notify_change(job_id)
         return deleted
+
+    def save_subtitle_validation(
+        self,
+        *,
+        job_id: str,
+        source_rel: str,
+        external_path: str,
+        external_hash: str,
+        candidate_path: str,
+        candidate_hash: str,
+        metrics: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        now = time.time()
+        validation_id = uuid4().hex
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO subtitle_validations (
+                    id, job_id, source_rel,
+                    external_path, external_hash,
+                    candidate_path, candidate_hash,
+                    metrics_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(job_id, external_hash, candidate_hash)
+                DO UPDATE SET
+                    external_path = excluded.external_path,
+                    candidate_path = excluded.candidate_path,
+                    metrics_json = excluded.metrics_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    validation_id,
+                    job_id,
+                    source_rel,
+                    external_path,
+                    external_hash,
+                    candidate_path,
+                    candidate_hash,
+                    json.dumps(dict(metrics), ensure_ascii=False, sort_keys=True),
+                    now,
+                    now,
+                ),
+            )
+            row = connection.execute(
+                """
+                SELECT * FROM subtitle_validations
+                WHERE job_id = ? AND external_hash = ? AND candidate_hash = ?
+                """,
+                (job_id, external_hash, candidate_hash),
+            ).fetchone()
+        validation = self._subtitle_validation_from_row(row)
+        if validation is None:
+            raise RuntimeError("subtitle validation could not be read")
+        return validation
+
+    def latest_subtitle_validation(self, job_id: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM subtitle_validations
+                WHERE job_id = ?
+                ORDER BY updated_at DESC, created_at DESC
+                LIMIT 1
+                """,
+                (job_id,),
+            ).fetchone()
+        return self._subtitle_validation_from_row(row)
+
+    def get_subtitle_validation(
+        self,
+        *,
+        job_id: str,
+        external_hash: str,
+        candidate_hash: str,
+    ) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM subtitle_validations
+                WHERE job_id = ? AND external_hash = ? AND candidate_hash = ?
+                """,
+                (job_id, external_hash, candidate_hash),
+            ).fetchone()
+        return self._subtitle_validation_from_row(row)
+
+    def get_subtitle_validation_by_id(
+        self,
+        validation_id: str,
+    ) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM subtitle_validations WHERE id = ?",
+                (validation_id,),
+            ).fetchone()
+        return self._subtitle_validation_from_row(row)
+
+    def save_subtitle_llm_validation(
+        self,
+        validation_id: str,
+        *,
+        result: Mapping[str, Any],
+        model: str,
+        input_hash: str,
+    ) -> dict[str, Any]:
+        with self._connect() as connection:
+            updated = connection.execute(
+                """
+                UPDATE subtitle_validations
+                SET llm_json = ?, validator_model = ?,
+                    validator_input_hash = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    json.dumps(dict(result), ensure_ascii=False, sort_keys=True),
+                    model,
+                    input_hash,
+                    time.time(),
+                    validation_id,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM subtitle_validations WHERE id = ?",
+                (validation_id,),
+            ).fetchone()
+        if updated.rowcount != 1:
+            raise ValueError("subtitle validation not found")
+        validation = self._subtitle_validation_from_row(row)
+        if validation is None:
+            raise RuntimeError("subtitle validation could not be read")
+        return validation
+
+    @staticmethod
+    def _subtitle_validation_from_row(
+        row: sqlite3.Row | None,
+    ) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        return {
+            "id": str(row["id"]),
+            "job_id": str(row["job_id"]),
+            "source_rel": str(row["source_rel"]),
+            "external_path": str(row["external_path"]),
+            "external_hash": str(row["external_hash"]),
+            "candidate_path": str(row["candidate_path"]),
+            "candidate_hash": str(row["candidate_hash"]),
+            "metrics": json.loads(str(row["metrics_json"])),
+            "llm": (
+                json.loads(str(row["llm_json"]))
+                if row["llm_json"] is not None
+                else None
+            ),
+            "validator_model": (
+                str(row["validator_model"])
+                if row["validator_model"] is not None
+                else None
+            ),
+            "validator_input_hash": (
+                str(row["validator_input_hash"])
+                if row["validator_input_hash"] is not None
+                else None
+            ),
+            "created_at": float(row["created_at"]),
+            "updated_at": float(row["updated_at"]),
+        }
 
     def add_event(self, job_id: str, level: str, message: str) -> None:
         with self._connect() as connection:

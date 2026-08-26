@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import replace
 from importlib.util import find_spec
 import json
 from pathlib import Path
@@ -1440,6 +1441,77 @@ class WebAppTests(unittest.TestCase):
             self.assertEqual(reloaded.lm_client.model, "new-model")
             self.assertIn("http://new-stt.test:8100", reloaded_page.text)
 
+    def test_saves_separate_commercial_subtitle_validator_settings(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+
+            with TestClient(create_app(self.settings(root, media_root))) as client:
+                page = client.get("/settings")
+                saved = client.post(
+                    "/settings/subtitle-validator",
+                    data={
+                        "validator_base_url": "https://validator.test/v1/",
+                        "validator_token": "paid-secret",
+                        "validator_model": "paid-model",
+                    },
+                    follow_redirects=False,
+                )
+                service = client.app.state.orchestrator
+                refreshed = client.get("/settings?validator_saved=true")
+
+            self.assertIn("상용 LLM 자막 검증", page.text)
+            self.assertEqual(saved.status_code, 303)
+            self.assertEqual(
+                service.subtitle_validator_view(),
+                {
+                    "base_url": "https://validator.test/v1",
+                    "token_configured": True,
+                    "model": "paid-model",
+                    "configured": True,
+                },
+            )
+            self.assertIn("상용 LLM 검증 설정을 저장했습니다.", refreshed.text)
+            self.assertNotIn("paid-secret", refreshed.text)
+
+    def test_translation_manual_gate_starts_and_stops_explicitly(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            settings = replace(
+                self.settings(root, media_root),
+                lm_manual_start=True,
+            )
+
+            with patch(
+                "stt_to_subtitle.orchestrator.list_openai_compatible_models",
+                return_value=["model"],
+            ) as models, TestClient(create_app(settings)) as client:
+                page = client.get("/settings")
+                started = client.post(
+                    "/settings/translation/start",
+                    follow_redirects=False,
+                )
+                service = client.app.state.orchestrator
+                ready_state = service.lm_gate_state
+                stopped = client.post(
+                    "/settings/translation/stop",
+                    follow_redirects=False,
+                )
+
+            self.assertIn("번역 시작/재개", page.text)
+            self.assertEqual(started.status_code, 303)
+            self.assertEqual(ready_state, "ready")
+            self.assertEqual(stopped.status_code, 303)
+            self.assertEqual(service.lm_gate_state, "offline")
+            models.assert_called_once_with(
+                "http://lm.test/v1",
+                "",
+                attempts=1,
+            )
+
     def test_manages_path_display_rules_and_shortens_job_paths(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2155,6 +2227,98 @@ class WebAppTests(unittest.TestCase):
             self.assertIn('event.code === "Space"', player_script.text)
             self.assertIn('event.key === "ArrowLeft"', player_script.text)
             self.assertIn('event.key === "ArrowUp"', player_script.text)
+
+    def test_external_subtitle_is_default_playback_and_can_be_validated(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            source = media_root / "movie.mp4"
+            source.write_bytes(b"media")
+            external = media_root / "movie.srt"
+            external.write_text(
+                "1\n00:00:01,000 --> 00:00:03,000\n외부 한국어 자막\n",
+                encoding="utf-8",
+            )
+            generated = media_root / "movie.ko.srt"
+            generated.write_text(
+                "1\n00:00:01,000 --> 00:00:03,000\n생성 한국어 자막\n",
+                encoding="utf-8",
+            )
+
+            with TestClient(create_app(self.settings(root, media_root))) as client:
+                service = client.app.state.orchestrator
+                service.stop()
+                job = service.create_job(
+                    "movie.mp4",
+                    force_overwrite=True,
+                    options={},
+                )
+                service.store.update(
+                    job.id,
+                    status="completed",
+                    srt_path=str(generated),
+                )
+                media_page = client.get("/media")
+                page = client.get(f"/jobs/{job.id}")
+                captions = client.get(f"/jobs/{job.id}/subtitles.vtt")
+                media_captions = client.get(
+                    "/media/subtitles.vtt",
+                    params={"path": "movie.mp4"},
+                )
+                compared = client.post(
+                    f"/jobs/{job.id}/validate-external-subtitle",
+                    follow_redirects=False,
+                )
+                compared_page = client.get(f"/jobs/{job.id}")
+                validator_saved = client.post(
+                    "/settings/subtitle-validator",
+                    data={
+                        "validator_base_url": "https://validator.test/v1",
+                        "validator_token": "paid-secret",
+                        "validator_model": "paid-model",
+                    },
+                    follow_redirects=False,
+                )
+                paid_result = {
+                    "severity": "review",
+                    "severity_label": "검토 필요",
+                    "summary": "표현 차이를 확인하세요.",
+                    "findings": [
+                        {
+                            "reference_index": 1,
+                            "category": "meaning",
+                            "category_label": "의미 차이",
+                            "message": "명사 표현이 다릅니다.",
+                        }
+                    ],
+                }
+                with patch(
+                    "stt_to_subtitle.orchestrator.SubtitleValidationClient"
+                ) as validator:
+                    validator.return_value.validate.return_value = paid_result
+                    paid = client.post(
+                        f"/jobs/{job.id}/validate-external-subtitle/llm",
+                        follow_redirects=False,
+                    )
+                validated_page = client.get(f"/jobs/{job.id}")
+
+            self.assertIn("외부 자막", media_page.text)
+            self.assertIn("외부 자막 비교", page.text)
+            self.assertEqual(captions.status_code, 200)
+            self.assertIn("외부 한국어 자막", captions.text)
+            self.assertNotIn("생성 한국어 자막", captions.text)
+            self.assertEqual(media_captions.status_code, 200)
+            self.assertIn("외부 한국어 자막", media_captions.text)
+            self.assertEqual(compared.status_code, 303)
+            self.assertIn("시간 일치율", compared_page.text)
+            self.assertEqual(validator_saved.status_code, 303)
+            self.assertEqual(paid.status_code, 303)
+            self.assertIn("상용 LLM · 검토 필요", validated_page.text)
+            self.assertIn("표현 차이를 확인하세요.", validated_page.text)
+            validator.return_value.validate.assert_called_once()
 
     def test_edits_source_named_json_and_shows_chunk_progress(self) -> None:
         with TemporaryDirectory() as directory:

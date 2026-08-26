@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
+import hashlib
 import json
 import logging
 import math
@@ -26,8 +27,9 @@ from .kotoba import DEFAULT_CHUNK_LENGTH_SECONDS, TranscriptionOptions
 from .path_display import PathDisplayRule
 from .web_config import (
     MediaLibrary,
-    WebSettings,
     RemoteServerSettings,
+    SubtitleValidatorSettings,
+    WebSettings,
     probe_media_duration,
 )
 from .job_store import (
@@ -43,9 +45,12 @@ from .service_clients import (
     OperationStopped,
     RequestConcurrencyLimiter,
     STTAPIClient,
+    SubtitleValidationClient,
     TranslationPaused,
+    list_openai_compatible_models,
 )
 from .subtitle import write_styled_subtitles_atomic
+from .subtitle_validation import build_subtitle_validator_payload
 from .translation_prompt import (
     KOREAN_JAV_SYSTEM_PROMPT,
     KOREAN_TRANSLATION_REVIEW_PROMPT,
@@ -227,6 +232,12 @@ class SubtitleOrchestrator:
             if saved_servers is not None
             else settings.remote_servers()
         )
+        saved_validator = self.store.get_subtitle_validator_settings()
+        self._subtitle_validator = (
+            SubtitleValidatorSettings(**saved_validator)
+            if saved_validator is not None
+            else SubtitleValidatorSettings()
+        )
         self._translation_request_limiter = RequestConcurrencyLimiter(
             initial_servers.translation_workers
         )
@@ -235,6 +246,17 @@ class SubtitleOrchestrator:
             OpenAICompatibleClient | None,
             RemoteServerSettings,
         ] = (None, None, initial_servers)
+        self._lm_gate_lock = threading.RLock()
+        self._lm_gate_state = (
+            "offline"
+            if settings.lm_manual_start or not initial_servers.is_complete
+            else "ready"
+        )
+        self._lm_gate_message = (
+            "사용자가 번역 서버를 시작할 때까지 대기합니다."
+            if self._lm_gate_state == "offline"
+            else "번역 서버 자동 시작 모드입니다."
+        )
         if initial_servers.is_complete:
             try:
                 self._set_remote_servers(initial_servers, persist=False)
@@ -287,6 +309,9 @@ class SubtitleOrchestrator:
 
     def remote_servers_view(self) -> dict[str, Any]:
         servers = self.remote_servers
+        with self._lm_gate_lock:
+            lm_gate_state = self._lm_gate_state
+            lm_gate_message = self._lm_gate_message
         return {
             "stt_base_url": servers.stt_base_url,
             "stt_token_configured": bool(servers.stt_token),
@@ -295,7 +320,127 @@ class SubtitleOrchestrator:
             "lm_model": servers.lm_model,
             "translation_workers": servers.translation_workers,
             "configured": self.remote_servers_configured,
+            "lm_manual_start": self.settings.lm_manual_start,
+            "lm_gate_state": lm_gate_state,
+            "lm_gate_message": lm_gate_message,
         }
+
+    def subtitle_validator_view(self) -> dict[str, Any]:
+        settings = self._subtitle_validator
+        return {
+            "base_url": settings.base_url,
+            "token_configured": bool(settings.token),
+            "model": settings.model,
+            "configured": settings.is_complete,
+        }
+
+    def update_subtitle_validator(
+        self,
+        settings: SubtitleValidatorSettings,
+    ) -> SubtitleValidatorSettings:
+        normalized = settings.normalized()
+        self.store.save_subtitle_validator_settings(
+            base_url=normalized.base_url,
+            token=normalized.token,
+            model=normalized.model,
+        )
+        self._subtitle_validator = normalized
+        return normalized
+
+    def validate_subtitles_with_llm(
+        self,
+        validation_id: str,
+    ) -> tuple[dict[str, Any], bool]:
+        validation = self.store.get_subtitle_validation_by_id(validation_id)
+        if validation is None:
+            raise ValueError("자막 비교 결과를 찾을 수 없습니다.")
+        settings = self._subtitle_validator.normalized()
+        payload = build_subtitle_validator_payload(validation["metrics"])
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        input_hash = hashlib.sha256(
+            settings.model.encode("utf-8") + b"\0" + encoded
+        ).hexdigest()
+        if (
+            validation["llm"] is not None
+            and validation["validator_model"] == settings.model
+            and validation["validator_input_hash"] == input_hash
+        ):
+            return validation, True
+        result = SubtitleValidationClient(
+            settings.base_url,
+            settings.token,
+            settings.model,
+        ).validate(payload)
+        updated = self.store.save_subtitle_llm_validation(
+            validation_id,
+            result=result,
+            model=settings.model,
+            input_hash=input_hash,
+        )
+        return updated, False
+
+    @property
+    def lm_gate_state(self) -> str:
+        with self._lm_gate_lock:
+            return self._lm_gate_state
+
+    def activate_translation_lm(self) -> int:
+        """Open the manual translation gate after one explicit preflight."""
+        servers = self.remote_servers
+        if self.lm_client is None:
+            raise ValueError("번역 서버 설정을 먼저 저장하세요.")
+        with self._lm_gate_lock:
+            self._lm_gate_state = "checking"
+            self._lm_gate_message = "번역 서버 연결을 확인하고 있습니다."
+        try:
+            models = list_openai_compatible_models(
+                servers.lm_base_url,
+                servers.lm_token,
+                attempts=1,
+            )
+            if servers.lm_model not in models:
+                raise ExternalServiceError(
+                    f"설정된 번역 모델을 찾을 수 없습니다: {servers.lm_model}"
+                )
+        except (ValueError, ExternalServiceError) as error:
+            with self._lm_gate_lock:
+                self._lm_gate_state = "offline"
+                self._lm_gate_message = self._sanitize_error(str(error))
+            raise
+        with self._lm_gate_lock:
+            self._lm_gate_state = "ready"
+            self._lm_gate_message = (
+                f"번역 서버가 준비되었습니다: {servers.lm_model}"
+            )
+
+        retried = 0
+        for job_id in self.store.ids_with_status("blocked"):
+            job = self.store.get(job_id)
+            if (
+                job is None
+                or job.blocked_stage != "translation"
+                or job.error in {USER_STOP_MESSAGE, USER_SELECTED_STOP_MESSAGE}
+            ):
+                continue
+            try:
+                self.retry(job.id)
+            except ValueError:
+                continue
+            retried += 1
+        return retried
+
+    def deactivate_translation_lm(self) -> None:
+        """Close the gate without making any network request."""
+        with self._lm_gate_lock:
+            self._lm_gate_state = "offline"
+            self._lm_gate_message = (
+                "번역 서버 사용이 중지되었습니다. 새 번역을 시작하지 않습니다."
+            )
 
     def active_prompt_categories(self) -> list[PromptCategory]:
         return self.store.list_prompt_categories()
@@ -405,6 +550,15 @@ class SubtitleOrchestrator:
             normalized.translation_workers
         )
         self._remote_runtime = (stt_client, lm_client, normalized)
+        with self._lm_gate_lock:
+            self._lm_gate_state = (
+                "offline" if self.settings.lm_manual_start else "ready"
+            )
+            self._lm_gate_message = (
+                "설정을 저장했습니다. 번역 시작/재개를 눌러 연결을 확인하세요."
+                if self.settings.lm_manual_start
+                else "번역 서버 자동 시작 모드입니다."
+            )
         return normalized
 
     def start(self) -> None:
@@ -1876,6 +2030,8 @@ class SubtitleOrchestrator:
         self._dispatch_translations()
 
     def _dispatch_translations(self) -> int:
+        if self.settings.lm_manual_start and self.lm_gate_state != "ready":
+            return 0
         if self.store.ids_with_status("translation_running"):
             return 0
         return int(
@@ -1927,6 +2083,10 @@ class SubtitleOrchestrator:
             self._mark_job_stopped(job_id, stage)
         except ExternalServiceError as error:
             message = self._sanitize_error(str(error))
+            if stage == "translation" and self.settings.lm_manual_start:
+                with self._lm_gate_lock:
+                    self._lm_gate_state = "lost"
+                    self._lm_gate_message = message
             self.store.update(
                 job_id,
                 status="blocked",
@@ -2437,7 +2597,16 @@ class SubtitleOrchestrator:
 
     def _sanitize_error(self, message: str) -> str:
         sanitized = message
-        for secret in (self.settings.stt_token, self.settings.lm_token):
+        for secret in {
+            self.settings.stt_token,
+            self.settings.lm_token,
+            self.remote_servers.stt_token,
+            self.remote_servers.lm_token,
+            self._subtitle_validator.token,
+        }:
             if secret:
                 sanitized = sanitized.replace(secret, "[redacted]")
         return sanitized[:2000]
+
+    def sanitize_external_error(self, message: str) -> str:
+        return self._sanitize_error(message)

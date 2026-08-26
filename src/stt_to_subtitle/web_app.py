@@ -33,6 +33,7 @@ from . import __version__
 from .artifacts import artifact_filename
 from .contracts import validate_transcript, validate_translation_items
 from .gpu_monitoring import GpuSnapshot, PrometheusGpuMonitor
+from .files import sha256_file
 from .job_store import RETRYABLE_STATUSES, RUNNING_STATUSES, SUCCESS_STATUSES
 from .media_preview import (
     guess_media_type,
@@ -44,8 +45,9 @@ from .path_display import shorten_display_path
 from .web_config import (
     group_multipart_media,
     MediaLibrary,
-    WebSettings,
     RemoteServerSettings,
+    SubtitleValidatorSettings,
+    WebSettings,
     normalize_server_url,
 )
 from .orchestrator import (
@@ -61,6 +63,12 @@ from .service_clients import (
     list_openai_compatible_models,
 )
 from .subtitle import render_webvtt
+from .subtitle_validation import (
+    compare_subtitles,
+    parse_subtitle,
+    render_webvtt as render_external_webvtt,
+    subtitle_asset_hash,
+)
 from .time_display import (
     configure_kst_logging,
     format_kst_iso,
@@ -2654,6 +2662,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             "error": error,
             "notice": notice,
             "remote_servers": server_values,
+            "subtitle_validator": service.subtitle_validator_view(),
             "prompt_categories": service.all_prompt_categories(),
         }
 
@@ -2663,6 +2672,10 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         saved: bool = False,
         prompt_saved: bool = False,
         path_saved: bool = False,
+        lm_started: bool = False,
+        lm_stopped: bool = False,
+        validator_saved: bool = False,
+        resumed: int = 0,
     ) -> Any:
         if not is_authenticated(request):
             return login_redirect()
@@ -2672,8 +2685,17 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             settings_context(
                 request,
                 notice=(
-                    "서버 설정을 저장했습니다."
+                    (
+                        "번역 서버 연결을 확인했습니다."
+                        + (f" 중단 작업 {resumed}건을 재개했습니다." if resumed else "")
+                    )
+                    if lm_started
+                    else "번역 서버 사용을 중지했습니다."
+                    if lm_stopped
+                    else "서버 설정을 저장했습니다."
                     if saved
+                    else "상용 LLM 검증 설정을 저장했습니다."
+                    if validator_saved
                     else "경로 표시 규칙을 저장했습니다."
                     if path_saved
                     else "번역 프롬프트 설정을 저장했습니다."
@@ -2681,6 +2703,42 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                     else None
                 ),
             ),
+        )
+
+    @app.post("/settings/translation/start", response_class=HTMLResponse)
+    def start_translation_lm(
+        request: Request,
+        csrf_token: str = Form(""),
+    ) -> Any:
+        if not is_authenticated(request):
+            return login_redirect()
+        validate_csrf(request, csrf_token)
+        try:
+            resumed = orchestrator(request).activate_translation_lm()
+        except (ValueError, ExternalServiceError) as error:
+            return TEMPLATES.TemplateResponse(
+                request,
+                "settings.html",
+                settings_context(request, error=str(error)),
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+        return RedirectResponse(
+            f"/settings?lm_started=true&resumed={resumed}",
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+
+    @app.post("/settings/translation/stop")
+    def stop_translation_lm(
+        request: Request,
+        csrf_token: str = Form(""),
+    ) -> Any:
+        if not is_authenticated(request):
+            return login_redirect()
+        validate_csrf(request, csrf_token)
+        orchestrator(request).deactivate_translation_lm()
+        return RedirectResponse(
+            "/settings?lm_stopped=true",
+            status_code=status.HTTP_303_SEE_OTHER,
         )
 
     @app.post("/settings/translation-models")
@@ -2770,6 +2828,52 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             )
         return RedirectResponse(
             "/settings?saved=true",
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+
+    @app.post("/settings/subtitle-validator", response_class=HTMLResponse)
+    def save_subtitle_validator_settings(
+        request: Request,
+        csrf_token: str = Form(""),
+        validator_base_url: str = Form(...),
+        validator_token: str = Form(""),
+        clear_validator_token: bool = Form(False),
+        validator_model: str = Form(...),
+    ) -> Any:
+        if not is_authenticated(request):
+            return login_redirect()
+        validate_csrf(request, csrf_token)
+        service = orchestrator(request)
+        current = service.subtitle_validator_view()
+        stored = service.store.get_subtitle_validator_settings() or {}
+        updated = SubtitleValidatorSettings(
+            base_url=validator_base_url,
+            token=(
+                ""
+                if clear_validator_token
+                else validator_token
+                if validator_token
+                else str(stored.get("token", ""))
+            ),
+            model=validator_model,
+        )
+        try:
+            service.update_subtitle_validator(updated)
+        except ValueError as error:
+            context = settings_context(request, error=str(error))
+            context["subtitle_validator"] = {
+                **current,
+                "base_url": validator_base_url,
+                "model": validator_model,
+            }
+            return TEMPLATES.TemplateResponse(
+                request,
+                "settings.html",
+                context,
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+        return RedirectResponse(
+            "/settings?validator_saved=true",
             status_code=status.HTTP_303_SEE_OTHER,
         )
 
@@ -3363,16 +3467,24 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             return login_redirect()
         service = orchestrator(request)
         job = service.store.get(job_id)
-        if job is None or not job.srt_path:
+        if job is None:
             raise HTTPException(status_code=404, detail="subtitle not found")
         try:
-            webvtt = styled_webvtt(job)
-            if webvtt is None:
-                source = service.library.resolve_file(job.source_rel)
-                subtitle = source.with_name(f"{source.stem}.ko.srt")
-                webvtt = srt_to_webvtt(
-                    subtitle.read_text(encoding="utf-8-sig")
+            external_subtitles = service.library.external_subtitles(job.source_rel)
+            if external_subtitles:
+                webvtt = render_external_webvtt(
+                    parse_subtitle(external_subtitles[0])
                 )
+            elif job.srt_path:
+                webvtt = styled_webvtt(job)
+                if webvtt is None:
+                    source = service.library.resolve_file(job.source_rel)
+                    subtitle = source.with_name(f"{source.stem}.ko.srt")
+                    webvtt = srt_to_webvtt(
+                        subtitle.read_text(encoding="utf-8-sig")
+                    )
+            else:
+                raise FileNotFoundError("subtitle not found")
         except (
             KeyError,
             OSError,
@@ -3384,6 +3496,31 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="subtitle not found",
+            ) from error
+        return Response(
+            webvtt,
+            media_type="text/vtt",
+            headers={"Cache-Control": "private, no-cache"},
+        )
+
+    @app.get(
+        "/media/subtitles.vtt",
+        name="media_external_subtitles",
+    )
+    def media_external_subtitles(request: Request, path: str) -> Any:
+        if not is_authenticated(request):
+            return login_redirect()
+        try:
+            external_subtitles = orchestrator(request).library.external_subtitles(path)
+            if not external_subtitles:
+                raise FileNotFoundError("external subtitle not found")
+            webvtt = render_external_webvtt(
+                parse_subtitle(external_subtitles[0])
+            )
+        except (OSError, UnicodeError, ValueError) as error:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="external subtitle not found",
             ) from error
         return Response(
             webvtt,
@@ -3682,6 +3819,39 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             status_code=status.HTTP_303_SEE_OTHER,
         )
 
+    def external_subtitles_for_job(
+        service: SubtitleOrchestrator,
+        source_rel: str,
+    ) -> tuple[Path, ...]:
+        try:
+            return service.library.external_subtitles(source_rel)
+        except (OSError, ValueError):
+            return ()
+
+    def current_subtitle_validation(
+        service: SubtitleOrchestrator,
+        job: Any,
+        external_subtitles: Sequence[Path],
+    ) -> dict[str, Any] | None:
+        candidate_path = next(
+            (
+                Path(value)
+                for value in (job.srt_path, job.ass_path)
+                if value and Path(value).is_file()
+            ),
+            None,
+        )
+        if not external_subtitles or candidate_path is None:
+            return None
+        try:
+            return service.store.get_subtitle_validation(
+                job_id=job.id,
+                external_hash=subtitle_asset_hash(external_subtitles),
+                candidate_hash=sha256_file(candidate_path),
+            )
+        except OSError:
+            return None
+
     @app.get("/jobs/{job_id}", response_class=HTMLResponse)
     def job_page(
         request: Request,
@@ -3705,6 +3875,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         job = service.store.get(job_id)
         if job is None:
             raise HTTPException(status_code=404, detail="job not found")
+        external_subtitles = external_subtitles_for_job(service, job.source_rel)
         return TEMPLATES.TemplateResponse(
             request,
             "job.html",
@@ -3724,6 +3895,23 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                 "csrf_token": request.session.get("csrf_token", ""),
                 "prompt_categories": service.active_prompt_categories(),
                 "video_mime_type": guess_media_type(job.source_rel),
+                "external_subtitle": (
+                    {
+                        "path": external_subtitles[0].name,
+                        "formats": [
+                            path.suffix.lower().lstrip(".")
+                            for path in external_subtitles
+                        ],
+                    }
+                    if external_subtitles
+                    else None
+                ),
+                "subtitle_validation": current_subtitle_validation(
+                    service,
+                    job,
+                    external_subtitles,
+                ),
+                "subtitle_validator": service.subtitle_validator_view(),
                 "artifact_names": {
                     "transcript": artifact_filename(
                         job.source_rel,
@@ -3760,6 +3948,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         job = service.store.get(job_id)
         if job is None:
             raise HTTPException(status_code=404, detail="job not found")
+        external_subtitles = external_subtitles_for_job(service, job.source_rel)
         return TEMPLATES.TemplateResponse(
             request,
             "_job_panel.html",
@@ -3778,6 +3967,23 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                 "csrf_token": request.session.get("csrf_token", ""),
                 "prompt_categories": service.active_prompt_categories(),
                 "video_mime_type": guess_media_type(job.source_rel),
+                "external_subtitle": (
+                    {
+                        "path": external_subtitles[0].name,
+                        "formats": [
+                            path.suffix.lower().lstrip(".")
+                            for path in external_subtitles
+                        ],
+                    }
+                    if external_subtitles
+                    else None
+                ),
+                "subtitle_validation": current_subtitle_validation(
+                    service,
+                    job,
+                    external_subtitles,
+                ),
+                "subtitle_validator": service.subtitle_validator_view(),
                 "artifact_names": {
                     "transcript": artifact_filename(
                         job.source_rel,
@@ -3789,6 +3995,103 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                     ),
                 },
             },
+        )
+
+    @app.post("/jobs/{job_id}/validate-external-subtitle")
+    def validate_external_subtitle(
+        request: Request,
+        job_id: str,
+        csrf_token: str = Form(""),
+    ) -> Any:
+        if not is_authenticated(request):
+            return login_redirect()
+        validate_csrf(request, csrf_token)
+        service = orchestrator(request)
+        job = service.store.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="job not found")
+        try:
+            external_subtitles = service.library.external_subtitles(job.source_rel)
+            if not external_subtitles:
+                raise ValueError("외부 자막이 없습니다.")
+            candidate_path = next(
+                (
+                    Path(value)
+                    for value in (job.srt_path, job.ass_path)
+                    if value and Path(value).is_file()
+                ),
+                None,
+            )
+            if candidate_path is None:
+                raise ValueError("비교할 시스템 생성 자막이 없습니다.")
+            metrics = compare_subtitles(
+                parse_subtitle(external_subtitles[0]),
+                parse_subtitle(candidate_path),
+            )
+            service.store.save_subtitle_validation(
+                job_id=job.id,
+                source_rel=job.source_rel,
+                external_path=str(external_subtitles[0]),
+                external_hash=subtitle_asset_hash(external_subtitles),
+                candidate_path=str(candidate_path),
+                candidate_hash=sha256_file(candidate_path),
+                metrics=metrics,
+            )
+            service.store.add_event(
+                job.id,
+                "info",
+                "외부 자막 비교 검증 완료",
+            )
+        except (OSError, UnicodeError, ValueError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        return RedirectResponse(
+            f"/jobs/{job.id}",
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+
+    @app.post("/jobs/{job_id}/validate-external-subtitle/llm")
+    def validate_external_subtitle_with_llm(
+        request: Request,
+        job_id: str,
+        csrf_token: str = Form(""),
+    ) -> Any:
+        if not is_authenticated(request):
+            return login_redirect()
+        validate_csrf(request, csrf_token)
+        service = orchestrator(request)
+        job = service.store.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="job not found")
+        external_subtitles = external_subtitles_for_job(service, job.source_rel)
+        validation = current_subtitle_validation(
+            service,
+            job,
+            external_subtitles,
+        )
+        if validation is None:
+            raise HTTPException(
+                status_code=400,
+                detail="현재 자막 파일의 비교 검증을 먼저 실행하세요.",
+            )
+        try:
+            _updated, cached = service.validate_subtitles_with_llm(
+                validation["id"]
+            )
+            service.store.add_event(
+                job.id,
+                "info",
+                "상용 LLM 자막 검증 저장 결과 재사용"
+                if cached
+                else "상용 LLM 자막 검증 완료",
+            )
+        except (ExternalServiceError, ValueError) as error:
+            raise HTTPException(
+                status_code=400,
+                detail=service.sanitize_external_error(str(error)),
+            ) from error
+        return RedirectResponse(
+            f"/jobs/{job.id}",
+            status_code=status.HTTP_303_SEE_OTHER,
         )
 
     @app.post("/jobs/{job_id}/retry")
