@@ -465,19 +465,25 @@ class SubtitleOrchestrator:
             and validation["validator_model"] == settings.model
             and validation["validator_input_hash"] == input_hash
         ):
+            self.record_subtitle_validation("llm", "cache_hit")
             return validation, True
-        result = SubtitleValidationClient(
-            settings.base_url,
-            settings.token,
-            settings.model,
-            request_observer=self.record_external_request,
-        ).validate(payload)
-        updated = self.store.save_subtitle_llm_validation(
-            validation_id,
-            result=result,
-            model=settings.model,
-            input_hash=input_hash,
-        )
+        try:
+            result = SubtitleValidationClient(
+                settings.base_url,
+                settings.token,
+                settings.model,
+                request_observer=self.record_external_request,
+            ).validate(payload)
+            updated = self.store.save_subtitle_llm_validation(
+                validation_id,
+                result=result,
+                model=settings.model,
+                input_hash=input_hash,
+            )
+        except Exception:
+            self.record_subtitle_validation("llm", "failed")
+            raise
+        self.record_subtitle_validation("llm", "completed")
         return updated, False
 
     @property
@@ -518,6 +524,28 @@ class SubtitleOrchestrator:
             "lease.fencing_rejections",
             1,
             labels={"stage": stage, "detection": detection},
+        )
+
+    def record_subtitle_validation(self, mode: str, outcome: str) -> None:
+        if mode not in {"local", "llm"}:
+            raise ValueError("invalid subtitle validation mode")
+        if outcome not in {"completed", "cache_hit", "failed"}:
+            raise ValueError("invalid subtitle validation outcome")
+        self._record_measurement(
+            "subtitle.validation.runs",
+            1,
+            labels={"mode": mode, "outcome": outcome},
+        )
+
+    def _record_dependency_readiness(
+        self,
+        dependency: str,
+        outcome: str,
+    ) -> None:
+        self._record_measurement(
+            "dependency.readiness_checks",
+            1,
+            labels={"dependency": dependency, "outcome": outcome},
         )
 
     def record_external_request(self, observation: Mapping[str, Any]) -> None:
@@ -588,6 +616,7 @@ class SubtitleOrchestrator:
         persist: bool = True,
     ) -> None:
         with self._stt_gate_lock:
+            previous_state = self._stt_gate_state
             self._stt_gate_state = state
             self._stt_gate_message = message
         if persist:
@@ -596,6 +625,17 @@ class SubtitleOrchestrator:
                 state=state,
                 reason_code=reason_code,
                 error=message if state in {"lost", "unknown"} else None,
+            )
+        if previous_state != state:
+            self._record_measurement(
+                "dependency.gate.transitions",
+                1,
+                labels={
+                    "dependency": "stt",
+                    "from_state": previous_state,
+                    "to_state": state,
+                    "reason": reason_code or "none",
+                },
             )
 
     def _set_lm_gate(
@@ -607,6 +647,7 @@ class SubtitleOrchestrator:
         persist: bool = True,
     ) -> None:
         with self._lm_gate_lock:
+            previous_state = self._lm_gate_state
             self._lm_gate_state = state
             self._lm_gate_message = message
         if persist:
@@ -616,18 +657,28 @@ class SubtitleOrchestrator:
                 reason_code=reason_code,
                 error=message if state in {"lost", "offline"} else None,
             )
+        if previous_state != state:
+            self._record_measurement(
+                "dependency.gate.transitions",
+                1,
+                labels={
+                    "dependency": "translation_lm",
+                    "from_state": previous_state,
+                    "to_state": state,
+                    "reason": reason_code or "none",
+                },
+            )
 
     def activate_transcription_stt(self) -> int:
         """Open the STT gate after one explicit readiness check."""
         if self.stt_client is None:
             raise ValueError("전사 서버 설정을 먼저 저장하세요.")
-        with self._stt_gate_lock:
-            self._stt_gate_state = "checking"
-            self._stt_gate_message = "연결 확인 중"
+        self._set_stt_gate("checking", "연결 확인 중", persist=False)
         try:
             readiness = self.stt_client.check_readiness()
             self._record_stt_queue_snapshot(readiness)
         except ExternalServiceError as error:
+            self._record_dependency_readiness("stt", "unavailable")
             message = self._sanitize_error(str(error))
             self._set_stt_gate(
                 "lost",
@@ -635,6 +686,7 @@ class SubtitleOrchestrator:
                 reason_code=JobReason.STT_UNAVAILABLE.value,
             )
             raise
+        self._record_dependency_readiness("stt", "ready")
         self._set_stt_gate("ready", "사용 가능")
 
         retried = 0
@@ -658,9 +710,11 @@ class SubtitleOrchestrator:
         servers = self.remote_servers
         if self.lm_client is None:
             raise ValueError("번역 서버 설정을 먼저 저장하세요.")
-        with self._lm_gate_lock:
-            self._lm_gate_state = "checking"
-            self._lm_gate_message = "번역 서버 연결을 확인하고 있습니다."
+        self._set_lm_gate(
+            "checking",
+            "번역 서버 연결을 확인하고 있습니다.",
+            persist=False,
+        )
         try:
             models = list_openai_compatible_models(
                 servers.lm_base_url,
@@ -673,12 +727,17 @@ class SubtitleOrchestrator:
                     f"설정된 번역 모델을 찾을 수 없습니다: {servers.lm_model}"
                 )
         except (ValueError, ExternalServiceError) as error:
+            self._record_dependency_readiness(
+                "translation_lm",
+                "unavailable",
+            )
             self._set_lm_gate(
                 "offline",
                 self._sanitize_error(str(error)),
                 reason_code=JobReason.LM_UNAVAILABLE.value,
             )
             raise
+        self._record_dependency_readiness("translation_lm", "ready")
         self._set_lm_gate(
             "ready",
             f"번역 서버가 준비되었습니다: {servers.lm_model}",

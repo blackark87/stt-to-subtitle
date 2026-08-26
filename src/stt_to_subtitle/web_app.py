@@ -4489,7 +4489,9 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                 event_code="subtitle.validation_completed",
                 payload={"validation_id": validation["id"]},
             )
+            service.record_subtitle_validation("local", "completed")
         except (OSError, UnicodeError, ValueError) as error:
+            service.record_subtitle_validation("local", "failed")
             raise HTTPException(status_code=400, detail=str(error)) from error
         return RedirectResponse(
             f"/jobs/{job.id}",

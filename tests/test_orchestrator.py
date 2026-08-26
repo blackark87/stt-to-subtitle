@@ -159,6 +159,13 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                 persisted_gate = orchestrator.store.get_dependency_state(
                     "translation_lm"
                 )
+                dependency_measurements = [
+                    measurement
+                    for measurement in (
+                        orchestrator.store.operational_measurements()
+                    )
+                    if measurement["metric"].startswith("dependency.")
+                ]
             finally:
                 orchestrator.stop()
 
@@ -172,6 +179,26 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                 "secret",
                 attempts=1,
                 request_observer=ANY,
+            )
+            self.assertTrue(
+                any(
+                    measurement["metric"]
+                    == "dependency.readiness_checks"
+                    and measurement["labels"]
+                    == {
+                        "dependency": "translation_lm",
+                        "outcome": "ready",
+                    }
+                    for measurement in dependency_measurements
+                )
+            )
+            self.assertTrue(
+                any(
+                    measurement["metric"]
+                    == "dependency.gate.transitions"
+                    and measurement["labels"]["to_state"] == "checking"
+                    for measurement in dependency_measurements
+                )
             )
 
     def test_manual_lm_gate_starts_closed_after_process_restart(self) -> None:
@@ -295,6 +322,21 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                         "cancel_requested": 2.0,
                     },
                 )
+                readiness_measurements = [
+                    measurement
+                    for measurement in (
+                        orchestrator.store.operational_measurements()
+                    )
+                    if measurement["metric"]
+                    == "dependency.readiness_checks"
+                ]
+                self.assertTrue(
+                    any(
+                        measurement["labels"]
+                        == {"dependency": "stt", "outcome": "ready"}
+                        for measurement in readiness_measurements
+                    )
+                )
             finally:
                 orchestrator.stop()
 
@@ -353,6 +395,16 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                     second, second_cached = orchestrator.validate_subtitles_with_llm(
                         validation["id"]
                     )
+                validation_measurements = {
+                    measurement["labels"]["outcome"]: measurement[
+                        "sample_count"
+                    ]
+                    for measurement in (
+                        orchestrator.store.operational_measurements()
+                    )
+                    if measurement["metric"] == "subtitle.validation.runs"
+                    and measurement["labels"]["mode"] == "llm"
+                }
             finally:
                 orchestrator.stop()
 
@@ -361,6 +413,10 @@ class SubtitleOrchestratorTests(unittest.TestCase):
             self.assertEqual(first["llm"], result)
             self.assertEqual(second["llm"], result)
             client.return_value.validate.assert_called_once()
+            self.assertEqual(
+                validation_measurements,
+                {"completed": 1, "cache_hit": 1},
+            )
 
     def test_zero_duration_means_process_to_end(self) -> None:
         with TemporaryDirectory() as directory:

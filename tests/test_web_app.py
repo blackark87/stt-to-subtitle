@@ -2609,6 +2609,14 @@ class WebAppTests(unittest.TestCase):
                         follow_redirects=False,
                     )
                 validated_page = client.get(f"/jobs/{job.id}")
+                validation_measurements = {
+                    (
+                        measurement["labels"]["mode"],
+                        measurement["labels"]["outcome"],
+                    ): measurement["sample_count"]
+                    for measurement in service.store.operational_measurements()
+                    if measurement["metric"] == "subtitle.validation.runs"
+                }
 
             self.assertIn("외부 자막", media_page.text)
             self.assertIn("외부 자막 비교", page.text)
@@ -2624,6 +2632,10 @@ class WebAppTests(unittest.TestCase):
             self.assertIn("상용 LLM · 검토 필요", validated_page.text)
             self.assertIn("표현 차이를 확인하세요.", validated_page.text)
             validator.return_value.validate.assert_called_once()
+            self.assertEqual(
+                validation_measurements,
+                {("local", "completed"): 1, ("llm", "completed"): 1},
+            )
 
     def test_edits_source_named_json_and_shows_chunk_progress(self) -> None:
         with TemporaryDirectory() as directory:
