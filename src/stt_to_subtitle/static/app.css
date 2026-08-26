@@ -969,6 +969,8 @@ th, td { border-bottom: 1px solid var(--line); padding: 10px 8px; text-align: le
 .error-text { color: var(--danger); }
 .actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 18px; }
 .actions form { margin: 0; }
+.compact-actions { gap: 6px; margin-top: 8px; }
+.compact-actions > button, .compact-actions > .button, .compact-actions > form { flex: 0 0 auto; }
 .reprocess-actions { display: grid; gap: 10px; margin-top: 20px; border-top: 1px solid var(--line); padding-top: 18px; }
 .reprocess-actions > div:first-child { display: grid; gap: 2px; }
 .reprocess-actions .actions { margin-top: 0; }
@@ -1124,6 +1126,7 @@ code { overflow-wrap: anywhere; }
   .actions > button, .actions > .button, .actions > form { flex: 1 1 200px; }
   .actions > form { display: grid; gap: 8px; }
   .actions > form > button, .actions > form > .button { width: 100%; }
+  .compact-actions > button, .compact-actions > .button, .compact-actions > form { flex: 0 0 auto; }
   .reprocess-form { display: grid; gap: 10px; }
   .reprocess-form label { min-width: 0; }
 

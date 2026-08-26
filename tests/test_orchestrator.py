@@ -2004,6 +2004,34 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                     )
                     for generation in generations
                 ]
+                subtitle_generations = (
+                    orchestrator.store.list_subtitle_generations(job.id)
+                )
+                generated_srt = srt_path.read_text(encoding="utf-8")
+                orchestrator.publish_subtitle_generation(
+                    job.id,
+                    subtitle_generations[0]["id"],
+                )
+                rolled_back_srt = srt_path.read_text(encoding="utf-8")
+                rolled_back_publication = (
+                    orchestrator.store.published_subtitle_generation(job.id)
+                )
+                orchestrator.publish_subtitle_generation(
+                    job.id,
+                    subtitle_generations[1]["id"],
+                )
+                republished_srt = srt_path.read_text(encoding="utf-8")
+                Path(
+                    subtitle_generations[0]["srt_artifact_path"]
+                ).write_text("tampered", encoding="utf-8")
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "generation file is invalid",
+                ):
+                    orchestrator.publish_subtitle_generation(
+                        job.id,
+                        subtitle_generations[0]["id"],
+                    )
             finally:
                 orchestrator.stop()
 
@@ -2015,9 +2043,9 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                 original_transcript,
             )
             self.assertEqual(completed.status, "completed")
-            self.assertIn("새 번역", srt_path.read_text(encoding="utf-8"))
+            self.assertIn("새 번역", generated_srt)
             self.assertIn("새 번역", ass_path.read_text(encoding="utf-8"))
-            self.assertNotIn("old srt", srt_path.read_text(encoding="utf-8"))
+            self.assertNotIn("old srt", generated_srt)
             self.assertEqual(
                 translation_client.translate.call_args.kwargs["existing"],
                 {},
@@ -2053,6 +2081,18 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                 generation_snapshots[1]["translations"][0]["text"],
                 "새 번역",
             )
+            self.assertEqual(
+                [item["origin"] for item in subtitle_generations],
+                ["legacy", "rendered"],
+            )
+            self.assertFalse(subtitle_generations[0]["is_published"])
+            self.assertTrue(subtitle_generations[1]["is_published"])
+            self.assertEqual(rolled_back_srt, "old srt")
+            self.assertEqual(
+                rolled_back_publication["id"],
+                subtitle_generations[0]["id"],
+            )
+            self.assertEqual(republished_srt, generated_srt)
 
     def test_restart_translation_rejects_an_incomplete_job(self) -> None:
         with TemporaryDirectory() as directory:

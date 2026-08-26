@@ -2422,6 +2422,18 @@ class WebAppTests(unittest.TestCase):
                     f"/jobs/{job.id}/translation-generations/"
                     f"{generations[-1]['id']}"
                 )
+                subtitle_generations = (
+                    service.store.list_subtitle_generations(job.id)
+                )
+                subtitle_generation_download = client.get(
+                    f"/jobs/{job.id}/subtitle-generations/"
+                    f"{subtitle_generations[-1]['id']}.srt"
+                )
+                subtitle_republish = client.post(
+                    f"/jobs/{job.id}/subtitle-generations/"
+                    f"{subtitle_generations[-1]['id']}/publish",
+                    follow_redirects=False,
+                )
                 completed_jobs = client.get("/jobs-fragment")
                 restart = client.post(
                     f"/jobs/{job.id}/restart-translation",
@@ -2469,6 +2481,11 @@ class WebAppTests(unittest.TestCase):
                 generation_download.json()["translations"][0]["text"],
                 "수정된 번역",
             )
+            self.assertIn("자막 이력", refreshed_page.text)
+            self.assertIn("자막 버전 1 · 게시 중", refreshed_page.text)
+            self.assertEqual(subtitle_generation_download.status_code, 200)
+            self.assertIn("수정된 번역", subtitle_generation_download.text)
+            self.assertEqual(subtitle_republish.status_code, 303)
             self.assertIn("번역 다시 시작", completed_jobs.text)
             self.assertIn(
                 f'/jobs/{job.id}/restart-translation',

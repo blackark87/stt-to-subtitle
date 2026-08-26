@@ -442,6 +442,41 @@ class JobStore:
                         REFERENCES translation_generations(id)
                 );
 
+                CREATE TABLE IF NOT EXISTS subtitle_generations (
+                    id TEXT PRIMARY KEY,
+                    job_id TEXT NOT NULL,
+                    generation_number INTEGER NOT NULL,
+                    translation_generation_id TEXT,
+                    transcript_hash TEXT NOT NULL,
+                    translation_hash TEXT NOT NULL,
+                    renderer_version TEXT NOT NULL,
+                    render_hash TEXT NOT NULL,
+                    srt_artifact_path TEXT NOT NULL,
+                    ass_artifact_path TEXT NOT NULL,
+                    srt_hash TEXT NOT NULL,
+                    ass_hash TEXT NOT NULL,
+                    origin TEXT NOT NULL,
+                    supersedes_generation_id TEXT,
+                    created_at REAL NOT NULL,
+                    published_at REAL,
+                    FOREIGN KEY (job_id) REFERENCES jobs(id),
+                    FOREIGN KEY (translation_generation_id)
+                        REFERENCES translation_generations(id),
+                    FOREIGN KEY (supersedes_generation_id)
+                        REFERENCES subtitle_generations(id),
+                    UNIQUE (job_id, generation_number)
+                );
+
+                CREATE TABLE IF NOT EXISTS subtitle_publications (
+                    source_rel TEXT PRIMARY KEY,
+                    job_id TEXT NOT NULL,
+                    subtitle_generation_id TEXT NOT NULL,
+                    updated_at REAL NOT NULL,
+                    FOREIGN KEY (job_id) REFERENCES jobs(id),
+                    FOREIGN KEY (subtitle_generation_id)
+                        REFERENCES subtitle_generations(id)
+                );
+
                 CREATE TABLE IF NOT EXISTS schema_migrations (
                     name TEXT PRIMARY KEY,
                     applied_at REAL NOT NULL
@@ -457,6 +492,8 @@ class JobStore:
                     ON translation_generations(job_id, generation_number DESC);
                 CREATE INDEX IF NOT EXISTS translation_items_generation_idx
                     ON translation_items(generation_id, segment_index);
+                CREATE INDEX IF NOT EXISTS subtitle_generations_job_idx
+                    ON subtitle_generations(job_id, generation_number DESC);
                 """
             )
             columns = {
@@ -1361,6 +1398,14 @@ class JobStore:
                     (job_id,),
                 ).fetchall()
             ]
+            connection.execute(
+                "DELETE FROM subtitle_publications WHERE job_id = ?",
+                (job_id,),
+            )
+            connection.execute(
+                "DELETE FROM subtitle_generations WHERE job_id = ?",
+                (job_id,),
+            )
             for generation_id in generation_ids:
                 connection.execute(
                     "DELETE FROM translation_items WHERE generation_id = ?",
@@ -1886,6 +1931,223 @@ class JobStore:
             for row in rows
         ]
 
+    def create_subtitle_generation(
+        self,
+        *,
+        generation_id: str,
+        job_id: str,
+        translation_generation_id: str | None,
+        transcript_hash: str,
+        translation_hash: str,
+        renderer_version: str,
+        render_hash: str,
+        srt_artifact_path: str,
+        ass_artifact_path: str,
+        srt_hash: str,
+        ass_hash: str,
+        origin: str,
+    ) -> dict[str, Any]:
+        if origin not in {"rendered", "legacy"}:
+            raise ValueError("invalid subtitle generation origin")
+        now = time.time()
+        with self._connect() as connection:
+            job = connection.execute(
+                "SELECT id FROM jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            if job is None:
+                raise ValueError("job not found")
+            if translation_generation_id is not None:
+                translation_generation = connection.execute(
+                    """
+                    SELECT id FROM translation_generations
+                    WHERE id = ? AND job_id = ?
+                    """,
+                    (translation_generation_id, job_id),
+                ).fetchone()
+                if translation_generation is None:
+                    raise ValueError("translation generation not found")
+            latest = connection.execute(
+                """
+                SELECT id, generation_number
+                FROM subtitle_generations
+                WHERE job_id = ?
+                ORDER BY generation_number DESC
+                LIMIT 1
+                """,
+                (job_id,),
+            ).fetchone()
+            generation_number = (
+                int(latest["generation_number"]) + 1
+                if latest is not None
+                else 1
+            )
+            supersedes = str(latest["id"]) if latest is not None else None
+            connection.execute(
+                """
+                INSERT INTO subtitle_generations (
+                    id, job_id, generation_number,
+                    translation_generation_id,
+                    transcript_hash, translation_hash,
+                    renderer_version, render_hash,
+                    srt_artifact_path, ass_artifact_path,
+                    srt_hash, ass_hash, origin,
+                    supersedes_generation_id, created_at, published_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                """,
+                (
+                    generation_id,
+                    job_id,
+                    generation_number,
+                    translation_generation_id,
+                    transcript_hash,
+                    translation_hash,
+                    renderer_version,
+                    render_hash,
+                    srt_artifact_path,
+                    ass_artifact_path,
+                    srt_hash,
+                    ass_hash,
+                    origin,
+                    supersedes,
+                    now,
+                ),
+            )
+            created = connection.execute(
+                "SELECT * FROM subtitle_generations WHERE id = ?",
+                (generation_id,),
+            ).fetchone()
+        return self._subtitle_generation_from_row(created)
+
+    def get_subtitle_generation(
+        self,
+        generation_id: str,
+    ) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT generation.*,
+                       publication.subtitle_generation_id IS NOT NULL
+                           AS is_published
+                FROM subtitle_generations AS generation
+                LEFT JOIN subtitle_publications AS publication
+                  ON publication.subtitle_generation_id = generation.id
+                WHERE generation.id = ?
+                """,
+                (generation_id,),
+            ).fetchone()
+        return (
+            self._subtitle_generation_from_row(row)
+            if row is not None
+            else None
+        )
+
+    def list_subtitle_generations(
+        self,
+        job_id: str,
+    ) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT generation.*,
+                       publication.subtitle_generation_id IS NOT NULL
+                           AS is_published
+                FROM subtitle_generations AS generation
+                LEFT JOIN subtitle_publications AS publication
+                  ON publication.subtitle_generation_id = generation.id
+                WHERE generation.job_id = ?
+                ORDER BY generation.generation_number
+                """,
+                (job_id,),
+            ).fetchall()
+        return [self._subtitle_generation_from_row(row) for row in rows]
+
+    def published_subtitle_generation(
+        self,
+        job_id: str,
+    ) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT generation.*, 1 AS is_published
+                FROM jobs AS requested_job
+                JOIN subtitle_publications AS publication
+                  ON publication.source_rel = requested_job.source_rel
+                JOIN subtitle_generations AS generation
+                  ON generation.id = publication.subtitle_generation_id
+                WHERE requested_job.id = ?
+                """,
+                (job_id,),
+            ).fetchone()
+        return (
+            self._subtitle_generation_from_row(row)
+            if row is not None
+            else None
+        )
+
+    def publish_subtitle_generation(
+        self,
+        generation_id: str,
+        *,
+        srt_path: str,
+        ass_path: str,
+    ) -> dict[str, Any]:
+        now = time.time()
+        with self._connect() as connection:
+            generation = connection.execute(
+                """
+                SELECT generation.*, job.source_rel
+                FROM subtitle_generations AS generation
+                JOIN jobs AS job ON job.id = generation.job_id
+                WHERE generation.id = ?
+                """,
+                (generation_id,),
+            ).fetchone()
+            if generation is None:
+                raise ValueError("subtitle generation not found")
+            job_id = str(generation["job_id"])
+            source_rel = str(generation["source_rel"])
+            connection.execute(
+                """
+                INSERT INTO subtitle_publications (
+                    source_rel, job_id, subtitle_generation_id, updated_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(source_rel) DO UPDATE SET
+                    job_id = excluded.job_id,
+                    subtitle_generation_id = excluded.subtitle_generation_id,
+                    updated_at = excluded.updated_at
+                """,
+                (source_rel, job_id, generation_id, now),
+            )
+            connection.execute(
+                """
+                UPDATE subtitle_generations
+                SET published_at = ?
+                WHERE id = ?
+                """,
+                (now, generation_id),
+            )
+            connection.execute(
+                """
+                UPDATE jobs
+                SET status = 'completed', srt_path = ?, ass_path = ?,
+                    blocked_stage = NULL, error = NULL,
+                    status_updated_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (srt_path, ass_path, now, now, job_id),
+            )
+            published = connection.execute(
+                """
+                SELECT generation.*, 1 AS is_published
+                FROM subtitle_generations AS generation
+                WHERE generation.id = ?
+                """,
+                (generation_id,),
+            ).fetchone()
+        self._notify_change(job_id)
+        return self._subtitle_generation_from_row(published)
+
     @staticmethod
     def _translation_generation_from_row(row: sqlite3.Row) -> dict[str, Any]:
         result = {
@@ -1922,6 +2184,42 @@ class JobStore:
             result["item_count"] = int(row["item_count"])
         if "completed_batch_count" in row.keys():
             result["completed_batch_count"] = int(row["completed_batch_count"])
+        return result
+
+    @staticmethod
+    def _subtitle_generation_from_row(row: sqlite3.Row) -> dict[str, Any]:
+        result = {
+            "id": str(row["id"]),
+            "job_id": str(row["job_id"]),
+            "generation_number": int(row["generation_number"]),
+            "translation_generation_id": (
+                str(row["translation_generation_id"])
+                if row["translation_generation_id"] is not None
+                else None
+            ),
+            "transcript_hash": str(row["transcript_hash"]),
+            "translation_hash": str(row["translation_hash"]),
+            "renderer_version": str(row["renderer_version"]),
+            "render_hash": str(row["render_hash"]),
+            "srt_artifact_path": str(row["srt_artifact_path"]),
+            "ass_artifact_path": str(row["ass_artifact_path"]),
+            "srt_hash": str(row["srt_hash"]),
+            "ass_hash": str(row["ass_hash"]),
+            "origin": str(row["origin"]),
+            "supersedes_generation_id": (
+                str(row["supersedes_generation_id"])
+                if row["supersedes_generation_id"] is not None
+                else None
+            ),
+            "created_at": float(row["created_at"]),
+            "published_at": (
+                float(row["published_at"])
+                if row["published_at"] is not None
+                else None
+            ),
+        }
+        if "is_published" in row.keys():
+            result["is_published"] = bool(row["is_published"])
         return result
 
     def save_subtitle_validation(

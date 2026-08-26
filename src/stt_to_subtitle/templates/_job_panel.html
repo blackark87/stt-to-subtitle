@@ -377,6 +377,42 @@
     {% endif %}
   </section>
 {% endif %}
+{% if subtitle_generations %}
+  <section class="card">
+    <div class="section-heading">
+      <div><h2>자막 이력</h2></div>
+      <span class="history-count">{{ subtitle_generations|length }}개 버전</span>
+    </div>
+    <div class="stack">
+      {% for generation in subtitle_generations|reverse %}
+        <article class="notice">
+          <strong>
+            자막 버전 {{ generation.generation_number }}{% if generation.is_published %} · 게시 중{% endif %}
+          </strong>
+          <span>{{ generation.origin_label }}</span>
+          <div class="actions compact-actions">
+            <a
+              class="button secondary"
+              href="{{ url_for('download_subtitle_generation', job_id=job.id, generation_id=generation.id, subtitle_format='srt') }}"
+              download
+            >SRT</a>
+            <a
+              class="button secondary"
+              href="{{ url_for('download_subtitle_generation', job_id=job.id, generation_id=generation.id, subtitle_format='ass') }}"
+              download
+            >ASS</a>
+            {% if not generation.is_published and job.status == "completed" %}
+              <form method="post" action="{{ url_for('publish_subtitle_generation', job_id=job.id, generation_id=generation.id) }}">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <button type="submit" class="secondary">이 버전 게시</button>
+              </form>
+            {% endif %}
+          </div>
+        </article>
+      {% endfor %}
+    </div>
+  </section>
+{% endif %}
 {% if translation_generations %}
   <section class="card">
     <div class="section-heading">

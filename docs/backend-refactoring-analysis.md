@@ -6,7 +6,7 @@
 
 ### 구현 진행 상태
 
-현재 작업 트리에는 계획의 두 번째 수직 슬라이스까지 반영됐다.
+현재 작업 트리에는 계획의 세 번째 수직 슬라이스까지 반영됐다.
 
 | 항목 | 반영 상태 | 남은 범위 |
 |---|---|---|
@@ -14,7 +14,8 @@
 | 외부 자막 | 같은 stem의 SRT/VTT/ASS 탐지, `외부 자막` 표시, 기본 WebVTT 재생 | 증분 asset/revision catalog·사용자별 재생 선택 |
 | 로컬 비교 | 시간 중첩 정렬, coverage·문장 유사도·경계 오차, 파일 해시별 SQLite 결과 | generation/publication FK·검증 알고리즘 version migration |
 | 상용 LLM 검증 | 번역 LLM과 분리된 설정, 명시적 1회 호출, 구조화 결과, 입력·모델 cache | provider별 adapter·비용/사용량 관측 |
-| 번역 generation | generation·batch·segment SQLite 원장, 입력 지문, 배치 시도·실패, DB 기반 JSON 복구, 재번역·직접 편집 이력 | immutable prompt revision·자막 publication/rollback·startup reconcile |
+| 번역 generation | generation·batch·segment SQLite 원장, 입력 지문, 배치 시도·실패, DB 기반 JSON 복구, 재번역·직접 편집 이력 | immutable prompt revision·startup reconcile |
+| 자막 publication | source별 단일 게시 포인터, generation별 SRT/ASS와 해시, 다운로드·과거 버전 재게시 | pair manifest·파일/DB startup reconcile·retention |
 
 이하의 문제 분석은 최초 분석 시점 구조를 기준으로 하되, 구현이 끝난 절은 현재
 동작과 남은 범위로 갱신했다.
@@ -32,7 +33,7 @@
 5. 2D 대시보드, 3D 대시보드, 작업 목록이 동일한 원천 상태를 각자 다시 분류해 상태 수와 필터 의미가 달라질 수 있다.
 6. 전사 중지 요청은 웹의 대기 루프만 중지하고 원격 STT 작업을 취소하지 않아 GPU 작업이 계속될 수 있다.
 7. 번역 결과는 generation·batch·segment 단위로 DB에 저장되고 JSON을 재생성할 수 있게 됐다. 다만 실행 중 프로세스 종료를 자동 reconcile하는 worker lease는 아직 없다.
-8. 프롬프트를 바꾼 재번역과 직접 편집은 별도 translation generation으로 보존한다. 그러나 SRT/ASS publication pointer와 rollback은 아직 없다.
+8. 프롬프트를 바꾼 재번역과 직접 편집은 별도 translation generation으로 보존하고, SRT/ASS도 generation별 보존·재게시할 수 있다. immutable prompt revision과 파일/DB startup reconcile은 아직 없다.
 9. 미디어 옆의 `<filename>.srt/.vtt/.ass` 외부 자막 탐지·재생·로컬 비교는 추가됐지만 asset/revision/publication 관계와 증분 catalog는 아직 없다.
 
 가장 먼저 해야 할 일은 UI 확장이 아니라 상태 모델과 스케줄러 제어의 정리다. `phase`, `state`, `reason_code`, `attempt`을 분리하고, 의존성별 수동·자동 복구 정책과 단계별 복구 정책을 추가해야 한다. 반복 번역·자막 재생성을 제품의 기본 사용 방식으로 보고 transcript revision, translation generation, subtitle asset/publication/validation도 영속 도메인으로 관리해야 한다.
@@ -373,6 +374,16 @@ translation_items(
 
 ### 9.2 오디오·자막 파일
 
+현재 렌더러는 generation별 SRT/ASS를 작업 디렉터리에 먼저 완성하고 각 파일의
+SHA-256을 DB에 저장한다. 미디어 옆 `.ko.srt/.ko.ass`는 저장본을 staging한 뒤
+교체하며, source 경로별 `subtitle_publications` 포인터를 마지막에 전환한다.
+작업 화면에서 과거 두 파일을 내려받거나 해시 검증 후 다시 게시할 수 있다. 재번역
+또는 직접 편집 전에 기존 자막이 있으면 legacy generation으로 가져온다.
+
+파일 두 개와 SQLite를 하나의 원자 연산으로 묶을 수는 없으므로, 프로세스 종료 시
+다음 시작에서 version 파일·미디어 복사본·게시 포인터를 대조하는 reconcile과 pair
+manifest는 여전히 필요하다.
+
 - WAV는 동일 디렉터리의 임시 파일에 생성하고 FFprobe 등으로 최소 유효성을 확인한 뒤 원자 교체한다.
 - SRT와 ASS는 각각 원자 교체하는 것만으로 두 파일의 동일 generation을 보장할 수 없다.
 - 두 파일의 hash, 입력 transcript/translation hash, renderer version을 담은 작은 manifest를 마지막에 원자 저장한다.
@@ -383,10 +394,11 @@ translation_items(
 ### 9.3 프롬프트 변경 후 재번역·재게시
 
 현재 `restart_translation()`은 완료 작업의 transcript를 보존하고 새 translation
-generation을 만든다. 이전 번역 JSON은 generation별 artifact로 보존하며, 새 결과가
-완성되기 전까지 기존 SRT/ASS도 유지한다. 직접 편집한 번역 역시 `manual`
-generation으로 import한다. 다만 prompt 본문 revision, generation 간 비교 UI,
-generation별 SRT/ASS와 publication pointer, rollback은 아직 구현되지 않았다.
+generation을 만든다. 이전 번역 JSON과 SRT/ASS는 각각 generation artifact로
+보존하며, 새 결과가 완성되기 전까지 기존 게시 자막을 유지한다. 직접 편집한 번역
+역시 `manual` generation으로 import한다. 렌더가 끝나면 새 자막 generation을
+게시하고, 작업 상세에서 과거 버전을 다시 게시할 수 있다. 다만 prompt 본문
+revision과 generation 간 번역 비교 UI는 아직 구현되지 않았다.
 
 일회성 생성기가 아니라면 다음 publication workflow가 필요하다.
 
@@ -782,7 +794,7 @@ src/stt_to_subtitle/
 |---|---|---|
 | 번역 청크 DB 저장이 없어도 되는가 | 안 된다. 현재 generation·batch·item 원장을 추가해 성공·실패 시도와 부분 결과를 저장하고 JSON을 snapshot으로 재생성한다. | startup reconcile, lease, immutable prompt revision, publication까지 확장한다. |
 | 이미 요청된 Whisper/Kotoba/WhisperJAV를 취소할 수 있는가 | 현재는 취소 API와 실행 핸들이 없어 불가능하다. 대기 작업은 즉시 취소 가능하고, WhisperX/JAV는 subprocess 종료, Kotoba는 cooperative hook 또는 subprocess 격리로 구현할 수 있다. | backend별 취소 adapter와 멱등 cancel API를 만든다. 취소와 사전 segmentation은 별도 요구다. |
-| 자막이 있는 상태에서 prompt 변경 재시도는 어떻게 되는가 | transcript와 기존 번역 generation을 보존하고 새 generation으로 번역한다. 새 번역 완료 전 기존 SRT/ASS도 유지한다. | immutable prompt revision과 subtitle publication pointer를 추가해 비교·게시·rollback을 완성한다. |
+| 자막이 있는 상태에서 prompt 변경 재시도는 어떻게 되는가 | transcript와 기존 번역·자막 generation을 보존하고 새 generation으로 처리한다. 새 번역 완료 전 기존 게시본을 유지하며 과거 SRT/ASS를 다시 게시할 수 있다. | immutable prompt revision, 번역 비교 UI, publication startup reconcile을 추가한다. |
 | `next_probe_at`은 계속 재시도한다는 뜻인가 | 번역 LLM이 평소 꺼져 있는 운영 환경에서는 호출 자체가 불필요하다. | LM은 manual gate로 두고 `next_probe_at`을 사용하지 않는다. STT처럼 자동 복구를 선택한 의존성에만 제한적으로 사용한다. |
 | 중단과 실패는 어떻게 구분하는가 | 현재 STT `failed`가 웹에서 `blocked`가 될 수 있어 일관되지 않다. | 외부 조건이 회복되면 그대로 재개 가능한 경우 `blocked`, 입력·모델 출력·코드 계약 오류처럼 변경이 필요한 경우 `failed`다. segment 구조 오류는 기본적으로 `failed/model_output_invalid`다. |
 | WAV와 transcript는 영속 데이터인가 | persistent volume에는 남지만 immutable revision은 아니다. 같은 job을 재사용하는 재전사·재추출에서는 같은 경로가 덮어써질 수 있고 DB 레코드 삭제 후 orphan도 남을 수 있다. | audio/transcript를 immutable revision으로 만들고 hash 기반 재사용, 참조 무결성, retention, garbage collection을 적용한다. |

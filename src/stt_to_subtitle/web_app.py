@@ -138,6 +138,10 @@ TRANSLATION_GENERATION_ORIGIN_LABELS = {
     "restart": "재번역",
     "manual": "직접 편집",
 }
+SUBTITLE_GENERATION_ORIGIN_LABELS = {
+    "rendered": "시스템 생성",
+    "legacy": "기존 자막 가져옴",
+}
 JOB_STAGE_FILTERS = {
     "extraction": {"queued", "extracting", "audio_completed"},
     "transcription": {
@@ -493,6 +497,21 @@ def translation_generation_view(
                 str(generation.get("state", "")),
             ),
             "origin_label": TRANSLATION_GENERATION_ORIGIN_LABELS.get(
+                str(generation.get("origin", "")),
+                str(generation.get("origin", "")),
+            ),
+        }
+        for generation in generations
+    ]
+
+
+def subtitle_generation_view(
+    generations: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    return [
+        {
+            **dict(generation),
+            "origin_label": SUBTITLE_GENERATION_ORIGIN_LABELS.get(
                 str(generation.get("origin", "")),
                 str(generation.get("origin", "")),
             ),
@@ -1706,11 +1725,15 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                 detail="artifact not found",
             ) from error
 
-    def styled_webvtt(job: Any) -> str | None:
+    def styled_webvtt(
+        job: Any,
+        *,
+        translation_override: Path | None = None,
+    ) -> str | None:
         if not job.transcript_path or not job.translation_path:
             return None
         transcript_path = Path(job.transcript_path)
-        translation_path = Path(job.translation_path)
+        translation_path = translation_override or Path(job.translation_path)
         if not transcript_path.is_file() or not translation_path.is_file():
             return None
         transcript_payload = json.loads(
@@ -3510,7 +3533,35 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                     parse_subtitle(external_subtitles[0])
                 )
             elif job.srt_path:
-                webvtt = styled_webvtt(job)
+                translation_override = None
+                published = service.store.published_subtitle_generation(
+                    job.id
+                )
+                if (
+                    published is not None
+                    and published["translation_generation_id"] is not None
+                    and job.transcript_path
+                    and Path(job.transcript_path).is_file()
+                    and sha256_file(Path(job.transcript_path))
+                    == published["transcript_hash"]
+                ):
+                    translation_generation = (
+                        service.store.get_translation_generation(
+                            published["translation_generation_id"]
+                        )
+                    )
+                    if translation_generation is not None:
+                        translation_override = Path(
+                            translation_generation["artifact_path"]
+                        )
+                webvtt = (
+                    styled_webvtt(
+                        job,
+                        translation_override=translation_override,
+                    )
+                    if published is None or translation_override is not None
+                    else None
+                )
                 if webvtt is None:
                     source = service.library.resolve_file(job.source_rel)
                     subtitle = source.with_name(f"{source.stem}.ko.srt")
@@ -3949,6 +4000,9 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                 "translation_generations": translation_generation_view(
                     service.store.list_translation_generations(job.id)
                 ),
+                "subtitle_generations": subtitle_generation_view(
+                    service.store.list_subtitle_generations(job.id)
+                ),
                 "artifact_names": {
                     "transcript": artifact_filename(
                         job.source_rel,
@@ -4023,6 +4077,9 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                 "subtitle_validator": service.subtitle_validator_view(),
                 "translation_generations": translation_generation_view(
                     service.store.list_translation_generations(job.id)
+                ),
+                "subtitle_generations": subtitle_generation_view(
+                    service.store.list_subtitle_generations(job.id)
                 ),
                 "artifact_names": {
                     "transcript": artifact_filename(
@@ -4547,6 +4604,78 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                 "translation-generation-"
                 f"{generation['generation_number']}.json"
             ),
+        )
+
+    @app.get(
+        "/jobs/{job_id}/subtitle-generations/"
+        "{generation_id}.{subtitle_format}",
+        name="download_subtitle_generation",
+    )
+    def download_subtitle_generation(
+        request: Request,
+        job_id: str,
+        generation_id: str,
+        subtitle_format: str,
+    ) -> Any:
+        if not is_authenticated(request):
+            return login_redirect()
+        service = orchestrator(request)
+        generation = service.store.get_subtitle_generation(generation_id)
+        if generation is None or generation["job_id"] != job_id:
+            raise HTTPException(status_code=404, detail="generation not found")
+        details = {
+            "srt": (
+                generation["srt_artifact_path"],
+                "application/x-subrip",
+            ),
+            "ass": (generation["ass_artifact_path"], "text/x-ssa"),
+        }
+        if subtitle_format not in details:
+            raise HTTPException(status_code=404, detail="generation not found")
+        path_value, media_type = details[subtitle_format]
+        job_root = (service.settings.jobs_dir / job_id).resolve()
+        artifact = Path(str(path_value)).resolve()
+        try:
+            artifact.relative_to(job_root)
+        except ValueError as error:
+            raise HTTPException(
+                status_code=404,
+                detail="generation not found",
+            ) from error
+        if not artifact.is_file():
+            raise HTTPException(status_code=404, detail="generation not found")
+        return FileResponse(
+            artifact,
+            media_type=media_type,
+            filename=(
+                f"subtitle-generation-{generation['generation_number']}."
+                f"{subtitle_format}"
+            ),
+        )
+
+    @app.post(
+        "/jobs/{job_id}/subtitle-generations/{generation_id}/publish",
+        name="publish_subtitle_generation",
+    )
+    def publish_subtitle_generation(
+        request: Request,
+        job_id: str,
+        generation_id: str,
+        csrf_token: str = Form(""),
+    ) -> Any:
+        if not is_authenticated(request):
+            return login_redirect()
+        validate_csrf(request, csrf_token)
+        try:
+            orchestrator(request).publish_subtitle_generation(
+                job_id,
+                generation_id,
+            )
+        except (OSError, ValueError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        return RedirectResponse(
+            f"/jobs/{job_id}",
+            status_code=status.HTTP_303_SEE_OTHER,
         )
 
     @app.get(

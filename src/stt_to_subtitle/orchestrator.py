@@ -21,7 +21,7 @@ from .contracts import (
     validate_transcript,
     validate_translation_items,
 )
-from .files import sha256_file, write_json_atomic
+from .files import copy_files_atomic, sha256_file, write_json_atomic
 from .hybrid_stt import HybridRescueOptions
 from .kotoba import DEFAULT_CHUNK_LENGTH_SECONDS, TranscriptionOptions
 from .path_display import PathDisplayRule
@@ -98,6 +98,7 @@ USER_STOP_MESSAGE = "사용자 요청으로 전체 작업이 중단되었습니�
 USER_SELECTED_STOP_MESSAGE = "사용자 요청으로 작업이 중단되었습니다."
 TRANSLATION_PROMPT_OPTION = "translation_prompt"
 TRANSLATION_REVIEW_ROUNDS = 2
+SUBTITLE_RENDERER_VERSION = "1"
 SUPPORTED_OPERATIONS = {"extract", "transcribe", "translate", "full"}
 TRANSLATION_OPERATIONS = {"translate", "full"}
 TRANSCRIPTION_COMPARISON_BACKENDS = (
@@ -259,6 +260,7 @@ class SubtitleOrchestrator:
             RemoteServerSettings,
         ] = (None, None, initial_servers)
         self._lm_gate_lock = threading.RLock()
+        self._subtitle_publication_lock = threading.RLock()
         self._lm_gate_state = (
             "offline"
             if settings.lm_manual_start or not initial_servers.is_complete
@@ -1706,12 +1708,20 @@ class SubtitleOrchestrator:
         current_prompt_snapshot = job.options.get(TRANSLATION_PROMPT_OPTION)
         if not isinstance(current_prompt_snapshot, Mapping):
             current_prompt_snapshot = self._legacy_prompt_snapshot()
-        self._capture_legacy_translation_generation(
+        legacy_translation = self._capture_legacy_translation_generation(
             job,
             transcript_payload,
             segments,
             current_prompt_snapshot,
             self.remote_servers,
+        )
+        self._capture_legacy_subtitle_generation(
+            job,
+            translation_generation_id=(
+                str(legacy_translation["id"])
+                if legacy_translation is not None
+                else None
+            ),
         )
 
         updated_options = dict(job.options)
@@ -2003,12 +2013,20 @@ class SubtitleOrchestrator:
             prompt_snapshot = job.options.get(TRANSLATION_PROMPT_OPTION)
             if not isinstance(prompt_snapshot, Mapping):
                 prompt_snapshot = self._legacy_prompt_snapshot()
-            self._capture_legacy_translation_generation(
+            legacy_translation = self._capture_legacy_translation_generation(
                 job,
                 transcript_payload,
                 segments,
                 prompt_snapshot,
                 self.remote_servers,
+            )
+            self._capture_legacy_subtitle_generation(
+                job,
+                translation_generation_id=(
+                    str(legacy_translation["id"])
+                    if legacy_translation is not None
+                    else None
+                ),
             )
             manual_generation = self._create_translation_generation(
                 job,
@@ -3011,6 +3029,178 @@ class SubtitleOrchestrator:
             f"({len(completed_translations)} segments)",
         )
 
+    def _subtitle_generation_artifact_paths(
+        self,
+        job_id: str,
+        generation_id: str,
+    ) -> tuple[Path, Path]:
+        directory = (
+            self.settings.jobs_dir / job_id / "subtitle-generations"
+        )
+        return (
+            directory / f"{generation_id}.srt",
+            directory / f"{generation_id}.ass",
+        )
+
+    def _capture_legacy_subtitle_generation(
+        self,
+        job: PipelineJob,
+        *,
+        translation_generation_id: str | None,
+    ) -> dict[str, Any] | None:
+        with self._subtitle_publication_lock:
+            return self._capture_legacy_subtitle_generation_locked(
+                job,
+                translation_generation_id=translation_generation_id,
+            )
+
+    def _capture_legacy_subtitle_generation_locked(
+        self,
+        job: PipelineJob,
+        *,
+        translation_generation_id: str | None,
+    ) -> dict[str, Any] | None:
+        published = self.store.published_subtitle_generation(job.id)
+        if published is not None:
+            return published
+        if (
+            not job.transcript_path
+            or not job.translation_path
+            or not job.srt_path
+            or not job.ass_path
+        ):
+            return None
+        transcript_path = Path(job.transcript_path)
+        translation_path = Path(job.translation_path)
+        srt_path = Path(job.srt_path)
+        ass_path = Path(job.ass_path)
+        if not all(
+            path.is_file()
+            for path in (
+                transcript_path,
+                translation_path,
+                srt_path,
+                ass_path,
+            )
+        ):
+            return None
+
+        generation_id = uuid4().hex
+        srt_artifact, ass_artifact = (
+            self._subtitle_generation_artifact_paths(
+                job.id,
+                generation_id,
+            )
+        )
+        copy_files_atomic(
+            (
+                (srt_path, srt_artifact),
+                (ass_path, ass_artifact),
+            ),
+            overwrite=False,
+        )
+        transcript_hash = sha256_file(transcript_path)
+        translation_hash = sha256_file(translation_path)
+        srt_hash = sha256_file(srt_artifact)
+        ass_hash = sha256_file(ass_artifact)
+        generation = self.store.create_subtitle_generation(
+            generation_id=generation_id,
+            job_id=job.id,
+            translation_generation_id=translation_generation_id,
+            transcript_hash=transcript_hash,
+            translation_hash=translation_hash,
+            renderer_version="legacy",
+            render_hash=_canonical_payload_hash(
+                {
+                    "transcript_hash": transcript_hash,
+                    "translation_hash": translation_hash,
+                    "srt_hash": srt_hash,
+                    "ass_hash": ass_hash,
+                    "renderer_version": "legacy",
+                }
+            ),
+            srt_artifact_path=str(srt_artifact),
+            ass_artifact_path=str(ass_artifact),
+            srt_hash=srt_hash,
+            ass_hash=ass_hash,
+            origin="legacy",
+        )
+        return self.store.publish_subtitle_generation(
+            generation["id"],
+            srt_path=str(srt_path),
+            ass_path=str(ass_path),
+        )
+
+    @staticmethod
+    def _translation_generation_id_from_snapshot(
+        job_id: str,
+        translation_payload: Mapping[str, Any],
+        store: JobStore,
+    ) -> str | None:
+        metadata = translation_payload.get("generation")
+        if not isinstance(metadata, Mapping):
+            return None
+        generation_id = str(metadata.get("id", "")).strip()
+        generation = store.get_translation_generation(generation_id)
+        if generation is None or generation["job_id"] != job_id:
+            return None
+        return generation_id
+
+    def publish_subtitle_generation(
+        self,
+        job_id: str,
+        generation_id: str,
+    ) -> PipelineJob:
+        job = self.store.get(job_id)
+        if job is None:
+            raise ValueError("job not found")
+        if job.status != "completed":
+            raise ValueError("completed subtitles can be published")
+        generation = self.store.get_subtitle_generation(generation_id)
+        if generation is None or generation["job_id"] != job.id:
+            raise ValueError("subtitle generation not found")
+        srt_artifact = Path(str(generation["srt_artifact_path"])).resolve()
+        ass_artifact = Path(str(generation["ass_artifact_path"])).resolve()
+        job_root = (self.settings.jobs_dir / job.id).resolve()
+        try:
+            srt_artifact.relative_to(job_root)
+            ass_artifact.relative_to(job_root)
+        except ValueError as error:
+            raise ValueError("subtitle generation path is invalid") from error
+        if (
+            not srt_artifact.is_file()
+            or not ass_artifact.is_file()
+            or sha256_file(srt_artifact) != generation["srt_hash"]
+            or sha256_file(ass_artifact) != generation["ass_hash"]
+        ):
+            raise ValueError("subtitle generation file is invalid")
+        source = self.library.resolve_file(job.source_rel)
+        srt_path = source.with_name(f"{source.stem}.ko.srt")
+        ass_path = source.with_name(f"{source.stem}.ko.ass")
+        with self._subtitle_publication_lock:
+            copy_files_atomic(
+                (
+                    (srt_artifact, srt_path),
+                    (ass_artifact, ass_path),
+                ),
+                overwrite=True,
+            )
+            self.store.publish_subtitle_generation(
+                generation["id"],
+                srt_path=str(srt_path),
+                ass_path=str(ass_path),
+            )
+        self.store.add_event(
+            job.id,
+            "info",
+            "subtitle generation "
+            f"{generation['generation_number']} published",
+        )
+        published_job = self.store.get(job.id)
+        if published_job is None:
+            raise RuntimeError("published subtitle job could not be read")
+        return published_job
+
     def _render(self, job: PipelineJob) -> None:
         self._render_artifacts(
             job,
@@ -3061,13 +3251,68 @@ class SubtitleOrchestrator:
         source = self.library.resolve_file(job.source_rel)
         srt_path = source.with_name(f"{source.stem}.ko.srt")
         ass_path = source.with_name(f"{source.stem}.ko.ass")
+        if not overwrite:
+            for path in (srt_path, ass_path):
+                if path.exists():
+                    raise FileExistsError(f"subtitle already exists: {path}")
+
+        generation_id = uuid4().hex
+        srt_artifact, ass_artifact = (
+            self._subtitle_generation_artifact_paths(
+                job.id,
+                generation_id,
+            )
+        )
         timeline = write_styled_subtitles_atomic(
-            srt_path,
-            ass_path,
+            srt_artifact,
+            ass_artifact,
             segments,
             translations,
-            overwrite=overwrite,
+            overwrite=False,
         )
+        transcript_path = Path(job.transcript_path)
+        translation_path = Path(job.translation_path)
+        transcript_hash = sha256_file(transcript_path)
+        translation_hash = sha256_file(translation_path)
+        generation = self.store.create_subtitle_generation(
+            generation_id=generation_id,
+            job_id=job.id,
+            translation_generation_id=(
+                self._translation_generation_id_from_snapshot(
+                    job.id,
+                    translation_payload,
+                    self.store,
+                )
+            ),
+            transcript_hash=transcript_hash,
+            translation_hash=translation_hash,
+            renderer_version=SUBTITLE_RENDERER_VERSION,
+            render_hash=_canonical_payload_hash(
+                {
+                    "transcript_hash": transcript_hash,
+                    "translation_hash": translation_hash,
+                    "renderer_version": SUBTITLE_RENDERER_VERSION,
+                }
+            ),
+            srt_artifact_path=str(srt_artifact),
+            ass_artifact_path=str(ass_artifact),
+            srt_hash=sha256_file(srt_artifact),
+            ass_hash=sha256_file(ass_artifact),
+            origin="rendered",
+        )
+        with self._subtitle_publication_lock:
+            copy_files_atomic(
+                (
+                    (srt_artifact, srt_path),
+                    (ass_artifact, ass_path),
+                ),
+                overwrite=overwrite,
+            )
+            self.store.publish_subtitle_generation(
+                generation["id"],
+                srt_path=str(srt_path),
+                ass_path=str(ass_path),
+            )
         if timeline.repaired_segment_ids:
             self.store.add_event(
                 job.id,
@@ -3076,14 +3321,6 @@ class SubtitleOrchestrator:
                 f"{len(timeline.repaired_segment_ids)} legacy or abnormal "
                 "subtitle timestamp(s)",
             )
-        self.store.update(
-            job.id,
-            status="completed",
-            srt_path=str(srt_path),
-            ass_path=str(ass_path),
-            blocked_stage=None,
-            error=None,
-        )
 
     def _sanitize_error(self, message: str) -> str:
         sanitized = message

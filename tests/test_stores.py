@@ -780,6 +780,109 @@ class JobStoreTests(unittest.TestCase):
                     ["segment-1"],
                 )
 
+    def test_versions_and_publishes_subtitle_pairs(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = JobStore(Path(directory) / "jobs.sqlite3")
+            store.create(
+                job_id="job-1",
+                source_rel="movie.mkv",
+                force_overwrite=False,
+                options={},
+            )
+            first = store.create_subtitle_generation(
+                generation_id="subtitle-1",
+                job_id="job-1",
+                translation_generation_id=None,
+                transcript_hash="transcript-v1",
+                translation_hash="translation-v1",
+                renderer_version="1",
+                render_hash="render-v1",
+                srt_artifact_path="subtitle-1.srt",
+                ass_artifact_path="subtitle-1.ass",
+                srt_hash="srt-v1",
+                ass_hash="ass-v1",
+                origin="legacy",
+            )
+            store.publish_subtitle_generation(
+                first["id"],
+                srt_path="movie.ko.srt",
+                ass_path="movie.ko.ass",
+            )
+            second = store.create_subtitle_generation(
+                generation_id="subtitle-2",
+                job_id="job-1",
+                translation_generation_id=None,
+                transcript_hash="transcript-v1",
+                translation_hash="translation-v2",
+                renderer_version="1",
+                render_hash="render-v2",
+                srt_artifact_path="subtitle-2.srt",
+                ass_artifact_path="subtitle-2.ass",
+                srt_hash="srt-v2",
+                ass_hash="ass-v2",
+                origin="rendered",
+            )
+            published = store.publish_subtitle_generation(
+                second["id"],
+                srt_path="movie.ko.srt",
+                ass_path="movie.ko.ass",
+            )
+            generations = store.list_subtitle_generations("job-1")
+
+            self.assertEqual(second["generation_number"], 2)
+            self.assertEqual(
+                second["supersedes_generation_id"],
+                first["id"],
+            )
+            self.assertEqual(
+                [item["is_published"] for item in generations],
+                [False, True],
+            )
+            self.assertTrue(published["is_published"])
+            self.assertEqual(
+                store.published_subtitle_generation("job-1")["id"],
+                second["id"],
+            )
+            self.assertEqual(store.get("job-1").srt_path, "movie.ko.srt")
+
+            store.create(
+                job_id="job-2",
+                source_rel="movie.mkv",
+                force_overwrite=True,
+                options={},
+            )
+            third = store.create_subtitle_generation(
+                generation_id="subtitle-3",
+                job_id="job-2",
+                translation_generation_id=None,
+                transcript_hash="transcript-v2",
+                translation_hash="translation-v3",
+                renderer_version="1",
+                render_hash="render-v3",
+                srt_artifact_path="subtitle-3.srt",
+                ass_artifact_path="subtitle-3.ass",
+                srt_hash="srt-v3",
+                ass_hash="ass-v3",
+                origin="rendered",
+            )
+            store.publish_subtitle_generation(
+                third["id"],
+                srt_path="movie.ko.srt",
+                ass_path="movie.ko.ass",
+            )
+
+            self.assertEqual(
+                [
+                    item["is_published"]
+                    for item in store.list_subtitle_generations("job-1")
+                ],
+                [False, False],
+            )
+            self.assertEqual(
+                store.published_subtitle_generation("job-1")["id"],
+                third["id"],
+            )
+
     def test_recovers_running_stage_as_manually_retryable(self) -> None:
         with TemporaryDirectory() as directory:
             store = JobStore(Path(directory) / "jobs.sqlite3")
