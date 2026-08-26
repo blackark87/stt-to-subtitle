@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient
 
 from stt_to_subtitle import __version__
 from stt_to_subtitle.stt_api import (
+    InvalidTranscriptionOutput,
     STTAPISettings,
     TranscriptionChangeHook,
     TranscriptionService,
@@ -41,6 +42,48 @@ class TranscriptionChangeHookTests(unittest.IsolatedAsyncioTestCase):
 
 
 class STTAPIHelpersTests(unittest.TestCase):
+    def test_invalid_backend_output_has_structured_failure_code(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            audio_path = root / "audio.wav"
+            with wave.open(str(audio_path), "wb") as wav_file:
+                wav_file.setnchannels(1)
+                wav_file.setsampwidth(2)
+                wav_file.setframerate(16000)
+                wav_file.writeframes(b"\x00\x00" * 16000)
+            settings = STTAPISettings(
+                state_dir=root / "state",
+                api_token="",
+                hf_token="hf-token",
+                device="cpu",
+                diarization_device="cpu",
+            )
+            service = TranscriptionService(settings)
+            service.store.create(
+                job_id="invalid-output",
+                idempotency_key="invalid-output-key",
+                audio_path=audio_path,
+                audio_sha256="abc",
+                options=_parse_options("{}", settings),
+            )
+
+            with patch.object(service, "_get_pipeline", return_value=Mock()):
+                with patch(
+                    "stt_to_subtitle.stt_api.run_pipeline",
+                    side_effect=InvalidTranscriptionOutput(
+                        "segments must be a list"
+                    ),
+                ):
+                    service._run_job("invalid-output")
+
+            failed = service.store.get("invalid-output")
+            self.assertEqual(failed.status, "failed")
+            self.assertEqual(failed.failure_code, "model_output_invalid")
+            self.assertEqual(
+                failed.public_dict()["failure_code"],
+                "model_output_invalid",
+            )
+
     def test_service_uses_separate_work_storage_and_rebases_uploads(
         self,
     ) -> None:

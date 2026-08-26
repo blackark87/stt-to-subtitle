@@ -11,6 +11,7 @@ from stt_to_subtitle.service_clients import (
     LMStudioClient,
     OpenAICompatibleClient,
     OperationStopped,
+    RemoteTranscriptionFailed,
     RequestConcurrencyLimiter,
     RetryingJSONClient,
     STTAPIClient,
@@ -282,6 +283,28 @@ class STTAPIClientProgressTests(unittest.TestCase):
             options={},
             idempotency_key="key",
         )
+
+    def test_exposes_structured_remote_job_failure(self) -> None:
+        failed = self.event_stream(
+            {
+                "status": "failed",
+                "failure_code": "model_output_invalid",
+                "error": "segments must be a list",
+            }
+        )
+        client = STTAPIClient("http://stt.test", "")
+        client.request = Mock(return_value=failed)
+        client._submit = Mock(return_value="new-job")
+
+        with self.assertRaises(RemoteTranscriptionFailed) as caught:
+            client.transcribe(
+                Path("/not-read.wav"),
+                options={},
+                idempotency_key="key",
+            )
+
+        self.assertEqual(caught.exception.failure_code, "model_output_invalid")
+        self.assertIn("segments must be a list", str(caught.exception))
 
     def test_forwards_changed_chunk_progress_from_event_stream(self) -> None:
         events = self.event_stream(

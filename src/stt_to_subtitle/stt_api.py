@@ -83,6 +83,10 @@ class TranscriptionCancelled(RuntimeError):
     """Raised when a persisted remote cancellation reaches a safe boundary."""
 
 
+class InvalidTranscriptionOutput(RuntimeError):
+    """A backend returned data that violates the transcript contract."""
+
+
 class TranscriptionChangeHook:
     """Bridge transcription-store changes from worker threads to SSE clients."""
 
@@ -1136,11 +1140,13 @@ class TranscriptionService:
             try:
                 payload = json.loads(worker_result.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError) as error:
-                raise RuntimeError(
+                raise InvalidTranscriptionOutput(
                     "WhisperX worker returned an invalid result"
                 ) from error
             if not isinstance(payload, Mapping):
-                raise RuntimeError("WhisperX worker result must be an object")
+                raise InvalidTranscriptionOutput(
+                    "WhisperX worker result must be an object"
+                )
             return payload
         finally:
             worker_result.unlink(missing_ok=True)
@@ -1238,11 +1244,13 @@ class TranscriptionService:
             try:
                 payload = json.loads(speaker_result.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError) as error:
-                raise RuntimeError(
+                raise InvalidTranscriptionOutput(
                     "WhisperJAV worker returned an invalid result"
                 ) from error
             if not isinstance(payload, Mapping):
-                raise RuntimeError("WhisperJAV worker result must be an object")
+                raise InvalidTranscriptionOutput(
+                    "WhisperJAV worker result must be an object"
+                )
             return payload
         finally:
             ensemble_result.unlink(missing_ok=True)
@@ -1388,7 +1396,7 @@ class TranscriptionService:
                 backend_result = self._run_whisperjav_worker(job)
                 raw_segments = backend_result.get("segments")
                 if not isinstance(raw_segments, list):
-                    raise RuntimeError(
+                    raise InvalidTranscriptionOutput(
                         "WhisperJAV worker result has no segments list"
                     )
                 segments = add_segment_ids(raw_segments)
@@ -1403,13 +1411,19 @@ class TranscriptionService:
                 if isinstance(raw_quality, Mapping):
                     backend_quality = dict(raw_quality)
                 if not isinstance(model, Mapping):
-                    raise RuntimeError("WhisperJAV worker result has no model")
+                    raise InvalidTranscriptionOutput(
+                        "WhisperJAV worker result has no model"
+                    )
                 if not isinstance(timing, Mapping):
-                    raise RuntimeError("WhisperJAV worker result has no timing")
+                    raise InvalidTranscriptionOutput(
+                        "WhisperJAV worker result has no timing"
+                    )
                 if not isinstance(runtime, Mapping):
-                    raise RuntimeError("WhisperJAV worker result has no runtime")
+                    raise InvalidTranscriptionOutput(
+                        "WhisperJAV worker result has no runtime"
+                    )
                 if not isinstance(noise_filter, Mapping):
-                    raise RuntimeError(
+                    raise InvalidTranscriptionOutput(
                         "WhisperJAV worker result has no noise_filter"
                     )
                 runtime = {
@@ -1420,7 +1434,7 @@ class TranscriptionService:
                 backend_result = self._run_whisperx_worker(job)
                 raw_segments = backend_result.get("segments")
                 if not isinstance(raw_segments, list):
-                    raise RuntimeError(
+                    raise InvalidTranscriptionOutput(
                         "WhisperX worker result has no segments list"
                     )
                 segments = add_segment_ids(raw_segments)
@@ -1435,13 +1449,19 @@ class TranscriptionService:
                 if isinstance(raw_quality, Mapping):
                     backend_quality = dict(raw_quality)
                 if not isinstance(model, Mapping):
-                    raise RuntimeError("WhisperX worker result has no model")
+                    raise InvalidTranscriptionOutput(
+                        "WhisperX worker result has no model"
+                    )
                 if not isinstance(timing, Mapping):
-                    raise RuntimeError("WhisperX worker result has no timing")
+                    raise InvalidTranscriptionOutput(
+                        "WhisperX worker result has no timing"
+                    )
                 if not isinstance(runtime, Mapping):
-                    raise RuntimeError("WhisperX worker result has no runtime")
+                    raise InvalidTranscriptionOutput(
+                        "WhisperX worker result has no runtime"
+                    )
                 if not isinstance(noise_filter, Mapping):
-                    raise RuntimeError(
+                    raise InvalidTranscriptionOutput(
                         "WhisperX worker result has no noise_filter"
                     )
                 runtime = {
@@ -1480,7 +1500,7 @@ class TranscriptionService:
                 )
                 raw_primary_segments = primary_result.get("segments")
                 if not isinstance(raw_primary_segments, list):
-                    raise RuntimeError(
+                    raise InvalidTranscriptionOutput(
                         "WhisperX worker result has no segments list"
                     )
                 raw_primary_words = primary_result.get("words", [])
@@ -1615,13 +1635,19 @@ class TranscriptionService:
                 primary_runtime = primary_result.get("runtime")
                 primary_noise_filter = primary_result.get("noise_filter")
                 if not isinstance(primary_model, Mapping):
-                    raise RuntimeError("WhisperX worker result has no model")
+                    raise InvalidTranscriptionOutput(
+                        "WhisperX worker result has no model"
+                    )
                 if not isinstance(primary_timing, Mapping):
-                    raise RuntimeError("WhisperX worker result has no timing")
+                    raise InvalidTranscriptionOutput(
+                        "WhisperX worker result has no timing"
+                    )
                 if not isinstance(primary_runtime, Mapping):
-                    raise RuntimeError("WhisperX worker result has no runtime")
+                    raise InvalidTranscriptionOutput(
+                        "WhisperX worker result has no runtime"
+                    )
                 if not isinstance(primary_noise_filter, Mapping):
-                    raise RuntimeError(
+                    raise InvalidTranscriptionOutput(
                         "WhisperX worker result has no noise_filter"
                     )
                 fallback_noise_filter = fallback_result.get(
@@ -1875,6 +1901,16 @@ class TranscriptionService:
         except TranscriptionCancelled:
             self.store.mark_cancelled(job.id)
             LOGGER.info("transcription job %s cancelled", job.id)
+        except InvalidTranscriptionOutput as error:
+            message = str(error).replace(self.settings.hf_token, "[redacted]")
+            self.store.update_if_status(
+                job.id,
+                {"running"},
+                status="failed",
+                error=message[:2000] or error.__class__.__name__,
+                failure_code="model_output_invalid",
+            )
+            LOGGER.exception("transcription job %s returned invalid output", job.id)
         except BaseException as error:
             message = str(error).replace(self.settings.hf_token, "[redacted]")
             if self.store.mark_cancelled(job.id):
@@ -1885,6 +1921,7 @@ class TranscriptionService:
                     {"running"},
                     status="failed",
                     error=message[:2000] or error.__class__.__name__,
+                    failure_code="internal_error",
                 )
                 LOGGER.exception("transcription job %s failed", job.id)
         finally:

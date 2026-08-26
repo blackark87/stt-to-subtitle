@@ -80,8 +80,11 @@ class TranscriptionStoreTests(unittest.TestCase):
             )
 
             self.assertEqual(store.fail_interrupted_jobs(), 1)
-            self.assertEqual(store.get("job-1").status, "failed")
-            public_job = store.get("job-1").public_dict()
+            recovered = store.get("job-1")
+            self.assertEqual(recovered.status, "failed")
+            self.assertEqual(recovered.failure_code, "service_restarted")
+            public_job = recovered.public_dict()
+            self.assertEqual(public_job["failure_code"], "service_restarted")
             self.assertEqual(
                 public_job["chunk_progress"],
                 {

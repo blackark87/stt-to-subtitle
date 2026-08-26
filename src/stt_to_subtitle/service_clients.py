@@ -28,6 +28,14 @@ class RemoteTranscriptionNotFound(ExternalServiceError):
     """The persisted remote transcription ID no longer exists."""
 
 
+class RemoteTranscriptionFailed(RuntimeError):
+    """The remote worker completed with a non-recoverable job failure."""
+
+    def __init__(self, message: str, *, failure_code: str | None) -> None:
+        super().__init__(message)
+        self.failure_code = failure_code
+
+
 class TranslationResponseIDError(ExternalServiceError):
     """The translation server returned a different segment ID set."""
 
@@ -223,9 +231,14 @@ class STTAPIClient(RetryingJSONClient):
                     may_requeue_existing = False
                     job_id = None
                     continue
-                raise ExternalServiceError(
+                raise RemoteTranscriptionFailed(
                     "transcription job failed: "
-                    f"{status_payload.get('error', 'unknown remote error')}"
+                    f"{status_payload.get('error', 'unknown remote error')}",
+                    failure_code=(
+                        str(status_payload["failure_code"])
+                        if status_payload.get("failure_code") is not None
+                        else None
+                    ),
                 )
 
         response = self.request(
@@ -244,7 +257,13 @@ class STTAPIClient(RetryingJSONClient):
             raise ExternalServiceError(
                 "transcription API returned invalid result JSON"
             ) from error
-        validate_transcript(payload)
+        try:
+            validate_transcript(payload)
+        except ValueError as error:
+            raise RemoteTranscriptionFailed(
+                "transcription API returned an invalid transcript",
+                failure_code="model_output_invalid",
+            ) from error
         return payload
 
     def cancel_job(self, job_id: str) -> Mapping[str, Any]:

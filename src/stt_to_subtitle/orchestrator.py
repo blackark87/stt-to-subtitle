@@ -44,6 +44,7 @@ from .service_clients import (
     ExternalServiceError,
     OpenAICompatibleClient,
     OperationStopped,
+    RemoteTranscriptionFailed,
     RequestConcurrencyLimiter,
     STTAPIClient,
     SubtitleValidationClient,
@@ -2339,6 +2340,24 @@ class SubtitleOrchestrator:
             self._raise_if_job_stop_requested(job_id)
         except OperationStopped:
             self._mark_job_stopped(job_id, stage)
+        except RemoteTranscriptionFailed as error:
+            message = self._sanitize_error(str(error))
+            reason_by_failure_code = {
+                "invalid_input": JobReason.INVALID_INPUT.value,
+                "model_output_invalid": JobReason.MODEL_OUTPUT_INVALID.value,
+            }
+            self.store.update(
+                job_id,
+                status="failed",
+                blocked_stage=stage,
+                reason_code=reason_by_failure_code.get(
+                    error.failure_code,
+                    JobReason.INTERNAL_ERROR.value,
+                ),
+                error=message,
+            )
+            self.store.add_event(job_id, "error", f"{stage} failed: {message}")
+            LOGGER.error("job %s %s failed: %s", job_id, stage, message)
         except ExternalServiceError as error:
             message = self._sanitize_error(str(error))
             if stage == "translation" and self.settings.lm_manual_start:

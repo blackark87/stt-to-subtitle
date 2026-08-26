@@ -6,7 +6,7 @@
 
 ### 구현 진행 상태
 
-현재 작업 트리에는 계획의 여섯 번째 수직 슬라이스까지 반영됐다.
+현재 작업 트리에는 계획의 일곱 번째 수직 슬라이스까지 반영됐다.
 
 | 항목 | 반영 상태 | 남은 범위 |
 |---|---|---|
@@ -19,6 +19,7 @@
 | 자막 publication | source별 단일 게시 포인터, generation별 SRT/ASS와 해시, 다운로드·과거 버전 재게시 | pair manifest·파일/DB startup reconcile·retention |
 | 원격 STT 취소 | 멱등 cancel API, `cancel_requested/cancelled` 영속 상태, 웹의 취소 호출·최종 확인, WhisperX/JAV process group 종료, Kotoba 청크 경계 취소 | Kotoba diarization/postprocess 즉시 중단·실제 GPU 자원 fault test |
 | 시작 복구 | 추출 재대기, 원격 STT 재연결·유실 ID 멱등 재제출, 번역 체크포인트 대기 복원, 검증된 전사·번역 산출물 기반 렌더 재개, 중지 요청 보존 | worker lease·렌더 publication pair manifest reconcile·강제 종료 fault test |
+| STT 실패 계약 | STT DB·API의 `failure_code`, 원격 실패 전용 예외, segment/schema 오류의 `failed/model_output_invalid`, 연결 오류의 `blocked/stt_unavailable` 분리 | backend OOM·인증·입력 오류 세분화와 `retryable/failure_scope` |
 
 이하의 문제 분석은 최초 분석 시점 구조를 기준으로 하되, 구현이 끝난 절은 현재
 동작과 남은 범위로 갱신했다.
@@ -74,7 +75,7 @@ flowchart LR
 | 파이프라인 실행 | [`orchestrator.py`](../src/stt_to_subtitle/orchestrator.py) | 단계 실행, 스케줄링, 정지, 복구, 이벤트 기록이 한 클래스에 집중 |
 | 웹 작업 저장 | [`job_store.py`](../src/stt_to_subtitle/job_store.py) | SQLite 기반 영속화는 적절하나 상태·마이그레이션 계약이 약함 |
 | 외부 API | [`service_clients.py`](../src/stt_to_subtitle/service_clients.py) | 요청 재시도와 SSE 재연결을 지원하나 장애 종류 분류와 회로 차단이 없음 |
-| STT 서비스 | [`stt_api.py`](../src/stt_to_subtitle/stt_api.py), [`transcription_store.py`](../src/stt_to_subtitle/transcription_store.py) | 전사 요청 멱등성과 독립 큐는 장점. 취소와 재시작 복구 정책이 부족 |
+| STT 서비스 | [`stt_api.py`](../src/stt_to_subtitle/stt_api.py), [`transcription_store.py`](../src/stt_to_subtitle/transcription_store.py) | 전사 요청 멱등성·독립 큐·취소·구조화 실패 코드를 제공. backend별 재시도 가능성 세분화는 남음 |
 | 산출물 | [`audio.py`](../src/stt_to_subtitle/audio.py), [`subtitle.py`](../src/stt_to_subtitle/subtitle.py), [`files.py`](../src/stt_to_subtitle/files.py) | JSON은 원자 저장. WAV 및 SRT/ASS 묶음의 장애 복구 보장은 보강 필요 |
 
 현재 SQLite와 단일 웹 스케줄러는 현 규모에서 유지할 수 있다. 상태 모델을 정리하기 전에 메시지 브로커나 분산 데이터베이스를 도입하면 복잡도만 늘어난다.
@@ -278,7 +279,7 @@ Whisper 계열의 segment 오류도 오류가 발생한 위치가 아니라 복�
 | 특정 입력에서 backend 코드가 항상 예외 발생 | `failed/transcription_processing_error` | 코드·입력·모델 변경이 필요 |
 | worker 프로세스 유실·서비스 재시작 | reconcile 후 재실행, 불가할 때 `blocked/service_restarted` | 먼저 원격 상태와 산출물을 확인해야 함 |
 
-현재 STT 서비스는 backend 예외를 거의 모두 remote `failed`로 저장하고, 웹은 그 원격 실패를 `ExternalServiceError`로 받아 `blocked`로 바꿀 수 있다. 동일 오류가 두 서비스에서 다르게 표현될 수 있으므로 STT API가 `error_code`, `retryable`, `failure_scope`를 구조적으로 반환해야 한다.
+STT 서비스는 실패에 `failure_code`를 저장·반환하고, 웹은 원격 작업 실패와 연결 실패를 별도 예외로 처리한다. 현재 segment/schema 계약 오류는 `failed/model_output_invalid`, HTTP 연결·서비스 불가는 `blocked/stt_unavailable`로 일관되게 전달된다. 다음 단계에서는 backend OOM·인증·입력 오류를 세분화하고 `retryable`, `failure_scope`를 추가해야 한다.
 
 버튼도 상태 수와 일대일로 만들 필요가 없다.
 
@@ -799,7 +800,7 @@ src/stt_to_subtitle/
 | 이미 요청된 Whisper/Kotoba/WhisperJAV를 취소할 수 있는가 | 가능하다. 대기 작업은 즉시 취소하고 WhisperX/JAV는 process group을 종료하며 Kotoba는 청크 경계에서 중지한다. 웹은 원격 `cancelled`를 확인한다. | Kotoba의 모델 로드·diarization·postprocess 즉시 중단이 필요하면 subprocess 격리를 추가한다. 취소와 사전 segmentation은 별도 요구다. |
 | 자막이 있는 상태에서 prompt 변경 재시도는 어떻게 되는가 | transcript와 기존 번역·자막 generation을 보존하고 새 generation으로 처리한다. 새 번역 완료 전 기존 게시본을 유지하며 과거 SRT/ASS를 다시 게시할 수 있다. | immutable prompt revision, 번역 비교 UI, publication startup reconcile을 추가한다. |
 | `next_probe_at`은 계속 재시도한다는 뜻인가 | 번역 LLM이 평소 꺼져 있는 운영 환경에서는 호출 자체가 불필요하다. | LM은 manual gate로 두고 `next_probe_at`을 사용하지 않는다. STT처럼 자동 복구를 선택한 의존성에만 제한적으로 사용한다. |
-| 중단과 실패는 어떻게 구분하는가 | 현재 STT `failed`가 웹에서 `blocked`가 될 수 있어 일관되지 않다. | 외부 조건이 회복되면 그대로 재개 가능한 경우 `blocked`, 입력·모델 출력·코드 계약 오류처럼 변경이 필요한 경우 `failed`다. segment 구조 오류는 기본적으로 `failed/model_output_invalid`다. |
+| 중단과 실패는 어떻게 구분하는가 | 외부 연결 불가는 `blocked/stt_unavailable`, 원격 segment/schema 계약 오류는 `failed/model_output_invalid`로 전달한다. | backend OOM·인증·입력 오류에도 구조화된 retry 가능성과 failure scope를 추가한다. |
 | WAV와 transcript는 영속 데이터인가 | persistent volume에는 남지만 immutable revision은 아니다. 같은 job을 재사용하는 재전사·재추출에서는 같은 경로가 덮어써질 수 있고 DB 레코드 삭제 후 orphan도 남을 수 있다. | audio/transcript를 immutable revision으로 만들고 hash 기반 재사용, 참조 무결성, retention, garbage collection을 적용한다. |
 | 외부 자막은 어떻게 다루는가 | 현재 `<filename>.srt/.vtt/.ass`를 독립 자산으로 탐지·재생·비교하는 계약이 없다. | 모두 한국어 `외부 자막`으로 등록해 기본 재생하며, 생성 자막과 시간 기반 로컬 비교 및 선택적 상용 LLM 검증을 수행한다. |
 | 내부망에서도 인증이 필요한가 | 현재도 비밀번호가 비어 있으면 인증이 꺼지지만 공식 운영 계약으로 강조되지 않았다. | 별도 웹 인증은 추가하지 않는다. 무인증 모드를 테스트로 고정하고 경로·입력·로그·파일 무결성만 보호한다. |

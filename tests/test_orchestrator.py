@@ -16,6 +16,7 @@ from stt_to_subtitle.orchestrator import (
 from stt_to_subtitle.job_store import JobStore
 from stt_to_subtitle.service_clients import (
     ExternalServiceError,
+    RemoteTranscriptionFailed,
     TranslationPaused,
 )
 
@@ -946,6 +947,45 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                 translation_client.translate.call_args.kwargs["max_workers"],
                 3,
             )
+
+    def test_remote_transcription_contract_error_is_failed_not_blocked(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            orchestrator = self.make_orchestrator(root, media_root)
+            try:
+                job = orchestrator.store.create(
+                    job_id="invalid-remote-output",
+                    source_rel="movie.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                orchestrator.store.update(
+                    job.id,
+                    status="transcription_running",
+                )
+
+                orchestrator._run_stage(
+                    job.id,
+                    "transcription",
+                    Mock(
+                        side_effect=RemoteTranscriptionFailed(
+                            "segments must be a list",
+                            failure_code="model_output_invalid",
+                        )
+                    ),
+                )
+                failed = orchestrator.store.get(job.id)
+            finally:
+                orchestrator.stop()
+
+            self.assertEqual(failed.status, "failed")
+            self.assertEqual(failed.state, "failed")
+            self.assertEqual(failed.reason_code, "model_output_invalid")
+            self.assertEqual(failed.blocked_stage, "transcription")
 
     def test_translation_persists_a_failed_logical_batch(self) -> None:
         with TemporaryDirectory() as directory:
