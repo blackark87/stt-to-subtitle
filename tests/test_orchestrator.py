@@ -153,17 +153,68 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                 ) as models:
                     resumed = orchestrator.activate_translation_lm()
                 dispatched = orchestrator._dispatch_translations()
+                persisted_gate = orchestrator.store.get_dependency_state(
+                    "translation_lm"
+                )
             finally:
                 orchestrator.stop()
 
             self.assertEqual(resumed, 0)
             self.assertEqual(dispatched, 1)
             self.assertEqual(orchestrator.lm_gate_state, "ready")
+            self.assertEqual(persisted_gate["state"], "ready")
+            self.assertIsNone(persisted_gate["reason_code"])
             models.assert_called_once_with(
                 "http://lm.test/v1",
                 "secret",
                 attempts=1,
             )
+
+    def test_manual_lm_gate_starts_closed_after_process_restart(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            settings = WebSettings(
+                state_dir=root / "state",
+                media_root=media_root,
+                admin_password="",
+                session_secret="",
+                stt_base_url="http://stt.test",
+                stt_token="",
+                lm_base_url="http://lm.test/v1",
+                lm_token="secret",
+                lm_model="model",
+                lm_manual_start=True,
+            )
+            first = SubtitleOrchestrator(settings)
+            try:
+                with patch(
+                    "stt_to_subtitle.orchestrator.list_openai_compatible_models",
+                    return_value=["model"],
+                ):
+                    first.activate_translation_lm()
+                self.assertEqual(first.lm_gate_state, "ready")
+            finally:
+                first.stop()
+
+            with patch(
+                "stt_to_subtitle.orchestrator.list_openai_compatible_models"
+            ) as models:
+                restarted = SubtitleOrchestrator(settings)
+            try:
+                persisted = restarted.store.get_dependency_state(
+                    "translation_lm"
+                )
+                self.assertEqual(restarted.lm_gate_state, "offline")
+                self.assertEqual(persisted["state"], "offline")
+                self.assertEqual(
+                    persisted["reason_code"],
+                    "manual_start_required",
+                )
+                models.assert_not_called()
+            finally:
+                restarted.stop()
 
     def test_stt_gate_stops_queue_cascade_until_explicit_preflight(self) -> None:
         with TemporaryDirectory() as directory:

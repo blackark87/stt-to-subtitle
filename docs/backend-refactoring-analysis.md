@@ -6,12 +6,12 @@
 
 ### 구현 진행 상태
 
-현재 작업 트리에는 계획의 여덟 번째 수직 슬라이스까지 반영됐다.
+현재 작업 트리에는 계획의 아홉 번째 수직 슬라이스까지 반영됐다.
 
 | 항목 | 반영 상태 | 남은 범위 |
 |---|---|---|
 | 작업 상태 계약 | `phase/state/reason_code/attempt` 영속 컬럼과 레거시 마이그레이션, 명시적 `stopped/user_stop`, 2D·3D·목록 공통 상태 집계, 단계+상태 결합 필터 | 스케줄러의 레거시 `status` 제거·전이 이벤트 코드·DB 전이 제약 |
-| 번역 LLM 수동 gate | 사용자가 시작할 때 `/models` 1회 확인, 연결 실패 시 gate 차단, 번역 중단 작업 수동 재개 | dependency state 영속화·reason code·재시작 복원 |
+| 번역 LLM 수동 gate | 사용자가 시작할 때 `/models` 1회 확인, 연결 실패 시 gate 차단, 번역 중단 작업 수동 재개, dependency state·reason 영속화, 재시작 시 자동 호출 없이 gate 닫기 | 운영 지표·실환경 장애 복구 검증 |
 | 외부 자막 | 같은 stem의 SRT/VTT/ASS 탐지, `외부 자막` 표시, 기본 WebVTT 재생 | 증분 asset/revision catalog·사용자별 재생 선택 |
 | 로컬 비교 | 시간 중첩 정렬, coverage·문장 유사도·경계 오차, 파일 해시별 SQLite 결과 | generation/publication FK·검증 알고리즘 version migration |
 | 상용 LLM 검증 | 번역 LLM과 분리된 설정, 명시적 1회 호출, 구조화 결과, 입력·모델 cache | provider별 adapter·비용/사용량 관측 |
@@ -32,7 +32,7 @@
 그러나 작업이 많거나 외부 서비스가 내려간 상황에서 안정적으로 운영하려면 다음 문제를 우선 해결해야 한다.
 
 1. 사용자 표시와 필터는 `phase/state/reason_code/attempt`로 분리됐지만 스케줄러 실행 전이는 아직 레거시 `status`를 호환 필드로 함께 사용한다.
-2. 언어 모델 수동 gate로 대기열 연쇄 실패는 차단했지만 gate가 프로세스 메모리에만 있어 재시작 복원과 구조화된 장애 사유가 없다.
+2. 언어 모델 수동 gate와 마지막 상태·사유를 영속화했다. 웹 재시작 시 마지막 `offline/lost`를 복원하고, 이전 상태가 `ready`였어도 자동 호출·dispatch 없이 `offline/manual_start_required`로 시작한다.
 3. 웹 프로세스 재시작 시 실행 중 작업을 단계별로 reconcile한다. 원격 STT는 기존 ID에 재연결하고 ID가 유실됐으면 동일 멱등 키로 재제출한다. 번역 LLM은 자동 호출하지 않고 체크포인트를 대기로 복원한다.
 4. 사용자 정지는 신규 작업에서 명시적 `stopped/user_stop`으로 저장한다. 기존 한국어 오류 문구 판별은 과거 DB를 한 번 마이그레이션할 때만 사용한다.
 5. 2D 대시보드, 3D 대시보드, 작업 목록은 영속 `state`를 공통 원천으로 사용하고 작업 목록은 `phase + state` 결합 필터를 지원한다.
@@ -191,6 +191,8 @@ sequenceDiagram
 ```
 
 이는 “대기 중인 작업은 그대로 대기한다”는 운영 기대와 맞지 않는다. 요청 재시도와 서비스 장애 제어는 별도 계층이어야 한다.
+
+현재 구현은 첫 번역 연결 실패에서 수동 gate를 닫아 나머지 작업을 `transcribed/waiting`으로 유지한다. gate 상태와 마지막 사유는 SQLite에 저장하며, 웹 재시작 후에도 background probe 없이 사용자의 `번역 시작/재개` 명령만 preflight를 수행한다.
 
 ### 5.2 의존성별 복구 모드
 
@@ -804,11 +806,11 @@ src/stt_to_subtitle/
 | `next_probe_at`은 계속 재시도한다는 뜻인가 | 번역 LLM이 평소 꺼져 있는 운영 환경에서는 호출 자체가 불필요하다. | LM은 manual gate로 두고 `next_probe_at`을 사용하지 않는다. STT처럼 자동 복구를 선택한 의존성에만 제한적으로 사용한다. |
 | 중단과 실패는 어떻게 구분하는가 | 외부 연결 불가는 `blocked/stt_unavailable`, 원격 segment/schema 계약 오류는 `failed/model_output_invalid`로 전달한다. | backend OOM·인증·입력 오류에도 구조화된 retry 가능성과 failure scope를 추가한다. |
 | WAV와 transcript는 영속 데이터인가 | persistent volume에는 남지만 immutable revision은 아니다. 같은 job을 재사용하는 재전사·재추출에서는 같은 경로가 덮어써질 수 있고 DB 레코드 삭제 후 orphan도 남을 수 있다. | audio/transcript를 immutable revision으로 만들고 hash 기반 재사용, 참조 무결성, retention, garbage collection을 적용한다. |
-| 외부 자막은 어떻게 다루는가 | 현재 `<filename>.srt/.vtt/.ass`를 독립 자산으로 탐지·재생·비교하는 계약이 없다. | 모두 한국어 `외부 자막`으로 등록해 기본 재생하며, 생성 자막과 시간 기반 로컬 비교 및 선택적 상용 LLM 검증을 수행한다. |
+| 외부 자막은 어떻게 다루는가 | `<filename>.srt/.vtt/.ass`를 한국어 `외부 자막`으로 탐지해 기본 재생하고, 생성 자막과 시간 기반 로컬 비교 및 선택적 상용 LLM 검증을 수행한다. | hash 기반 immutable external subtitle revision과 증분 catalog로 확장한다. |
 | 내부망에서도 인증이 필요한가 | 현재도 비밀번호가 비어 있으면 인증이 꺼지지만 공식 운영 계약으로 강조되지 않았다. | 별도 웹 인증은 추가하지 않는다. 무인증 모드를 테스트로 고정하고 경로·입력·로그·파일 무결성만 보호한다. |
 
 ## 20. 최종 권고
 
-이 프로젝트의 다음 리팩터링 단위는 “화면별 상태 라벨 수정”이 아니라 “작업 실행 및 산출물 revision 계약의 재정의”여야 한다. 먼저 명시적 상태 모델과 공통 projection을 도입하고, 번역 LLM의 수동 dispatch gate, 단계별 재시작 복구, backend별 STT 취소를 구현해야 한다. 자동 회복은 상시 가동 의존성에만 선택적으로 적용한다.
+명시적 상태 모델과 공통 projection, 번역 LLM·STT dispatch gate, 단계별 재시작 복구, backend별 STT 취소는 반영됐다. 다음 리팩터링 단위는 worker lease와 자막 pair manifest reconcile, backend별 실패 계약 세분화, immutable audio/transcript revision이어야 한다. 자동 회복은 상시 가동 의존성에만 선택적으로 적용한다.
 
 동시에 transcript revision, translation generation/batch/item, external/generated subtitle asset, publication, validation을 영속 모델로 추가해야 한다. 그래야 프롬프트 수정 재번역, 부분 번역 재개, 외부 자막 재생·비교, 선택적 상용 LLM 평가, 자막 게시·rollback, WAV·전사본 재사용을 데이터 손실 없이 반복할 수 있다. 내부망 무인증 운영은 그대로 유지하고 인증보다 실행·파일·참조 무결성에 구현 역량을 집중한다.

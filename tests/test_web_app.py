@@ -1557,12 +1557,17 @@ class WebAppTests(unittest.TestCase):
                     "/settings/translation/stop",
                     follow_redirects=False,
                 )
+                persisted_gate = service.store.get_dependency_state(
+                    "translation_lm"
+                )
 
             self.assertIn("번역 시작/재개", page.text)
             self.assertEqual(started.status_code, 303)
             self.assertEqual(ready_state, "ready")
             self.assertEqual(stopped.status_code, 303)
             self.assertEqual(service.lm_gate_state, "offline")
+            self.assertEqual(persisted_gate["state"], "offline")
+            self.assertEqual(persisted_gate["reason_code"], "manual_stop")
             models.assert_called_once_with(
                 "http://lm.test/v1",
                 "",

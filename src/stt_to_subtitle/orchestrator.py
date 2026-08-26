@@ -270,16 +270,44 @@ class SubtitleOrchestrator:
         self._stt_gate_lock = threading.RLock()
         self._lm_gate_lock = threading.RLock()
         self._subtitle_publication_lock = threading.RLock()
-        self._lm_gate_state = (
-            "offline"
-            if settings.lm_manual_start or not initial_servers.is_complete
-            else "ready"
-        )
-        self._lm_gate_message = (
-            "사용자가 번역 서버를 시작할 때까지 대기합니다."
-            if self._lm_gate_state == "offline"
-            else "번역 서버 자동 시작 모드입니다."
-        )
+        saved_lm_gate = self.store.get_dependency_state("translation_lm")
+        if settings.lm_manual_start:
+            saved_lm_state = (
+                str(saved_lm_gate["state"])
+                if saved_lm_gate is not None
+                else "offline"
+            )
+            self._lm_gate_state = (
+                saved_lm_state
+                if saved_lm_state in {"offline", "lost"}
+                else "offline"
+            )
+            self._lm_gate_message = (
+                str(saved_lm_gate.get("last_error"))
+                if saved_lm_gate is not None
+                and saved_lm_gate.get("last_error")
+                and saved_lm_state in {"offline", "lost"}
+                else "사용자가 번역 서버를 시작할 때까지 대기합니다."
+            )
+            if (
+                saved_lm_gate is None
+                or saved_lm_state not in {"offline", "lost"}
+            ):
+                self.store.save_dependency_state(
+                    "translation_lm",
+                    state="offline",
+                    reason_code="manual_start_required",
+                    error=self._lm_gate_message,
+                )
+        else:
+            self._lm_gate_state = (
+                "ready" if initial_servers.is_complete else "offline"
+            )
+            self._lm_gate_message = (
+                "번역 서버 자동 시작 모드입니다."
+                if self._lm_gate_state == "ready"
+                else "번역 서버 설정이 필요합니다."
+            )
         saved_stt_gate = self.store.get_dependency_state("stt")
         self._stt_gate_state = (
             str(saved_stt_gate["state"])
@@ -455,6 +483,25 @@ class SubtitleOrchestrator:
                 error=message if state in {"lost", "unknown"} else None,
             )
 
+    def _set_lm_gate(
+        self,
+        state: str,
+        message: str,
+        *,
+        reason_code: str | None = None,
+        persist: bool = True,
+    ) -> None:
+        with self._lm_gate_lock:
+            self._lm_gate_state = state
+            self._lm_gate_message = message
+        if persist:
+            self.store.save_dependency_state(
+                "translation_lm",
+                state=state,
+                reason_code=reason_code,
+                error=message if state in {"lost", "offline"} else None,
+            )
+
     def activate_transcription_stt(self) -> int:
         """Open the STT gate after one explicit readiness check."""
         if self.stt_client is None:
@@ -509,15 +556,16 @@ class SubtitleOrchestrator:
                     f"설정된 번역 모델을 찾을 수 없습니다: {servers.lm_model}"
                 )
         except (ValueError, ExternalServiceError) as error:
-            with self._lm_gate_lock:
-                self._lm_gate_state = "offline"
-                self._lm_gate_message = self._sanitize_error(str(error))
-            raise
-        with self._lm_gate_lock:
-            self._lm_gate_state = "ready"
-            self._lm_gate_message = (
-                f"번역 서버가 준비되었습니다: {servers.lm_model}"
+            self._set_lm_gate(
+                "offline",
+                self._sanitize_error(str(error)),
+                reason_code=JobReason.LM_UNAVAILABLE.value,
             )
+            raise
+        self._set_lm_gate(
+            "ready",
+            f"번역 서버가 준비되었습니다: {servers.lm_model}",
+        )
 
         retried = 0
         for job_id in self.store.ids_with_status("blocked"):
@@ -537,11 +585,11 @@ class SubtitleOrchestrator:
 
     def deactivate_translation_lm(self) -> None:
         """Close the gate without making any network request."""
-        with self._lm_gate_lock:
-            self._lm_gate_state = "offline"
-            self._lm_gate_message = (
-                "번역 서버 사용이 중지되었습니다. 새 번역을 시작하지 않습니다."
-            )
+        self._set_lm_gate(
+            "offline",
+            "번역 서버 사용이 중지되었습니다. 새 번역을 시작하지 않습니다.",
+            reason_code="manual_stop",
+        )
 
     def active_prompt_categories(self) -> list[PromptCategory]:
         return self.store.list_prompt_categories()
@@ -656,14 +704,19 @@ class SubtitleOrchestrator:
                 "unknown",
                 "연결 확인이 필요합니다.",
             )
-        with self._lm_gate_lock:
-            self._lm_gate_state = (
-                "offline" if self.settings.lm_manual_start else "ready"
-            )
-            self._lm_gate_message = (
-                "설정을 저장했습니다. 번역 시작/재개를 눌러 연결을 확인하세요."
-                if self.settings.lm_manual_start
-                else "번역 서버 자동 시작 모드입니다."
+        if persist:
+            self._set_lm_gate(
+                "offline" if self.settings.lm_manual_start else "ready",
+                (
+                    "설정을 저장했습니다. 번역 시작/재개를 눌러 연결을 확인하세요."
+                    if self.settings.lm_manual_start
+                    else "번역 서버 자동 시작 모드입니다."
+                ),
+                reason_code=(
+                    "configuration_changed"
+                    if self.settings.lm_manual_start
+                    else None
+                ),
             )
         return normalized
 
@@ -2454,9 +2507,11 @@ class SubtitleOrchestrator:
                     reason_code=JobReason.STT_UNAVAILABLE.value,
                 )
             if stage == "translation" and self.settings.lm_manual_start:
-                with self._lm_gate_lock:
-                    self._lm_gate_state = "lost"
-                    self._lm_gate_message = message
+                self._set_lm_gate(
+                    "lost",
+                    message,
+                    reason_code=JobReason.LM_UNAVAILABLE.value,
+                )
             self.store.update(
                 job_id,
                 status="blocked",

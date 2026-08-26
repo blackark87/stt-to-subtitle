@@ -662,12 +662,24 @@ class JobStoreTests(unittest.TestCase):
                 reason_code="stt_unavailable",
                 error="connection refused",
             )
+            store.save_dependency_state(
+                "translation_lm",
+                state="offline",
+                reason_code="manual_stop",
+                error="stopped by operator",
+            )
 
             state = JobStore(database_path).get_dependency_state("stt")
             self.assertEqual(state["dependency"], "stt")
             self.assertEqual(state["state"], "lost")
             self.assertEqual(state["reason_code"], "stt_unavailable")
             self.assertEqual(state["last_error"], "connection refused")
+            lm_state = JobStore(database_path).get_dependency_state(
+                "translation_lm"
+            )
+            self.assertEqual(lm_state["state"], "offline")
+            self.assertEqual(lm_state["reason_code"], "manual_stop")
+            self.assertEqual(lm_state["last_error"], "stopped by operator")
 
     def test_persists_subtitle_validator_settings(self) -> None:
         with TemporaryDirectory() as directory:
