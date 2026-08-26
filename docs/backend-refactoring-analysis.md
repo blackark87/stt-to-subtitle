@@ -6,7 +6,7 @@
 
 ### 구현 진행 상태
 
-현재 작업 트리에는 계획의 열두 번째 수직 슬라이스까지 반영됐다.
+현재 작업 트리에는 계획의 열세 번째 수직 슬라이스까지 반영됐다.
 
 | 항목 | 반영 상태 | 남은 범위 |
 |---|---|---|
@@ -18,7 +18,7 @@
 | 번역 generation | generation·batch·segment SQLite 원장, 입력 지문, 배치 시도·실패, DB 기반 JSON 복구, 재번역·직접 편집 이력 | immutable prompt revision·startup reconcile |
 | 자막 publication | source별 단일 게시 포인터, generation별 SRT/ASS와 해시, 다운로드·과거 버전 재게시, pair manifest·파일/DB startup reconcile | retention·교체 지점별 강제 종료 fault test |
 | 원격 STT 취소 | 멱등 cancel API, `cancel_requested/cancelled` 영속 상태, 웹의 취소 호출·최종 확인, WhisperX/JAV process group 종료, Kotoba 청크 경계 취소 | Kotoba diarization/postprocess 즉시 중단·실제 GPU 자원 fault test |
-| 시작 복구 | 추출 재대기, 원격 STT 재연결·유실 ID 멱등 재제출, 번역 체크포인트 대기 복원, 검증된 전사·번역 산출물 기반 렌더 재개, 게시 자막 pair reconcile, worker lease claim·heartbeat·만료 회수, 중지 요청 보존 | fencing token·graceful drain·강제 종료 fault test |
+| 시작 복구 | 추출 재대기, 원격 STT 재연결·유실 ID 멱등 재제출, 번역 체크포인트 대기 복원, 검증된 전사·번역 산출물 기반 렌더 재개, 게시 자막 pair reconcile, worker lease claim·heartbeat·만료 회수, 단조 증가 fencing token, 중지 요청 보존 | graceful drain·강제 종료 fault test |
 | STT 실패 계약 | STT DB·API의 `failure_code/retryable/failure_scope`, segment/schema·OOM·인증·입력·처리·재시작 오류 분류, retryable 실패만 원격 재제출 | 실제 backend별 fault test·오류 코드 운영 지표 |
 | STT dispatch gate | 첫 연결 실패 시 영속 gate 차단, 뒤 작업 `audio_ready` 유지, 명시적 연결 확인의 제한된 3회 요청 후 중단 작업 재개 | 자동 recovery mode가 실제로 필요한지 운영 검증·회로 메트릭 |
 
@@ -157,7 +157,7 @@ stateDiagram-v2
 | 원격 STT 제어 | 제출·조회·SSE 진행률 | 원격 취소 API, 취소 멱등성, 취소 완료 확인 | P0 |
 | 번역 체크포인트 | DB에는 청크 수만 저장하고 실제 결과는 동일 JSON 전체를 배치마다 원자 교체 | translation generation·batch·segment 영속화, 모델·프롬프트·원문·배치 설정 지문 검증 | P0–P1 |
 | 스케줄링 | 생성 시각 FIFO, 단계별 제한 | 의존성별 admission control, 우선순위·공정성, starvation 방지 | P1 |
-| 종료 처리 | scheduler 중지 후 executor 신규 작업 취소, 실행 작업 lease heartbeat·만료 회수 | graceful drain 제한 시간, fencing token, 종료 체크포인트 | P1 |
+| 종료 처리 | scheduler 중지 후 executor 신규 작업 취소, 실행 작업 lease heartbeat·만료 회수·fencing token | graceful drain 제한 시간, 종료 체크포인트 | P1 |
 | 오디오·전사 산출물 | 작업 디렉터리에 지속되지만 같은 작업 재시도 시 같은 경로를 재사용 | immutable revision과 retention 정책, 임시 WAV 검증·원자 교체 | P1 |
 | 자막 산출물 | SRT/ASS 각각 임시 저장하며 재번역 시 기존 배포 파일을 덮어씀 | versioned generation, publication pointer, rollback, 한 manifest로 파일 쌍 검증 | P0–P1 |
 | 외부 자막 | `<filename>.ko.srt/.ko.ass`만 생성 자막처럼 탐지하고 VTT·출처·비교 관계가 없음 | `<filename>.srt/.vtt/.ass`를 `외부 자막`으로 등록, 기본 재생, 로컬 비교 검증, 선택적 상용 LLM 평가 | P0–P1 |
@@ -604,7 +604,7 @@ jobs(
 
 단일 웹 인스턴스에서는 SQLite를 유지할 수 있다. 다중 웹 스케줄러를 실제로 운영해야 할 때 lease 경쟁, 알림 지연, 쓰기 경합을 측정한 뒤 PostgreSQL이나 브로커 전환을 판단한다.
 
-현재 `jobs.lease_owner/lease_expires_at`과 `(status, lease_expires_at)` 인덱스를 추가했다. dispatch와 startup recovery는 조건부 갱신으로 lease를 claim하고 실행 중 heartbeat를 갱신하며, 정상 단계 전환에서는 lease를 제거한다. 다음 보강은 lease 만료 직전 멈췄던 과거 worker의 늦은 쓰기를 차단하는 단조 증가 fencing token과 제한 시간 내 graceful drain이다.
+현재 `jobs.lease_owner/lease_expires_at/lease_token`과 `(status, lease_expires_at)` 인덱스를 추가했다. dispatch와 startup recovery는 조건부 갱신으로 lease를 claim하면서 token을 증가시키고, 실행 중 heartbeat와 단계 상태 반영은 `owner + token`이 모두 일치할 때만 성공한다. 자막 게시는 프로세스 간 파일 잠금 안에서 lease를 재검증하고 DB 게시도 같은 token으로 확정해 구 worker의 늦은 게시를 차단한다. 다음 보강은 제한 시간 내 graceful drain과 오디오·전사 파일의 immutable revision이다.
 
 ## 12. 관측성과 운영 기능
 
@@ -813,6 +813,6 @@ src/stt_to_subtitle/
 
 ## 20. 최종 권고
 
-명시적 상태 모델과 공통 projection, 번역 LLM·STT dispatch gate, worker lease 기반 단계별 재시작 복구, 자막 pair manifest reconcile, backend별 STT 취소·실패 계약은 반영됐다. 다음 리팩터링 단위는 lease fencing/graceful drain과 immutable audio/transcript revision이어야 한다. 자동 회복은 상시 가동 의존성에만 선택적으로 적용한다.
+명시적 상태 모델과 공통 projection, 번역 LLM·STT dispatch gate, worker lease·fencing 기반 단계별 재시작 복구, 자막 pair manifest reconcile, backend별 STT 취소·실패 계약은 반영됐다. 다음 리팩터링 단위는 graceful drain과 immutable audio/transcript revision이어야 한다. 자동 회복은 상시 가동 의존성에만 선택적으로 적용한다.
 
 동시에 transcript revision, translation generation/batch/item, external/generated subtitle asset, publication, validation을 영속 모델로 추가해야 한다. 그래야 프롬프트 수정 재번역, 부분 번역 재개, 외부 자막 재생·비교, 선택적 상용 LLM 평가, 자막 게시·rollback, WAV·전사본 재사용을 데이터 손실 없이 반복할 수 있다. 내부망 무인증 운영은 그대로 유지하고 인증보다 실행·파일·참조 무결성에 구현 역량을 집중한다.

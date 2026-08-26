@@ -70,6 +70,10 @@ _COMPARISON_TRANSCRIPTION_SQL = (
 )
 
 
+class WorkerLeaseLost(RuntimeError):
+    """Raised when a superseded worker tries to publish stage output."""
+
+
 def _canonical_json_hash(value: Any) -> str:
     encoded = json.dumps(
         value,
@@ -122,6 +126,7 @@ class PipelineJob:
     job_stop_requested: bool
     lease_owner: str | None
     lease_expires_at: float | None
+    lease_token: int
     created_at: float
     status_updated_at: float
     updated_at: float
@@ -387,6 +392,7 @@ class JobStore:
                     job_stop_requested INTEGER NOT NULL DEFAULT 0,
                     lease_owner TEXT,
                     lease_expires_at REAL,
+                    lease_token INTEGER NOT NULL DEFAULT 0,
                     created_at REAL NOT NULL,
                     status_updated_at REAL NOT NULL,
                     updated_at REAL NOT NULL
@@ -637,6 +643,10 @@ class JobStore:
                 ),
                 "lease_expires_at": (
                     "ALTER TABLE jobs ADD COLUMN lease_expires_at REAL"
+                ),
+                "lease_token": (
+                    "ALTER TABLE jobs ADD COLUMN "
+                    "lease_token INTEGER NOT NULL DEFAULT 0"
                 ),
             }
             for column, statement in migrations.items():
@@ -1308,6 +1318,7 @@ class JobStore:
                 if row["lease_expires_at"] is not None
                 else None
             ),
+            lease_token=int(row["lease_token"]),
             created_at=float(row["created_at"]),
             status_updated_at=float(row["status_updated_at"]),
             updated_at=float(row["updated_at"]),
@@ -1600,7 +1611,7 @@ class JobStore:
         *,
         lease_owner: str = "legacy-dispatcher",
         lease_seconds: float = 60.0,
-    ) -> bool:
+    ) -> int | None:
         if not lease_owner.strip():
             raise ValueError("lease owner is required")
         if lease_seconds <= 0:
@@ -1623,6 +1634,7 @@ class JobStore:
                 "UPDATE jobs SET status = ?, phase = ?, state = ?, "
                 "reason_code = NULL, blocked_stage = NULL, error = NULL, "
                 "lease_owner = ?, lease_expires_at = ?, "
+                "lease_token = lease_token + 1, "
                 "status_updated_at = ?, updated_at = ? "
                 "WHERE id = ? AND status = ? AND job_stop_requested = 0 "
                 "AND (lease_expires_at IS NULL OR lease_expires_at <= ?)"
@@ -1640,10 +1652,19 @@ class JobStore:
                     now,
                 ),
             )
-        claimed = result.rowcount == 1
-        if claimed:
+            claimed = connection.execute(
+                "SELECT lease_token FROM jobs "
+                "WHERE id = ? AND lease_owner = ?",
+                (job_id, lease_owner),
+            ).fetchone()
+        lease_token = (
+            int(claimed["lease_token"])
+            if result.rowcount == 1 and claimed is not None
+            else None
+        )
+        if lease_token is not None:
             self._notify_change(job_id)
-        return claimed
+        return lease_token
 
     def recoverable_running_jobs(
         self,
@@ -1674,7 +1695,7 @@ class JobStore:
         *,
         lease_owner: str,
         lease_seconds: float,
-    ) -> bool:
+    ) -> int | None:
         if not lease_owner.strip():
             raise ValueError("lease owner is required")
         if lease_seconds <= 0:
@@ -1684,7 +1705,8 @@ class JobStore:
             result = connection.execute(
                 """
                 UPDATE jobs
-                SET lease_owner = ?, lease_expires_at = ?
+                SET lease_owner = ?, lease_expires_at = ?,
+                    lease_token = lease_token + 1
                 WHERE id = ? AND status = ?
                   AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
                 """,
@@ -1696,21 +1718,38 @@ class JobStore:
                     now,
                 ),
             )
-        return result.rowcount == 1
+            claimed = connection.execute(
+                "SELECT lease_token FROM jobs "
+                "WHERE id = ? AND lease_owner = ?",
+                (job_id, lease_owner),
+            ).fetchone()
+        if result.rowcount != 1 or claimed is None:
+            return None
+        return int(claimed["lease_token"])
 
     def refresh_job_lease(
         self,
         job_id: str,
         *,
         lease_owner: str,
+        lease_token: int | None = None,
         lease_seconds: float,
     ) -> bool:
         if lease_seconds <= 0:
             raise ValueError("lease seconds must be positive")
         now = time.time()
+        token_condition = " AND lease_token = ?" if lease_token is not None else ""
+        parameters: list[Any] = [
+            now + lease_seconds,
+            job_id,
+            lease_owner,
+            now,
+        ]
+        if lease_token is not None:
+            parameters.append(lease_token)
         with self._connect() as connection:
             result = connection.execute(
-                """
+                f"""
                 UPDATE jobs
                 SET lease_expires_at = ?
                 WHERE id = ? AND lease_owner = ?
@@ -1719,22 +1758,87 @@ class JobStore:
                       'extracting', 'transcription_running',
                       'translation_running', 'rendering'
                   )
+                  {token_condition}
                 """,
-                (now + lease_seconds, job_id, lease_owner, now),
+                parameters,
             )
         return result.rowcount == 1
 
-    def release_job_lease(self, job_id: str, *, lease_owner: str) -> bool:
+    def release_job_lease(
+        self,
+        job_id: str,
+        *,
+        lease_owner: str,
+        lease_token: int | None = None,
+    ) -> bool:
+        token_condition = " AND lease_token = ?" if lease_token is not None else ""
+        parameters: list[Any] = [job_id, lease_owner]
+        if lease_token is not None:
+            parameters.append(lease_token)
         with self._connect() as connection:
             result = connection.execute(
-                """
+                f"""
                 UPDATE jobs
                 SET lease_owner = NULL, lease_expires_at = NULL
                 WHERE id = ? AND lease_owner = ?
+                {token_condition}
                 """,
-                (job_id, lease_owner),
+                parameters,
             )
         return result.rowcount == 1
+
+    def update_if_lease(
+        self,
+        job_id: str,
+        *,
+        lease_owner: str,
+        lease_token: int,
+        **fields: Any,
+    ) -> bool:
+        if not fields:
+            return False
+        fields = self._with_structured_state(job_id, fields)
+        self._validate_structured_fields(fields)
+        unknown = set(fields) - self._UPDATABLE_FIELDS
+        if unknown:
+            raise ValueError(f"unsupported job fields: {sorted(unknown)}")
+        assignments = [f"{field} = ?" for field in fields]
+        values = [fields[field] for field in fields]
+        now = time.time()
+        if "status" in fields:
+            assignments.append("status_updated_at = ?")
+            values.append(now)
+        assignments.append("updated_at = ?")
+        values.extend([now, job_id, lease_owner, lease_token, now])
+        with self._connect() as connection:
+            result = connection.execute(
+                f"UPDATE jobs SET {', '.join(assignments)} "
+                "WHERE id = ? AND lease_owner = ? AND lease_token = ? "
+                "AND lease_expires_at > ?",
+                values,
+            )
+        updated = result.rowcount == 1
+        if updated:
+            self._notify_change(job_id)
+        return updated
+
+    def lease_is_active(
+        self,
+        job_id: str,
+        *,
+        lease_owner: str,
+        lease_token: int,
+    ) -> bool:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT 1 FROM jobs
+                WHERE id = ? AND lease_owner = ? AND lease_token = ?
+                  AND lease_expires_at > ?
+                """,
+                (job_id, lease_owner, lease_token, time.time()),
+            ).fetchone()
+        return row is not None
 
     def update(self, job_id: str, **fields: Any) -> None:
         if not fields:
@@ -2573,7 +2677,11 @@ class JobStore:
         *,
         srt_path: str,
         ass_path: str,
+        lease_owner: str | None = None,
+        lease_token: int | None = None,
     ) -> dict[str, Any]:
+        if (lease_owner is None) != (lease_token is None):
+            raise ValueError("lease owner and token must be provided together")
         now = time.time()
         with self._connect() as connection:
             generation = connection.execute(
@@ -2589,6 +2697,19 @@ class JobStore:
                 raise ValueError("subtitle generation not found")
             job_id = str(generation["job_id"])
             source_rel = str(generation["source_rel"])
+            if lease_owner is not None and lease_token is not None:
+                owned = connection.execute(
+                    """
+                    UPDATE jobs
+                    SET lease_expires_at = lease_expires_at
+                    WHERE id = ? AND status = 'rendering'
+                      AND lease_owner = ? AND lease_token = ?
+                      AND lease_expires_at > ?
+                    """,
+                    (job_id, lease_owner, lease_token, now),
+                )
+                if owned.rowcount != 1:
+                    raise WorkerLeaseLost("worker lease was superseded")
             connection.execute(
                 """
                 INSERT INTO subtitle_publications (

@@ -22,7 +22,12 @@ from .contracts import (
     validate_transcript,
     validate_translation_items,
 )
-from .files import copy_files_atomic, sha256_file, write_json_atomic
+from .files import (
+    copy_files_atomic,
+    exclusive_file_lock,
+    sha256_file,
+    write_json_atomic,
+)
 from .hybrid_stt import HybridRescueOptions
 from .kotoba import DEFAULT_CHUNK_LENGTH_SECONDS, TranscriptionOptions
 from .path_display import PathDisplayRule
@@ -39,6 +44,7 @@ from .job_store import (
     PromptCategory,
     RETRYABLE_STATUSES,
     SUCCESS_STATUSES,
+    WorkerLeaseLost,
 )
 from .job_state import JobReason, JobState
 from .service_clients import (
@@ -743,13 +749,18 @@ class SubtitleOrchestrator:
         interrupted = self.store.recoverable_running_jobs(RUNNING_STATUSES)
         recovered = 0
         for job in interrupted:
-            if not self.store.claim_recovery_lease(
+            lease_token = self.store.claim_recovery_lease(
                 job.id,
                 job.status,
                 lease_owner=self._worker_id,
                 lease_seconds=JOB_LEASE_SECONDS,
-            ):
+            )
+            if lease_token is None:
                 continue
+            claimed_job = self.store.get(job.id)
+            if claimed_job is None:
+                continue
+            job = claimed_job
             recovered += 1
             stage = RUNNING_STAGE_BY_STATUS[job.status]
             if job.job_stop_requested:
@@ -768,9 +779,10 @@ class SubtitleOrchestrator:
                         job.id,
                         "transcription",
                         self._cancel_interrupted_transcription,
+                        lease_token,
                     )
                 else:
-                    self._mark_job_stopped(job.id, stage)
+                    self._mark_job_stopped(job, stage)
                 continue
 
             if (
@@ -790,6 +802,7 @@ class SubtitleOrchestrator:
                     job.id,
                     "transcription",
                     self._transcribe,
+                    lease_token,
                 )
                 continue
 
@@ -820,9 +833,10 @@ class SubtitleOrchestrator:
             }
             if target_status != "translation_paused":
                 fields["translation_pause_requested"] = 0
-            if self.store.update_if_status(
+            if self.store.update_if_lease(
                 job.id,
-                {job.status},
+                lease_owner=self._worker_id,
+                lease_token=lease_token,
                 **fields,
             ):
                 self.store.add_event(
@@ -2469,13 +2483,14 @@ class SubtitleOrchestrator:
     ) -> bool:
         waiting_ids = self.store.dispatchable_ids_with_status(waiting)
         for job_id in waiting_ids:
-            if not self.store.claim_for_dispatch(
+            lease_token = self.store.claim_for_dispatch(
                 job_id,
                 waiting,
                 running,
                 lease_owner=self._worker_id,
                 lease_seconds=JOB_LEASE_SECONDS,
-            ):
+            )
+            if lease_token is None:
                 continue
             self.store.add_event(job_id, "info", f"{stage} started")
             executor.submit(
@@ -2483,6 +2498,7 @@ class SubtitleOrchestrator:
                 job_id,
                 stage,
                 operation,
+                lease_token,
             )
             return True
         return False
@@ -2492,9 +2508,20 @@ class SubtitleOrchestrator:
         job_id: str,
         stage: str,
         operation: Callable[[PipelineJob], None],
+        expected_lease_token: int | None = None,
     ) -> None:
         job = self.store.get(job_id)
         if job is None:
+            return
+        if expected_lease_token is not None and (
+            job.lease_owner != self._worker_id
+            or job.lease_token != expected_lease_token
+        ):
+            LOGGER.warning(
+                "discarded superseded %s stage for job %s",
+                stage,
+                job_id,
+            )
             return
         lease_stop: threading.Event | None = None
         lease_heartbeat: threading.Thread | None = None
@@ -2502,7 +2529,7 @@ class SubtitleOrchestrator:
             lease_stop = threading.Event()
             lease_heartbeat = threading.Thread(
                 target=self._lease_heartbeat_loop,
-                args=(job_id, lease_stop),
+                args=(job_id, job.lease_token, lease_stop),
                 name=f"pipeline-lease-{job_id[:8]}",
                 daemon=True,
             )
@@ -2511,8 +2538,14 @@ class SubtitleOrchestrator:
             self._raise_if_job_stop_requested(job_id)
             operation(job)
             self._raise_if_job_stop_requested(job_id)
+        except WorkerLeaseLost:
+            LOGGER.warning(
+                "discarded superseded %s result for job %s",
+                stage,
+                job_id,
+            )
         except OperationStopped:
-            self._mark_job_stopped(job_id, stage)
+            self._mark_job_stopped(job, stage)
         except RemoteTranscriptionFailed as error:
             message = self._sanitize_error(str(error))
             reason_by_failure_code = {
@@ -2532,19 +2565,20 @@ class SubtitleOrchestrator:
             blocked = bool(error.retryable) or (
                 error.failure_code == "auth_required"
             )
+            if not self._update_stage_job(
+                job,
+                status="blocked" if blocked else "failed",
+                blocked_stage=stage,
+                reason_code=reason_code,
+                error=message,
+            ):
+                return
             if error.failure_code == "auth_required":
                 self._set_stt_gate(
                     "lost",
                     message,
                     reason_code=JobReason.AUTH_REQUIRED.value,
                 )
-            self.store.update(
-                job_id,
-                status="blocked" if blocked else "failed",
-                blocked_stage=stage,
-                reason_code=reason_code,
-                error=message,
-            )
             outcome = "blocked" if blocked else "failed"
             level = "warning" if blocked else "error"
             self.store.add_event(
@@ -2561,6 +2595,18 @@ class SubtitleOrchestrator:
             )
         except ExternalServiceError as error:
             message = self._sanitize_error(str(error))
+            if not self._update_stage_job(
+                job,
+                status="blocked",
+                blocked_stage=stage,
+                reason_code=(
+                    JobReason.LM_UNAVAILABLE.value
+                    if stage == "translation"
+                    else JobReason.STT_UNAVAILABLE.value
+                ),
+                error=message,
+            ):
+                return
             if stage == "transcription":
                 self._set_stt_gate(
                     "lost",
@@ -2573,41 +2619,32 @@ class SubtitleOrchestrator:
                     message,
                     reason_code=JobReason.LM_UNAVAILABLE.value,
                 )
-            self.store.update(
-                job_id,
-                status="blocked",
-                blocked_stage=stage,
-                reason_code=(
-                    JobReason.LM_UNAVAILABLE.value
-                    if stage == "translation"
-                    else JobReason.STT_UNAVAILABLE.value
-                ),
-                error=message,
-            )
             self.store.add_event(job_id, "warning", f"{stage} blocked: {message}")
             LOGGER.warning("job %s %s blocked: %s", job_id, stage, message)
         except TranslationPaused:
             current = self.store.get(job_id)
             if current is not None and current.job_stop_requested:
-                self._mark_job_stopped(job_id, stage)
+                self._mark_job_stopped(job, stage)
             else:
-                self.store.update(
-                    job_id,
+                if not self._update_stage_job(
+                    job,
                     status="translation_paused",
                     blocked_stage=None,
                     error=None,
                     translation_pause_requested=1,
-                )
+                ):
+                    return
                 self.store.add_event(job_id, "info", "translation paused")
         except BaseException as error:
             message = self._sanitize_error(str(error) or error.__class__.__name__)
-            self.store.update(
-                job_id,
+            if not self._update_stage_job(
+                job,
                 status="failed",
                 blocked_stage=stage,
                 reason_code=JobReason.INTERNAL_ERROR.value,
                 error=message,
-            )
+            ):
+                return
             self.store.add_event(job_id, "error", f"{stage} failed: {message}")
             LOGGER.exception("job %s %s failed", job_id, stage)
         finally:
@@ -2619,11 +2656,13 @@ class SubtitleOrchestrator:
                 self.store.release_job_lease(
                     job_id,
                     lease_owner=self._worker_id,
+                    lease_token=job.lease_token,
                 )
 
     def _lease_heartbeat_loop(
         self,
         job_id: str,
+        lease_token: int,
         stop_event: threading.Event,
     ) -> None:
         while not stop_event.wait(JOB_LEASE_HEARTBEAT_SECONDS):
@@ -2631,6 +2670,7 @@ class SubtitleOrchestrator:
                 if not self.store.refresh_job_lease(
                     job_id,
                     lease_owner=self._worker_id,
+                    lease_token=lease_token,
                     lease_seconds=JOB_LEASE_SECONDS,
                 ):
                     return
@@ -2642,9 +2682,24 @@ class SubtitleOrchestrator:
         if current is not None and current.job_stop_requested:
             raise OperationStopped("job stop requested")
 
-    def _mark_job_stopped(self, job_id: str, stage: str) -> None:
-        self.store.update(
-            job_id,
+    def _update_stage_job(self, job: PipelineJob, **fields: Any) -> bool:
+        if job.lease_owner == self._worker_id and job.lease_token > 0:
+            return self.store.update_if_lease(
+                job.id,
+                lease_owner=self._worker_id,
+                lease_token=job.lease_token,
+                **fields,
+            )
+        self.store.update(job.id, **fields)
+        return True
+
+    def _require_stage_update(self, job: PipelineJob, **fields: Any) -> None:
+        if not self._update_stage_job(job, **fields):
+            raise WorkerLeaseLost("worker lease was superseded")
+
+    def _mark_job_stopped(self, job: PipelineJob, stage: str) -> None:
+        if not self._update_stage_job(
+            job,
             status="blocked",
             state=JobState.STOPPED.value,
             reason_code=JobReason.USER_STOP.value,
@@ -2652,8 +2707,9 @@ class SubtitleOrchestrator:
             error=USER_STOP_MESSAGE,
             translation_pause_requested=0,
             job_stop_requested=0,
-        )
-        self.store.add_event(job_id, "warning", "job stopped by user request")
+        ):
+            return
+        self.store.add_event(job.id, "warning", "job stopped by user request")
 
     def _extract(self, job: PipelineJob) -> None:
         source = self.library.resolve_file(job.source_rel)
@@ -2674,8 +2730,8 @@ class SubtitleOrchestrator:
         next_status = (
             "audio_completed" if job.operation == "extract" else "audio_ready"
         )
-        self.store.update(
-            job.id,
+        self._require_stage_update(
+            job,
             status=next_status,
             audio_path=str(audio_path),
             audio_sha256=digest,
@@ -2778,7 +2834,7 @@ class SubtitleOrchestrator:
         )
 
         def save_remote_job(remote_job_id: str) -> None:
-            self.store.update(job.id, stt_job_id=remote_job_id)
+            self._require_stage_update(job, stt_job_id=remote_job_id)
             self.store.add_event(
                 job.id,
                 "info",
@@ -2789,8 +2845,8 @@ class SubtitleOrchestrator:
             created = int(progress["created"])
             completed = int(progress["completed"])
             report_every = int(progress.get("report_every", 10))
-            self.store.update(
-                job.id,
+            self._require_stage_update(
+                job,
                 chunks_created=created,
                 chunks_completed=completed,
                 chunk_progress_every=report_every,
@@ -2864,8 +2920,8 @@ class SubtitleOrchestrator:
             if current is not None
             else 0
         )
-        self.store.update(
-            job.id,
+        self._require_stage_update(
+            job,
             status=next_status,
             transcript_path=str(transcript_path),
             chunks_created=final_chunk_total,
@@ -3212,7 +3268,10 @@ class SubtitleOrchestrator:
                 "translation",
             )
         )
-        self.store.update(job.id, translation_path=str(translation_path))
+        self._require_stage_update(
+            job,
+            translation_path=str(translation_path),
+        )
         generation = self._create_translation_generation(
             job,
             transcript_payload,
@@ -3346,8 +3405,8 @@ class SubtitleOrchestrator:
         )
 
         def update_translation_progress(completed: int, total: int) -> None:
-            self.store.update(
-                job.id,
+            self._require_stage_update(
+                job,
                 translation_chunks_total=progress_base + total,
                 translation_chunks_completed=progress_base + completed,
             )
@@ -3441,8 +3500,8 @@ class SubtitleOrchestrator:
             translations=completed_translations,
         )
         refreshed = self.store.get(job.id)
-        self.store.update(
-            job.id,
+        self._require_stage_update(
+            job,
             status="translated",
             translation_pause_requested=0,
             translation_chunks_completed=(
@@ -3691,25 +3750,58 @@ class SubtitleOrchestrator:
     ) -> dict[str, Any]:
         if not self._subtitle_generation_files_valid(generation):
             raise ValueError("subtitle generation file is invalid")
-        if copy_to_media:
-            copy_files_atomic(
-                (
-                    (Path(str(generation["srt_artifact_path"])), srt_path),
-                    (Path(str(generation["ass_artifact_path"])), ass_path),
-                ),
-                overwrite=overwrite,
+        lease_owner = (
+            self._worker_id
+            if job.lease_owner == self._worker_id and job.lease_token > 0
+            else None
+        )
+        lease_token = job.lease_token if lease_owner is not None else None
+        lock_path = self._subtitle_publication_manifest_path(
+            job.source_rel
+        ).with_suffix(".lock")
+        with exclusive_file_lock(lock_path):
+            if lease_owner is not None and lease_token is not None:
+                if not self.store.lease_is_active(
+                    job.id,
+                    lease_owner=lease_owner,
+                    lease_token=lease_token,
+                ):
+                    raise WorkerLeaseLost("worker lease was superseded")
+            if copy_to_media:
+                copy_files_atomic(
+                    (
+                        (
+                            Path(str(generation["srt_artifact_path"])),
+                            srt_path,
+                        ),
+                        (
+                            Path(str(generation["ass_artifact_path"])),
+                            ass_path,
+                        ),
+                    ),
+                    overwrite=overwrite,
+                )
+            if lease_owner is not None and lease_token is not None:
+                if not self.store.refresh_job_lease(
+                    job.id,
+                    lease_owner=lease_owner,
+                    lease_token=lease_token,
+                    lease_seconds=JOB_LEASE_SECONDS,
+                ):
+                    raise WorkerLeaseLost("worker lease was superseded")
+            self._write_subtitle_publication_manifest(
+                job,
+                generation,
+                srt_path=srt_path,
+                ass_path=ass_path,
             )
-        self._write_subtitle_publication_manifest(
-            job,
-            generation,
-            srt_path=srt_path,
-            ass_path=ass_path,
-        )
-        return self.store.publish_subtitle_generation(
-            str(generation["id"]),
-            srt_path=str(srt_path),
-            ass_path=str(ass_path),
-        )
+            return self.store.publish_subtitle_generation(
+                str(generation["id"]),
+                srt_path=str(srt_path),
+                ass_path=str(ass_path),
+                lease_owner=lease_owner,
+                lease_token=lease_token,
+            )
 
     def _capture_legacy_subtitle_generation(
         self,

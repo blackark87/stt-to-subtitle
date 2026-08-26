@@ -2,8 +2,9 @@ import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import threading
+import time
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 
 from stt_to_subtitle.web_config import (
     RemoteServerSettings,
@@ -651,6 +652,61 @@ class SubtitleOrchestratorTests(unittest.TestCase):
             self.assertEqual(completed.status, "audio_ready")
             self.assertIsNone(completed.lease_owner)
             self.assertIsNone(completed.lease_expires_at)
+
+    def test_superseded_worker_cannot_persist_a_stage_result(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            orchestrator = self.make_orchestrator(root, media_root)
+            try:
+                job = orchestrator.store.create(
+                    job_id="lease-fenced",
+                    source_rel="movie.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                lease_token = orchestrator.store.claim_for_dispatch(
+                    job.id,
+                    "queued",
+                    "extracting",
+                    lease_owner=orchestrator._worker_id,
+                    lease_seconds=60,
+                )
+                replacement_token: list[int] = []
+
+                def supersede(stage_job):
+                    orchestrator.store.update(
+                        job.id,
+                        lease_expires_at=time.time() - 1,
+                    )
+                    claimed = orchestrator.store.claim_recovery_lease(
+                        job.id,
+                        "extracting",
+                        lease_owner="replacement-worker",
+                        lease_seconds=60,
+                    )
+                    self.assertIsNotNone(claimed)
+                    replacement_token.append(claimed)
+                    orchestrator._require_stage_update(
+                        stage_job,
+                        status="audio_ready",
+                    )
+
+                orchestrator._run_stage(
+                    job.id,
+                    "audio extraction",
+                    supersede,
+                    lease_token,
+                )
+                fenced = orchestrator.store.get(job.id)
+            finally:
+                orchestrator.stop()
+
+            self.assertEqual(replacement_token, [lease_token + 1])
+            self.assertEqual(fenced.status, "extracting")
+            self.assertEqual(fenced.lease_owner, "replacement-worker")
+            self.assertEqual(fenced.lease_token, replacement_token[0])
 
     def test_requires_web_server_settings_before_creating_job(self) -> None:
         with TemporaryDirectory() as directory:
@@ -1710,12 +1766,14 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                     remote.id,
                     "transcription",
                     orchestrator._transcribe,
+                    ANY,
                 )
                 orchestrator._stt_executor.submit.assert_any_call(
                     orchestrator._run_stage,
                     remote_stopping.id,
                     "transcription",
                     orchestrator._cancel_interrupted_transcription,
+                    ANY,
                 )
             finally:
                 orchestrator.stop()
@@ -2622,7 +2680,14 @@ class _RecordingExecutor:
     def __init__(self) -> None:
         self.submitted: list[tuple[str, str]] = []
 
-    def submit(self, _run_stage, job_id, stage, _operation):  # noqa: ANN001
+    def submit(  # noqa: ANN001
+        self,
+        _run_stage,
+        job_id,
+        stage,
+        _operation,
+        _lease_token,
+    ):
         self.submitted.append((stage, job_id))
 
     def shutdown(self, **_kwargs) -> None:

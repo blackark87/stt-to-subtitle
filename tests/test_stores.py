@@ -4,7 +4,7 @@ from tempfile import TemporaryDirectory
 import time
 import unittest
 
-from stt_to_subtitle.job_store import JobStore
+from stt_to_subtitle.job_store import JobStore, WorkerLeaseLost
 from stt_to_subtitle.transcription_store import TranscriptionStore
 
 
@@ -693,7 +693,9 @@ class JobStoreTests(unittest.TestCase):
             leased = store.get(job.id)
 
             self.assertTrue(claimed)
+            self.assertEqual(claimed, 1)
             self.assertEqual(leased.lease_owner, "worker-a")
+            self.assertEqual(leased.lease_token, 1)
             self.assertGreater(leased.lease_expires_at, time.time())
             self.assertFalse(
                 store.claim_recovery_lease(
@@ -707,6 +709,7 @@ class JobStoreTests(unittest.TestCase):
                 store.refresh_job_lease(
                     job.id,
                     lease_owner="worker-b",
+                    lease_token=leased.lease_token,
                     lease_seconds=60,
                 )
             )
@@ -714,6 +717,7 @@ class JobStoreTests(unittest.TestCase):
                 store.refresh_job_lease(
                     job.id,
                     lease_owner="worker-a",
+                    lease_token=leased.lease_token,
                     lease_seconds=60,
                 )
             )
@@ -724,6 +728,7 @@ class JobStoreTests(unittest.TestCase):
                 store.refresh_job_lease(
                     job.id,
                     lease_owner="worker-a",
+                    lease_token=leased.lease_token,
                     lease_seconds=60,
                 )
             )
@@ -731,18 +736,33 @@ class JobStoreTests(unittest.TestCase):
                 [item.id for item in store.recoverable_running_jobs({"extracting"})],
                 [job.id],
             )
-            self.assertTrue(
-                store.claim_recovery_lease(
+            recovered_token = store.claim_recovery_lease(
+                job.id,
+                "extracting",
+                lease_owner="worker-b",
+                lease_seconds=60,
+            )
+            self.assertEqual(recovered_token, 2)
+            self.assertFalse(
+                store.update_if_lease(
                     job.id,
-                    "extracting",
-                    lease_owner="worker-b",
-                    lease_seconds=60,
+                    lease_owner="worker-a",
+                    lease_token=leased.lease_token,
+                    status="audio_ready",
                 )
             )
-            store.update(job.id, status="audio_ready")
+            self.assertTrue(
+                store.update_if_lease(
+                    job.id,
+                    lease_owner="worker-b",
+                    lease_token=recovered_token,
+                    status="audio_ready",
+                )
+            )
             completed = store.get(job.id)
             self.assertIsNone(completed.lease_owner)
             self.assertIsNone(completed.lease_expires_at)
+            self.assertEqual(completed.lease_token, 2)
 
     def test_deletes_a_job_and_its_events(self) -> None:
         with TemporaryDirectory() as directory:
@@ -1143,6 +1163,59 @@ class JobStoreTests(unittest.TestCase):
                 third["id"],
             )
 
+    def test_superseded_worker_cannot_publish_subtitles(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = JobStore(Path(directory) / "jobs.sqlite3")
+            job = store.create(
+                job_id="render-job",
+                source_rel="movie.mkv",
+                force_overwrite=False,
+                options={},
+            )
+            first_token = store.claim_for_dispatch(
+                job.id,
+                "queued",
+                "rendering",
+                lease_owner="worker-a",
+                lease_seconds=60,
+            )
+            generation = store.create_subtitle_generation(
+                generation_id="subtitle-fenced",
+                job_id=job.id,
+                translation_generation_id=None,
+                transcript_hash="transcript-v1",
+                translation_hash="translation-v1",
+                renderer_version="1",
+                render_hash="render-v1",
+                srt_artifact_path="subtitle.srt",
+                ass_artifact_path="subtitle.ass",
+                srt_hash="srt-v1",
+                ass_hash="ass-v1",
+                origin="rendered",
+            )
+            store.update(job.id, lease_expires_at=time.time() - 1)
+            second_token = store.claim_recovery_lease(
+                job.id,
+                "rendering",
+                lease_owner="worker-b",
+                lease_seconds=60,
+            )
+
+            with self.assertRaises(WorkerLeaseLost):
+                store.publish_subtitle_generation(
+                    generation["id"],
+                    srt_path="movie.ko.srt",
+                    ass_path="movie.ko.ass",
+                    lease_owner="worker-a",
+                    lease_token=first_token,
+                )
+
+            fenced = store.get(job.id)
+            self.assertEqual(second_token, first_token + 1)
+            self.assertEqual(fenced.status, "rendering")
+            self.assertEqual(fenced.lease_owner, "worker-b")
+            self.assertIsNone(store.published_subtitle_generation(job.id))
+
     def test_persists_chunk_progress_for_the_job_panel(self) -> None:
         with TemporaryDirectory() as directory:
             store = JobStore(Path(directory) / "jobs.sqlite3")
@@ -1235,6 +1308,7 @@ class JobStoreTests(unittest.TestCase):
             self.assertEqual(job.attempt, 1)
             self.assertIsNone(job.lease_owner)
             self.assertIsNone(job.lease_expires_at)
+            self.assertEqual(job.lease_token, 0)
             stopped = JobStore(database_path).get("job-2")
             self.assertEqual(stopped.phase, "translation")
             self.assertEqual(stopped.state, "stopped")
