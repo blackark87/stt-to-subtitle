@@ -299,6 +299,7 @@
       <details class="card settings-card prompt-category-card{% if category.archived %} is-archived{% endif %}">
         <summary>
           <strong>{{ category.name }}</strong>
+          <span class="status">v{{ category.prompt_revision_number }}</span>
           {% if category.archived %}<span class="status">보관됨</span>{% endif %}
         </summary>
         <form method="post" action="/settings/prompt-categories/{{ category.id }}" class="stack">
@@ -316,6 +317,37 @@
             <button type="submit">프롬프트 저장</button>
           </div>
         </form>
+        {% set revisions = prompt_revisions_by_category.get(category.id, []) %}
+        {% if revisions|length > 1 %}
+          <details class="prompt-revision-history">
+            <summary>이전 리비전 {{ revisions|length - 1 }}개</summary>
+            <div class="prompt-revision-list">
+              {% for revision in revisions %}
+                {% if revision.id != category.prompt_revision_id %}
+                  <article class="prompt-revision-comparison">
+                    <header>v{{ revision.revision_number }}</header>
+                    <div class="prompt-revision-grid">
+                      <section>
+                        <strong>현재 v{{ category.prompt_revision_number }}</strong>
+                        <span class="prompt-revision-field">번역 프롬프트</span>
+                        <pre>{{ category.translation_prompt }}</pre>
+                        <span class="prompt-revision-field">자가검토 프롬프트</span>
+                        <pre>{{ category.review_prompt }}</pre>
+                      </section>
+                      <section>
+                        <strong>v{{ revision.revision_number }}</strong>
+                        <span class="prompt-revision-field">번역 프롬프트</span>
+                        <pre>{{ revision.translation_prompt }}</pre>
+                        <span class="prompt-revision-field">자가검토 프롬프트</span>
+                        <pre>{{ revision.review_prompt }}</pre>
+                      </section>
+                    </div>
+                  </article>
+                {% endif %}
+              {% endfor %}
+            </div>
+          </details>
+        {% endif %}
         {% if category.archived %}
           <form method="post" action="/settings/prompt-categories/{{ category.id }}/restore">
             <input type="hidden" name="csrf_token" value="{{ csrf_token }}">

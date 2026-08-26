@@ -65,7 +65,7 @@
         <span>상태 변경 <time datetime="{{ job.status_updated_at|datetime_iso }}">{{ job.status_updated_at|datetime }}</time></span>
         <code title="작업 ID: {{ job.id }}">#{{ job.id[:8] }}</code>
         {% if job.operation in ["translate", "full"] and job.options.translation_prompt %}
-          <span>프롬프트 {{ job.prompt_category_name }}</span>
+          <span>프롬프트 {{ job.prompt_category_name }}{% if job.options.translation_prompt.revision_number %} · v{{ job.options.translation_prompt.revision_number }}{% endif %}</span>
         {% endif %}
       </div>
       <div class="job-progress-overview">
@@ -157,7 +157,7 @@
           <input type="hidden" name="return_folder" value="{{ current_folder }}">
           <select name="prompt_category_id" aria-label="번역 프롬프트 카테고리" required>
             {% for category in prompt_categories %}
-              <option value="{{ category.id }}"{% if job.options.translation_prompt and job.options.translation_prompt.category_id == category.id %} selected{% endif %}>{{ category.name }}</option>
+              <option value="{{ category.id }}"{% if job.options.translation_prompt and job.options.translation_prompt.revision_id == category.revision_id %} selected{% endif %}>{{ category.name }}</option>
             {% endfor %}
           </select>
           <button type="submit" class="secondary compact">{{ icons.refresh(14) }}번역 다시 시작</button>

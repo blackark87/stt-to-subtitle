@@ -1736,6 +1736,64 @@ class WebAppTests(unittest.TestCase):
             )
             self.assertEqual(restored.status_code, 303)
 
+    def test_compares_and_selects_historical_prompt_revisions(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            (media_root / "movie.mkv").write_bytes(b"media")
+
+            with TestClient(
+                create_app(self.settings(root, media_root))
+            ) as client:
+                service = client.app.state.orchestrator
+                service.stop()
+                category = service.store.get_prompt_category("variety")
+                service.store.update_prompt_category(
+                    category.id,
+                    name=category.name,
+                    translation_prompt="current translation prompt",
+                    review_prompt="current review prompt",
+                )
+                historical = service.store.list_prompt_revisions(
+                    category.id
+                )[0]
+                selection = f"{category.id}@{historical['id']}"
+
+                settings_page = client.get("/settings")
+                media_page = client.get("/media")
+                response = client.post(
+                    "/jobs",
+                    data={
+                        "source_rels": "movie.mkv",
+                        "backend": "hybrid",
+                        "operation": "full",
+                        "prompt_category_id": selection,
+                    },
+                    follow_redirects=False,
+                )
+                job = service.store.latest_jobs_by_source()["movie.mkv"]
+
+            self.assertEqual(settings_page.status_code, 200)
+            self.assertIn("이전 리비전 1개", settings_page.text)
+            self.assertIn("current translation prompt", settings_page.text)
+            self.assertIn(
+                historical["translation_prompt"].splitlines()[0],
+                settings_page.text,
+            )
+            self.assertIn("버라이어티 · v2 (현재)", media_page.text)
+            self.assertIn("버라이어티 · v1", media_page.text)
+            self.assertIn(f'value="{selection}"', media_page.text)
+            self.assertEqual(response.status_code, 303)
+            self.assertEqual(
+                job.options["translation_prompt"]["revision_id"],
+                historical["id"],
+            )
+            self.assertEqual(
+                job.options["translation_prompt"]["translation_prompt"],
+                historical["translation_prompt"],
+            )
+
     def test_queries_openai_compatible_models_for_settings_list(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)

@@ -2022,7 +2022,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             "error": error,
             "notice": notice,
             "remote_servers": service.remote_servers_view(),
-            "prompt_categories": service.active_prompt_categories(),
+            "prompt_categories": service.prompt_revision_choices(),
             "search_query": normalized_query,
             "actor_filter": normalized_actor,
             **browser,
@@ -2405,7 +2405,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                 STT_BACKEND_LABELS[backend]
                 for backend in comparison_backends
             ),
-            "prompt_categories": service.active_prompt_categories(),
+            "prompt_categories": service.prompt_revision_choices(),
             "translation_prompt_category_id": (
                 translation_prompt_category_id
             ),
@@ -2699,7 +2699,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                 "csrf_token": request.session.get("csrf_token", ""),
                 "prompt_categories": orchestrator(
                     request
-                ).active_prompt_categories(),
+                ).prompt_revision_choices(),
                 "notice": (
                     f"선택한 전사 작업 {translations_queued}개를 번역으로 "
                     "전환했습니다."
@@ -2790,6 +2790,14 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             "remote_servers": server_values,
             "subtitle_validator": service.subtitle_validator_view(),
             "prompt_categories": service.all_prompt_categories(),
+            "prompt_revisions_by_category": {
+                category.id: list(
+                    reversed(
+                        service.store.list_prompt_revisions(category.id)
+                    )
+                )
+                for category in service.all_prompt_categories()
+            },
         }
 
     @app.get("/settings", response_class=HTMLResponse)
@@ -3326,7 +3334,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             {
                 "request": request,
                 **context,
-                "prompt_categories": service.active_prompt_categories(),
+                "prompt_categories": service.prompt_revision_choices(),
                 "csrf_token": request.session.get("csrf_token", ""),
             },
         )
@@ -4080,7 +4088,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                     )
                 ],
                 "csrf_token": request.session.get("csrf_token", ""),
-                "prompt_categories": service.active_prompt_categories(),
+                "prompt_categories": service.prompt_revision_choices(),
                 "video_mime_type": guess_media_type(job.source_rel),
                 "external_subtitle": (
                     {
@@ -4158,7 +4166,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                     )
                 ],
                 "csrf_token": request.session.get("csrf_token", ""),
-                "prompt_categories": service.active_prompt_categories(),
+                "prompt_categories": service.prompt_revision_choices(),
                 "video_mime_type": guess_media_type(job.source_rel),
                 "external_subtitle": (
                     {
@@ -4458,7 +4466,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                 ),
                 "status_groups": JOB_STATUS_GROUP_LABELS,
                 "csrf_token": request.session.get("csrf_token", ""),
-                "prompt_categories": service.active_prompt_categories(),
+                "prompt_categories": service.prompt_revision_choices(),
                 "notice": None,
                 "error": str(error),
             }

@@ -1236,6 +1236,31 @@ class JobStore:
             for row in rows
         ]
 
+    def get_prompt_revision(
+        self,
+        category_id: str,
+        revision_id: str,
+    ) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM prompt_revisions
+                WHERE id = ? AND category_id = ?
+                """,
+                (revision_id, category_id),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "id": str(row["id"]),
+            "category_id": str(row["category_id"]),
+            "revision_number": int(row["revision_number"]),
+            "translation_prompt": str(row["translation_prompt"]),
+            "review_prompt": str(row["review_prompt"]),
+            "content_hash": str(row["content_hash"]),
+            "created_at": float(row["created_at"]),
+        }
+
     def set_prompt_category_archived(
         self,
         category_id: str,

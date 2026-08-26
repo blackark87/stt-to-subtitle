@@ -652,17 +652,64 @@ class SubtitleOrchestrator:
             self.store.list_path_display_rules()
         )
 
-    def _prompt_snapshot(self, category_id: str) -> dict[str, Any]:
-        category = self.store.get_prompt_category(category_id.strip())
+    def prompt_revision_choices(self) -> list[dict[str, Any]]:
+        choices: list[dict[str, Any]] = []
+        for category in self.active_prompt_categories():
+            revisions = sorted(
+                self.store.list_prompt_revisions(category.id),
+                key=lambda revision: int(revision["revision_number"]),
+                reverse=True,
+            )
+            for revision in revisions:
+                is_active = revision["id"] == category.prompt_revision_id
+                revision_number = int(revision["revision_number"])
+                choices.append(
+                    {
+                        "id": (
+                            category.id
+                            if is_active
+                            else f"{category.id}@{revision['id']}"
+                        ),
+                        "category_id": category.id,
+                        "name": (
+                            f"{category.name} · v{revision_number}"
+                            + (" (현재)" if is_active else "")
+                        ),
+                        "revision_id": str(revision["id"]),
+                        "revision_number": revision_number,
+                        "is_active": is_active,
+                    }
+                )
+        return choices
+
+    def _prompt_snapshot(self, selection: str) -> dict[str, Any]:
+        category_id, separator, revision_id = selection.strip().partition("@")
+        category = self.store.get_prompt_category(category_id)
         if category is None or category.archived:
             raise ValueError("사용할 수 있는 번역 프롬프트를 선택하세요.")
+        if separator:
+            revision = self.store.get_prompt_revision(
+                category.id,
+                revision_id,
+            )
+            if revision is None:
+                raise ValueError("사용할 수 있는 번역 프롬프트를 선택하세요.")
+            selected_revision_id = str(revision["id"])
+            selected_revision_number = int(revision["revision_number"])
+            translation_prompt = str(revision["translation_prompt"])
+            review_prompt = str(revision["review_prompt"])
+        else:
+            selected_revision_id = category.prompt_revision_id
+            selected_revision_number = category.prompt_revision_number
+            translation_prompt = category.translation_prompt
+            review_prompt = category.review_prompt
         return {
             "category_id": category.id,
             "category_name": category.name,
-            "revision_id": category.prompt_revision_id,
-            "revision_number": category.prompt_revision_number,
-            "translation_prompt": category.translation_prompt,
-            "review_prompt": category.review_prompt,
+            "revision_id": selected_revision_id,
+            "revision_number": selected_revision_number,
+            "translation_prompt": translation_prompt,
+            "review_prompt": review_prompt,
             "review_rounds": TRANSLATION_REVIEW_ROUNDS,
         }
 

@@ -622,6 +622,15 @@ a.subtitle-state:hover { text-decoration: underline; }
 .prompt-category-card summary strong { margin-right: 8px; }
 .prompt-category-card.is-archived { opacity: .78; }
 .prompt-category-card form { margin-top: 14px; }
+.prompt-revision-history { border-top: 1px solid var(--line); padding-top: 12px; }
+.prompt-revision-history > summary { color: var(--muted); font-size: .86rem; font-weight: 700; }
+.prompt-revision-list { display: grid; gap: 12px; margin-top: 12px; }
+.prompt-revision-comparison { border: 1px solid var(--line); border-radius: var(--radius-control); padding: 12px; background: var(--surface-sunken); }
+.prompt-revision-comparison header { margin-bottom: 10px; font-size: .82rem; font-weight: 750; }
+.prompt-revision-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.prompt-revision-grid section { min-width: 0; }
+.prompt-revision-field { display: block; margin-top: 10px; color: var(--muted); font-size: .72rem; font-weight: 700; }
+.prompt-revision-grid pre { max-height: 18rem; margin: 8px 0 0; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; font-size: .78rem; line-height: 1.5; }
 .result-player-shell { display: grid; gap: 10px; }
 .result-player-shell:focus-visible {
   outline: 3px solid color-mix(in srgb, var(--accent) 45%, transparent);
@@ -1129,6 +1138,7 @@ code { overflow-wrap: anywhere; }
 
   .submit-row > button, .submit-row > .button { flex: 1 1 140px; }
   .path-rule-grid { grid-template-columns: 1fr; }
+  .prompt-revision-grid { grid-template-columns: minmax(0, 1fr); }
   .actions > button, .actions > .button, .actions > form { flex: 1 1 200px; }
   .actions > form { display: grid; gap: 8px; }
   .actions > form > button, .actions > form > .button { width: 100%; }

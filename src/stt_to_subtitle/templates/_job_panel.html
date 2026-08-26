@@ -96,7 +96,7 @@
       <dt>전사 엔진</dt><dd>{{ job.options.backend|stt_backend }}</dd>
     {% endif %}
     {% if job.operation in ["translate", "full"] %}
-      <dt>번역 프롬프트</dt><dd>{{ job.prompt_category_name }}</dd>
+      <dt>번역 프롬프트</dt><dd>{{ job.prompt_category_name }}{% if job.options.translation_prompt and job.options.translation_prompt.revision_number %} · v{{ job.options.translation_prompt.revision_number }}{% endif %}</dd>
     {% endif %}
     {% if job.blocked_stage %}
       <dt>확인 단계</dt>
@@ -126,7 +126,7 @@
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <select name="prompt_category_id" aria-label="번역 프롬프트 카테고리" required>
           {% for category in prompt_categories %}
-            <option value="{{ category.id }}"{% if job.options.translation_prompt and job.options.translation_prompt.category_id == category.id %} selected{% endif %}>{{ category.name }}</option>
+            <option value="{{ category.id }}"{% if job.options.translation_prompt and job.options.translation_prompt.revision_id == category.revision_id %} selected{% endif %}>{{ category.name }}</option>
           {% endfor %}
         </select>
         <button type="submit" class="secondary" title="일본어 전사는 다시 실행하지 않습니다">{{ icons.refresh(16) }}번역부터 다시 시작</button>
@@ -181,7 +181,7 @@
             <select name="prompt_category_id">
               <option value="">번역 작업 시 선택</option>
               {% for category in prompt_categories %}
-                <option value="{{ category.id }}"{% if job.options.translation_prompt and job.options.translation_prompt.category_id == category.id %} selected{% endif %}>{{ category.name }}</option>
+                <option value="{{ category.id }}"{% if job.options.translation_prompt and job.options.translation_prompt.revision_id == category.revision_id %} selected{% endif %}>{{ category.name }}</option>
               {% endfor %}
             </select>
           </label>

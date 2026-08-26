@@ -1098,6 +1098,52 @@ class SubtitleOrchestratorTests(unittest.TestCase):
             self.assertEqual(original.id, reused.id)
             self.assertEqual([job.id for job in all_jobs], [transcribed.id])
 
+    def test_selects_a_historical_prompt_revision_for_a_new_job(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            (media_root / "movie.mkv").write_bytes(b"media")
+            orchestrator = self.make_orchestrator(root, media_root)
+            try:
+                original = orchestrator.store.get_prompt_category("variety")
+                updated = orchestrator.store.update_prompt_category(
+                    "variety",
+                    name=original.name,
+                    translation_prompt="current translation prompt",
+                    review_prompt="current review prompt",
+                )
+                revisions = orchestrator.store.list_prompt_revisions("variety")
+                historical = revisions[0]
+                selection = f"variety@{historical['id']}"
+                choices = orchestrator.prompt_revision_choices()
+
+                job = orchestrator.create_job(
+                    "movie.mkv",
+                    force_overwrite=False,
+                    options={},
+                    operation="full",
+                    prompt_category_id=selection,
+                )
+
+                snapshot = job.options["translation_prompt"]
+                self.assertEqual(updated.prompt_revision_number, 2)
+                self.assertEqual(snapshot["revision_id"], historical["id"])
+                self.assertEqual(snapshot["revision_number"], 1)
+                self.assertEqual(
+                    snapshot["translation_prompt"],
+                    historical["translation_prompt"],
+                )
+                self.assertIn(
+                    selection,
+                    [choice["id"] for choice in choices],
+                )
+                self.assertIn("variety", [choice["id"] for choice in choices])
+                with self.assertRaisesRegex(ValueError, "사용할 수 있는"):
+                    orchestrator._prompt_snapshot(f"jav@{historical['id']}")
+            finally:
+                orchestrator.stop()
+
     def test_pauses_waiting_translation_and_resumes_checkpoint(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
