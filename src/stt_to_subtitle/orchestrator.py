@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import asdict
 import hashlib
 import json
@@ -15,7 +15,7 @@ from typing import Any, Callable, Mapping, Sequence
 from uuid import uuid4
 import wave
 
-from .artifacts import artifact_path
+from .artifacts import artifact_filename, artifact_path
 from .audio import AudioExtraction, extract_audio
 from .contracts import (
     TRANSLATION_SCHEMA_VERSION,
@@ -99,6 +99,7 @@ RUNNING_STAGE_BY_STATUS = {
 }
 JOB_LEASE_SECONDS = 60.0
 JOB_LEASE_HEARTBEAT_SECONDS = 15.0
+JOB_SHUTDOWN_GRACE_SECONDS = 5.0
 
 
 def _canonical_payload_hash(value: Any) -> str:
@@ -279,6 +280,8 @@ class SubtitleOrchestrator:
         self._stt_gate_lock = threading.RLock()
         self._lm_gate_lock = threading.RLock()
         self._subtitle_publication_lock = threading.RLock()
+        self._stage_futures_lock = threading.RLock()
+        self._stage_futures: set[Future[Any]] = set()
         self._worker_id = f"web-{uuid4().hex}"
         saved_lm_gate = self.store.get_dependency_state("translation_lm")
         if settings.lm_manual_start:
@@ -774,8 +777,8 @@ class SubtitleOrchestrator:
                         "service restart detected; confirming requested "
                         "remote transcription cancellation",
                     )
-                    self._stt_executor.submit(
-                        self._run_stage,
+                    self._submit_stage(
+                        self._stt_executor,
                         job.id,
                         "transcription",
                         self._cancel_interrupted_transcription,
@@ -797,8 +800,8 @@ class SubtitleOrchestrator:
                     "service restart detected; reconnecting remote "
                     f"transcription {job.stt_job_id}",
                 )
-                self._stt_executor.submit(
-                    self._run_stage,
+                self._submit_stage(
+                    self._stt_executor,
                     job.id,
                     "transcription",
                     self._transcribe,
@@ -900,7 +903,13 @@ class SubtitleOrchestrator:
             return "translation_paused"
         return "transcribed"
 
-    def stop(self) -> None:
+    def stop(
+        self,
+        *,
+        grace_seconds: float = JOB_SHUTDOWN_GRACE_SECONDS,
+    ) -> None:
+        if grace_seconds < 0:
+            raise ValueError("shutdown grace seconds cannot be negative")
         self._stop_event.set()
         if self._scheduler.is_alive():
             self._scheduler.join(timeout=5)
@@ -911,6 +920,15 @@ class SubtitleOrchestrator:
             self._translation_executor,
         ):
             executor.shutdown(wait=False, cancel_futures=True)
+        with self._stage_futures_lock:
+            active = set(self._stage_futures)
+        if active:
+            _done, pending = wait(active, timeout=grace_seconds)
+            if pending:
+                LOGGER.warning(
+                    "shutdown grace expired with %d pipeline stage(s) active",
+                    len(pending),
+                )
 
     def create_job(
         self,
@@ -1099,8 +1117,14 @@ class SubtitleOrchestrator:
                     audio_sha256=(
                         reusable_audio.audio_sha256 if audio_available else None
                     ),
+                    audio_revision_id=(
+                        reusable_audio.audio_revision_id
+                        if audio_available
+                        else None
+                    ),
                     stt_job_id=None,
                     transcript_path=None,
+                    transcript_revision_id=None,
                     translation_path=None,
                     srt_path=None,
                     ass_path=None,
@@ -1163,21 +1187,42 @@ class SubtitleOrchestrator:
                     force_overwrite=force_overwrite,
                     options=reusable_options,
                     operation="translate",
-                )
-                transcript_path = artifact_path(
-                    self.settings.jobs_dir,
-                    created.id,
-                    source_rel,
-                    "transcript",
-                )
-                write_json_atomic(transcript_path, transcript_payload)
-                self.store.update(
-                    created.id,
-                    status="transcribed",
                     audio_path=reusable.audio_path,
                     audio_sha256=reusable.audio_sha256,
-                    transcript_path=str(transcript_path),
+                    audio_revision_id=reusable.audio_revision_id,
                 )
+                revision_id = uuid4().hex
+                transcript_payload["revision"] = {
+                    "id": revision_id,
+                    "source_revision_id": reusable.transcript_revision_id,
+                    "origin": "imported",
+                }
+                transcript_path = (
+                    self.settings.jobs_dir
+                    / created.id
+                    / "transcript-revisions"
+                    / revision_id
+                    / artifact_filename(source_rel, "transcript")
+                )
+                write_json_atomic(transcript_path, transcript_payload)
+                persisted = self.store.record_transcript_revision(
+                    revision_id=revision_id,
+                    job_id=created.id,
+                    audio_revision_id=reusable.audio_revision_id,
+                    remote_job_id=reusable.stt_job_id,
+                    backend=str(reusable.options.get("backend", "imported")),
+                    model_revision="imported",
+                    options_hash=_canonical_payload_hash(reusable.options),
+                    artifact_path=str(transcript_path),
+                    content_hash=sha256_file(transcript_path),
+                    origin="imported",
+                    status="transcribed",
+                    chunks_total=reusable.transcription_chunks_total,
+                )
+                if not persisted:
+                    raise RuntimeError(
+                        "imported transcript revision was not saved"
+                    )
                 self.store.add_event(
                     created.id,
                     "info",
@@ -1322,6 +1367,11 @@ class SubtitleOrchestrator:
                     audio_path=audio_path,
                     audio_sha256=(
                         reusable_audio.audio_sha256
+                        if reusable_audio is not None
+                        else None
+                    ),
+                    audio_revision_id=(
+                        reusable_audio.audio_revision_id
                         if reusable_audio is not None
                         else None
                     ),
@@ -1551,21 +1601,40 @@ class SubtitleOrchestrator:
                 force_overwrite=True,
                 options=options,
                 operation="translate",
-            )
-            transcript_path = artifact_path(
-                self.settings.jobs_dir,
-                created.id,
-                created.source_rel,
-                "transcript",
-            )
-            write_json_atomic(transcript_path, transcript_payload)
-            self.store.update(
-                created.id,
-                status="transcribed",
                 audio_path=reusable.audio_path,
                 audio_sha256=reusable.audio_sha256,
-                transcript_path=str(transcript_path),
+                audio_revision_id=reusable.audio_revision_id,
             )
+            revision_id = uuid4().hex
+            transcript_payload["revision"] = {
+                "id": revision_id,
+                "source_revision_id": reusable.transcript_revision_id,
+                "origin": "imported",
+            }
+            transcript_path = (
+                self.settings.jobs_dir
+                / created.id
+                / "transcript-revisions"
+                / revision_id
+                / artifact_filename(created.source_rel, "transcript")
+            )
+            write_json_atomic(transcript_path, transcript_payload)
+            persisted = self.store.record_transcript_revision(
+                revision_id=revision_id,
+                job_id=created.id,
+                audio_revision_id=reusable.audio_revision_id,
+                remote_job_id=reusable.stt_job_id,
+                backend=str(reusable.options.get("backend", "imported")),
+                model_revision="imported",
+                options_hash=_canonical_payload_hash(reusable.options),
+                artifact_path=str(transcript_path),
+                content_hash=sha256_file(transcript_path),
+                origin="imported",
+                status="transcribed",
+                chunks_total=reusable.transcription_chunks_total,
+            )
+            if not persisted:
+                raise RuntimeError("imported transcript revision was not saved")
             self.store.add_event(
                 created.id,
                 "info",
@@ -2384,7 +2453,41 @@ class SubtitleOrchestrator:
                 [str(segment["id"]) for segment in segments],
             )
 
-        artifact = Path(selected_path)
+        if kind == "transcript":
+            revision_id = uuid4().hex
+            payload = {
+                **dict(payload),
+                "revision": {
+                    "id": revision_id,
+                    "supersedes_revision_id": job.transcript_revision_id,
+                    "origin": "manual",
+                },
+            }
+            artifact = (
+                self.settings.jobs_dir
+                / job.id
+                / "transcript-revisions"
+                / revision_id
+                / artifact_filename(job.source_rel, "transcript")
+            )
+            write_json_atomic(artifact, payload)
+            if not self.store.record_transcript_revision(
+                revision_id=revision_id,
+                job_id=job.id,
+                audio_revision_id=job.audio_revision_id,
+                remote_job_id=job.stt_job_id,
+                backend=str(job.options.get("backend", "manual")),
+                model_revision="manual",
+                options_hash=_canonical_payload_hash(job.options),
+                artifact_path=str(artifact),
+                content_hash=sha256_file(artifact),
+                origin="manual",
+                status=None,
+                chunks_total=job.transcription_chunks_total,
+            ):
+                raise RuntimeError("manual transcript revision was not saved")
+        else:
+            artifact = Path(selected_path)
         if manual_generation is not None:
             self._write_translation_generation_snapshot(
                 artifact,
@@ -2393,7 +2496,7 @@ class SubtitleOrchestrator:
                 status="completed",
                 translations=translations,
             )
-        else:
+        elif kind != "transcript":
             write_json_atomic(artifact, payload)
 
         refreshed = self.store.get(job.id)
@@ -2493,8 +2596,8 @@ class SubtitleOrchestrator:
             if lease_token is None:
                 continue
             self.store.add_event(job_id, "info", f"{stage} started")
-            executor.submit(
-                self._run_stage,
+            self._submit_stage(
+                executor,
                 job_id,
                 stage,
                 operation,
@@ -2502,6 +2605,31 @@ class SubtitleOrchestrator:
             )
             return True
         return False
+
+    def _submit_stage(
+        self,
+        executor: ThreadPoolExecutor,
+        job_id: str,
+        stage: str,
+        operation: Callable[[PipelineJob], None],
+        lease_token: int,
+    ) -> None:
+        future = executor.submit(
+            self._run_stage,
+            job_id,
+            stage,
+            operation,
+            lease_token,
+        )
+        if not isinstance(future, Future):
+            return
+        with self._stage_futures_lock:
+            self._stage_futures.add(future)
+        future.add_done_callback(self._forget_stage_future)
+
+    def _forget_stage_future(self, future: Future[Any]) -> None:
+        with self._stage_futures_lock:
+            self._stage_futures.discard(future)
 
     def _run_stage(
         self,
@@ -2713,12 +2841,52 @@ class SubtitleOrchestrator:
 
     def _extract(self, job: PipelineJob) -> None:
         source = self.library.resolve_file(job.source_rel)
-        artifact_dir = self.settings.jobs_dir / job.id
-        audio_path = artifact_dir / "audio.16k.wav"
         options = AudioExtraction(
             audio_stream=int(job.options["audio_stream"]),
             start_seconds=float(job.options["start_seconds"]),
             duration_seconds=job.options["duration_seconds"],
+        )
+        source_hash = sha256_file(source)
+        extraction_hash = _canonical_payload_hash(asdict(options))
+        next_status = (
+            "audio_completed" if job.operation == "extract" else "audio_ready"
+        )
+        for revision in self.store.audio_revisions_for_signature(
+            source_rel=job.source_rel,
+            source_hash=source_hash,
+            extraction_hash=extraction_hash,
+        ):
+            reusable_path = Path(str(revision["artifact_path"]))
+            if (
+                reusable_path.is_file()
+                and sha256_file(reusable_path) == revision["content_hash"]
+            ):
+                chunk_estimate = estimate_transcription_chunks(
+                    revision["duration_seconds"],
+                    job.options,
+                )
+                self._require_stage_update(
+                    job,
+                    status=next_status,
+                    audio_path=str(reusable_path),
+                    audio_sha256=str(revision["content_hash"]),
+                    audio_revision_id=str(revision["id"]),
+                    chunks_total_estimate=chunk_estimate,
+                )
+                self.store.add_event(
+                    job.id,
+                    "info",
+                    "audio extraction reused immutable revision "
+                    f"{revision['id']}",
+                )
+                return
+        revision_id = uuid4().hex
+        audio_path = (
+            self.settings.jobs_dir
+            / job.id
+            / "audio-revisions"
+            / revision_id
+            / "audio.16k.wav"
         )
         extract_audio(source, audio_path, options)
         digest = sha256_file(audio_path)
@@ -2727,16 +2895,25 @@ class SubtitleOrchestrator:
             audio_duration,
             job.options,
         )
-        next_status = (
-            "audio_completed" if job.operation == "extract" else "audio_ready"
+        lease_owner = (
+            self._worker_id if job.lease_owner == self._worker_id else None
         )
-        self._require_stage_update(
-            job,
+        persisted = self.store.record_audio_revision(
+            revision_id=revision_id,
+            job_id=job.id,
+            source_rel=job.source_rel,
+            source_hash=source_hash,
+            extraction_hash=extraction_hash,
+            artifact_path=str(audio_path),
+            content_hash=digest,
+            duration_seconds=audio_duration,
             status=next_status,
-            audio_path=str(audio_path),
-            audio_sha256=digest,
             chunks_total_estimate=chunk_estimate,
+            lease_owner=lease_owner,
+            lease_token=(job.lease_token if lease_owner is not None else None),
         )
+        if not persisted:
+            raise WorkerLeaseLost("worker lease was superseded")
         progress_detail = (
             f"; {audio_duration:.1f}s; approximately {chunk_estimate} "
             "transcription chunk(s)"
@@ -2896,12 +3073,19 @@ class SubtitleOrchestrator:
                 }
             )
         validate_transcript(payload)
-        transcript_path = artifact_path(
-            self.settings.jobs_dir,
-            job.id,
-            job.source_rel,
-            "transcript",
+        revision_id = uuid4().hex
+        transcript_path = (
+            self.settings.jobs_dir
+            / job.id
+            / "transcript-revisions"
+            / revision_id
+            / artifact_filename(job.source_rel, "transcript")
         )
+        payload["revision"] = {
+            "id": revision_id,
+            "audio_revision_id": job.audio_revision_id,
+            "origin": "automatic",
+        }
         write_json_atomic(transcript_path, payload)
         current = self.store.get(job.id)
         translation_paused = bool(
@@ -2920,14 +3104,36 @@ class SubtitleOrchestrator:
             if current is not None
             else 0
         )
-        self._require_stage_update(
-            job,
-            status=next_status,
-            transcript_path=str(transcript_path),
-            chunks_created=final_chunk_total,
-            chunks_completed=final_chunk_total,
-            chunks_total_estimate=final_chunk_total,
+        model_revision = str(
+            payload.get("model_revision")
+            or payload.get("model")
+            or payload.get("backend")
+            or options["backend"]
         )
+        lease_owner = (
+            self._worker_id if job.lease_owner == self._worker_id else None
+        )
+        persisted = self.store.record_transcript_revision(
+            revision_id=revision_id,
+            job_id=job.id,
+            audio_revision_id=job.audio_revision_id,
+            remote_job_id=(
+                str(payload["job_id"]) if payload.get("job_id") else job.stt_job_id
+            ),
+            backend=str(options["backend"]),
+            model_revision=model_revision,
+            options_hash=_canonical_payload_hash(options),
+            artifact_path=str(transcript_path),
+            content_hash=sha256_file(transcript_path),
+            origin="automatic",
+            status=next_status,
+            chunks_total=final_chunk_total,
+            translation_pause_requested=translation_paused,
+            lease_owner=lease_owner,
+            lease_token=(job.lease_token if lease_owner is not None else None),
+        )
+        if not persisted:
+            raise WorkerLeaseLost("worker lease was superseded")
         self.store.add_event(
             job.id,
             "info",
@@ -3028,6 +3234,7 @@ class SubtitleOrchestrator:
         return self.store.create_translation_generation(
             generation_id=generation_id,
             job_id=job.id,
+            transcript_revision_id=job.transcript_revision_id,
             artifact_path=str(generation_path),
             origin=origin,
             force_new=force_new,
@@ -3321,8 +3528,13 @@ class SubtitleOrchestrator:
             status="partial",
             translations=self._translation_snapshot_items(stored_items),
         )
+        lease_owner = (
+            self._worker_id if job.lease_owner == self._worker_id else None
+        )
         generation_attempt = self.store.begin_translation_generation_attempt(
-            generation["id"]
+            generation["id"],
+            lease_owner=lease_owner,
+            lease_token=(job.lease_token if lease_owner is not None else None),
         )
         next_batch_index = self.store.next_translation_batch_index(
             generation["id"]
@@ -3372,6 +3584,7 @@ class SubtitleOrchestrator:
                 generation["id"],
                 batch_index=database_batch_index,
                 error=self._sanitize_error(error),
+                generation_attempt=generation_attempt,
             )
 
         def save_batch(items: list[dict[str, str]]) -> None:
@@ -3451,6 +3664,7 @@ class SubtitleOrchestrator:
                 generation["id"],
                 state="paused",
                 error=str(error),
+                generation_attempt=generation_attempt,
             )
             raise
         except ExternalServiceError as error:
@@ -3458,6 +3672,7 @@ class SubtitleOrchestrator:
                 generation["id"],
                 state="blocked",
                 error=self._sanitize_error(str(error)),
+                generation_attempt=generation_attempt,
             )
             raise
         except OperationStopped as error:
@@ -3465,6 +3680,7 @@ class SubtitleOrchestrator:
                 generation["id"],
                 state="stopped",
                 error=str(error),
+                generation_attempt=generation_attempt,
             )
             raise
         except Exception as error:
@@ -3472,6 +3688,7 @@ class SubtitleOrchestrator:
                 generation["id"],
                 state="failed",
                 error=self._sanitize_error(str(error)),
+                generation_attempt=generation_attempt,
             )
             raise
 
@@ -3491,6 +3708,7 @@ class SubtitleOrchestrator:
         completed_translations = self.store.complete_translation_generation(
             generation["id"],
             expected_id_list,
+            generation_attempt=generation_attempt,
         )
         self._write_translation_generation_snapshot(
             translation_path,

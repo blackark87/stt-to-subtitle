@@ -1,5 +1,8 @@
 from pathlib import Path
+import signal
 import sqlite3
+import subprocess
+import sys
 from tempfile import TemporaryDirectory
 import time
 import unittest
@@ -764,6 +767,53 @@ class JobStoreTests(unittest.TestCase):
             self.assertIsNone(completed.lease_expires_at)
             self.assertEqual(completed.lease_token, 2)
 
+    def test_recovers_a_lease_after_the_worker_process_is_killed(self) -> None:
+        with TemporaryDirectory() as directory:
+            database_path = Path(directory) / "jobs.sqlite3"
+            store = JobStore(database_path)
+            store.create(
+                job_id="killed-worker",
+                source_rel="movie.mkv",
+                force_overwrite=False,
+                options={},
+            )
+            script = "\n".join(
+                (
+                    "import os",
+                    "from pathlib import Path",
+                    "import signal",
+                    "from stt_to_subtitle.job_store import JobStore",
+                    f"store = JobStore(Path({str(database_path)!r}))",
+                    "token = store.claim_for_dispatch(",
+                    "    'killed-worker', 'queued', 'extracting',",
+                    "    lease_owner='worker-child', lease_seconds=0.05,",
+                    ")",
+                    "assert token == 1",
+                    "os.kill(os.getpid(), signal.SIGKILL)",
+                )
+            )
+
+            killed = subprocess.run(
+                [sys.executable, "-c", script],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            time.sleep(0.1)
+            recovered = store.claim_recovery_lease(
+                "killed-worker",
+                "extracting",
+                lease_owner="worker-parent",
+                lease_seconds=60,
+            )
+
+            self.assertEqual(killed.returncode, -signal.SIGKILL)
+            self.assertEqual(recovered, 2)
+            self.assertEqual(
+                store.get("killed-worker").lease_owner,
+                "worker-parent",
+            )
+
     def test_deletes_a_job_and_its_events(self) -> None:
         with TemporaryDirectory() as directory:
             store = JobStore(Path(directory) / "jobs.sqlite3")
@@ -1056,6 +1106,80 @@ class JobStoreTests(unittest.TestCase):
                     ["segment-1"],
                 )
 
+    def test_translation_attempt_rejects_superseded_batch_writes(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = JobStore(Path(directory) / "jobs.sqlite3")
+            job = store.create(
+                job_id="translation-fenced",
+                source_rel="movie.mkv",
+                force_overwrite=False,
+                options={},
+                status="transcribed",
+            )
+            first_token = store.claim_for_dispatch(
+                job.id,
+                "transcribed",
+                "translation_running",
+                lease_owner="worker-a",
+                lease_seconds=60,
+            )
+            generation = store.create_translation_generation(
+                generation_id="generation-fenced",
+                job_id=job.id,
+                transcript_job_id="remote-job",
+                transcript_hash="transcript-hash",
+                prompt_hash="prompt-hash",
+                endpoint_key="http://lm.test/v1",
+                model="model",
+                config_hash="config-hash",
+                artifact_path="generation.json",
+                origin="automatic",
+            )
+            first_attempt = store.begin_translation_generation_attempt(
+                generation["id"],
+                lease_owner="worker-a",
+                lease_token=first_token,
+            )
+            store.start_translation_batch(
+                generation["id"],
+                batch_index=0,
+                generation_attempt=first_attempt,
+                items=[{"id": "segment-1", "source_hash": "source-1"}],
+            )
+            store.update(job.id, lease_expires_at=time.time() - 1)
+            second_token = store.claim_recovery_lease(
+                job.id,
+                "translation_running",
+                lease_owner="worker-b",
+                lease_seconds=60,
+            )
+            second_attempt = store.begin_translation_generation_attempt(
+                generation["id"],
+                lease_owner="worker-b",
+                lease_token=second_token,
+            )
+
+            with self.assertRaises(WorkerLeaseLost):
+                store.save_translation_batch(
+                    generation["id"],
+                    batch_index=0,
+                    generation_attempt=first_attempt,
+                    kind="remote",
+                    items=[
+                        {
+                            "id": "segment-1",
+                            "text": "stale",
+                            "source_hash": "source-1",
+                            "segment_index": 0,
+                        }
+                    ],
+                )
+
+            self.assertEqual(first_attempt, 1)
+            self.assertEqual(second_attempt, 2)
+            self.assertEqual(second_token, first_token + 1)
+            self.assertEqual(store.translation_items(generation["id"]), [])
+
     def test_versions_and_publishes_subtitle_pairs(self) -> None:
         with TemporaryDirectory() as directory:
             store = JobStore(Path(directory) / "jobs.sqlite3")
@@ -1309,6 +1433,8 @@ class JobStoreTests(unittest.TestCase):
             self.assertIsNone(job.lease_owner)
             self.assertIsNone(job.lease_expires_at)
             self.assertEqual(job.lease_token, 0)
+            self.assertIsNone(job.audio_revision_id)
+            self.assertIsNone(job.transcript_revision_id)
             stopped = JobStore(database_path).get("job-2")
             self.assertEqual(stopped.phase, "translation")
             self.assertEqual(stopped.state, "stopped")

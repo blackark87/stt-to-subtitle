@@ -109,8 +109,10 @@ class PipelineJob:
     options: dict[str, Any]
     audio_path: str | None
     audio_sha256: str | None
+    audio_revision_id: str | None
     stt_job_id: str | None
     transcript_path: str | None
+    transcript_revision_id: str | None
     translation_path: str | None
     srt_path: str | None
     ass_path: str | None
@@ -219,8 +221,10 @@ class JobStore:
         "options_json",
         "audio_path",
         "audio_sha256",
+        "audio_revision_id",
         "stt_job_id",
         "transcript_path",
+        "transcript_revision_id",
         "translation_path",
         "srt_path",
         "ass_path",
@@ -290,6 +294,24 @@ class JobStore:
                     (*rebased, str(row["id"])),
                 )
                 changed += 1
+            for table in ("audio_revisions", "transcript_revisions"):
+                revision_rows = connection.execute(
+                    f"SELECT id, artifact_path FROM {table}"
+                ).fetchall()
+                for row in revision_rows:
+                    original = str(row["artifact_path"])
+                    rebased = rebase_stored_path(
+                        original,
+                        previous_root=previous_root,
+                        current_root=current_root,
+                    )
+                    if rebased == original:
+                        continue
+                    connection.execute(
+                        f"UPDATE {table} SET artifact_path = ? WHERE id = ?",
+                        (rebased, str(row["id"])),
+                    )
+                    changed += 1
             translation_rows = connection.execute(
                 "SELECT id, artifact_path FROM translation_generations"
             ).fetchall()
@@ -375,8 +397,10 @@ class JobStore:
                     options_json TEXT NOT NULL,
                     audio_path TEXT,
                     audio_sha256 TEXT,
+                    audio_revision_id TEXT,
                     stt_job_id TEXT,
                     transcript_path TEXT,
+                    transcript_revision_id TEXT,
                     translation_path TEXT,
                     srt_path TEXT,
                     ass_path TEXT,
@@ -472,11 +496,40 @@ class JobStore:
                     UNIQUE (job_id, external_hash, candidate_hash)
                 );
 
+                CREATE TABLE IF NOT EXISTS audio_revisions (
+                    id TEXT PRIMARY KEY,
+                    created_by_job_id TEXT NOT NULL,
+                    source_rel TEXT NOT NULL,
+                    source_hash TEXT NOT NULL,
+                    extraction_hash TEXT NOT NULL,
+                    artifact_path TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    duration_seconds REAL,
+                    created_at REAL NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS transcript_revisions (
+                    id TEXT PRIMARY KEY,
+                    created_by_job_id TEXT NOT NULL,
+                    audio_revision_id TEXT,
+                    remote_job_id TEXT,
+                    backend TEXT NOT NULL,
+                    model_revision TEXT NOT NULL,
+                    options_hash TEXT NOT NULL,
+                    artifact_path TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    origin TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    FOREIGN KEY (audio_revision_id)
+                        REFERENCES audio_revisions(id)
+                );
+
                 CREATE TABLE IF NOT EXISTS translation_generations (
                     id TEXT PRIMARY KEY,
                     job_id TEXT NOT NULL,
                     generation_number INTEGER NOT NULL,
                     transcript_job_id TEXT NOT NULL,
+                    transcript_revision_id TEXT,
                     transcript_hash TEXT NOT NULL,
                     prompt_hash TEXT NOT NULL,
                     endpoint_key TEXT NOT NULL,
@@ -573,6 +626,12 @@ class JobStore:
                     ON job_events(job_id, id);
                 CREATE INDEX IF NOT EXISTS subtitle_validations_job_idx
                     ON subtitle_validations(job_id, updated_at DESC);
+                CREATE INDEX IF NOT EXISTS audio_revisions_lookup_idx
+                    ON audio_revisions(
+                        source_rel, source_hash, extraction_hash, created_at DESC
+                    );
+                CREATE INDEX IF NOT EXISTS transcript_revisions_job_idx
+                    ON transcript_revisions(created_by_job_id, created_at DESC);
                 CREATE INDEX IF NOT EXISTS translation_generations_job_idx
                     ON translation_generations(job_id, generation_number DESC);
                 CREATE INDEX IF NOT EXISTS translation_items_generation_idx
@@ -648,10 +707,27 @@ class JobStore:
                     "ALTER TABLE jobs ADD COLUMN "
                     "lease_token INTEGER NOT NULL DEFAULT 0"
                 ),
+                "audio_revision_id": (
+                    "ALTER TABLE jobs ADD COLUMN audio_revision_id TEXT"
+                ),
+                "transcript_revision_id": (
+                    "ALTER TABLE jobs ADD COLUMN transcript_revision_id TEXT"
+                ),
             }
             for column, statement in migrations.items():
                 if column not in columns:
                     connection.execute(statement)
+            translation_columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(translation_generations)"
+                ).fetchall()
+            }
+            if "transcript_revision_id" not in translation_columns:
+                connection.execute(
+                    "ALTER TABLE translation_generations "
+                    "ADD COLUMN transcript_revision_id TEXT"
+                )
             if "status_updated_at" not in columns:
                 connection.execute(
                     "ALTER TABLE jobs ADD COLUMN status_updated_at REAL"
@@ -1285,9 +1361,19 @@ class JobStore:
             audio_sha256=(
                 str(row["audio_sha256"]) if row["audio_sha256"] else None
             ),
+            audio_revision_id=(
+                str(row["audio_revision_id"])
+                if row["audio_revision_id"]
+                else None
+            ),
             stt_job_id=str(row["stt_job_id"]) if row["stt_job_id"] else None,
             transcript_path=(
                 str(row["transcript_path"]) if row["transcript_path"] else None
+            ),
+            transcript_revision_id=(
+                str(row["transcript_revision_id"])
+                if row["transcript_revision_id"]
+                else None
             ),
             translation_path=(
                 str(row["translation_path"]) if row["translation_path"] else None
@@ -1335,6 +1421,9 @@ class JobStore:
         status: str = "queued",
         audio_path: str | None = None,
         audio_sha256: str | None = None,
+        audio_revision_id: str | None = None,
+        transcript_path: str | None = None,
+        transcript_revision_id: str | None = None,
         chunks_total_estimate: int = 0,
     ) -> PipelineJob:
         now = time.time()
@@ -1348,10 +1437,13 @@ class JobStore:
                 INSERT INTO jobs (
                     id, source_rel, status, force_overwrite, operation,
                     phase, state, reason_code, attempt,
-                    options_json, audio_path, audio_sha256,
+                    options_json, audio_path, audio_sha256, audio_revision_id,
+                    transcript_path, transcript_revision_id,
                     chunks_total_estimate,
                     created_at, status_updated_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                )
                 """,
                 (
                     job_id,
@@ -1369,6 +1461,9 @@ class JobStore:
                     json.dumps(dict(options), sort_keys=True),
                     audio_path,
                     audio_sha256,
+                    audio_revision_id,
+                    transcript_path,
+                    transcript_revision_id,
                     max(0, int(chunks_total_estimate)),
                     now,
                     now,
@@ -1840,6 +1935,267 @@ class JobStore:
             ).fetchone()
         return row is not None
 
+    def audio_revisions_for_signature(
+        self,
+        *,
+        source_rel: str,
+        source_hash: str,
+        extraction_hash: str,
+    ) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM audio_revisions
+                WHERE source_rel = ? AND source_hash = ?
+                  AND extraction_hash = ?
+                ORDER BY created_at DESC
+                """,
+                (source_rel, source_hash, extraction_hash),
+            ).fetchall()
+        return [self._audio_revision_from_row(row) for row in rows]
+
+    def get_audio_revision(self, revision_id: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM audio_revisions WHERE id = ?",
+                (revision_id,),
+            ).fetchone()
+        return self._audio_revision_from_row(row) if row is not None else None
+
+    def record_audio_revision(
+        self,
+        *,
+        revision_id: str,
+        job_id: str,
+        source_rel: str,
+        source_hash: str,
+        extraction_hash: str,
+        artifact_path: str,
+        content_hash: str,
+        duration_seconds: float | None,
+        status: str,
+        chunks_total_estimate: int,
+        lease_owner: str | None = None,
+        lease_token: int | None = None,
+    ) -> bool:
+        if (lease_owner is None) != (lease_token is None):
+            raise ValueError("lease owner and token must be provided together")
+        now = time.time()
+        with self._connect() as connection:
+            job = connection.execute(
+                "SELECT operation FROM jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            if job is None:
+                raise ValueError("job not found")
+            if lease_owner is not None and lease_token is not None:
+                owned = connection.execute(
+                    """
+                    UPDATE jobs
+                    SET lease_expires_at = lease_expires_at
+                    WHERE id = ? AND status = 'extracting'
+                      AND lease_owner = ? AND lease_token = ?
+                      AND lease_expires_at > ?
+                    """,
+                    (job_id, lease_owner, lease_token, now),
+                )
+                if owned.rowcount != 1:
+                    return False
+            projected = structured_state_from_legacy(
+                status=status,
+                operation=str(job["operation"]),
+            )
+            connection.execute(
+                """
+                INSERT INTO audio_revisions (
+                    id, created_by_job_id, source_rel, source_hash,
+                    extraction_hash, artifact_path, content_hash,
+                    duration_seconds, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    revision_id,
+                    job_id,
+                    source_rel,
+                    source_hash,
+                    extraction_hash,
+                    artifact_path,
+                    content_hash,
+                    duration_seconds,
+                    now,
+                ),
+            )
+            updated = connection.execute(
+                """
+                UPDATE jobs
+                SET status = ?, phase = ?, state = ?, reason_code = ?,
+                    audio_path = ?, audio_sha256 = ?, audio_revision_id = ?,
+                    chunks_total_estimate = ?, blocked_stage = NULL,
+                    error = NULL, lease_owner = NULL,
+                    lease_expires_at = NULL,
+                    status_updated_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    status,
+                    projected.phase.value,
+                    projected.state.value,
+                    (
+                        projected.reason_code.value
+                        if projected.reason_code is not None
+                        else None
+                    ),
+                    artifact_path,
+                    content_hash,
+                    revision_id,
+                    max(0, int(chunks_total_estimate)),
+                    now,
+                    now,
+                    job_id,
+                ),
+            )
+        persisted = updated.rowcount == 1
+        if persisted:
+            self._notify_change(job_id)
+        return persisted
+
+    def record_transcript_revision(
+        self,
+        *,
+        revision_id: str,
+        job_id: str,
+        audio_revision_id: str | None,
+        remote_job_id: str | None,
+        backend: str,
+        model_revision: str,
+        options_hash: str,
+        artifact_path: str,
+        content_hash: str,
+        origin: str,
+        status: str | None,
+        chunks_total: int,
+        translation_pause_requested: bool = False,
+        lease_owner: str | None = None,
+        lease_token: int | None = None,
+    ) -> bool:
+        if origin not in {"automatic", "manual", "imported"}:
+            raise ValueError("invalid transcript revision origin")
+        if (lease_owner is None) != (lease_token is None):
+            raise ValueError("lease owner and token must be provided together")
+        now = time.time()
+        with self._connect() as connection:
+            job = connection.execute(
+                "SELECT operation FROM jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            if job is None:
+                raise ValueError("job not found")
+            if lease_owner is not None and lease_token is not None:
+                owned = connection.execute(
+                    """
+                    UPDATE jobs
+                    SET lease_expires_at = lease_expires_at
+                    WHERE id = ? AND status = 'transcription_running'
+                      AND lease_owner = ? AND lease_token = ?
+                      AND lease_expires_at > ?
+                    """,
+                    (job_id, lease_owner, lease_token, now),
+                )
+                if owned.rowcount != 1:
+                    return False
+            connection.execute(
+                """
+                INSERT INTO transcript_revisions (
+                    id, created_by_job_id, audio_revision_id, remote_job_id,
+                    backend, model_revision, options_hash, artifact_path,
+                    content_hash, origin, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    revision_id,
+                    job_id,
+                    audio_revision_id,
+                    remote_job_id,
+                    backend,
+                    model_revision,
+                    options_hash,
+                    artifact_path,
+                    content_hash,
+                    origin,
+                    now,
+                ),
+            )
+            assignments = [
+                "transcript_path = ?",
+                "transcript_revision_id = ?",
+                "chunks_created = ?",
+                "chunks_completed = ?",
+                "chunks_total_estimate = ?",
+                "updated_at = ?",
+            ]
+            values: list[Any] = [
+                artifact_path,
+                revision_id,
+                max(0, int(chunks_total)),
+                max(0, int(chunks_total)),
+                max(0, int(chunks_total)),
+                now,
+            ]
+            if status is not None:
+                projected = structured_state_from_legacy(
+                    status=status,
+                    operation=str(job["operation"]),
+                )
+                assignments.extend(
+                    [
+                        "status = ?",
+                        "phase = ?",
+                        "state = ?",
+                        "reason_code = ?",
+                        "translation_pause_requested = ?",
+                        "blocked_stage = NULL",
+                        "error = NULL",
+                        "lease_owner = NULL",
+                        "lease_expires_at = NULL",
+                        "status_updated_at = ?",
+                    ]
+                )
+                values.extend(
+                    [
+                        status,
+                        projected.phase.value,
+                        projected.state.value,
+                        (
+                            projected.reason_code.value
+                            if projected.reason_code is not None
+                            else None
+                        ),
+                        int(translation_pause_requested),
+                        now,
+                    ]
+                )
+            values.append(job_id)
+            updated = connection.execute(
+                f"UPDATE jobs SET {', '.join(assignments)} WHERE id = ?",
+                values,
+            )
+        persisted = updated.rowcount == 1
+        if persisted:
+            self._notify_change(job_id)
+        return persisted
+
+    def transcript_revisions(self, job_id: str) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM transcript_revisions
+                WHERE created_by_job_id = ?
+                ORDER BY created_at
+                """,
+                (job_id,),
+            ).fetchall()
+        return [self._transcript_revision_from_row(row) for row in rows]
+
     def update(self, job_id: str, **fields: Any) -> None:
         if not fields:
             return
@@ -2012,6 +2368,7 @@ class JobStore:
         config_hash: str,
         artifact_path: str,
         origin: str,
+        transcript_revision_id: str | None = None,
         force_new: bool = False,
     ) -> dict[str, Any]:
         if origin not in {"automatic", "legacy", "restart", "manual"}:
@@ -2049,19 +2406,23 @@ class JobStore:
                 """
                 INSERT INTO translation_generations (
                     id, job_id, generation_number,
-                    transcript_job_id, transcript_hash, prompt_hash,
+                    transcript_job_id, transcript_revision_id,
+                    transcript_hash, prompt_hash,
                     endpoint_key, model, config_hash,
                     state, attempt, origin, supersedes_generation_id,
                     artifact_path, last_error,
                     created_at, updated_at, completed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'partial', 0, ?, ?, ?,
-                          NULL, ?, ?, NULL)
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'partial', 0, ?, ?, ?,
+                    NULL, ?, ?, NULL
+                )
                 """,
                 (
                     generation_id,
                     job_id,
                     generation_number,
                     transcript_job_id,
+                    transcript_revision_id,
                     transcript_hash,
                     prompt_hash,
                     endpoint_key,
@@ -2140,22 +2501,45 @@ class JobStore:
             ).fetchall()
         return [self._translation_generation_from_row(row) for row in rows]
 
-    def begin_translation_generation_attempt(self, generation_id: str) -> int:
+    def begin_translation_generation_attempt(
+        self,
+        generation_id: str,
+        *,
+        lease_owner: str | None = None,
+        lease_token: int | None = None,
+    ) -> int:
+        if (lease_owner is None) != (lease_token is None):
+            raise ValueError("lease owner and token must be provided together")
+        lease_condition = ""
+        parameters: list[Any] = [time.time(), generation_id]
+        if lease_owner is not None and lease_token is not None:
+            lease_condition = (
+                " AND EXISTS (SELECT 1 FROM jobs "
+                "WHERE jobs.id = translation_generations.job_id "
+                "AND jobs.lease_owner = ? AND jobs.lease_token = ? "
+                "AND jobs.lease_expires_at > ?)"
+            )
+            parameters.extend([lease_owner, lease_token, time.time()])
         with self._connect() as connection:
             updated = connection.execute(
-                """
+                f"""
                 UPDATE translation_generations
                 SET state = 'running', attempt = attempt + 1,
                     last_error = NULL, updated_at = ?
                 WHERE id = ?
+                {lease_condition}
                 """,
-                (time.time(), generation_id),
+                parameters,
             )
             row = connection.execute(
                 "SELECT attempt FROM translation_generations WHERE id = ?",
                 (generation_id,),
             ).fetchone()
-        if updated.rowcount != 1 or row is None:
+        if updated.rowcount != 1:
+            if lease_owner is not None:
+                raise WorkerLeaseLost("worker lease was superseded")
+            raise ValueError("translation generation not found")
+        if row is None:
             raise ValueError("translation generation not found")
         return int(row["attempt"])
 
@@ -2165,19 +2549,29 @@ class JobStore:
         *,
         state: str,
         error: str | None = None,
+        generation_attempt: int | None = None,
     ) -> None:
         if state not in {"partial", "paused", "blocked", "failed", "stopped"}:
             raise ValueError("invalid translation generation state")
+        attempt_condition = (
+            " AND attempt = ?" if generation_attempt is not None else ""
+        )
+        parameters: list[Any] = [state, error, time.time(), generation_id]
+        if generation_attempt is not None:
+            parameters.append(generation_attempt)
         with self._connect() as connection:
             updated = connection.execute(
-                """
+                f"""
                 UPDATE translation_generations
                 SET state = ?, last_error = ?, updated_at = ?
                 WHERE id = ?
+                {attempt_condition}
                 """,
-                (state, error, time.time(), generation_id),
+                parameters,
             )
         if updated.rowcount != 1:
+            if generation_attempt is not None:
+                raise WorkerLeaseLost("translation attempt was superseded")
             raise ValueError("translation generation not found")
 
     def next_translation_batch_index(self, generation_id: str) -> int:
@@ -2233,11 +2627,15 @@ class JobStore:
         now = time.time()
         with self._connect() as connection:
             generation = connection.execute(
-                "SELECT id FROM translation_generations WHERE id = ?",
-                (generation_id,),
-            ).fetchone()
-            if generation is None:
-                raise ValueError("translation generation not found")
+                """
+                UPDATE translation_generations
+                SET updated_at = updated_at
+                WHERE id = ? AND attempt = ? AND state = 'running'
+                """,
+                (generation_id, generation_attempt),
+            )
+            if generation.rowcount != 1:
+                raise WorkerLeaseLost("translation attempt was superseded")
             connection.execute(
                 """
                 INSERT INTO translation_batches (
@@ -2270,17 +2668,36 @@ class JobStore:
         *,
         batch_index: int,
         error: str,
+        generation_attempt: int | None = None,
     ) -> None:
+        attempt_condition = ""
+        parameters: list[Any] = [
+            error[:2000],
+            time.time(),
+            generation_id,
+            batch_index,
+        ]
+        if generation_attempt is not None:
+            attempt_condition = (
+                " AND EXISTS (SELECT 1 FROM translation_generations "
+                "WHERE translation_generations.id = "
+                "translation_batches.generation_id "
+                "AND translation_generations.attempt = ?)"
+            )
+            parameters.append(generation_attempt)
         with self._connect() as connection:
             updated = connection.execute(
-                """
+                f"""
                 UPDATE translation_batches
                 SET state = 'failed', error = ?, updated_at = ?
                 WHERE generation_id = ? AND batch_index = ?
+                {attempt_condition}
                 """,
-                (error[:2000], time.time(), generation_id, batch_index),
+                parameters,
             )
         if updated.rowcount != 1:
+            if generation_attempt is not None:
+                raise WorkerLeaseLost("translation attempt was superseded")
             raise ValueError("translation batch not found")
 
     def translation_batches(
@@ -2368,11 +2785,15 @@ class JobStore:
         now = time.time()
         with self._connect() as connection:
             generation = connection.execute(
-                "SELECT id FROM translation_generations WHERE id = ?",
-                (generation_id,),
-            ).fetchone()
-            if generation is None:
-                raise ValueError("translation generation not found")
+                """
+                UPDATE translation_generations
+                SET updated_at = updated_at
+                WHERE id = ? AND attempt = ?
+                """,
+                (generation_id, generation_attempt),
+            )
+            if generation.rowcount != 1:
+                raise WorkerLeaseLost("translation attempt was superseded")
             connection.execute(
                 """
                 INSERT INTO translation_batches (
@@ -2465,6 +2886,8 @@ class JobStore:
         self,
         generation_id: str,
         expected_segment_ids: Sequence[str],
+        *,
+        generation_attempt: int | None = None,
     ) -> list[dict[str, str]]:
         with self._connect() as connection:
             rows = connection.execute(
@@ -2482,16 +2905,25 @@ class JobStore:
                     "translation generation items do not match transcript"
                 )
             now = time.time()
+            attempt_condition = (
+                " AND attempt = ?" if generation_attempt is not None else ""
+            )
+            parameters: list[Any] = [now, now, generation_id]
+            if generation_attempt is not None:
+                parameters.append(generation_attempt)
             updated = connection.execute(
-                """
+                f"""
                 UPDATE translation_generations
                 SET state = 'completed', last_error = NULL,
                     completed_at = ?, updated_at = ?
                 WHERE id = ?
+                {attempt_condition}
                 """,
-                (now, now, generation_id),
+                parameters,
             )
         if updated.rowcount != 1:
+            if generation_attempt is not None:
+                raise WorkerLeaseLost("translation attempt was superseded")
             raise ValueError("translation generation not found")
         return [
             {"id": str(row["segment_id"]), "text": str(row["translated_text"])}
@@ -2753,12 +3185,57 @@ class JobStore:
         return self._subtitle_generation_from_row(published)
 
     @staticmethod
+    def _audio_revision_from_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": str(row["id"]),
+            "created_by_job_id": str(row["created_by_job_id"]),
+            "source_rel": str(row["source_rel"]),
+            "source_hash": str(row["source_hash"]),
+            "extraction_hash": str(row["extraction_hash"]),
+            "artifact_path": str(row["artifact_path"]),
+            "content_hash": str(row["content_hash"]),
+            "duration_seconds": (
+                float(row["duration_seconds"])
+                if row["duration_seconds"] is not None
+                else None
+            ),
+            "created_at": float(row["created_at"]),
+        }
+
+    @staticmethod
+    def _transcript_revision_from_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": str(row["id"]),
+            "created_by_job_id": str(row["created_by_job_id"]),
+            "audio_revision_id": (
+                str(row["audio_revision_id"])
+                if row["audio_revision_id"]
+                else None
+            ),
+            "remote_job_id": (
+                str(row["remote_job_id"]) if row["remote_job_id"] else None
+            ),
+            "backend": str(row["backend"]),
+            "model_revision": str(row["model_revision"]),
+            "options_hash": str(row["options_hash"]),
+            "artifact_path": str(row["artifact_path"]),
+            "content_hash": str(row["content_hash"]),
+            "origin": str(row["origin"]),
+            "created_at": float(row["created_at"]),
+        }
+
+    @staticmethod
     def _translation_generation_from_row(row: sqlite3.Row) -> dict[str, Any]:
         result = {
             "id": str(row["id"]),
             "job_id": str(row["job_id"]),
             "generation_number": int(row["generation_number"]),
             "transcript_job_id": str(row["transcript_job_id"]),
+            "transcript_revision_id": (
+                str(row["transcript_revision_id"])
+                if row["transcript_revision_id"]
+                else None
+            ),
             "transcript_hash": str(row["transcript_hash"]),
             "prompt_hash": str(row["prompt_hash"]),
             "endpoint_key": str(row["endpoint_key"]),

@@ -6,7 +6,7 @@
 
 ### 구현 진행 상태
 
-현재 작업 트리에는 계획의 열세 번째 수직 슬라이스까지 반영됐다.
+현재 작업 트리에는 계획의 열여섯 번째 수직 슬라이스까지 반영됐다.
 
 | 항목 | 반영 상태 | 남은 범위 |
 |---|---|---|
@@ -15,10 +15,11 @@
 | 외부 자막 | 같은 stem의 SRT/VTT/ASS 탐지, `외부 자막` 표시, 기본 WebVTT 재생 | 증분 asset/revision catalog·사용자별 재생 선택 |
 | 로컬 비교 | 시간 중첩 정렬, coverage·문장 유사도·경계 오차, 파일 해시별 SQLite 결과 | generation/publication FK·검증 알고리즘 version migration |
 | 상용 LLM 검증 | 번역 LLM과 분리된 설정, 명시적 1회 호출, 구조화 결과, 입력·모델 cache | provider별 adapter·비용/사용량 관측 |
-| 번역 generation | generation·batch·segment SQLite 원장, 입력 지문, 배치 시도·실패, DB 기반 JSON 복구, 재번역·직접 편집 이력 | immutable prompt revision·startup reconcile |
+| 번역 generation | generation·batch·segment SQLite 원장, 입력 지문, 배치 시도·실패, DB 기반 JSON 복구, 재번역·직접 편집 이력, generation attempt fencing | immutable prompt revision·startup reconcile fault test |
 | 자막 publication | source별 단일 게시 포인터, generation별 SRT/ASS와 해시, 다운로드·과거 버전 재게시, pair manifest·파일/DB startup reconcile | retention·교체 지점별 강제 종료 fault test |
 | 원격 STT 취소 | 멱등 cancel API, `cancel_requested/cancelled` 영속 상태, 웹의 취소 호출·최종 확인, WhisperX/JAV process group 종료, Kotoba 청크 경계 취소 | Kotoba diarization/postprocess 즉시 중단·실제 GPU 자원 fault test |
-| 시작 복구 | 추출 재대기, 원격 STT 재연결·유실 ID 멱등 재제출, 번역 체크포인트 대기 복원, 검증된 전사·번역 산출물 기반 렌더 재개, 게시 자막 pair reconcile, worker lease claim·heartbeat·만료 회수, 단조 증가 fencing token, 중지 요청 보존 | graceful drain·강제 종료 fault test |
+| 시작 복구 | 추출 재대기, 원격 STT 재연결·유실 ID 멱등 재제출, 번역 체크포인트 대기 복원, 검증된 전사·번역 산출물 기반 렌더 재개, 게시 자막 pair reconcile, worker lease claim·heartbeat·만료 회수, 단조 증가 fencing token, 제한 시간 graceful drain, SIGKILL 뒤 lease 회수 test, 중지 요청 보존 | artifact 게시 교체 지점별 fault matrix |
+| 오디오·전사 revision | source·추출 설정 hash 기반 WAV 재사용, immutable WAV·전사 JSON 경로, DB revision 원장·활성 포인터, 직접 편집·비교 선택의 별도 전사 revision, 번역 generation의 transcript revision 참조 | retention·orphan collector·과거 revision 선택 UI |
 | STT 실패 계약 | STT DB·API의 `failure_code/retryable/failure_scope`, segment/schema·OOM·인증·입력·처리·재시작 오류 분류, retryable 실패만 원격 재제출 | 실제 backend별 fault test·오류 코드 운영 지표 |
 | STT dispatch gate | 첫 연결 실패 시 영속 gate 차단, 뒤 작업 `audio_ready` 유지, 명시적 연결 확인의 제한된 3회 요청 후 중단 작업 재개 | 자동 recovery mode가 실제로 필요한지 운영 검증·회로 메트릭 |
 
@@ -37,7 +38,7 @@
 4. 사용자 정지는 신규 작업에서 명시적 `stopped/user_stop`으로 저장한다. 기존 한국어 오류 문구 판별은 과거 DB를 한 번 마이그레이션할 때만 사용한다.
 5. 2D 대시보드, 3D 대시보드, 작업 목록은 영속 `state`를 공통 원천으로 사용하고 작업 목록은 `phase + state` 결합 필터를 지원한다.
 6. 전사 중지는 원격 STT cancel API를 호출하고 `cancelled` 확인 뒤 웹 작업을 `stopped/user_stop`으로 확정한다. WhisperX/JAV는 process group을 종료하고 Kotoba는 청크 경계에서 협력적으로 중지한다.
-7. 번역 결과는 generation·batch·segment 단위로 DB에 저장되고 JSON을 재생성할 수 있다. 실행 작업은 worker lease를 원자적으로 claim하고 heartbeat로 연장하며, 시작 복구는 유효한 다른 소유자의 lease를 건드리지 않고 만료된 작업만 회수한다.
+7. 번역 결과는 generation·batch·segment 단위로 DB에 저장되고 JSON을 재생성할 수 있다. 실행 작업은 worker lease를 원자적으로 claim하고 heartbeat로 연장하며, 시작 복구는 유효한 다른 소유자의 lease를 건드리지 않고 만료된 작업만 회수한다. 번역 batch·완료 갱신은 현재 generation attempt와 일치해야 한다.
 8. 프롬프트를 바꾼 재번역과 직접 편집은 별도 translation generation으로 보존하고, SRT/ASS도 generation별 보존·재게시할 수 있다. immutable prompt revision과 파일/DB startup reconcile은 아직 없다.
 9. 미디어 옆의 `<filename>.srt/.vtt/.ass` 외부 자막 탐지·재생·로컬 비교는 추가됐지만 asset/revision/publication 관계와 증분 catalog는 아직 없다.
 10. STT 연결 실패는 영속 dispatch gate를 닫아 뒤 작업의 연쇄 실패를 막는다. 자동 background probe는 하지 않으며 사용자가 연결 확인/재개를 실행할 때만 제한된 확인 후 gate를 연다.
@@ -157,8 +158,8 @@ stateDiagram-v2
 | 원격 STT 제어 | 제출·조회·SSE 진행률 | 원격 취소 API, 취소 멱등성, 취소 완료 확인 | P0 |
 | 번역 체크포인트 | DB에는 청크 수만 저장하고 실제 결과는 동일 JSON 전체를 배치마다 원자 교체 | translation generation·batch·segment 영속화, 모델·프롬프트·원문·배치 설정 지문 검증 | P0–P1 |
 | 스케줄링 | 생성 시각 FIFO, 단계별 제한 | 의존성별 admission control, 우선순위·공정성, starvation 방지 | P1 |
-| 종료 처리 | scheduler 중지 후 executor 신규 작업 취소, 실행 작업 lease heartbeat·만료 회수·fencing token | graceful drain 제한 시간, 종료 체크포인트 | P1 |
-| 오디오·전사 산출물 | 작업 디렉터리에 지속되지만 같은 작업 재시도 시 같은 경로를 재사용 | immutable revision과 retention 정책, 임시 WAV 검증·원자 교체 | P1 |
+| 종료 처리 | scheduler 중지 후 executor 신규 작업 취소, 실행 작업 lease heartbeat·만료 회수·fencing token, 실행 Future 제한 시간 drain, worker SIGKILL 회수 test | artifact 교체 지점별 fault matrix, 종료 지표 | P1 |
+| 오디오·전사 산출물 | immutable revision 원장·고유 경로, source·추출 설정 hash 기반 WAV 재사용, 직접 편집·비교 import revision, translation generation 참조 | retention 정책, orphan collector, 과거 revision 선택 UI | P1 |
 | 자막 산출물 | SRT/ASS 각각 임시 저장하며 재번역 시 기존 배포 파일을 덮어씀 | versioned generation, publication pointer, rollback, 한 manifest로 파일 쌍 검증 | P0–P1 |
 | 외부 자막 | `<filename>.ko.srt/.ko.ass`만 생성 자막처럼 탐지하고 VTT·출처·비교 관계가 없음 | `<filename>.srt/.vtt/.ass`를 `외부 자막`으로 등록, 기본 재생, 로컬 비교 검증, 선택적 상용 LLM 평가 | P0–P1 |
 | 화면 집계 | 화면별 상태 재분류 | 공통 projection DTO, 동일한 phase/state 필터 계약 | P0 |
@@ -335,10 +336,9 @@ endpoint·model·batch 설정의 지문을 저장하고, 논리 배치는 호출
 
 현재 수직 슬라이스 이후에도 다음 범위는 남는다.
 
-- 병렬 배치가 진행 중일 때 어떤 배치가 lease를 보유하는지
 - 실행 중 종료된 generation·batch를 startup에서 어떤 상태로 확정할지
 - prompt 본문 자체를 immutable revision으로 보존하고 비교하는 방법
-- generation별 SRT/ASS를 게시·rollback하는 방법
+- revision·generation retention과 orphan 정리 정책
 
 부분 JSON의 관리 방법은 반드시 알아야 하며 공개된 영속 계약으로 만들어야 한다. 권장 구조는 DB를 실행·revision의 원장으로 사용하고 JSON을 특정 generation의 편집·교환 가능한 snapshot으로 취급하는 것이다.
 
@@ -432,18 +432,18 @@ flowchart LR
 
 ### 9.4 WAV·전사본의 영속성과 덮어쓰기
 
-현재 WAV와 transcript JSON은 persistent volume 아래에 저장되므로 컨테이너 재시작 후에도 남는다. 그러나 immutable 영속 데이터나 보존 정책으로 모델링되어 있지는 않다.
+현재 WAV와 transcript JSON은 persistent volume 아래의 revision별 고유 경로에 저장되고 SQLite 원장과 작업의 active revision 포인터로 연결된다. 보존·정리 정책과 과거 revision 선택 UI는 아직 없다.
 
 | 동작 | 현재 WAV | 현재 transcript JSON |
 |---|---|---|
 | 같은 작업의 수동 retry | 유효한 WAV가 있으면 재사용 | 유효하면 전사 단계를 건너뛰고 재사용 |
-| 완료된 전사 작업에서 전사 재요청 | 최신 작업의 WAV를 같은 job에서 재사용 가능 | `transcript_path`를 비운 뒤 같은 job 경로에 새 결과를 원자 교체하므로 이전 내용 소실 |
+| 완료된 전사 작업에서 전사 재요청 | source·추출 설정 hash가 같은 검증된 revision 재사용 | 새 transcript revision 생성, 이전 내용 보존 |
 | 번역만 재시작 | 그대로 유지 | 그대로 유지 |
-| 새 full reprocess | 새 job 디렉터리에 다시 추출 | 새 job 디렉터리에 새 전사본 생성 |
-| 같은 job에서 추출 단계 재실행 | `audio.16k.wav`에 FFmpeg `-y`로 직접 덮어씀 | 이후 전사 시 같은 job transcript 경로를 덮어쓸 수 있음 |
-| 작업 DB 레코드 삭제 | 현재 구현은 DB 행만 삭제 | artifact 디렉터리가 남아 orphan이 될 수 있음 |
+| 새 full reprocess | 동일 지문 revision이 유효하면 재사용, 아니면 새 revision 생성 | 새 transcript revision 생성 |
+| 같은 job에서 추출 단계 재실행 | revision별 고유 경로에 생성 | 기존 transcript revision은 유지 |
+| 작업 DB 레코드 삭제 | revision retention 미구현 | artifact와 revision 원장이 남아 orphan이 될 수 있음 |
 
-권장 계약은 다음과 같다.
+현재 반영된 계약과 남은 범위는 다음과 같다.
 
 - WAV를 `audio_revision`으로 관리하고 `source hash + extraction options hash`가 같을 때만 재사용한다.
 - transcript는 `audio_revision + backend/model/options hash`별 immutable `transcript_revision`으로 저장한다.
@@ -604,7 +604,7 @@ jobs(
 
 단일 웹 인스턴스에서는 SQLite를 유지할 수 있다. 다중 웹 스케줄러를 실제로 운영해야 할 때 lease 경쟁, 알림 지연, 쓰기 경합을 측정한 뒤 PostgreSQL이나 브로커 전환을 판단한다.
 
-현재 `jobs.lease_owner/lease_expires_at/lease_token`과 `(status, lease_expires_at)` 인덱스를 추가했다. dispatch와 startup recovery는 조건부 갱신으로 lease를 claim하면서 token을 증가시키고, 실행 중 heartbeat와 단계 상태 반영은 `owner + token`이 모두 일치할 때만 성공한다. 자막 게시는 프로세스 간 파일 잠금 안에서 lease를 재검증하고 DB 게시도 같은 token으로 확정해 구 worker의 늦은 게시를 차단한다. 다음 보강은 제한 시간 내 graceful drain과 오디오·전사 파일의 immutable revision이다.
+현재 `jobs.lease_owner/lease_expires_at/lease_token`과 `(status, lease_expires_at)` 인덱스를 추가했다. dispatch와 startup recovery는 조건부 갱신으로 lease를 claim하면서 token을 증가시키고, 실행 중 heartbeat와 단계 상태 반영은 `owner + token`이 모두 일치할 때만 성공한다. 자막 게시는 프로세스 간 파일 잠금 안에서 lease를 재검증하고 DB 게시도 같은 token으로 확정해 구 worker의 늦은 게시를 차단한다. 종료 시 scheduler와 신규 Future를 닫은 뒤 실행 Future를 제한 시간 동안 drain하며, 완료되지 않은 작업은 lease 만료 후 시작 복구가 회수한다. 별도 worker 프로세스를 SIGKILL한 테스트에서도 만료 뒤 새 token으로 회수됨을 검증했다.
 
 ## 12. 관측성과 운영 기능
 
@@ -807,12 +807,12 @@ src/stt_to_subtitle/
 | 자막이 있는 상태에서 prompt 변경 재시도는 어떻게 되는가 | transcript와 기존 번역·자막 generation을 보존하고 새 generation으로 처리한다. 새 번역 완료 전 기존 게시본을 유지하며 과거 SRT/ASS를 다시 게시할 수 있다. | immutable prompt revision, 번역 비교 UI, publication startup reconcile을 추가한다. |
 | `next_probe_at`은 계속 재시도한다는 뜻인가 | 번역 LLM이 평소 꺼져 있는 운영 환경에서는 호출 자체가 불필요하다. | LM은 manual gate로 두고 `next_probe_at`을 사용하지 않는다. STT처럼 자동 복구를 선택한 의존성에만 제한적으로 사용한다. |
 | 중단과 실패는 어떻게 구분하는가 | 외부 연결 불가는 `blocked/stt_unavailable`, 인증 설정 오류는 `blocked/auth_required`, 원격 segment/schema 계약 오류는 `failed/model_output_invalid`, 완화가 끝난 OOM은 `failed/resource_exhausted`로 전달하며 `retryable/failure_scope`를 함께 제공한다. | 실환경 backend fault test와 오류 코드별 운영 지표를 추가한다. |
-| WAV와 transcript는 영속 데이터인가 | persistent volume에는 남지만 immutable revision은 아니다. 같은 job을 재사용하는 재전사·재추출에서는 같은 경로가 덮어써질 수 있고 DB 레코드 삭제 후 orphan도 남을 수 있다. | audio/transcript를 immutable revision으로 만들고 hash 기반 재사용, 참조 무결성, retention, garbage collection을 적용한다. |
+| WAV와 transcript는 영속 데이터인가 | `audio_revisions`와 `transcript_revisions` 원장 및 고유 artifact 경로로 영속화했다. 같은 source·추출 설정 hash의 검증된 WAV만 재사용하고 재전사·직접 편집은 새 revision을 만든다. | retention, orphan garbage collection, 과거 revision 선택·삭제 정책을 적용한다. |
 | 외부 자막은 어떻게 다루는가 | `<filename>.srt/.vtt/.ass`를 한국어 `외부 자막`으로 탐지해 기본 재생하고, 생성 자막과 시간 기반 로컬 비교 및 선택적 상용 LLM 검증을 수행한다. | hash 기반 immutable external subtitle revision과 증분 catalog로 확장한다. |
 | 내부망에서도 인증이 필요한가 | 현재도 비밀번호가 비어 있으면 인증이 꺼지지만 공식 운영 계약으로 강조되지 않았다. | 별도 웹 인증은 추가하지 않는다. 무인증 모드를 테스트로 고정하고 경로·입력·로그·파일 무결성만 보호한다. |
 
 ## 20. 최종 권고
 
-명시적 상태 모델과 공통 projection, 번역 LLM·STT dispatch gate, worker lease·fencing 기반 단계별 재시작 복구, 자막 pair manifest reconcile, backend별 STT 취소·실패 계약은 반영됐다. 다음 리팩터링 단위는 graceful drain과 immutable audio/transcript revision이어야 한다. 자동 회복은 상시 가동 의존성에만 선택적으로 적용한다.
+명시적 상태 모델과 공통 projection, 번역 LLM·STT dispatch gate, worker lease·fencing·graceful drain 기반 단계별 재시작 복구, immutable audio/transcript revision, 자막 pair manifest reconcile, backend별 STT 취소·실패 계약은 반영됐다. 다음 리팩터링 단위는 immutable prompt revision, revision retention/orphan collector, artifact 게시 교체 지점별 fault matrix다. 자동 회복은 상시 가동 의존성에만 선택적으로 적용한다.
 
 동시에 transcript revision, translation generation/batch/item, external/generated subtitle asset, publication, validation을 영속 모델로 추가해야 한다. 그래야 프롬프트 수정 재번역, 부분 번역 재개, 외부 자막 재생·비교, 선택적 상용 LLM 평가, 자막 게시·rollback, WAV·전사본 재사용을 데이터 손실 없이 반복할 수 있다. 내부망 무인증 운영은 그대로 유지하고 인증보다 실행·파일·참조 무결성에 구현 역량을 집중한다.

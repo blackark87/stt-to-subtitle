@@ -708,6 +708,56 @@ class SubtitleOrchestratorTests(unittest.TestCase):
             self.assertEqual(fenced.lease_owner, "replacement-worker")
             self.assertEqual(fenced.lease_token, replacement_token[0])
 
+    def test_shutdown_drains_an_active_stage_within_grace_period(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            orchestrator = self.make_orchestrator(root, media_root)
+            release = threading.Event()
+            started = threading.Event()
+            job = orchestrator.store.create(
+                job_id="shutdown-drain",
+                source_rel="movie.mkv",
+                force_overwrite=False,
+                options={},
+            )
+            lease_token = orchestrator.store.claim_for_dispatch(
+                job.id,
+                "queued",
+                "extracting",
+                lease_owner=orchestrator._worker_id,
+                lease_seconds=60,
+            )
+
+            def complete_after_release(stage_job):
+                started.set()
+                self.assertTrue(release.wait(timeout=1))
+                orchestrator._require_stage_update(
+                    stage_job,
+                    status="audio_ready",
+                )
+
+            orchestrator._submit_stage(
+                orchestrator._audio_executor,
+                job.id,
+                "audio extraction",
+                complete_after_release,
+                lease_token,
+            )
+            self.assertTrue(started.wait(timeout=1))
+            timer = threading.Timer(0.05, release.set)
+            timer.start()
+            try:
+                orchestrator.stop(grace_seconds=1)
+                completed = orchestrator.store.get(job.id)
+            finally:
+                release.set()
+                timer.cancel()
+
+            self.assertEqual(completed.status, "audio_ready")
+            self.assertIsNone(completed.lease_owner)
+
     def test_requires_web_server_settings_before_creating_job(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -788,6 +838,12 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                 )
                 orchestrator._transcribe(extracted)
                 completed = orchestrator.store.get(job.id)
+                audio_revision = orchestrator.store.get_audio_revision(
+                    completed.audio_revision_id
+                )
+                transcript_revisions = (
+                    orchestrator.store.transcript_revisions(job.id)
+                )
             finally:
                 orchestrator.stop()
 
@@ -797,8 +853,74 @@ class SubtitleOrchestratorTests(unittest.TestCase):
             self.assertEqual(completed.operation, "transcribe")
             self.assertTrue(Path(completed.audio_path).is_file())
             self.assertTrue(Path(completed.transcript_path).is_file())
+            self.assertIsNotNone(audio_revision)
+            self.assertEqual(
+                audio_revision["artifact_path"],
+                completed.audio_path,
+            )
+            self.assertEqual(len(transcript_revisions), 1)
+            self.assertEqual(
+                transcript_revisions[0]["id"],
+                completed.transcript_revision_id,
+            )
+            self.assertEqual(
+                transcript_revisions[0]["audio_revision_id"],
+                completed.audio_revision_id,
+            )
             self.assertIsNone(completed.translation_path)
             self.assertFalse(completed.can_pause_translation)
+
+    def test_audio_extraction_reuses_a_valid_immutable_revision(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            (media_root / "movie.mkv").write_bytes(b"media")
+            orchestrator = self.make_orchestrator(root, media_root)
+            try:
+                first = orchestrator.create_job(
+                    "movie.mkv",
+                    force_overwrite=False,
+                    options={},
+                    operation="extract",
+                )
+                extract = Mock()
+
+                def fake_extract(_source, target, _options):
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(b"wave")
+
+                extract.side_effect = fake_extract
+                with patch(
+                    "stt_to_subtitle.orchestrator.extract_audio",
+                    extract,
+                ), patch(
+                    "stt_to_subtitle.orchestrator.wav_duration_seconds",
+                    return_value=30.0,
+                ):
+                    orchestrator._extract(first)
+                    first_completed = orchestrator.store.get(first.id)
+                    second = orchestrator.store.create(
+                        job_id="second-extraction",
+                        source_rel="movie.mkv",
+                        force_overwrite=False,
+                        options=first.options,
+                        operation="extract",
+                    )
+                    orchestrator._extract(second)
+                    second_completed = orchestrator.store.get(second.id)
+            finally:
+                orchestrator.stop()
+
+            extract.assert_called_once()
+            self.assertEqual(
+                second_completed.audio_revision_id,
+                first_completed.audio_revision_id,
+            )
+            self.assertEqual(
+                second_completed.audio_path,
+                first_completed.audio_path,
+            )
 
     def test_transcription_reuses_persisted_legacy_audio_job_in_place(
         self,
@@ -2423,6 +2545,77 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                 ],
                 "수정된 번역",
             )
+
+    def test_editing_transcript_creates_an_immutable_revision(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            (media_root / "movie.mkv").write_bytes(b"media")
+            orchestrator = self.make_orchestrator(root, media_root)
+            try:
+                job = orchestrator.create_job(
+                    "movie.mkv",
+                    force_overwrite=False,
+                    options={},
+                    operation="transcribe",
+                )
+                legacy_path = root / "state" / "jobs" / job.id / "legacy.json"
+                legacy_path.parent.mkdir(parents=True)
+                original = {
+                    "schema_version": 1,
+                    "job_id": "remote-job",
+                    "segments": [
+                        {
+                            "id": "segment-000001",
+                            "start": 0,
+                            "end": 1,
+                            "speaker": "SPEAKER_00",
+                            "text": "원본",
+                        }
+                    ],
+                }
+                legacy_path.write_text(
+                    json.dumps(original, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                orchestrator.store.update(
+                    job.id,
+                    status="transcription_completed",
+                    transcript_path=str(legacy_path),
+                )
+                edited_payload = {
+                    **original,
+                    "segments": [
+                        {
+                            **original["segments"][0],
+                            "text": "수정본",
+                        }
+                    ],
+                }
+
+                edited_path = orchestrator.save_artifact(
+                    job.id,
+                    "transcript",
+                    json.dumps(edited_payload, ensure_ascii=False),
+                )
+                refreshed = orchestrator.store.get(job.id)
+                revisions = orchestrator.store.transcript_revisions(job.id)
+            finally:
+                orchestrator.stop()
+
+            self.assertNotEqual(edited_path, legacy_path)
+            self.assertIn(
+                "원본",
+                legacy_path.read_text(encoding="utf-8"),
+            )
+            self.assertIn(
+                "수정본",
+                edited_path.read_text(encoding="utf-8"),
+            )
+            self.assertEqual(refreshed.transcript_path, str(edited_path))
+            self.assertEqual(refreshed.transcript_revision_id, revisions[0]["id"])
+            self.assertEqual(revisions[0]["origin"], "manual")
 
     def test_restart_translation_preserves_transcript_and_rerenders(self) -> None:
         with TemporaryDirectory() as directory:
