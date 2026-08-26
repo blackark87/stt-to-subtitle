@@ -6,7 +6,7 @@
 
 ### 구현 진행 상태
 
-현재 작업 트리에는 계획의 열 번째 수직 슬라이스까지 반영됐다.
+현재 작업 트리에는 계획의 열한 번째 수직 슬라이스까지 반영됐다.
 
 | 항목 | 반영 상태 | 남은 범위 |
 |---|---|---|
@@ -16,9 +16,9 @@
 | 로컬 비교 | 시간 중첩 정렬, coverage·문장 유사도·경계 오차, 파일 해시별 SQLite 결과 | generation/publication FK·검증 알고리즘 version migration |
 | 상용 LLM 검증 | 번역 LLM과 분리된 설정, 명시적 1회 호출, 구조화 결과, 입력·모델 cache | provider별 adapter·비용/사용량 관측 |
 | 번역 generation | generation·batch·segment SQLite 원장, 입력 지문, 배치 시도·실패, DB 기반 JSON 복구, 재번역·직접 편집 이력 | immutable prompt revision·startup reconcile |
-| 자막 publication | source별 단일 게시 포인터, generation별 SRT/ASS와 해시, 다운로드·과거 버전 재게시 | pair manifest·파일/DB startup reconcile·retention |
+| 자막 publication | source별 단일 게시 포인터, generation별 SRT/ASS와 해시, 다운로드·과거 버전 재게시, pair manifest·파일/DB startup reconcile | retention·교체 지점별 강제 종료 fault test |
 | 원격 STT 취소 | 멱등 cancel API, `cancel_requested/cancelled` 영속 상태, 웹의 취소 호출·최종 확인, WhisperX/JAV process group 종료, Kotoba 청크 경계 취소 | Kotoba diarization/postprocess 즉시 중단·실제 GPU 자원 fault test |
-| 시작 복구 | 추출 재대기, 원격 STT 재연결·유실 ID 멱등 재제출, 번역 체크포인트 대기 복원, 검증된 전사·번역 산출물 기반 렌더 재개, 중지 요청 보존 | worker lease·렌더 publication pair manifest reconcile·강제 종료 fault test |
+| 시작 복구 | 추출 재대기, 원격 STT 재연결·유실 ID 멱등 재제출, 번역 체크포인트 대기 복원, 검증된 전사·번역 산출물 기반 렌더 재개, 게시 자막 pair reconcile, 중지 요청 보존 | worker lease·강제 종료 fault test |
 | STT 실패 계약 | STT DB·API의 `failure_code/retryable/failure_scope`, segment/schema·OOM·인증·입력·처리·재시작 오류 분류, retryable 실패만 원격 재제출 | 실제 backend별 fault test·오류 코드 운영 지표 |
 | STT dispatch gate | 첫 연결 실패 시 영속 gate 차단, 뒤 작업 `audio_ready` 유지, 명시적 연결 확인의 제한된 3회 요청 후 중단 작업 재개 | 자동 recovery mode가 실제로 필요한지 운영 검증·회로 메트릭 |
 
@@ -388,14 +388,14 @@ SHA-256을 DB에 저장한다. 미디어 옆 `.ko.srt/.ko.ass`는 저장본을 s
 작업 화면에서 과거 두 파일을 내려받거나 해시 검증 후 다시 게시할 수 있다. 재번역
 또는 직접 편집 전에 기존 자막이 있으면 legacy generation으로 가져온다.
 
-파일 두 개와 SQLite를 하나의 원자 연산으로 묶을 수는 없으므로, 프로세스 종료 시
-다음 시작에서 version 파일·미디어 복사본·게시 포인터를 대조하는 reconcile과 pair
-manifest는 여전히 필요하다.
+파일 두 개와 SQLite를 하나의 원자 연산으로 묶을 수는 없으므로, 게시 직후 pair
+manifest를 원자 저장하고 다음 시작에서 generation 파일·미디어 복사본·게시 포인터를
+대조하는 reconcile을 수행한다.
 
 - WAV는 동일 디렉터리의 임시 파일에 생성하고 FFprobe 등으로 최소 유효성을 확인한 뒤 원자 교체한다.
 - SRT와 ASS는 각각 원자 교체하는 것만으로 두 파일의 동일 generation을 보장할 수 없다.
-- 두 파일의 hash, 입력 transcript/translation hash, renderer version을 담은 작은 manifest를 마지막에 원자 저장한다.
-- 재시작 시 manifest가 없거나 hash가 맞지 않으면 전체 렌더 단계를 다시 실행한다.
+- 두 파일의 hash, 입력 transcript/translation hash, renderer version을 담은 작은 manifest를 파일 쌍 교체 후 DB 포인터 전환 전에 원자 저장한다.
+- 재시작 시 manifest가 새 generation의 완성된 파일 쌍을 증명하면 DB 포인터를 전진시키고, manifest가 없거나 불일치하면 현재 DB 게시 generation의 저장본으로 SRT/ASS 쌍과 manifest를 복구한다.
 
 파일 생성과 DB 상태 갱신은 하나의 ACID 트랜잭션이 될 수 없으므로, “파일을 먼저 안전하게 완성 → manifest 확정 → DB 완료 처리” 순서와 재시작 reconcile로 일관성을 보장한다.
 
@@ -811,6 +811,6 @@ src/stt_to_subtitle/
 
 ## 20. 최종 권고
 
-명시적 상태 모델과 공통 projection, 번역 LLM·STT dispatch gate, 단계별 재시작 복구, backend별 STT 취소·실패 계약은 반영됐다. 다음 리팩터링 단위는 worker lease와 자막 pair manifest reconcile, immutable audio/transcript revision이어야 한다. 자동 회복은 상시 가동 의존성에만 선택적으로 적용한다.
+명시적 상태 모델과 공통 projection, 번역 LLM·STT dispatch gate, 단계별 재시작 복구, 자막 pair manifest reconcile, backend별 STT 취소·실패 계약은 반영됐다. 다음 리팩터링 단위는 worker lease와 immutable audio/transcript revision이어야 한다. 자동 회복은 상시 가동 의존성에만 선택적으로 적용한다.
 
 동시에 transcript revision, translation generation/batch/item, external/generated subtitle asset, publication, validation을 영속 모델로 추가해야 한다. 그래야 프롬프트 수정 재번역, 부분 번역 재개, 외부 자막 재생·비교, 선택적 상용 LLM 평가, 자막 게시·rollback, WAV·전사본 재사용을 데이터 손실 없이 반복할 수 있다. 내부망 무인증 운영은 그대로 유지하고 인증보다 실행·파일·참조 무결성에 구현 역량을 집중한다.

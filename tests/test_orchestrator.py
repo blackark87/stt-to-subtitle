@@ -2404,6 +2404,32 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                     subtitle_generations[1]["id"],
                 )
                 republished_srt = srt_path.read_text(encoding="utf-8")
+                manifest_path = (
+                    orchestrator._subtitle_publication_manifest_path(
+                        job.source_rel
+                    )
+                )
+                publication_manifest = json.loads(
+                    manifest_path.read_text(encoding="utf-8")
+                )
+                orchestrator.store.publish_subtitle_generation(
+                    subtitle_generations[0]["id"],
+                    srt_path=str(srt_path),
+                    ass_path=str(ass_path),
+                )
+                manifest_repaired = (
+                    orchestrator._reconcile_subtitle_publications()
+                )
+                reconciled_publication = (
+                    orchestrator.store.published_subtitle_generation(job.id)
+                )
+                manifest_path.unlink()
+                srt_path.write_text("partial replacement", encoding="utf-8")
+                pair_repaired = (
+                    orchestrator._reconcile_subtitle_publications()
+                )
+                repaired_srt = srt_path.read_text(encoding="utf-8")
+                repaired_ass = ass_path.read_text(encoding="utf-8")
                 Path(
                     subtitle_generations[0]["srt_artifact_path"]
                 ).write_text("tampered", encoding="utf-8")
@@ -2476,6 +2502,19 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                 subtitle_generations[0]["id"],
             )
             self.assertEqual(republished_srt, generated_srt)
+            self.assertEqual(
+                publication_manifest["subtitle_generation_id"],
+                subtitle_generations[1]["id"],
+            )
+            self.assertEqual(manifest_repaired, 1)
+            self.assertEqual(
+                reconciled_publication["id"],
+                subtitle_generations[1]["id"],
+            )
+            self.assertEqual(pair_repaired, 1)
+            self.assertEqual(repaired_srt, generated_srt)
+            self.assertIn("새 번역", repaired_ass)
+            self.assertTrue(manifest_path.is_file())
 
     def test_restart_translation_rejects_an_incomplete_job(self) -> None:
         with TemporaryDirectory() as directory:

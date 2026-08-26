@@ -275,6 +275,57 @@ class JobStore:
                     (*rebased, str(row["id"])),
                 )
                 changed += 1
+            translation_rows = connection.execute(
+                "SELECT id, artifact_path FROM translation_generations"
+            ).fetchall()
+            for row in translation_rows:
+                original = str(row["artifact_path"])
+                rebased = rebase_stored_path(
+                    original,
+                    previous_root=previous_root,
+                    current_root=current_root,
+                )
+                if rebased == original:
+                    continue
+                connection.execute(
+                    """
+                    UPDATE translation_generations
+                    SET artifact_path = ?
+                    WHERE id = ?
+                    """,
+                    (rebased, str(row["id"])),
+                )
+                changed += 1
+            subtitle_rows = connection.execute(
+                """
+                SELECT id, srt_artifact_path, ass_artifact_path
+                FROM subtitle_generations
+                """
+            ).fetchall()
+            for row in subtitle_rows:
+                original = (
+                    str(row["srt_artifact_path"]),
+                    str(row["ass_artifact_path"]),
+                )
+                rebased = tuple(
+                    rebase_stored_path(
+                        path,
+                        previous_root=previous_root,
+                        current_root=current_root,
+                    )
+                    for path in original
+                )
+                if rebased == original:
+                    continue
+                connection.execute(
+                    """
+                    UPDATE subtitle_generations
+                    SET srt_artifact_path = ?, ass_artifact_path = ?
+                    WHERE id = ?
+                    """,
+                    (*rebased, str(row["id"])),
+                )
+                changed += 1
         return changed
 
     def _notify_change(self, job_id: str) -> None:
@@ -2358,6 +2409,25 @@ class JobStore:
             if row is not None
             else None
         )
+
+    def list_subtitle_publications(self) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT generation.*, 1 AS is_published,
+                       publication.source_rel AS publication_source_rel
+                FROM subtitle_publications AS publication
+                JOIN subtitle_generations AS generation
+                  ON generation.id = publication.subtitle_generation_id
+                ORDER BY publication.source_rel
+                """
+            ).fetchall()
+        publications: list[dict[str, Any]] = []
+        for row in rows:
+            publication = self._subtitle_generation_from_row(row)
+            publication["source_rel"] = str(row["publication_source_rel"])
+            publications.append(publication)
+        return publications
 
     def publish_subtitle_generation(
         self,

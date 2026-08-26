@@ -277,6 +277,38 @@ class JobStoreTests(unittest.TestCase):
                 transcript_path="/var/lib/stt/jobs/job-1/transcript.json",
                 translation_path="/media/external-result.json",
             )
+            store.create_translation_generation(
+                generation_id="translation-1",
+                job_id=job.id,
+                transcript_job_id="remote-1",
+                transcript_hash="transcript-hash",
+                prompt_hash="prompt-hash",
+                endpoint_key="http://lm.test/v1",
+                model="model",
+                config_hash="config-hash",
+                artifact_path=(
+                    "/var/lib/stt/jobs/job-1/translation-1.json"
+                ),
+                origin="automatic",
+            )
+            store.create_subtitle_generation(
+                generation_id="subtitle-1",
+                job_id=job.id,
+                translation_generation_id="translation-1",
+                transcript_hash="transcript-hash",
+                translation_hash="translation-hash",
+                renderer_version="1",
+                render_hash="render-hash",
+                srt_artifact_path=(
+                    "/var/lib/stt/jobs/job-1/subtitle-1.srt"
+                ),
+                ass_artifact_path=(
+                    "/var/lib/stt/jobs/job-1/subtitle-1.ass"
+                ),
+                srt_hash="srt-hash",
+                ass_hash="ass-hash",
+                origin="rendered",
+            )
 
             changed = store.rebase_artifact_paths(
                 previous_root=Path("/var/lib/stt/jobs"),
@@ -284,7 +316,7 @@ class JobStoreTests(unittest.TestCase):
             )
 
             rebased = store.get(job.id)
-            self.assertEqual(changed, 1)
+            self.assertEqual(changed, 3)
             self.assertEqual(
                 rebased.audio_path,
                 "/var/lib/stt-work/job-1/audio.16k.wav",
@@ -296,6 +328,20 @@ class JobStoreTests(unittest.TestCase):
             self.assertEqual(
                 rebased.translation_path,
                 "/media/external-result.json",
+            )
+            translation = store.latest_translation_generation(job.id)
+            subtitle = store.get_subtitle_generation("subtitle-1")
+            self.assertEqual(
+                translation["artifact_path"],
+                "/var/lib/stt-work/job-1/translation-1.json",
+            )
+            self.assertEqual(
+                subtitle["srt_artifact_path"],
+                "/var/lib/stt-work/job-1/subtitle-1.srt",
+            )
+            self.assertEqual(
+                subtitle["ass_artifact_path"],
+                "/var/lib/stt-work/job-1/subtitle-1.ass",
             )
 
     def test_lists_and_counts_jobs_by_status(self) -> None:
@@ -982,6 +1028,10 @@ class JobStoreTests(unittest.TestCase):
                 store.published_subtitle_generation("job-1")["id"],
                 second["id"],
             )
+            publications = store.list_subtitle_publications()
+            self.assertEqual(len(publications), 1)
+            self.assertEqual(publications[0]["source_rel"], "movie.mkv")
+            self.assertEqual(publications[0]["id"], second["id"])
             self.assertEqual(store.get("job-1").srt_path, "movie.ko.srt")
 
             store.create(

@@ -244,7 +244,7 @@ class SubtitleOrchestrator:
         )
         if rebased_paths:
             LOGGER.info(
-                "rebased artifact paths for %d web job(s)",
+                "rebased artifact paths for %d record(s)",
                 rebased_paths,
             )
         saved_servers = self.store.get_remote_server_settings()
@@ -721,6 +721,12 @@ class SubtitleOrchestrator:
         return normalized
 
     def start(self) -> None:
+        repaired_publications = self._reconcile_subtitle_publications()
+        if repaired_publications:
+            LOGGER.warning(
+                "reconciled %d subtitle publication(s)",
+                repaired_publications,
+            )
         recovered = self._reconcile_interrupted_jobs()
         if recovered:
             LOGGER.warning(
@@ -3411,6 +3417,247 @@ class SubtitleOrchestrator:
             directory / f"{generation_id}.ass",
         )
 
+    def _subtitle_publication_manifest_path(self, source_rel: str) -> Path:
+        source_key = hashlib.sha256(source_rel.encode("utf-8")).hexdigest()
+        return (
+            self.settings.state_dir
+            / "subtitle-publications"
+            / f"{source_key}.json"
+        )
+
+    @staticmethod
+    def _published_subtitle_pair_matches(
+        generation: Mapping[str, Any],
+        *,
+        srt_path: Path,
+        ass_path: Path,
+    ) -> bool:
+        return (
+            srt_path.is_file()
+            and ass_path.is_file()
+            and sha256_file(srt_path) == generation["srt_hash"]
+            and sha256_file(ass_path) == generation["ass_hash"]
+        )
+
+    def _read_subtitle_publication_manifest(
+        self,
+        source_rel: str,
+    ) -> Mapping[str, Any] | None:
+        path = self._subtitle_publication_manifest_path(source_rel)
+        if not path.is_file():
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if (
+            not isinstance(payload, Mapping)
+            or payload.get("schema_version") != 1
+            or payload.get("source_rel") != source_rel
+        ):
+            return None
+        return payload
+
+    def _manifest_generation_for_source(
+        self,
+        source_rel: str,
+        manifest: Mapping[str, Any] | None,
+        *,
+        srt_path: Path,
+        ass_path: Path,
+    ) -> tuple[PipelineJob, dict[str, Any]] | None:
+        if manifest is None:
+            return None
+        generation_id = str(manifest.get("subtitle_generation_id", ""))
+        generation = self.store.get_subtitle_generation(generation_id)
+        if generation is None:
+            return None
+        job = self.store.get(str(generation["job_id"]))
+        if job is None or job.source_rel != source_rel:
+            return None
+        if (
+            manifest.get("job_id") != job.id
+            or manifest.get("srt_name") != srt_path.name
+            or manifest.get("ass_name") != ass_path.name
+            or manifest.get("srt_hash") != generation["srt_hash"]
+            or manifest.get("ass_hash") != generation["ass_hash"]
+            or manifest.get("transcript_hash")
+            != generation["transcript_hash"]
+            or manifest.get("translation_hash")
+            != generation["translation_hash"]
+            or manifest.get("renderer_version")
+            != generation["renderer_version"]
+            or manifest.get("render_hash") != generation["render_hash"]
+            or not self._subtitle_generation_files_valid(generation)
+            or not self._published_subtitle_pair_matches(
+                generation,
+                srt_path=srt_path,
+                ass_path=ass_path,
+            )
+        ):
+            return None
+        return job, generation
+
+    def _reconcile_subtitle_publications(self) -> int:
+        repaired = 0
+        with self._subtitle_publication_lock:
+            for publication in self.store.list_subtitle_publications():
+                try:
+                    repaired += int(
+                        self._reconcile_subtitle_publication(publication)
+                    )
+                except (OSError, RuntimeError, ValueError):
+                    LOGGER.exception(
+                        "subtitle publication reconcile failed for %s",
+                        publication["source_rel"],
+                    )
+        return repaired
+
+    def _reconcile_subtitle_publication(
+        self,
+        publication: Mapping[str, Any],
+    ) -> bool:
+        source_rel = str(publication["source_rel"])
+        source = self.library.resolve_file(source_rel)
+        srt_path = source.with_name(f"{source.stem}.ko.srt")
+        ass_path = source.with_name(f"{source.stem}.ko.ass")
+        manifest_generation = self._manifest_generation_for_source(
+            source_rel,
+            self._read_subtitle_publication_manifest(source_rel),
+            srt_path=srt_path,
+            ass_path=ass_path,
+        )
+        if manifest_generation is not None:
+            manifest_job, manifest_target = manifest_generation
+            if (
+                manifest_target["id"] == publication["id"]
+                and manifest_job.srt_path == str(srt_path)
+                and manifest_job.ass_path == str(ass_path)
+            ):
+                return False
+            self.store.publish_subtitle_generation(
+                str(manifest_target["id"]),
+                srt_path=str(srt_path),
+                ass_path=str(ass_path),
+            )
+            return True
+
+        published_job = self.store.get(str(publication["job_id"]))
+        if published_job is None:
+            raise RuntimeError("published subtitle job is unavailable")
+        if not self._subtitle_generation_files_valid(publication):
+            raise RuntimeError(
+                "published subtitle generation artifacts are invalid"
+            )
+        if not self._published_subtitle_pair_matches(
+            publication,
+            srt_path=srt_path,
+            ass_path=ass_path,
+        ):
+            copy_files_atomic(
+                (
+                    (
+                        Path(str(publication["srt_artifact_path"])),
+                        srt_path,
+                    ),
+                    (
+                        Path(str(publication["ass_artifact_path"])),
+                        ass_path,
+                    ),
+                ),
+                overwrite=True,
+            )
+        self._write_subtitle_publication_manifest(
+            published_job,
+            publication,
+            srt_path=srt_path,
+            ass_path=ass_path,
+        )
+        self.store.publish_subtitle_generation(
+            str(publication["id"]),
+            srt_path=str(srt_path),
+            ass_path=str(ass_path),
+        )
+        return True
+
+    @staticmethod
+    def _subtitle_generation_files_valid(
+        generation: Mapping[str, Any],
+    ) -> bool:
+        srt_artifact = Path(str(generation["srt_artifact_path"]))
+        ass_artifact = Path(str(generation["ass_artifact_path"]))
+        return (
+            srt_artifact.is_file()
+            and ass_artifact.is_file()
+            and sha256_file(srt_artifact) == generation["srt_hash"]
+            and sha256_file(ass_artifact) == generation["ass_hash"]
+        )
+
+    def _write_subtitle_publication_manifest(
+        self,
+        job: PipelineJob,
+        generation: Mapping[str, Any],
+        *,
+        srt_path: Path,
+        ass_path: Path,
+    ) -> None:
+        if (
+            not srt_path.is_file()
+            or not ass_path.is_file()
+            or sha256_file(srt_path) != generation["srt_hash"]
+            or sha256_file(ass_path) != generation["ass_hash"]
+        ):
+            raise RuntimeError("published subtitle pair is incomplete")
+        write_json_atomic(
+            self._subtitle_publication_manifest_path(job.source_rel),
+            {
+                "schema_version": 1,
+                "source_rel": job.source_rel,
+                "job_id": job.id,
+                "subtitle_generation_id": generation["id"],
+                "srt_name": srt_path.name,
+                "ass_name": ass_path.name,
+                "srt_hash": generation["srt_hash"],
+                "ass_hash": generation["ass_hash"],
+                "transcript_hash": generation["transcript_hash"],
+                "translation_hash": generation["translation_hash"],
+                "renderer_version": generation["renderer_version"],
+                "render_hash": generation["render_hash"],
+            },
+        )
+
+    def _publish_subtitle_pair_locked(
+        self,
+        job: PipelineJob,
+        generation: Mapping[str, Any],
+        *,
+        srt_path: Path,
+        ass_path: Path,
+        overwrite: bool,
+        copy_to_media: bool = True,
+    ) -> dict[str, Any]:
+        if not self._subtitle_generation_files_valid(generation):
+            raise ValueError("subtitle generation file is invalid")
+        if copy_to_media:
+            copy_files_atomic(
+                (
+                    (Path(str(generation["srt_artifact_path"])), srt_path),
+                    (Path(str(generation["ass_artifact_path"])), ass_path),
+                ),
+                overwrite=overwrite,
+            )
+        self._write_subtitle_publication_manifest(
+            job,
+            generation,
+            srt_path=srt_path,
+            ass_path=ass_path,
+        )
+        return self.store.publish_subtitle_generation(
+            str(generation["id"]),
+            srt_path=str(srt_path),
+            ass_path=str(ass_path),
+        )
+
     def _capture_legacy_subtitle_generation(
         self,
         job: PipelineJob,
@@ -3494,10 +3741,13 @@ class SubtitleOrchestrator:
             ass_hash=ass_hash,
             origin="legacy",
         )
-        return self.store.publish_subtitle_generation(
-            generation["id"],
-            srt_path=str(srt_path),
-            ass_path=str(ass_path),
+        return self._publish_subtitle_pair_locked(
+            job,
+            generation,
+            srt_path=srt_path,
+            ass_path=ass_path,
+            overwrite=False,
+            copy_to_media=False,
         )
 
     @staticmethod
@@ -3536,28 +3786,18 @@ class SubtitleOrchestrator:
             ass_artifact.relative_to(job_root)
         except ValueError as error:
             raise ValueError("subtitle generation path is invalid") from error
-        if (
-            not srt_artifact.is_file()
-            or not ass_artifact.is_file()
-            or sha256_file(srt_artifact) != generation["srt_hash"]
-            or sha256_file(ass_artifact) != generation["ass_hash"]
-        ):
+        if not self._subtitle_generation_files_valid(generation):
             raise ValueError("subtitle generation file is invalid")
         source = self.library.resolve_file(job.source_rel)
         srt_path = source.with_name(f"{source.stem}.ko.srt")
         ass_path = source.with_name(f"{source.stem}.ko.ass")
         with self._subtitle_publication_lock:
-            copy_files_atomic(
-                (
-                    (srt_artifact, srt_path),
-                    (ass_artifact, ass_path),
-                ),
+            self._publish_subtitle_pair_locked(
+                job,
+                generation,
+                srt_path=srt_path,
+                ass_path=ass_path,
                 overwrite=True,
-            )
-            self.store.publish_subtitle_generation(
-                generation["id"],
-                srt_path=str(srt_path),
-                ass_path=str(ass_path),
             )
         self.store.add_event(
             job.id,
@@ -3670,17 +3910,12 @@ class SubtitleOrchestrator:
             origin="rendered",
         )
         with self._subtitle_publication_lock:
-            copy_files_atomic(
-                (
-                    (srt_artifact, srt_path),
-                    (ass_artifact, ass_path),
-                ),
+            self._publish_subtitle_pair_locked(
+                job,
+                generation,
+                srt_path=srt_path,
+                ass_path=ass_path,
                 overwrite=overwrite,
-            )
-            self.store.publish_subtitle_generation(
-                generation["id"],
-                srt_path=str(srt_path),
-                ass_path=str(ass_path),
             )
         if timeline.repaired_segment_ids:
             self.store.add_event(
