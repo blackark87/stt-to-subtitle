@@ -24,7 +24,7 @@
             <a href="/"{% if request.url.path == '/' %} class="is-active" aria-current="page"{% endif %}>
               {{ icons.dashboard(18) }}<span>대시보드</span>
             </a>
-            <a href="/?view=3d">
+            <a class="desktop-3d-only" href="/?view=3d">
               {{ icons.activity(18) }}<span>3D 대시보드</span>
             </a>
             <a href="/media"{% if request.url.path.startswith('/media') %} class="is-active" aria-current="page"{% endif %}>

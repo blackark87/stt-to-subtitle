@@ -853,6 +853,7 @@ class WebAppTests(unittest.TestCase):
                     "/static/vendor/three.core.min.js"
                 )
                 stylesheet = client.get("/static/webgpu.css")
+                app_stylesheet = client.get("/static/app.css")
 
             self.assertEqual(page.status_code, 200)
             self.assertEqual(empty_gpu_page.status_code, 200)
@@ -991,12 +992,18 @@ class WebAppTests(unittest.TestCase):
             )
             self.assertIn("worker unavailable", page.text)
             self.assertIn('href="/?view=2d"', page.text)
+            self.assertIn('window.location.replace("/?view=2d")', page.text)
+            self.assertIn(
+                "(hover: none) and (pointer: coarse)",
+                page.text,
+            )
             self.assertIn('href="/media">미디어 선택</a>', page.text)
             self.assertIn("location.assign(o.userData.href)", page.text)
             self.assertNotIn("/option-B", page.text)
             self.assertNotIn("상주 모델 정보", page.text)
             self.assertNotIn("Prometheus 연결을 설정하면", page.text)
             self.assertIn('href="/?view=3d"', dashboard.text)
+            self.assertIn("desktop-3d-only", dashboard.text)
             self.assertIn("<h1>대시보드</h1>", persisted_dashboard.text)
             self.assertIn(
                 'class="dashboard-option-b"',
@@ -1025,6 +1032,12 @@ class WebAppTests(unittest.TestCase):
             self.assertEqual(renderer_core.status_code, 200)
             self.assertEqual(stylesheet.status_code, 200)
             self.assertIn("--accent", stylesheet.text)
+            self.assertEqual(app_stylesheet.status_code, 200)
+            self.assertIn(".desktop-3d-only", app_stylesheet.text)
+            self.assertIn(
+                "(hover: none) and (pointer: coarse)",
+                app_stylesheet.text,
+            )
 
     def test_webgpu_workers_rest_when_no_jobs_exist(self) -> None:
         with TemporaryDirectory() as directory:
