@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import threading
@@ -3405,6 +3406,106 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                     self.assertIsNone(recovered_job.lease_owner)
                 finally:
                     orchestrator.stop()
+
+    @unittest.skipIf(
+        os.geteuid() == 0,
+        "filesystem permission faults require a non-root test process",
+    )
+    def test_recovers_subtitle_publication_after_real_permission_fault(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            (media_root / "movie.mkv").write_bytes(b"media")
+            orchestrator = self.make_orchestrator(root, media_root)
+            media_mode = media_root.stat().st_mode & 0o777
+            try:
+                job = orchestrator.store.create(
+                    job_id="render-permission-fault",
+                    source_rel="movie.mkv",
+                    force_overwrite=True,
+                    options={},
+                    status="translated",
+                )
+                orchestrator.store.update(job.id, status="rendering")
+                generation_id = "subtitle-permission-fault"
+                srt_artifact, ass_artifact = (
+                    orchestrator._subtitle_generation_artifact_paths(
+                        job.id,
+                        generation_id,
+                    )
+                )
+                srt_artifact.parent.mkdir(parents=True)
+                srt_artifact.write_text("new srt", encoding="utf-8")
+                ass_artifact.write_text("new ass", encoding="utf-8")
+                orchestrator.store.create_subtitle_generation(
+                    generation_id=generation_id,
+                    job_id=job.id,
+                    translation_generation_id=None,
+                    transcript_hash="transcript-hash",
+                    translation_hash="translation-hash",
+                    renderer_version="1",
+                    render_hash="render-permission-fault",
+                    srt_artifact_path=str(srt_artifact),
+                    ass_artifact_path=str(ass_artifact),
+                    srt_hash=sha256_file(srt_artifact),
+                    ass_hash=sha256_file(ass_artifact),
+                    origin="rendered",
+                )
+
+                media_root.chmod(0o555)
+                try:
+                    with self.assertLogs(
+                        "stt_to_subtitle.orchestrator",
+                        level="ERROR",
+                    ) as failure_logs:
+                        blocked_repair_count = (
+                            orchestrator._reconcile_subtitle_publications()
+                        )
+                finally:
+                    media_root.chmod(media_mode)
+
+                blocked_job = orchestrator.store.get(job.id)
+                self.assertEqual(blocked_repair_count, 0)
+                self.assertTrue(
+                    any(
+                        "subtitle generation recovery failed" in message
+                        for message in failure_logs.output
+                    )
+                )
+                self.assertEqual(blocked_job.status, "rendering")
+                self.assertIsNone(blocked_job.lease_owner)
+                self.assertFalse((media_root / "movie.ko.srt").exists())
+                self.assertFalse((media_root / "movie.ko.ass").exists())
+                self.assertIsNone(
+                    orchestrator.store.published_subtitle_generation(job.id)
+                )
+
+                repaired = orchestrator._reconcile_subtitle_publications()
+
+                recovered_job = orchestrator.store.get(job.id)
+                publication = (
+                    orchestrator.store.published_subtitle_generation(job.id)
+                )
+                self.assertEqual(repaired, 1)
+                self.assertEqual(recovered_job.status, "completed")
+                self.assertEqual(recovered_job.phase, "complete")
+                self.assertEqual(recovered_job.state, "done")
+                self.assertIsNone(recovered_job.lease_owner)
+                self.assertEqual(
+                    (media_root / "movie.ko.srt").read_text(encoding="utf-8"),
+                    "new srt",
+                )
+                self.assertEqual(
+                    (media_root / "movie.ko.ass").read_text(encoding="utf-8"),
+                    "new ass",
+                )
+                self.assertEqual(publication["id"], generation_id)
+            finally:
+                media_root.chmod(media_mode)
+                orchestrator.stop()
 
     def test_does_not_recover_render_owned_by_an_active_worker(self) -> None:
         with TemporaryDirectory() as directory:

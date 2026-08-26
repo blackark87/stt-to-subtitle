@@ -6,7 +6,7 @@
 
 ### 구현 진행 상태
 
-현재 작업 트리에는 계획의 서른 번째 수직 슬라이스까지 반영됐다.
+현재 작업 트리에는 계획의 서른한 번째 수직 슬라이스까지 반영됐다.
 
 | 항목 | 반영 상태 | 남은 범위 |
 |---|---|---|
@@ -17,11 +17,11 @@
 | 상용 LLM 검증 | 번역 LLM과 분리된 설정, 명시적 1회 호출, 구조화 결과, 입력·모델 cache와 완료·실패·cache hit 계측 | provider별 adapter·비용/사용량 관측 |
 | 프롬프트 revision | 카테고리 생성·수정·보관·복원, 본문 변경별 immutable revision, 현재/과거 본문 비교, 새 작업·재번역의 과거 revision 선택, 작업 snapshot·translation generation 고정 참조, revision별 번역 결과 비교 | - |
 | 번역 generation | generation·batch·segment SQLite 원장, 입력 지문, prompt·transcript revision 참조, 배치 시도·실패, DB 기반 JSON 복구, 재번역·직접 편집 이력, generation attempt fencing, startup generation·batch reconcile, 세그먼트 ID 기반 버전 비교·필터·페이지네이션 | 강제 종료 시점별 실환경 fault test |
-| 자막 publication | source별 단일 게시 포인터, generation별 SRT/ASS와 해시, 다운로드·과거 버전 재게시, pair manifest·파일/DB startup reconcile, 최초 게시 4개 교체 지점 fault matrix, 활성 worker lease 보호 | 실제 파일시스템 장애 주입 |
-| 원격 STT 취소 | 멱등 cancel API, `cancel_requested/cancelled` 영속 상태, 웹의 취소 호출·최종 확인, WhisperX/JAV process group 종료, Kotoba 청크 경계 취소 | Kotoba diarization/postprocess 즉시 중단·실제 GPU 자원 fault test |
-| 시작 복구 | 추출 재대기, 원격 STT 재연결·유실 ID 멱등 재제출, 번역 체크포인트 대기 복원, generation·batch 중단 attempt 확정, 복구 lease 즉시 반환, 검증된 전사·번역 산출물 기반 렌더 재개, 미완료 최초 게시 generation 완결, 게시 자막 pair reconcile, worker lease claim·heartbeat·만료 회수, 단조 증가 fencing token, 제한 시간 graceful drain, SIGKILL 뒤 lease 회수 test, 중지 요청 보존 | 실제 파일시스템·GPU worker fault test |
+| 자막 publication | source별 단일 게시 포인터, generation별 SRT/ASS와 해시, 다운로드·과거 버전 재게시, pair manifest·파일/DB startup reconcile, 최초 게시 4개 교체 지점 fault matrix, 활성 worker lease 보호, 실제 쓰기 권한 장애 후 lease 반환·재시도 복구 test | ENOSPC·원격 read-only mount 검증이 운영상 필요하면 추가 |
+| 원격 STT 취소 | 멱등 cancel API, `cancel_requested/cancelled` 영속 상태, 웹의 취소 호출·최종 확인, WhisperX/JAV process group 종료, Kotoba 청크 경계 취소, 실행 중 WhisperX subprocess를 포함한 STT 프로세스 SIGKILL·잔류 worker 없음 확인 | Kotoba diarization/postprocess 즉시 중단·WhisperJAV 실제 취소 검증 |
+| 시작 복구 | 추출 재대기, 원격 STT 재연결·유실 ID 멱등 재제출, 번역 체크포인트 대기 복원, generation·batch 중단 attempt 확정, 복구 lease 즉시 반환, 검증된 전사·번역 산출물 기반 렌더 재개, 미완료 최초 게시 generation 완결, 게시 자막 pair reconcile, worker lease claim·heartbeat·만료 회수, 단조 증가 fencing token, 제한 시간 graceful drain, SIGKILL 뒤 lease 회수 test, 중지 요청 보존, 실제 WhisperX 실행 중 서비스 SIGKILL 후 healthy 복귀·중단 job 확정 | 현재 소스 이미지 배포 후 구조화 `service_restarted` 계약 재검증 |
 | 오디오·전사 revision | source·추출 설정 hash 기반 WAV 재사용, immutable WAV·전사 JSON 경로, DB revision 원장·활성 포인터, 직접 편집·비교 선택의 별도 전사 revision, 번역 generation의 transcript revision 참조, 전체 DB 참조 기반 감사·명시적 orphan 정리, 과거 전사 revision 선택·무결성 검증·새 번역 generation 연동 | revision 간 전사 내용 비교가 필요하면 후속 추가 |
-| STT 실패 계약 | STT DB·API의 `failure_code/retryable/failure_scope`, segment/schema·OOM·인증·입력·처리·재시작 오류 분류, retryable 실패만 원격 재제출 | 실제 backend별 fault test·오류 코드 운영 지표 |
+| STT 실패 계약 | STT DB·API의 `failure_code/retryable/failure_scope`, segment/schema·OOM·인증·입력·처리·재시작 오류 분류, retryable 실패만 원격 재제출 | 실제 배포 이미지의 계약 drift 해소 후 backend별 fault test·오류 코드 운영 지표 |
 | STT dispatch gate | 첫 연결 실패 시 영속 gate 차단, 뒤 작업 `audio_ready` 유지, 명시적 연결 확인의 제한된 3회 요청 후 중단 작업 재개 | 자동 recovery mode가 실제로 필요한지 운영 검증·회로 메트릭 |
 | 이벤트·관측성 | 구조화 전이 이벤트, 단계 대기·처리 시간, 외부 API attempt별 결과·소요 시간, dependency readiness·gate 전이, STT 큐와 원격 실행·취소 수, artifact 감사·정리, startup reconcile, lease fencing 거부, 번역 checkpoint와 자막 검증 결과를 SQLite에 누적하고 JSON·Prometheus text로 제공 | lease 복구·중복 실행 방지 세부 counter |
 | DB 무결성 | 외래키 활성화, 레거시 dangling 참조 정리, 상태 projection/domain·원장 소유 관계 guard, 공유 WAV 참조 보존, 순번·이름 ledger와 migration별 savepoint rollback, 레거시 ledger sequence backfill, quick/FK/migration 운영 지표, 원본 무변경 SQLite backup dry-run CLI와 실제 JobStore 검증 | - |
@@ -824,6 +824,31 @@ src/stt_to_subtitle/
 37. 순번형 migration이 sequence 순서로 한 번만 실행되고, 기존 name-only ledger를 backfill하며, 실패한 migration의 부분 쓰기와 ledger 기록을 savepoint로 함께 rollback하는지 확인
 38. migration dry-run이 SQLite backup 사본에만 변경을 적용하고 원본 bytes를 유지하며, 적용 migration·sequence backfill·quick/FK 결과만 경로 없이 반환하는지 확인
 
+### 17.1 실제 fault 검증 결과
+
+2026-08-26에 활성 웹·STT 작업이 0건이고 양쪽 SQLite `quick_check`가
+정상인 상태에서 다음 검증을 수행했다.
+
+- 임시 미디어 디렉터리 권한을 `0555`로 바꿔 실제 `EACCES`를 발생시켰다.
+  첫 reconcile은 SRT/ASS와 DB 게시 포인터를 만들지 않았고 recovery lease를
+  반환했다. 권한을 복구한 두 번째 reconcile은 같은 generation을 한 번만
+  게시하고 job을 `completed/complete/done`으로 확정했다. 이 시나리오는
+  non-root 환경에서 반복 실행하는 단위 테스트로 고정했다.
+- 300초 합성 PCM을 WhisperX에 제출하고 job `running`과 별도
+  `whisperx_worker` 프로세스를 확인한 즉시 STT 서비스 프로세스를
+  `SIGKILL`했다. 컨테이너는 재시작 정책으로 새 PID에서 healthy/ready로
+  복귀했고 실행 job은 `failed`와 `service restarted while transcription was
+  running`으로 확정됐다. SQLite는 정상이었고 잔류 WhisperX 프로세스와 GPU
+  실행 프로세스는 없었다.
+- 검증용 job·WAV·결과 파일은 정확한 ID를 확인한 뒤 제거했으며 활성 작업
+  0건과 기존 상태별 건수, DB 무결성이 복원됐음을 확인했다.
+
+검증 당시 실행 중이던 배포 이미지는 현재 소스의
+`failure_code/retryable/failure_scope` migration 이전 계약이었다. 따라서
+물리적 재시작과 비정형 `failed/error` 복구는 확인됐지만, 현재 소스 이미지를
+배포한 뒤 `service_restarted/true/service` 응답까지 같은 시나리오로 다시
+확인해야 한다.
+
 ## 18. 피해야 할 변경
 
 - 취소 기능을 만들 수 있다는 이유만으로 최종 자막 segment를 전사 전에 확정하지 않는다. 재개형 전사가 필요하면 overlap·화자 연속성·merge 계약을 가진 오디오 work unit으로 별도 설계한다.
@@ -856,6 +881,6 @@ src/stt_to_subtitle/
 
 ## 20. 최종 권고
 
-명시적 상태 모델과 공통 projection, 번역 LLM·STT dispatch gate, worker lease·fencing·graceful drain 및 번역 attempt reconcile 기반 단계별 재시작 복구, 비교·선택 가능한 immutable prompt revision, 세그먼트 ID 기반 translation generation 비교, 선택·재사용 가능한 immutable audio/transcript revision, 참조 기반 artifact 보존·수동 orphan 정리, 최초·재게시 cutpoint를 포함한 자막 pair manifest reconcile, backend별 STT 취소·실패 계약, 구조화 전이 이벤트, 외부 요청·dependency gate·원격 STT 큐·artifact/startup reconcile·lease fencing·checkpoint·자막 검증 영속 measurement, JSON·Prometheus 운영 스냅샷, 순번형 migration runner와 실제 JobStore 원본 무변경 dry-run, SQLite 외래키·상태 projection·원장 소유 관계 guard는 반영됐다. 남은 검증 단위는 실제 파일시스템·GPU worker fault test다. 자동 회복은 상시 가동 의존성에만 선택적으로 적용한다.
+명시적 상태 모델과 공통 projection, 번역 LLM·STT dispatch gate, worker lease·fencing·graceful drain 및 번역 attempt reconcile 기반 단계별 재시작 복구, 비교·선택 가능한 immutable prompt revision, 세그먼트 ID 기반 translation generation 비교, 선택·재사용 가능한 immutable audio/transcript revision, 참조 기반 artifact 보존·수동 orphan 정리, 최초·재게시 cutpoint를 포함한 자막 pair manifest reconcile, backend별 STT 취소·실패 계약, 구조화 전이 이벤트, 외부 요청·dependency gate·원격 STT 큐·artifact/startup reconcile·lease fencing·checkpoint·자막 검증 영속 measurement, JSON·Prometheus 운영 스냅샷, 순번형 migration runner와 실제 JobStore 원본 무변경 dry-run, SQLite 외래키·상태 projection·원장 소유 관계 guard는 반영됐다. 실제 파일 쓰기 권한 장애와 실행 중 WhisperX worker를 포함한 서비스 SIGKILL 복구도 확인했다. 다음 운영 검증은 현재 소스 이미지를 배포한 뒤 구조화 `service_restarted` 응답과 backend별 직접 취소를 확인하는 것이다. 자동 회복은 상시 가동 의존성에만 선택적으로 적용한다.
 
 동시에 transcript revision, translation generation/batch/item, external/generated subtitle asset, publication, validation을 영속 모델로 추가해야 한다. 그래야 프롬프트 수정 재번역, 부분 번역 재개, 외부 자막 재생·비교, 선택적 상용 LLM 평가, 자막 게시·rollback, WAV·전사본 재사용을 데이터 손실 없이 반복할 수 있다. 내부망 무인증 운영은 그대로 유지하고 인증보다 실행·파일·참조 무결성에 구현 역량을 집중한다.
