@@ -123,6 +123,21 @@ JOB_STATUS_GROUP_LABELS = {
     "waiting": "대기",
     "completed": "완료",
 }
+TRANSLATION_GENERATION_STATE_LABELS = {
+    "partial": "부분 저장",
+    "running": "진행 중",
+    "paused": "일시정지",
+    "blocked": "중단",
+    "failed": "실패",
+    "stopped": "사용자 정지",
+    "completed": "완료",
+}
+TRANSLATION_GENERATION_ORIGIN_LABELS = {
+    "automatic": "자동 번역",
+    "legacy": "이전 JSON 가져옴",
+    "restart": "재번역",
+    "manual": "직접 편집",
+}
 JOB_STAGE_FILTERS = {
     "extraction": {"queued", "extracting", "audio_completed"},
     "transcription": {
@@ -465,6 +480,25 @@ def job_progress_view(job: Any) -> dict[str, Any]:
             stage["state"] == "done" for stage in stages
         ),
     }
+
+
+def translation_generation_view(
+    generations: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    return [
+        {
+            **dict(generation),
+            "state_label": TRANSLATION_GENERATION_STATE_LABELS.get(
+                str(generation.get("state", "")),
+                str(generation.get("state", "")),
+            ),
+            "origin_label": TRANSLATION_GENERATION_ORIGIN_LABELS.get(
+                str(generation.get("origin", "")),
+                str(generation.get("origin", "")),
+            ),
+        }
+        for generation in generations
+    ]
 
 
 def _webgpu_stage_progress(
@@ -3912,6 +3946,9 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                     external_subtitles,
                 ),
                 "subtitle_validator": service.subtitle_validator_view(),
+                "translation_generations": translation_generation_view(
+                    service.store.list_translation_generations(job.id)
+                ),
                 "artifact_names": {
                     "transcript": artifact_filename(
                         job.source_rel,
@@ -3984,6 +4021,9 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                     external_subtitles,
                 ),
                 "subtitle_validator": service.subtitle_validator_view(),
+                "translation_generations": translation_generation_view(
+                    service.store.list_translation_generations(job.id)
+                ),
                 "artifact_names": {
                     "transcript": artifact_filename(
                         job.source_rel,
@@ -4472,6 +4512,41 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         return RedirectResponse(
             f"/jobs/{created.id}",
             status_code=status.HTTP_303_SEE_OTHER,
+        )
+
+    @app.get(
+        "/jobs/{job_id}/translation-generations/{generation_id}",
+        name="download_translation_generation",
+    )
+    def download_translation_generation(
+        request: Request,
+        job_id: str,
+        generation_id: str,
+    ) -> Any:
+        if not is_authenticated(request):
+            return login_redirect()
+        service = orchestrator(request)
+        generation = service.store.get_translation_generation(generation_id)
+        if generation is None or generation["job_id"] != job_id:
+            raise HTTPException(status_code=404, detail="generation not found")
+        job_root = (service.settings.jobs_dir / job_id).resolve()
+        artifact = Path(str(generation["artifact_path"])).resolve()
+        try:
+            artifact.relative_to(job_root)
+        except ValueError as error:
+            raise HTTPException(
+                status_code=404,
+                detail="generation not found",
+            ) from error
+        if not artifact.is_file():
+            raise HTTPException(status_code=404, detail="generation not found")
+        return FileResponse(
+            artifact,
+            media_type="application/json",
+            filename=(
+                "translation-generation-"
+                f"{generation['generation_number']}.json"
+            ),
         )
 
     @app.get(

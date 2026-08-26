@@ -2417,6 +2417,11 @@ class WebAppTests(unittest.TestCase):
                     f"/jobs/{job.id}/subtitle.ass"
                 )
                 refreshed_page = client.get(f"/jobs/{job.id}")
+                generations = service.store.list_translation_generations(job.id)
+                generation_download = client.get(
+                    f"/jobs/{job.id}/translation-generations/"
+                    f"{generations[-1]['id']}"
+                )
                 completed_jobs = client.get("/jobs-fragment")
                 restart = client.post(
                     f"/jobs/{job.id}/restart-translation",
@@ -2456,6 +2461,14 @@ class WebAppTests(unittest.TestCase):
             self.assertIn("[V4+ Styles]", styled_subtitle.text)
             self.assertIn("스타일 ASS 다운로드", refreshed_page.text)
             self.assertIn("번역부터 다시 시작", refreshed_page.text)
+            self.assertIn("번역 이력", refreshed_page.text)
+            self.assertIn("번역 버전 2 · 완료", refreshed_page.text)
+            self.assertIn("직접 편집", refreshed_page.text)
+            self.assertEqual(generation_download.status_code, 200)
+            self.assertEqual(
+                generation_download.json()["translations"][0]["text"],
+                "수정된 번역",
+            )
             self.assertIn("번역 다시 시작", completed_jobs.text)
             self.assertIn(
                 f'/jobs/{job.id}/restart-translation',

@@ -399,6 +399,8 @@ class TranslationResponseTests(unittest.TestCase):
         )
         progress: list[tuple[int, int]] = []
         checkpoints: list[list[dict[str, str]]] = []
+        started: list[tuple[int, list[str]]] = []
+        completed: list[tuple[int, list[dict[str, str]]]] = []
 
         with self.assertRaises(TranslationPaused):
             client.translate(
@@ -407,6 +409,10 @@ class TranslationResponseTests(unittest.TestCase):
                     {"id": "segment-2", "text": "二"},
                 ],
                 on_batch=checkpoints.append,
+                on_batch_started=lambda index, ids: started.append((index, ids)),
+                on_logical_batch=lambda index, items: completed.append(
+                    (index, items)
+                ),
                 on_progress=lambda completed, total: progress.append(
                     (completed, total)
                 ),
@@ -419,6 +425,35 @@ class TranslationResponseTests(unittest.TestCase):
             [[{"id": "segment-1", "text": "번역"}]],
         )
         self.assertEqual(client._translate_batch_with_recovery.call_count, 1)
+        self.assertEqual(started, [(0, ["segment-1"])])
+        self.assertEqual(
+            completed,
+            [(0, [{"id": "segment-1", "text": "번역"}])],
+        )
+
+    def test_reports_a_failed_logical_batch(self) -> None:
+        client = OpenAICompatibleClient(
+            "http://translation.test/v1",
+            "",
+            "model",
+        )
+        client._translate_batch_with_recovery = Mock(
+            side_effect=ExternalServiceError("server offline")
+        )
+        failures: list[tuple[int, list[str], str]] = []
+
+        with self.assertRaises(ExternalServiceError):
+            client.translate(
+                [{"id": "segment-1", "text": "一"}],
+                on_batch_failed=lambda index, ids, error: failures.append(
+                    (index, ids, error)
+                ),
+            )
+
+        self.assertEqual(
+            failures,
+            [(0, ["segment-1"], "server offline")],
+        )
 
     def test_translates_one_file_batches_in_parallel_and_reorders_results(
         self,
@@ -461,6 +496,8 @@ class TranslationResponseTests(unittest.TestCase):
         )
         progress: list[tuple[int, int]] = []
         checkpoints: list[list[dict[str, str]]] = []
+        batch_starts: list[tuple[int, list[str]]] = []
+        batch_completions: list[tuple[int, list[str]]] = []
         segments = [
             {"id": f"segment-{index}", "text": str(index)}
             for index in range(1, 4)
@@ -470,6 +507,12 @@ class TranslationResponseTests(unittest.TestCase):
             segments,
             max_workers=3,
             on_batch=checkpoints.append,
+            on_batch_started=lambda index, ids: batch_starts.append(
+                (index, ids)
+            ),
+            on_logical_batch=lambda index, items: batch_completions.append(
+                (index, [item["id"] for item in items])
+            ),
             on_progress=lambda completed, total: progress.append(
                 (completed, total)
             ),
@@ -486,6 +529,22 @@ class TranslationResponseTests(unittest.TestCase):
         self.assertEqual(progress[0], (0, 3))
         self.assertEqual(progress[-1], (3, 3))
         self.assertEqual(checkpoints[-1], result)
+        self.assertEqual(
+            batch_starts,
+            [
+                (0, ["segment-1"]),
+                (1, ["segment-2"]),
+                (2, ["segment-3"]),
+            ],
+        )
+        self.assertCountEqual(
+            batch_completions,
+            [
+                (0, ["segment-1"]),
+                (1, ["segment-2"]),
+                (2, ["segment-3"]),
+            ],
+        )
 
     def test_parallel_translation_pauses_after_active_batches_checkpoint(
         self,

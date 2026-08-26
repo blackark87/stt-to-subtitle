@@ -377,6 +377,30 @@
     {% endif %}
   </section>
 {% endif %}
+{% if translation_generations %}
+  <section class="card">
+    <div class="section-heading">
+      <div><h2>번역 이력</h2></div>
+      <span class="history-count">{{ translation_generations|length }}개 버전</span>
+    </div>
+    <div class="stack">
+      {% for generation in translation_generations|reverse %}
+        <article class="notice">
+          <strong>번역 버전 {{ generation.generation_number }} · {{ generation.state_label }}</strong>
+          <span>
+            {{ generation.origin_label }}{% if generation.model != "manual" %} · {{ generation.model }}{% endif %} ·
+            {{ generation.item_count }}개 항목
+          </span>
+          <a
+            class="button secondary"
+            href="{{ url_for('download_translation_generation', job_id=job.id, generation_id=generation.id) }}"
+            download
+          >JSON 다운로드</a>
+        </article>
+      {% endfor %}
+    </div>
+  </section>
+{% endif %}
 <section class="card job-history-card">
   <div class="section-heading">
     <div>

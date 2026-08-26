@@ -752,6 +752,13 @@ class OpenAICompatibleClient(RetryingJSONClient):
         review_rounds: int = 0,
         existing: Mapping[str, str] | None = None,
         on_batch: Callable[[list[dict[str, str]]], None] | None = None,
+        on_batch_started: Callable[[int, list[str]], None] | None = None,
+        on_logical_batch: (
+            Callable[[int, list[dict[str, str]]], None] | None
+        ) = None,
+        on_batch_failed: (
+            Callable[[int, list[str], str], None] | None
+        ) = None,
         on_progress: Callable[[int, int], None] | None = None,
         should_pause: Callable[[], bool] | None = None,
         on_review_warning: Callable[[str], None] | None = None,
@@ -794,12 +801,15 @@ class OpenAICompatibleClient(RetryingJSONClient):
         completed_batches = 0
 
         def accept_batch(
+            batch_index: int,
             translated: list[dict[str, str]],
             review_warning: str | None,
         ) -> None:
             nonlocal completed_batches
             if review_warning is not None and on_review_warning is not None:
                 on_review_warning(review_warning)
+            if on_logical_batch is not None:
+                on_logical_batch(batch_index, translated)
             for item in translated:
                 known[item["id"]] = item["text"]
             completed_batches += 1
@@ -815,16 +825,23 @@ class OpenAICompatibleClient(RetryingJSONClient):
                 on_progress(completed_batches, len(batches))
 
         if len(batches) <= 1 or max_workers == 1:
-            for batch in batches:
-                accept_batch(
-                    *self._translate_logical_batch(
+            for batch_index, batch in enumerate(batches):
+                segment_ids = [str(segment["id"]) for segment in batch]
+                if on_batch_started is not None:
+                    on_batch_started(batch_index, segment_ids)
+                try:
+                    result = self._translate_logical_batch(
                         segments,
                         batch,
                         system_prompt=system_prompt,
                         review_prompt=review_prompt,
                         review_rounds=review_rounds,
                     )
-                )
+                except Exception as error:
+                    if on_batch_failed is not None:
+                        on_batch_failed(batch_index, segment_ids, str(error))
+                    raise
+                accept_batch(batch_index, *result)
                 if should_pause is not None and should_pause():
                     raise TranslationPaused(
                         "translation paused after checkpoint"
@@ -838,6 +855,8 @@ class OpenAICompatibleClient(RetryingJSONClient):
                 review_rounds=review_rounds,
                 max_workers=max_workers,
                 accept_batch=accept_batch,
+                on_batch_started=on_batch_started,
+                on_batch_failed=on_batch_failed,
                 should_pause=should_pause,
             )
 
@@ -857,7 +876,11 @@ class OpenAICompatibleClient(RetryingJSONClient):
         review_prompt: str,
         review_rounds: int,
         max_workers: int,
-        accept_batch: Callable[[list[dict[str, str]], str | None], None],
+        accept_batch: Callable[
+            [int, list[dict[str, str]], str | None], None
+        ],
+        on_batch_started: Callable[[int, list[str]], None] | None,
+        on_batch_failed: Callable[[int, list[str], str], None] | None,
         should_pause: Callable[[], bool] | None,
     ) -> None:
         worker_count = min(max_workers, len(batches))
@@ -879,6 +902,11 @@ class OpenAICompatibleClient(RetryingJSONClient):
                 batch_index = next_batch
                 batch = batches[batch_index]
                 next_batch += 1
+                if on_batch_started is not None:
+                    on_batch_started(
+                        batch_index,
+                        [str(segment["id"]) for segment in batch],
+                    )
                 future = executor.submit(
                     self._translate_logical_batch,
                     all_segments,
@@ -897,12 +925,27 @@ class OpenAICompatibleClient(RetryingJSONClient):
                     return_when=FIRST_COMPLETED,
                 )
                 for future in sorted(done, key=in_flight.__getitem__):
-                    in_flight.pop(future)
+                    batch_index = in_flight.pop(future)
                     try:
-                        accept_batch(*future.result())
+                        result = future.result()
                     except BaseException as error:
+                        if on_batch_failed is not None:
+                            on_batch_failed(
+                                batch_index,
+                                [
+                                    str(segment["id"])
+                                    for segment in batches[batch_index]
+                                ],
+                                str(error),
+                            )
                         if first_error is None:
                             first_error = error
+                    else:
+                        try:
+                            accept_batch(batch_index, *result)
+                        except BaseException as error:
+                            if first_error is None:
+                                first_error = error
                 if (
                     first_error is None
                     and not pause_requested

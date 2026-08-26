@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+import hashlib
 import json
 from pathlib import Path
 import sqlite3
 import time
-from typing import Any, Callable, Collection, Iterator, Mapping
+from typing import Any, Callable, Collection, Iterator, Mapping, Sequence
 from uuid import uuid4
 
 from .path_display import (
@@ -67,6 +68,16 @@ _COMPARISON_TRANSCRIPTION_SQL = (
     "operation = 'transcribe' AND "
     "json_extract(options_json, '$.comparison_id') IS NOT NULL"
 )
+
+
+def _canonical_json_hash(value: Any) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -376,6 +387,61 @@ class JobStore:
                     UNIQUE (job_id, external_hash, candidate_hash)
                 );
 
+                CREATE TABLE IF NOT EXISTS translation_generations (
+                    id TEXT PRIMARY KEY,
+                    job_id TEXT NOT NULL,
+                    generation_number INTEGER NOT NULL,
+                    transcript_job_id TEXT NOT NULL,
+                    transcript_hash TEXT NOT NULL,
+                    prompt_hash TEXT NOT NULL,
+                    endpoint_key TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    config_hash TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    attempt INTEGER NOT NULL DEFAULT 0,
+                    origin TEXT NOT NULL,
+                    supersedes_generation_id TEXT,
+                    artifact_path TEXT NOT NULL,
+                    last_error TEXT,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    completed_at REAL,
+                    FOREIGN KEY (job_id) REFERENCES jobs(id),
+                    FOREIGN KEY (supersedes_generation_id)
+                        REFERENCES translation_generations(id),
+                    UNIQUE (job_id, generation_number)
+                );
+
+                CREATE TABLE IF NOT EXISTS translation_batches (
+                    generation_id TEXT NOT NULL,
+                    batch_index INTEGER NOT NULL,
+                    generation_attempt INTEGER NOT NULL,
+                    kind TEXT NOT NULL,
+                    segment_ids_json TEXT NOT NULL,
+                    input_hash TEXT NOT NULL,
+                    output_hash TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    error TEXT,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY (generation_id, batch_index),
+                    FOREIGN KEY (generation_id)
+                        REFERENCES translation_generations(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS translation_items (
+                    generation_id TEXT NOT NULL,
+                    segment_id TEXT NOT NULL,
+                    segment_index INTEGER NOT NULL,
+                    source_hash TEXT NOT NULL,
+                    translated_text TEXT NOT NULL,
+                    batch_index INTEGER NOT NULL,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY (generation_id, segment_id),
+                    FOREIGN KEY (generation_id)
+                        REFERENCES translation_generations(id)
+                );
+
                 CREATE TABLE IF NOT EXISTS schema_migrations (
                     name TEXT PRIMARY KEY,
                     applied_at REAL NOT NULL
@@ -387,6 +453,10 @@ class JobStore:
                     ON job_events(job_id, id);
                 CREATE INDEX IF NOT EXISTS subtitle_validations_job_idx
                     ON subtitle_validations(job_id, updated_at DESC);
+                CREATE INDEX IF NOT EXISTS translation_generations_job_idx
+                    ON translation_generations(job_id, generation_number DESC);
+                CREATE INDEX IF NOT EXISTS translation_items_generation_idx
+                    ON translation_items(generation_id, segment_index);
                 """
             )
             columns = {
@@ -1284,6 +1354,26 @@ class JobStore:
                 "DELETE FROM subtitle_validations WHERE job_id = ?",
                 (job_id,),
             )
+            generation_ids = [
+                str(row["id"])
+                for row in connection.execute(
+                    "SELECT id FROM translation_generations WHERE job_id = ?",
+                    (job_id,),
+                ).fetchall()
+            ]
+            for generation_id in generation_ids:
+                connection.execute(
+                    "DELETE FROM translation_items WHERE generation_id = ?",
+                    (generation_id,),
+                )
+                connection.execute(
+                    "DELETE FROM translation_batches WHERE generation_id = ?",
+                    (generation_id,),
+                )
+            connection.execute(
+                "DELETE FROM translation_generations WHERE job_id = ?",
+                (job_id,),
+            )
             connection.execute(
                 "DELETE FROM job_events WHERE job_id = ?",
                 (job_id,),
@@ -1296,6 +1386,543 @@ class JobStore:
         if deleted:
             self._notify_change(job_id)
         return deleted
+
+    def create_translation_generation(
+        self,
+        *,
+        generation_id: str,
+        job_id: str,
+        transcript_job_id: str,
+        transcript_hash: str,
+        prompt_hash: str,
+        endpoint_key: str,
+        model: str,
+        config_hash: str,
+        artifact_path: str,
+        origin: str,
+        force_new: bool = False,
+    ) -> dict[str, Any]:
+        if origin not in {"automatic", "legacy", "restart", "manual"}:
+            raise ValueError("invalid translation generation origin")
+        now = time.time()
+        with self._connect() as connection:
+            job = connection.execute(
+                "SELECT id FROM jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            if job is None:
+                raise ValueError("job not found")
+            latest = connection.execute(
+                """
+                SELECT * FROM translation_generations
+                WHERE job_id = ?
+                ORDER BY generation_number DESC
+                LIMIT 1
+                """,
+                (job_id,),
+            ).fetchone()
+            if (
+                not force_new
+                and latest is not None
+                and str(latest["config_hash"]) == config_hash
+            ):
+                return self._translation_generation_from_row(latest)
+            generation_number = (
+                int(latest["generation_number"]) + 1
+                if latest is not None
+                else 1
+            )
+            supersedes = str(latest["id"]) if latest is not None else None
+            connection.execute(
+                """
+                INSERT INTO translation_generations (
+                    id, job_id, generation_number,
+                    transcript_job_id, transcript_hash, prompt_hash,
+                    endpoint_key, model, config_hash,
+                    state, attempt, origin, supersedes_generation_id,
+                    artifact_path, last_error,
+                    created_at, updated_at, completed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'partial', 0, ?, ?, ?,
+                          NULL, ?, ?, NULL)
+                """,
+                (
+                    generation_id,
+                    job_id,
+                    generation_number,
+                    transcript_job_id,
+                    transcript_hash,
+                    prompt_hash,
+                    endpoint_key,
+                    model,
+                    config_hash,
+                    origin,
+                    supersedes,
+                    artifact_path,
+                    now,
+                    now,
+                ),
+            )
+            created = connection.execute(
+                "SELECT * FROM translation_generations WHERE id = ?",
+                (generation_id,),
+            ).fetchone()
+        return self._translation_generation_from_row(created)
+
+    def latest_translation_generation(
+        self,
+        job_id: str,
+    ) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM translation_generations
+                WHERE job_id = ?
+                ORDER BY generation_number DESC
+                LIMIT 1
+                """,
+                (job_id,),
+            ).fetchone()
+        return (
+            self._translation_generation_from_row(row)
+            if row is not None
+            else None
+        )
+
+    def get_translation_generation(
+        self,
+        generation_id: str,
+    ) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM translation_generations WHERE id = ?",
+                (generation_id,),
+            ).fetchone()
+        return (
+            self._translation_generation_from_row(row)
+            if row is not None
+            else None
+        )
+
+    def list_translation_generations(
+        self,
+        job_id: str,
+    ) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT generation.*,
+                       (
+                           SELECT COUNT(*) FROM translation_items AS item
+                           WHERE item.generation_id = generation.id
+                       ) AS item_count,
+                       (
+                           SELECT COUNT(*) FROM translation_batches AS batch
+                           WHERE batch.generation_id = generation.id
+                             AND batch.state = 'completed'
+                       ) AS completed_batch_count
+                FROM translation_generations AS generation
+                WHERE generation.job_id = ?
+                ORDER BY generation_number
+                """,
+                (job_id,),
+            ).fetchall()
+        return [self._translation_generation_from_row(row) for row in rows]
+
+    def begin_translation_generation_attempt(self, generation_id: str) -> int:
+        with self._connect() as connection:
+            updated = connection.execute(
+                """
+                UPDATE translation_generations
+                SET state = 'running', attempt = attempt + 1,
+                    last_error = NULL, updated_at = ?
+                WHERE id = ?
+                """,
+                (time.time(), generation_id),
+            )
+            row = connection.execute(
+                "SELECT attempt FROM translation_generations WHERE id = ?",
+                (generation_id,),
+            ).fetchone()
+        if updated.rowcount != 1 or row is None:
+            raise ValueError("translation generation not found")
+        return int(row["attempt"])
+
+    def mark_translation_generation(
+        self,
+        generation_id: str,
+        *,
+        state: str,
+        error: str | None = None,
+    ) -> None:
+        if state not in {"partial", "paused", "blocked", "failed", "stopped"}:
+            raise ValueError("invalid translation generation state")
+        with self._connect() as connection:
+            updated = connection.execute(
+                """
+                UPDATE translation_generations
+                SET state = ?, last_error = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (state, error, time.time(), generation_id),
+            )
+        if updated.rowcount != 1:
+            raise ValueError("translation generation not found")
+
+    def next_translation_batch_index(self, generation_id: str) -> int:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT COALESCE(MAX(batch_index), -1) + 1 AS next_index
+                FROM translation_batches
+                WHERE generation_id = ?
+                """,
+                (generation_id,),
+            ).fetchone()
+        return int(row["next_index"]) if row is not None else 0
+
+    def completed_translation_batch_count(self, generation_id: str) -> int:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM translation_batches
+                WHERE generation_id = ? AND state = 'completed'
+                  AND kind = 'remote'
+                """,
+                (generation_id,),
+            ).fetchone()
+        return int(row["count"]) if row is not None else 0
+
+    def start_translation_batch(
+        self,
+        generation_id: str,
+        *,
+        batch_index: int,
+        generation_attempt: int,
+        items: Sequence[Mapping[str, Any]],
+    ) -> None:
+        if batch_index < 0 or generation_attempt < 0:
+            raise ValueError("invalid translation batch index or attempt")
+        normalized: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in items:
+            segment_id = str(item.get("id", "")).strip()
+            source_hash = str(item.get("source_hash", "")).strip()
+            if not segment_id or segment_id in seen or not source_hash:
+                raise ValueError("invalid translation batch source item")
+            seen.add(segment_id)
+            normalized.append(
+                {"id": segment_id, "source_hash": source_hash}
+            )
+        if not normalized:
+            raise ValueError("translation batch must contain source items")
+        segment_ids = [item["id"] for item in normalized]
+        input_hash = _canonical_json_hash(normalized)
+        now = time.time()
+        with self._connect() as connection:
+            generation = connection.execute(
+                "SELECT id FROM translation_generations WHERE id = ?",
+                (generation_id,),
+            ).fetchone()
+            if generation is None:
+                raise ValueError("translation generation not found")
+            connection.execute(
+                """
+                INSERT INTO translation_batches (
+                    generation_id, batch_index, generation_attempt, kind,
+                    segment_ids_json, input_hash, output_hash,
+                    state, error, created_at, updated_at
+                ) VALUES (?, ?, ?, 'remote', ?, ?, '', 'running', NULL, ?, ?)
+                ON CONFLICT(generation_id, batch_index) DO UPDATE SET
+                    generation_attempt = excluded.generation_attempt,
+                    kind = 'remote',
+                    segment_ids_json = excluded.segment_ids_json,
+                    input_hash = excluded.input_hash,
+                    output_hash = '', state = 'running', error = NULL,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    generation_id,
+                    batch_index,
+                    generation_attempt,
+                    json.dumps(segment_ids, ensure_ascii=False),
+                    input_hash,
+                    now,
+                    now,
+                ),
+            )
+
+    def fail_translation_batch(
+        self,
+        generation_id: str,
+        *,
+        batch_index: int,
+        error: str,
+    ) -> None:
+        with self._connect() as connection:
+            updated = connection.execute(
+                """
+                UPDATE translation_batches
+                SET state = 'failed', error = ?, updated_at = ?
+                WHERE generation_id = ? AND batch_index = ?
+                """,
+                (error[:2000], time.time(), generation_id, batch_index),
+            )
+        if updated.rowcount != 1:
+            raise ValueError("translation batch not found")
+
+    def translation_batches(
+        self,
+        generation_id: str,
+    ) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT batch_index, generation_attempt, kind,
+                       segment_ids_json, input_hash, output_hash,
+                       state, error, created_at, updated_at
+                FROM translation_batches
+                WHERE generation_id = ?
+                ORDER BY batch_index
+                """,
+                (generation_id,),
+            ).fetchall()
+        return [
+            {
+                "batch_index": int(row["batch_index"]),
+                "generation_attempt": int(row["generation_attempt"]),
+                "kind": str(row["kind"]),
+                "segment_ids": json.loads(str(row["segment_ids_json"])),
+                "input_hash": str(row["input_hash"]),
+                "output_hash": str(row["output_hash"]),
+                "state": str(row["state"]),
+                "error": row["error"],
+                "created_at": float(row["created_at"]),
+                "updated_at": float(row["updated_at"]),
+            }
+            for row in rows
+        ]
+
+    def save_translation_batch(
+        self,
+        generation_id: str,
+        *,
+        batch_index: int,
+        generation_attempt: int,
+        kind: str,
+        items: Sequence[Mapping[str, Any]],
+    ) -> None:
+        if kind not in {"remote", "legacy", "manual", "final"}:
+            raise ValueError("invalid translation batch kind")
+        if batch_index < 0 or generation_attempt < 0:
+            raise ValueError("invalid translation batch index or attempt")
+        normalized: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in items:
+            segment_id = str(item.get("id", "")).strip()
+            text = str(item.get("text", "")).strip()
+            source_hash = str(item.get("source_hash", "")).strip()
+            segment_index = item.get("segment_index")
+            if (
+                not segment_id
+                or segment_id in seen
+                or not text
+                or not source_hash
+                or not isinstance(segment_index, int)
+                or segment_index < 0
+            ):
+                raise ValueError("invalid translation batch item")
+            seen.add(segment_id)
+            normalized.append(
+                {
+                    "id": segment_id,
+                    "text": text,
+                    "source_hash": source_hash,
+                    "segment_index": segment_index,
+                }
+            )
+        if not normalized:
+            return
+        segment_ids = [item["id"] for item in normalized]
+        input_hash = _canonical_json_hash(
+            [
+                {"id": item["id"], "source_hash": item["source_hash"]}
+                for item in normalized
+            ]
+        )
+        output_hash = _canonical_json_hash(
+            [{"id": item["id"], "text": item["text"]} for item in normalized]
+        )
+        now = time.time()
+        with self._connect() as connection:
+            generation = connection.execute(
+                "SELECT id FROM translation_generations WHERE id = ?",
+                (generation_id,),
+            ).fetchone()
+            if generation is None:
+                raise ValueError("translation generation not found")
+            connection.execute(
+                """
+                INSERT INTO translation_batches (
+                    generation_id, batch_index, generation_attempt, kind,
+                    segment_ids_json, input_hash, output_hash,
+                    state, error, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'completed', NULL, ?, ?)
+                ON CONFLICT(generation_id, batch_index) DO UPDATE SET
+                    generation_attempt = excluded.generation_attempt,
+                    kind = excluded.kind,
+                    segment_ids_json = excluded.segment_ids_json,
+                    input_hash = excluded.input_hash,
+                    output_hash = excluded.output_hash,
+                    state = 'completed', error = NULL,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    generation_id,
+                    batch_index,
+                    generation_attempt,
+                    kind,
+                    json.dumps(segment_ids, ensure_ascii=False),
+                    input_hash,
+                    output_hash,
+                    now,
+                    now,
+                ),
+            )
+            for item in normalized:
+                connection.execute(
+                    """
+                    INSERT INTO translation_items (
+                        generation_id, segment_id, segment_index,
+                        source_hash, translated_text, batch_index, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(generation_id, segment_id) DO UPDATE SET
+                        segment_index = excluded.segment_index,
+                        source_hash = excluded.source_hash,
+                        translated_text = excluded.translated_text,
+                        batch_index = excluded.batch_index,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        generation_id,
+                        item["id"],
+                        item["segment_index"],
+                        item["source_hash"],
+                        item["text"],
+                        batch_index,
+                        now,
+                    ),
+                )
+            connection.execute(
+                """
+                UPDATE translation_generations
+                SET state = 'partial', updated_at = ?
+                WHERE id = ?
+                """,
+                (now, generation_id),
+            )
+
+    def translation_items(
+        self,
+        generation_id: str,
+    ) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT segment_id, segment_index, source_hash,
+                       translated_text, batch_index, updated_at
+                FROM translation_items
+                WHERE generation_id = ?
+                ORDER BY segment_index, segment_id
+                """,
+                (generation_id,),
+            ).fetchall()
+        return [
+            {
+                "id": str(row["segment_id"]),
+                "text": str(row["translated_text"]),
+                "segment_index": int(row["segment_index"]),
+                "source_hash": str(row["source_hash"]),
+                "batch_index": int(row["batch_index"]),
+                "updated_at": float(row["updated_at"]),
+            }
+            for row in rows
+        ]
+
+    def complete_translation_generation(
+        self,
+        generation_id: str,
+        expected_segment_ids: Sequence[str],
+    ) -> list[dict[str, str]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT segment_id, translated_text
+                FROM translation_items
+                WHERE generation_id = ?
+                ORDER BY segment_index, segment_id
+                """,
+                (generation_id,),
+            ).fetchall()
+            received_ids = [str(row["segment_id"]) for row in rows]
+            if received_ids != list(expected_segment_ids):
+                raise ValueError(
+                    "translation generation items do not match transcript"
+                )
+            now = time.time()
+            updated = connection.execute(
+                """
+                UPDATE translation_generations
+                SET state = 'completed', last_error = NULL,
+                    completed_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (now, now, generation_id),
+            )
+        if updated.rowcount != 1:
+            raise ValueError("translation generation not found")
+        return [
+            {"id": str(row["segment_id"]), "text": str(row["translated_text"])}
+            for row in rows
+        ]
+
+    @staticmethod
+    def _translation_generation_from_row(row: sqlite3.Row) -> dict[str, Any]:
+        result = {
+            "id": str(row["id"]),
+            "job_id": str(row["job_id"]),
+            "generation_number": int(row["generation_number"]),
+            "transcript_job_id": str(row["transcript_job_id"]),
+            "transcript_hash": str(row["transcript_hash"]),
+            "prompt_hash": str(row["prompt_hash"]),
+            "endpoint_key": str(row["endpoint_key"]),
+            "model": str(row["model"]),
+            "config_hash": str(row["config_hash"]),
+            "state": str(row["state"]),
+            "attempt": int(row["attempt"]),
+            "origin": str(row["origin"]),
+            "supersedes_generation_id": (
+                str(row["supersedes_generation_id"])
+                if row["supersedes_generation_id"] is not None
+                else None
+            ),
+            "artifact_path": str(row["artifact_path"]),
+            "last_error": (
+                str(row["last_error"]) if row["last_error"] is not None else None
+            ),
+            "created_at": float(row["created_at"]),
+            "updated_at": float(row["updated_at"]),
+            "completed_at": (
+                float(row["completed_at"])
+                if row["completed_at"] is not None
+                else None
+            ),
+        }
+        if "item_count" in row.keys():
+            result["item_count"] = int(row["item_count"])
+        if "completed_batch_count" in row.keys():
+            result["completed_batch_count"] = int(row["completed_batch_count"])
+        return result
 
     def save_subtitle_validation(
         self,

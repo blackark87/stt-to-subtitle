@@ -14,7 +14,10 @@ from stt_to_subtitle.orchestrator import (
     estimate_transcription_chunks,
 )
 from stt_to_subtitle.job_store import JobStore
-from stt_to_subtitle.service_clients import TranslationPaused
+from stt_to_subtitle.service_clients import (
+    ExternalServiceError,
+    TranslationPaused,
+)
 
 
 class SubtitleOrchestratorTests(unittest.TestCase):
@@ -824,6 +827,11 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                 def pause_after_checkpoint(_segments, **kwargs):
                     items = [{"id": "segment-000001", "text": "안녕하세요"}]
                     kwargs["on_progress"](0, 2)
+                    kwargs["on_batch_started"](
+                        0,
+                        ["segment-000001"],
+                    )
+                    kwargs["on_logical_batch"](0, items)
                     kwargs["on_batch"](items)
                     kwargs["on_progress"](1, 2)
                     raise TranslationPaused()
@@ -844,6 +852,15 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                 checkpoint = json.loads(
                     Path(paused.translation_path).read_text(encoding="utf-8")
                 )
+                generations = orchestrator.store.list_translation_generations(
+                    job.id
+                )
+                generation_items = orchestrator.store.translation_items(
+                    generations[0]["id"]
+                )
+                generation_batches = orchestrator.store.translation_batches(
+                    generations[0]["id"]
+                )
             finally:
                 orchestrator.stop()
 
@@ -854,6 +871,12 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                 checkpoint["translations"],
                 [{"id": "segment-000001", "text": "안녕하세요"}],
             )
+            self.assertEqual(generations[0]["state"], "paused")
+            self.assertEqual(generations[0]["attempt"], 1)
+            self.assertEqual(generation_items[0]["text"], "안녕하세요")
+            self.assertEqual(len(generation_batches), 1)
+            self.assertEqual(generation_batches[0]["state"], "completed")
+            self.assertTrue(Path(generations[0]["artifact_path"]).is_file())
 
     def test_translation_uses_configured_workers_for_one_file(self) -> None:
         with TemporaryDirectory() as directory:
@@ -923,6 +946,169 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                 translation_client.translate.call_args.kwargs["max_workers"],
                 3,
             )
+
+    def test_translation_persists_a_failed_logical_batch(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            (media_root / "movie.mkv").write_bytes(b"media")
+            orchestrator = self.make_orchestrator(root, media_root)
+            try:
+                job = orchestrator.create_job(
+                    "movie.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                artifact_dir = root / "state" / "jobs" / job.id
+                artifact_dir.mkdir(parents=True)
+                transcript_path = artifact_dir / "transcript.json"
+                transcript_path.write_text(
+                    json.dumps(
+                        {
+                            "schema_version": 1,
+                            "job_id": "remote-job",
+                            "segments": [
+                                {
+                                    "id": "segment-000001",
+                                    "start": 0,
+                                    "end": 1,
+                                    "speaker": "SPEAKER_00",
+                                    "text": "こんにちは",
+                                }
+                            ],
+                        },
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+                orchestrator.store.update(
+                    job.id,
+                    status="translation_running",
+                    transcript_path=str(transcript_path),
+                )
+                translation_client = Mock()
+
+                def fail_batch(_segments, **kwargs):
+                    segment_ids = ["segment-000001"]
+                    kwargs["on_batch_started"](0, segment_ids)
+                    kwargs["on_batch_failed"](
+                        0,
+                        segment_ids,
+                        "server offline",
+                    )
+                    raise ExternalServiceError("server offline")
+
+                translation_client.translate = Mock(side_effect=fail_batch)
+                orchestrator._make_translation_client = Mock(
+                    return_value=translation_client
+                )
+
+                orchestrator._run_stage(
+                    job.id,
+                    "translation",
+                    orchestrator._translate,
+                )
+                blocked = orchestrator.store.get(job.id)
+                generation = (
+                    orchestrator.store.latest_translation_generation(job.id)
+                )
+                batches = orchestrator.store.translation_batches(
+                    generation["id"]
+                )
+            finally:
+                orchestrator.stop()
+
+            self.assertEqual(blocked.status, "blocked")
+            self.assertEqual(generation["state"], "blocked")
+            self.assertEqual(batches[0]["state"], "failed")
+            self.assertEqual(batches[0]["error"], "server offline")
+
+    def test_translation_rebuilds_missing_json_from_database_items(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            (media_root / "movie.mkv").write_bytes(b"media")
+            orchestrator = self.make_orchestrator(root, media_root)
+            job = orchestrator.create_job(
+                "movie.mkv",
+                force_overwrite=False,
+                options={},
+            )
+            artifact_dir = root / "state" / "jobs" / job.id
+            artifact_dir.mkdir(parents=True)
+            transcript_path = artifact_dir / "movie_translate.json"
+            transcript_payload = {
+                "schema_version": 1,
+                "job_id": "remote-job",
+                "segments": [
+                    {
+                        "id": "segment-000001",
+                        "start": 0,
+                        "end": 1,
+                        "speaker": "SPEAKER_00",
+                        "text": "こんにちは",
+                    }
+                ],
+            }
+            transcript_path.write_text(
+                json.dumps(transcript_payload, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            orchestrator.store.update(
+                job.id,
+                status="translation_running",
+                transcript_path=str(transcript_path),
+            )
+            running = orchestrator.store.get(job.id)
+            prompt_snapshot = running.options["translation_prompt"]
+            generation = orchestrator._create_translation_generation(
+                running,
+                transcript_payload,
+                prompt_snapshot,
+                orchestrator.remote_servers,
+                origin="automatic",
+            )
+            orchestrator.store.save_translation_batch(
+                generation["id"],
+                batch_index=0,
+                generation_attempt=0,
+                kind="remote",
+                items=orchestrator._translation_item_records(
+                    transcript_payload["segments"],
+                    [{"id": "segment-000001", "text": "DB 번역"}],
+                ),
+            )
+            translation_client = Mock()
+
+            def finish_from_existing(_segments, **kwargs):
+                self.assertEqual(
+                    kwargs["existing"],
+                    {"segment-000001": "DB 번역"},
+                )
+                return [{"id": "segment-000001", "text": "DB 번역"}]
+
+            translation_client.translate = Mock(side_effect=finish_from_existing)
+            orchestrator._make_translation_client = Mock(
+                return_value=translation_client
+            )
+            try:
+                orchestrator._translate(running)
+                completed = orchestrator.store.get(job.id)
+                snapshot = json.loads(
+                    Path(completed.translation_path).read_text(encoding="utf-8")
+                )
+                stored_generation = (
+                    orchestrator.store.latest_translation_generation(job.id)
+                )
+            finally:
+                orchestrator.stop()
+
+            self.assertEqual(snapshot["status"], "completed")
+            self.assertEqual(snapshot["translations"][0]["text"], "DB 번역")
+            self.assertEqual(stored_generation["state"], "completed")
+            self.assertEqual(stored_generation["attempt"], 1)
 
     def test_pauses_all_current_and_future_translation_stages(self) -> None:
         with TemporaryDirectory() as directory:
@@ -1685,6 +1871,9 @@ class SubtitleOrchestratorTests(unittest.TestCase):
             )
             try:
                 orchestrator.save_artifact(job.id, "translation", edited)
+                generations = orchestrator.store.list_translation_generations(
+                    job.id
+                )
             finally:
                 orchestrator.stop()
 
@@ -1695,6 +1884,22 @@ class SubtitleOrchestratorTests(unittest.TestCase):
             self.assertIn(
                 "수정된 번역",
                 (media_root / "movie.ko.ass").read_text(encoding="utf-8"),
+            )
+            self.assertEqual(
+                [generation["origin"] for generation in generations],
+                ["legacy", "manual"],
+            )
+            self.assertEqual(
+                orchestrator.store.translation_items(generations[0]["id"])[0][
+                    "text"
+                ],
+                "안녕하세요",
+            )
+            self.assertEqual(
+                orchestrator.store.translation_items(generations[1]["id"])[0][
+                    "text"
+                ],
+                "수정된 번역",
             )
 
     def test_restart_translation_preserves_transcript_and_rerenders(self) -> None:
@@ -1788,6 +1993,17 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                     event["message"]
                     for event in orchestrator.store.events(job.id)
                 ]
+                generations = orchestrator.store.list_translation_generations(
+                    job.id
+                )
+                generation_snapshots = [
+                    json.loads(
+                        Path(generation["artifact_path"]).read_text(
+                            encoding="utf-8"
+                        )
+                    )
+                    for generation in generations
+                ]
             finally:
                 orchestrator.stop()
 
@@ -1823,6 +2039,19 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                     "transcript preserved" in message
                     for message in messages
                 )
+            )
+            self.assertEqual(len(generations), 2)
+            self.assertEqual(
+                [generation["state"] for generation in generations],
+                ["completed", "completed"],
+            )
+            self.assertEqual(
+                generation_snapshots[0]["translations"][0]["text"],
+                "이전 번역",
+            )
+            self.assertEqual(
+                generation_snapshots[1]["translations"][0]["text"],
+                "새 번역",
             )
 
     def test_restart_translation_rejects_an_incomplete_job(self) -> None:

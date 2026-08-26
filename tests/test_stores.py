@@ -633,6 +633,153 @@ class JobStoreTests(unittest.TestCase):
                 store.get_subtitle_validation_by_id(validation["id"])
             )
 
+    def test_translation_generations_preserve_batches_items_and_history(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            store = JobStore(Path(directory) / "jobs.sqlite3")
+            store.create(
+                job_id="job-1",
+                source_rel="movie.mkv",
+                force_overwrite=False,
+                options={},
+            )
+            first = store.create_translation_generation(
+                generation_id="generation-1",
+                job_id="job-1",
+                transcript_job_id="transcript-1",
+                transcript_hash="transcript-hash",
+                prompt_hash="prompt-v1",
+                endpoint_key="http://lm.test/v1",
+                model="model",
+                config_hash="config-v1",
+                artifact_path="generation-1.json",
+                origin="automatic",
+            )
+            self.assertEqual(
+                store.begin_translation_generation_attempt(first["id"]),
+                1,
+            )
+            store.start_translation_batch(
+                first["id"],
+                batch_index=0,
+                generation_attempt=1,
+                items=[
+                    {"id": "segment-1", "source_hash": "source-1"}
+                ],
+            )
+            store.fail_translation_batch(
+                first["id"],
+                batch_index=0,
+                error="model unavailable",
+            )
+            failed_batch = store.translation_batches(first["id"])[0]
+            self.assertEqual(failed_batch["state"], "failed")
+            self.assertEqual(failed_batch["error"], "model unavailable")
+            self.assertEqual(
+                store.completed_translation_batch_count(first["id"]),
+                0,
+            )
+            store.save_translation_batch(
+                first["id"],
+                batch_index=0,
+                generation_attempt=1,
+                kind="remote",
+                items=[
+                    {
+                        "id": "segment-1",
+                        "text": "첫 번역",
+                        "source_hash": "source-1",
+                        "segment_index": 0,
+                    }
+                ],
+            )
+            store.save_translation_batch(
+                first["id"],
+                batch_index=1,
+                generation_attempt=1,
+                kind="remote",
+                items=[
+                    {
+                        "id": "segment-2",
+                        "text": "둘째 번역",
+                        "source_hash": "source-2",
+                        "segment_index": 1,
+                    }
+                ],
+            )
+            completed = store.complete_translation_generation(
+                first["id"],
+                ["segment-1", "segment-2"],
+            )
+            second = store.create_translation_generation(
+                generation_id="generation-2",
+                job_id="job-1",
+                transcript_job_id="transcript-1",
+                transcript_hash="transcript-hash",
+                prompt_hash="prompt-v2",
+                endpoint_key="http://lm.test/v1",
+                model="model",
+                config_hash="config-v2",
+                artifact_path="generation-2.json",
+                origin="restart",
+                force_new=True,
+            )
+
+            self.assertEqual(
+                completed,
+                [
+                    {"id": "segment-1", "text": "첫 번역"},
+                    {"id": "segment-2", "text": "둘째 번역"},
+                ],
+            )
+            self.assertEqual(
+                store.completed_translation_batch_count(first["id"]),
+                2,
+            )
+            self.assertEqual(store.next_translation_batch_index(first["id"]), 2)
+            self.assertEqual(
+                [item["id"] for item in store.translation_items(first["id"])],
+                ["segment-1", "segment-2"],
+            )
+            self.assertEqual(second["generation_number"], 2)
+            self.assertEqual(second["supersedes_generation_id"], first["id"])
+            self.assertEqual(
+                [
+                    item["state"]
+                    for item in store.list_translation_generations("job-1")
+                ],
+                ["completed", "partial"],
+            )
+
+    def test_translation_generation_rejects_an_incomplete_item_set(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = JobStore(Path(directory) / "jobs.sqlite3")
+            store.create(
+                job_id="job-1",
+                source_rel="movie.mkv",
+                force_overwrite=False,
+                options={},
+            )
+            generation = store.create_translation_generation(
+                generation_id="generation-1",
+                job_id="job-1",
+                transcript_job_id="transcript-1",
+                transcript_hash="transcript-hash",
+                prompt_hash="prompt-hash",
+                endpoint_key="http://lm.test/v1",
+                model="model",
+                config_hash="config-hash",
+                artifact_path="generation-1.json",
+                origin="automatic",
+            )
+
+            with self.assertRaisesRegex(ValueError, "do not match"):
+                store.complete_translation_generation(
+                    generation["id"],
+                    ["segment-1"],
+                )
+
     def test_recovers_running_stage_as_manually_retryable(self) -> None:
         with TemporaryDirectory() as directory:
             store = JobStore(Path(directory) / "jobs.sqlite3")

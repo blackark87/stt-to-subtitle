@@ -6,7 +6,7 @@
 
 ### 구현 진행 상태
 
-이번 작업 트리에는 계획의 첫 수직 슬라이스가 반영됐다.
+현재 작업 트리에는 계획의 두 번째 수직 슬라이스까지 반영됐다.
 
 | 항목 | 반영 상태 | 남은 범위 |
 |---|---|---|
@@ -14,9 +14,10 @@
 | 외부 자막 | 같은 stem의 SRT/VTT/ASS 탐지, `외부 자막` 표시, 기본 WebVTT 재생 | 증분 asset/revision catalog·사용자별 재생 선택 |
 | 로컬 비교 | 시간 중첩 정렬, coverage·문장 유사도·경계 오차, 파일 해시별 SQLite 결과 | generation/publication FK·검증 알고리즘 version migration |
 | 상용 LLM 검증 | 번역 LLM과 분리된 설정, 명시적 1회 호출, 구조화 결과, 입력·모델 cache | provider별 adapter·비용/사용량 관측 |
+| 번역 generation | generation·batch·segment SQLite 원장, 입력 지문, 배치 시도·실패, DB 기반 JSON 복구, 재번역·직접 편집 이력 | immutable prompt revision·자막 publication/rollback·startup reconcile |
 
-이하의 `현재 구조`와 문제 분석은 첫 수직 슬라이스 이전 구조를 기준으로 하며,
-위 표에 반영된 항목은 후속 영속 도메인 설계를 설명하는 목표 모델로 읽는다.
+이하의 문제 분석은 최초 분석 시점 구조를 기준으로 하되, 구현이 끝난 절은 현재
+동작과 남은 범위로 갱신했다.
 
 ## 1. 결론 요약
 
@@ -30,8 +31,8 @@
 4. 사용자 정지를 독립 상태가 아니라 `blocked + 특정 한국어 오류 문구`로 저장한다. UI와 필터가 문구 일치에 의존한다.
 5. 2D 대시보드, 3D 대시보드, 작업 목록이 동일한 원천 상태를 각자 다시 분류해 상태 수와 필터 의미가 달라질 수 있다.
 6. 전사 중지 요청은 웹의 대기 루프만 중지하고 원격 STT 작업을 취소하지 않아 GPU 작업이 계속될 수 있다.
-7. 번역 청크의 실제 결과는 DB가 아니라 하나의 부분 번역 JSON에 누적되며, DB에는 청크 총량과 완료량만 저장된다. generation·batch·segment별 재시도와 호환성을 DB에서 추적할 수 없다.
-8. 프롬프트를 바꿔 재번역하면 기존 전사본은 유지하지만 번역 JSON과 배포된 SRT/ASS는 같은 경로에서 덮어쓴다. 이전 번역과 자막을 비교·복구·재게시할 revision 계약이 없다.
+7. 번역 결과는 generation·batch·segment 단위로 DB에 저장되고 JSON을 재생성할 수 있게 됐다. 다만 실행 중 프로세스 종료를 자동 reconcile하는 worker lease는 아직 없다.
+8. 프롬프트를 바꾼 재번역과 직접 편집은 별도 translation generation으로 보존한다. 그러나 SRT/ASS publication pointer와 rollback은 아직 없다.
 9. 미디어 옆의 `<filename>.srt/.vtt/.ass` 외부 자막 탐지·재생·로컬 비교는 추가됐지만 asset/revision/publication 관계와 증분 catalog는 아직 없다.
 
 가장 먼저 해야 할 일은 UI 확장이 아니라 상태 모델과 스케줄러 제어의 정리다. `phase`, `state`, `reason_code`, `attempt`을 분리하고, 의존성별 수동·자동 복구 정책과 단계별 복구 정책을 추가해야 한다. 반복 번역·자막 재생성을 제품의 기본 사용 방식으로 보고 transcript revision, translation generation, subtitle asset/publication/validation도 영속 도메인으로 관리해야 한다.
@@ -315,15 +316,20 @@ POST /v1/transcriptions/{job_id}/cancel
 
 ### 9.1 번역 체크포인트
 
-현재 DB의 `translation_chunks_total/completed`는 진행률만 저장한다. 실제 부분 번역은 `<job>/<stem>_result_ko.json` 하나에 `status=partial`과 현재까지 완료된 모든 번역 항목을 넣고, 논리 배치가 끝날 때마다 파일 전체를 원자 교체한다. 재개할 때는 transcript에 존재하는 ID의 번역만 `existing`으로 읽어 나머지를 다시 요청한다.
+현재 구현은 `translation_generations`, `translation_batches`,
+`translation_items`를 SQLite 원장으로 사용한다. generation에는 transcript·prompt·
+endpoint·model·batch 설정의 지문을 저장하고, 논리 배치는 호출 직전에 `running`,
+성공 시 item과 함께 `completed`, 예외 시 `failed`로 기록한다. 부분 JSON은 DB item에서
+원자적으로 다시 생성하므로 JSON이 없거나 교체 도중 프로세스가 종료돼도 저장된
+세그먼트부터 재구성할 수 있다. 기존 단일 JSON은 첫 접근 시 legacy generation으로
+가져온다.
 
-이 방식은 단일 프로세스 재개에는 유효하지만 다음 정보를 잃는다.
+현재 수직 슬라이스 이후에도 다음 범위는 남는다.
 
-- 어느 논리 배치가 몇 번째 시도에서 성공·실패했는지
 - 병렬 배치가 진행 중일 때 어떤 배치가 lease를 보유하는지
-- 부분 결과가 어느 prompt/model/transcript revision에서 생성됐는지
-- JSON 교체와 DB 진행률 갱신 사이의 crash를 어떻게 reconcile할지
-- 프롬프트 변경 후 이전 부분 결과를 폐기·비교·재사용할지
+- 실행 중 종료된 generation·batch를 startup에서 어떤 상태로 확정할지
+- prompt 본문 자체를 immutable revision으로 보존하고 비교하는 방법
+- generation별 SRT/ASS를 게시·rollback하는 방법
 
 부분 JSON의 관리 방법은 반드시 알아야 하며 공개된 영속 계약으로 만들어야 한다. 권장 구조는 DB를 실행·revision의 원장으로 사용하고 JSON을 특정 generation의 편집·교환 가능한 snapshot으로 취급하는 것이다.
 
@@ -376,7 +382,11 @@ translation_items(
 
 ### 9.3 프롬프트 변경 후 재번역·재게시
 
-현재 `restart_translation()`은 완료 작업의 transcript JSON을 검증해 그대로 보존하고, 선택한 prompt category snapshot을 `options_json`에 넣은 다음 기존 translation JSON을 빈 `partial` 문서로 즉시 덮어쓴다. 재번역이 끝나면 같은 JSON이 `completed`로 바뀌고 기존 `<media>.ko.srt/.ass`도 덮어쓴다. 테스트는 전사본 보존과 새 자막 덮어쓰기를 보장하지만 이전 번역·프롬프트·자막의 이력과 rollback은 보장하지 않는다.
+현재 `restart_translation()`은 완료 작업의 transcript를 보존하고 새 translation
+generation을 만든다. 이전 번역 JSON은 generation별 artifact로 보존하며, 새 결과가
+완성되기 전까지 기존 SRT/ASS도 유지한다. 직접 편집한 번역 역시 `manual`
+generation으로 import한다. 다만 prompt 본문 revision, generation 간 비교 UI,
+generation별 SRT/ASS와 publication pointer, rollback은 아직 구현되지 않았다.
 
 일회성 생성기가 아니라면 다음 publication workflow가 필요하다.
 
@@ -770,9 +780,9 @@ src/stt_to_subtitle/
 
 | 질의 | 현재 코드 기준 답변 | 보고서 권고 |
 |---|---|---|
-| 번역 청크 DB 저장이 없어도 되는가 | 안 된다. 현재 DB에는 진행률 숫자만 있고 실제 부분 결과는 하나의 JSON 전체 교체로 관리된다. 단순 재개는 가능하지만 배치 시도·generation·호환성·crash reconcile을 설명하지 못한다. | translation generation/batch/item을 DB에 저장하고 JSON은 versioned snapshot으로 생성한다. |
+| 번역 청크 DB 저장이 없어도 되는가 | 안 된다. 현재 generation·batch·item 원장을 추가해 성공·실패 시도와 부분 결과를 저장하고 JSON을 snapshot으로 재생성한다. | startup reconcile, lease, immutable prompt revision, publication까지 확장한다. |
 | 이미 요청된 Whisper/Kotoba/WhisperJAV를 취소할 수 있는가 | 현재는 취소 API와 실행 핸들이 없어 불가능하다. 대기 작업은 즉시 취소 가능하고, WhisperX/JAV는 subprocess 종료, Kotoba는 cooperative hook 또는 subprocess 격리로 구현할 수 있다. | backend별 취소 adapter와 멱등 cancel API를 만든다. 취소와 사전 segmentation은 별도 요구다. |
-| 자막이 있는 상태에서 prompt 변경 재시도는 어떻게 되는가 | transcript는 유지되지만 translation JSON과 SRT/ASS가 기존 경로에서 덮어써지고 이력·rollback은 없다. | 새 prompt revision과 translation/subtitle generation을 만든 후 검증된 결과만 publish한다. 실패 시 기존 자막을 유지한다. |
+| 자막이 있는 상태에서 prompt 변경 재시도는 어떻게 되는가 | transcript와 기존 번역 generation을 보존하고 새 generation으로 번역한다. 새 번역 완료 전 기존 SRT/ASS도 유지한다. | immutable prompt revision과 subtitle publication pointer를 추가해 비교·게시·rollback을 완성한다. |
 | `next_probe_at`은 계속 재시도한다는 뜻인가 | 번역 LLM이 평소 꺼져 있는 운영 환경에서는 호출 자체가 불필요하다. | LM은 manual gate로 두고 `next_probe_at`을 사용하지 않는다. STT처럼 자동 복구를 선택한 의존성에만 제한적으로 사용한다. |
 | 중단과 실패는 어떻게 구분하는가 | 현재 STT `failed`가 웹에서 `blocked`가 될 수 있어 일관되지 않다. | 외부 조건이 회복되면 그대로 재개 가능한 경우 `blocked`, 입력·모델 출력·코드 계약 오류처럼 변경이 필요한 경우 `failed`다. segment 구조 오류는 기본적으로 `failed/model_output_invalid`다. |
 | WAV와 transcript는 영속 데이터인가 | persistent volume에는 남지만 immutable revision은 아니다. 같은 job을 재사용하는 재전사·재추출에서는 같은 경로가 덮어써질 수 있고 DB 레코드 삭제 후 orphan도 남을 수 있다. | audio/transcript를 immutable revision으로 만들고 hash 기반 재사용, 참조 무결성, retention, garbage collection을 적용한다. |

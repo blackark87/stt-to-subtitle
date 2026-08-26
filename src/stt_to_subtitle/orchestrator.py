@@ -82,6 +82,18 @@ RUNNING_STATUSES = {
     "translation_running",
     "rendering",
 }
+
+
+def _canonical_payload_hash(value: Any) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 USER_STOP_MESSAGE = "사용자 요청으로 전체 작업이 중단되었습니다."
 USER_SELECTED_STOP_MESSAGE = "사용자 요청으로 작업이 중단되었습니다."
 TRANSLATION_PROMPT_OPTION = "translation_prompt"
@@ -1684,12 +1696,23 @@ class SubtitleOrchestrator:
             raise ValueError("transcript artifact could not be read") from error
         if not isinstance(transcript_payload, Mapping):
             raise ValueError("transcript JSON document must be an object")
-        validate_transcript(transcript_payload)
+        segments = validate_transcript(transcript_payload)
         transcript_job_id = str(
             transcript_payload.get("job_id", "")
         ).strip()
         if not transcript_job_id:
             raise ValueError("transcript job_id is unavailable")
+
+        current_prompt_snapshot = job.options.get(TRANSLATION_PROMPT_OPTION)
+        if not isinstance(current_prompt_snapshot, Mapping):
+            current_prompt_snapshot = self._legacy_prompt_snapshot()
+        self._capture_legacy_translation_generation(
+            job,
+            transcript_payload,
+            segments,
+            current_prompt_snapshot,
+            self.remote_servers,
+        )
 
         updated_options = dict(job.options)
         if prompt_category_id:
@@ -1713,14 +1736,23 @@ class SubtitleOrchestrator:
                 "translation",
             )
         )
-        write_json_atomic(
+        updated_prompt_snapshot = updated_options.get(TRANSLATION_PROMPT_OPTION)
+        if not isinstance(updated_prompt_snapshot, Mapping):
+            updated_prompt_snapshot = self._legacy_prompt_snapshot()
+        generation = self._create_translation_generation(
+            job,
+            transcript_payload,
+            updated_prompt_snapshot,
+            self.remote_servers,
+            origin="restart",
+            force_new=True,
+        )
+        self._write_translation_generation_snapshot(
             translation_path,
-            {
-                "schema_version": TRANSLATION_SCHEMA_VERSION,
-                "status": "partial",
-                "transcript_job_id": transcript_job_id,
-                "translations": [],
-            },
+            generation,
+            transcript_job_id=transcript_job_id,
+            status="partial",
+            translations=[],
         )
         self.store.update(
             job.id,
@@ -1737,7 +1769,7 @@ class SubtitleOrchestrator:
             job.id,
             "info",
             "translation restart requested; transcript preserved and "
-            "translation checkpoint reset",
+            f"generation {generation['generation_number']} created",
         )
         restarted = self.store.get(job.id)
         if restarted is None:
@@ -1932,6 +1964,7 @@ class SubtitleOrchestrator:
         if not isinstance(payload, Mapping):
             raise ValueError("JSON document must be an object")
 
+        manual_generation: dict[str, Any] | None = None
         if kind == "transcript":
             segments = validate_transcript(payload)
             if job.translation_path and Path(job.translation_path).is_file():
@@ -1967,8 +2000,49 @@ class SubtitleOrchestrator:
                 "translations": translations,
             }
 
+            prompt_snapshot = job.options.get(TRANSLATION_PROMPT_OPTION)
+            if not isinstance(prompt_snapshot, Mapping):
+                prompt_snapshot = self._legacy_prompt_snapshot()
+            self._capture_legacy_translation_generation(
+                job,
+                transcript_payload,
+                segments,
+                prompt_snapshot,
+                self.remote_servers,
+            )
+            manual_generation = self._create_translation_generation(
+                job,
+                transcript_payload,
+                prompt_snapshot,
+                self.remote_servers,
+                origin="manual",
+                force_new=True,
+                model="manual",
+                endpoint_key="manual",
+            )
+            self.store.save_translation_batch(
+                manual_generation["id"],
+                batch_index=0,
+                generation_attempt=0,
+                kind="manual",
+                items=self._translation_item_records(segments, translations),
+            )
+            translations = self.store.complete_translation_generation(
+                manual_generation["id"],
+                [str(segment["id"]) for segment in segments],
+            )
+
         artifact = Path(selected_path)
-        write_json_atomic(artifact, payload)
+        if manual_generation is not None:
+            self._write_translation_generation_snapshot(
+                artifact,
+                manual_generation,
+                transcript_job_id=str(transcript_payload["job_id"]),
+                status="completed",
+                translations=translations,
+            )
+        else:
+            write_json_atomic(artifact, payload)
 
         refreshed = self.store.get(job.id)
         if (
@@ -2381,6 +2455,281 @@ class SubtitleOrchestrator:
             request_limiter=self._translation_request_limiter,
         )
 
+    def _translation_generation_contract(
+        self,
+        job: PipelineJob,
+        transcript_payload: Mapping[str, Any],
+        prompt_snapshot: Mapping[str, Any],
+        servers: RemoteServerSettings,
+        *,
+        model: str | None = None,
+        endpoint_key: str | None = None,
+    ) -> dict[str, str]:
+        if not job.transcript_path:
+            raise ValueError("transcript artifact is unavailable")
+        transcript_job_id = str(transcript_payload.get("job_id", "")).strip()
+        if not transcript_job_id:
+            raise ValueError("transcript job_id is unavailable")
+        transcript_hash = sha256_file(Path(job.transcript_path))
+        prompt_hash = _canonical_payload_hash(dict(prompt_snapshot))
+        selected_model = (model or servers.lm_model).strip()
+        selected_endpoint = (endpoint_key or servers.lm_base_url).rstrip("/")
+        config_hash = _canonical_payload_hash(
+            {
+                "schema_version": TRANSLATION_SCHEMA_VERSION,
+                "transcript_hash": transcript_hash,
+                "prompt_hash": prompt_hash,
+                "endpoint_key": selected_endpoint,
+                "model": selected_model,
+                "source_language": "ja",
+                "target_language": "ko",
+                "batch_segments": self.settings.translation_batch_segments,
+                "batch_characters": self.settings.translation_batch_characters,
+            }
+        )
+        return {
+            "transcript_job_id": transcript_job_id,
+            "transcript_hash": transcript_hash,
+            "prompt_hash": prompt_hash,
+            "endpoint_key": selected_endpoint,
+            "model": selected_model,
+            "config_hash": config_hash,
+        }
+
+    def _create_translation_generation(
+        self,
+        job: PipelineJob,
+        transcript_payload: Mapping[str, Any],
+        prompt_snapshot: Mapping[str, Any],
+        servers: RemoteServerSettings,
+        *,
+        origin: str,
+        force_new: bool = False,
+        model: str | None = None,
+        endpoint_key: str | None = None,
+    ) -> dict[str, Any]:
+        generation_id = uuid4().hex
+        contract = self._translation_generation_contract(
+            job,
+            transcript_payload,
+            prompt_snapshot,
+            servers,
+            model=model,
+            endpoint_key=endpoint_key,
+        )
+        generation_path = (
+            self.settings.jobs_dir
+            / job.id
+            / "translation-generations"
+            / f"{generation_id}.json"
+        )
+        return self.store.create_translation_generation(
+            generation_id=generation_id,
+            job_id=job.id,
+            artifact_path=str(generation_path),
+            origin=origin,
+            force_new=force_new,
+            **contract,
+        )
+
+    @staticmethod
+    def _translation_item_records(
+        segments: Sequence[Mapping[str, Any]],
+        translations: Sequence[Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        segment_by_id = {
+            str(segment["id"]): (index, segment)
+            for index, segment in enumerate(segments)
+        }
+        records: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in translations:
+            segment_id = str(item.get("id", "")).strip()
+            text = str(item.get("text", "")).strip()
+            if (
+                not segment_id
+                or segment_id in seen
+                or segment_id not in segment_by_id
+                or not text
+            ):
+                raise ValueError("translation item does not match transcript")
+            seen.add(segment_id)
+            segment_index, segment = segment_by_id[segment_id]
+            records.append(
+                {
+                    "id": segment_id,
+                    "text": text,
+                    "segment_index": segment_index,
+                    "source_hash": _canonical_payload_hash(dict(segment)),
+                }
+            )
+        return records
+
+    @staticmethod
+    def _translation_source_records(
+        segments: Sequence[Mapping[str, Any]],
+        segment_ids: Sequence[str],
+    ) -> list[dict[str, str]]:
+        segment_by_id = {
+            str(segment["id"]): segment for segment in segments
+        }
+        records: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for raw_segment_id in segment_ids:
+            segment_id = str(raw_segment_id).strip()
+            if (
+                not segment_id
+                or segment_id in seen
+                or segment_id not in segment_by_id
+            ):
+                raise ValueError("translation batch does not match transcript")
+            seen.add(segment_id)
+            records.append(
+                {
+                    "id": segment_id,
+                    "source_hash": _canonical_payload_hash(
+                        dict(segment_by_id[segment_id])
+                    ),
+                }
+            )
+        return records
+
+    @staticmethod
+    def _read_translation_checkpoint(
+        translation_path: Path,
+        expected_ids: set[str],
+    ) -> tuple[list[dict[str, str]], int, Mapping[str, Any] | None]:
+        if not translation_path.is_file():
+            return [], 0, None
+        try:
+            payload = json.loads(translation_path.read_text(encoding="utf-8"))
+            if not isinstance(payload, Mapping):
+                raise ValueError("translation checkpoint must be an object")
+            raw_items = payload.get("translations", [])
+            if not isinstance(raw_items, list):
+                raise ValueError("translations must be a list")
+            items: list[dict[str, str]] = []
+            seen: set[str] = set()
+            ignored = 0
+            for item in raw_items:
+                if not isinstance(item, Mapping):
+                    ignored += 1
+                    continue
+                segment_id = str(item.get("id", "")).strip()
+                text = str(item.get("text", "")).strip()
+                if (
+                    segment_id in expected_ids
+                    and segment_id not in seen
+                    and text
+                ):
+                    seen.add(segment_id)
+                    items.append({"id": segment_id, "text": text})
+                elif segment_id:
+                    ignored += 1
+            return items, ignored, payload
+        except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+            return [], 0, None
+
+    @staticmethod
+    def _translation_snapshot_items(
+        stored_items: Sequence[Mapping[str, Any]],
+    ) -> list[dict[str, str]]:
+        return [
+            {"id": str(item["id"]), "text": str(item["text"])}
+            for item in stored_items
+        ]
+
+    def _write_translation_generation_snapshot(
+        self,
+        translation_path: Path,
+        generation: Mapping[str, Any],
+        *,
+        transcript_job_id: str,
+        status: str,
+        translations: Sequence[Mapping[str, str]],
+    ) -> None:
+        payload: dict[str, Any] = {
+            "schema_version": TRANSLATION_SCHEMA_VERSION,
+            "status": status,
+            "transcript_job_id": transcript_job_id,
+            "generation": {
+                "id": generation["id"],
+                "number": generation["generation_number"],
+                "config_hash": generation["config_hash"],
+            },
+            "translations": [dict(item) for item in translations],
+        }
+        if status == "completed":
+            payload["model"] = generation["model"]
+        write_json_atomic(Path(str(generation["artifact_path"])), payload)
+        write_json_atomic(translation_path, payload)
+
+    def _capture_legacy_translation_generation(
+        self,
+        job: PipelineJob,
+        transcript_payload: Mapping[str, Any],
+        segments: Sequence[Mapping[str, Any]],
+        prompt_snapshot: Mapping[str, Any],
+        servers: RemoteServerSettings,
+    ) -> dict[str, Any] | None:
+        if not job.translation_path:
+            return None
+        translation_path = Path(job.translation_path)
+        expected_ids = {str(segment["id"]) for segment in segments}
+        items, _ignored, payload = self._read_translation_checkpoint(
+            translation_path,
+            expected_ids,
+        )
+        if payload is None or not items:
+            return None
+        generation = None
+        generation_metadata = payload.get("generation")
+        if isinstance(generation_metadata, Mapping):
+            saved_generation_id = str(
+                generation_metadata.get("id", "")
+            ).strip()
+            saved_generation = self.store.get_translation_generation(
+                saved_generation_id
+            )
+            if (
+                saved_generation is not None
+                and saved_generation["job_id"] == job.id
+            ):
+                generation = saved_generation
+        if generation is None:
+            payload_model = (
+                str(payload.get("model", "")).strip() or servers.lm_model
+            )
+            generation = self._create_translation_generation(
+                job,
+                transcript_payload,
+                prompt_snapshot,
+                servers,
+                origin="legacy",
+                model=payload_model,
+            )
+        if not self.store.translation_items(generation["id"]):
+            self.store.save_translation_batch(
+                generation["id"],
+                batch_index=0,
+                generation_attempt=0,
+                kind="legacy",
+                items=self._translation_item_records(segments, items),
+            )
+        if len(items) == len(segments):
+            completed = self.store.complete_translation_generation(
+                generation["id"],
+                [str(segment["id"]) for segment in segments],
+            )
+            self._write_translation_generation_snapshot(
+                translation_path,
+                generation,
+                transcript_job_id=str(transcript_payload["job_id"]),
+                status="completed",
+                translations=completed,
+            )
+        return generation
+
     def _translate(self, job: PipelineJob) -> None:
         remote_runtime = self._remote_runtime
         servers = remote_runtime[2]
@@ -2418,26 +2767,36 @@ class SubtitleOrchestrator:
             )
         )
         self.store.update(job.id, translation_path=str(translation_path))
-
-        existing: dict[str, str] = {}
-        expected_ids = {str(segment["id"]) for segment in segments}
+        generation = self._create_translation_generation(
+            job,
+            transcript_payload,
+            prompt_snapshot,
+            servers,
+            origin="automatic",
+        )
+        expected_id_list = [str(segment["id"]) for segment in segments]
+        expected_ids = set(expected_id_list)
+        stored_items = self.store.translation_items(generation["id"])
         ignored_checkpoint_ids = 0
-        if translation_path.is_file():
-            try:
-                partial = json.loads(translation_path.read_text(encoding="utf-8"))
-                if not isinstance(partial, Mapping):
-                    raise ValueError(
-                        "translation checkpoint must be an object"
-                    )
-                for item in partial.get("translations", []):
-                    segment_id = str(item["id"])
-                    text = str(item["text"]).strip()
-                    if segment_id in expected_ids and text:
-                        existing[segment_id] = text
-                    elif segment_id:
-                        ignored_checkpoint_ids += 1
-            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-                existing = {}
+        if not stored_items and generation["supersedes_generation_id"] is None:
+            checkpoint_items, ignored_checkpoint_ids, _payload = (
+                self._read_translation_checkpoint(
+                    translation_path,
+                    expected_ids,
+                )
+            )
+            if checkpoint_items:
+                self.store.save_translation_batch(
+                    generation["id"],
+                    batch_index=0,
+                    generation_attempt=0,
+                    kind="legacy",
+                    items=self._translation_item_records(
+                        segments,
+                        checkpoint_items,
+                    ),
+                )
+                stored_items = self.store.translation_items(generation["id"])
         if ignored_checkpoint_ids:
             self.store.add_event(
                 job.id,
@@ -2446,17 +2805,99 @@ class SubtitleOrchestrator:
                 f"{ignored_checkpoint_ids} stale translation checkpoint id(s)",
             )
 
-        def save_batch(items: list[dict[str, str]]) -> None:
-            write_json_atomic(
-                translation_path,
-                {
-                    "schema_version": TRANSLATION_SCHEMA_VERSION,
-                    "status": "partial",
-                    "transcript_job_id": transcript_payload["job_id"],
-                    "translations": items,
-                },
+        existing = {
+            str(item["id"]): str(item["text"])
+            for item in stored_items
+        }
+        self._write_translation_generation_snapshot(
+            translation_path,
+            generation,
+            transcript_job_id=str(transcript_payload["job_id"]),
+            status="partial",
+            translations=self._translation_snapshot_items(stored_items),
+        )
+        generation_attempt = self.store.begin_translation_generation_attempt(
+            generation["id"]
+        )
+        next_batch_index = self.store.next_translation_batch_index(
+            generation["id"]
+        )
+        persisted = dict(existing)
+        run_batch_indexes: dict[int, int] = {}
+
+        def start_batch(run_batch_index: int, segment_ids: list[str]) -> None:
+            nonlocal next_batch_index
+            database_batch_index = next_batch_index
+            next_batch_index += 1
+            run_batch_indexes[run_batch_index] = database_batch_index
+            self.store.start_translation_batch(
+                generation["id"],
+                batch_index=database_batch_index,
+                generation_attempt=generation_attempt,
+                items=self._translation_source_records(
+                    segments,
+                    segment_ids,
+                ),
             )
-        progress_base = job.translation_chunks_completed
+
+        def complete_batch(
+            run_batch_index: int,
+            items: list[dict[str, str]],
+        ) -> None:
+            database_batch_index = run_batch_indexes[run_batch_index]
+            self.store.save_translation_batch(
+                generation["id"],
+                batch_index=database_batch_index,
+                generation_attempt=generation_attempt,
+                kind="remote",
+                items=self._translation_item_records(segments, items),
+            )
+            for item in items:
+                persisted[str(item["id"])] = str(item["text"]).strip()
+
+        def fail_batch(
+            run_batch_index: int,
+            _segment_ids: list[str],
+            error: str,
+        ) -> None:
+            database_batch_index = run_batch_indexes.get(run_batch_index)
+            if database_batch_index is None:
+                return
+            self.store.fail_translation_batch(
+                generation["id"],
+                batch_index=database_batch_index,
+                error=self._sanitize_error(error),
+            )
+
+        def save_batch(items: list[dict[str, str]]) -> None:
+            nonlocal next_batch_index
+            changed = [
+                item
+                for item in items
+                if persisted.get(str(item["id"])) != str(item["text"]).strip()
+            ]
+            if changed:
+                self.store.save_translation_batch(
+                    generation["id"],
+                    batch_index=next_batch_index,
+                    generation_attempt=generation_attempt,
+                    kind="remote",
+                    items=self._translation_item_records(segments, changed),
+                )
+                next_batch_index += 1
+                for item in changed:
+                    persisted[str(item["id"])] = str(item["text"]).strip()
+            current_items = self.store.translation_items(generation["id"])
+            self._write_translation_generation_snapshot(
+                translation_path,
+                generation,
+                transcript_job_id=str(transcript_payload["job_id"]),
+                status="partial",
+                translations=self._translation_snapshot_items(current_items),
+            )
+        progress_base = self.store.completed_translation_batch_count(
+            generation["id"]
+        )
 
         def update_translation_progress(completed: int, total: int) -> None:
             self.store.update(
@@ -2483,28 +2924,75 @@ class SubtitleOrchestrator:
                 f"{self._sanitize_error(message)}",
             )
 
-        translations = lm_client.translate(
-            segments,
-            system_prompt=translation_prompt,
-            review_prompt=review_prompt,
-            review_rounds=review_rounds,
-            existing=existing,
-            on_batch=save_batch,
-            on_progress=update_translation_progress,
-            should_pause=should_pause,
-            on_review_warning=review_warning,
-            max_workers=servers.translation_workers,
+        try:
+            translations = lm_client.translate(
+                segments,
+                system_prompt=translation_prompt,
+                review_prompt=review_prompt,
+                review_rounds=review_rounds,
+                existing=existing,
+                on_batch=save_batch,
+                on_batch_started=start_batch,
+                on_logical_batch=complete_batch,
+                on_batch_failed=fail_batch,
+                on_progress=update_translation_progress,
+                should_pause=should_pause,
+                on_review_warning=review_warning,
+                max_workers=servers.translation_workers,
+            )
+            self._raise_if_job_stop_requested(job.id)
+        except TranslationPaused as error:
+            self.store.mark_translation_generation(
+                generation["id"],
+                state="paused",
+                error=str(error),
+            )
+            raise
+        except ExternalServiceError as error:
+            self.store.mark_translation_generation(
+                generation["id"],
+                state="blocked",
+                error=self._sanitize_error(str(error)),
+            )
+            raise
+        except OperationStopped as error:
+            self.store.mark_translation_generation(
+                generation["id"],
+                state="stopped",
+                error=str(error),
+            )
+            raise
+        except Exception as error:
+            self.store.mark_translation_generation(
+                generation["id"],
+                state="failed",
+                error=self._sanitize_error(str(error)),
+            )
+            raise
+
+        final_changes = [
+            item
+            for item in translations
+            if persisted.get(str(item["id"])) != str(item["text"]).strip()
+        ]
+        if final_changes:
+            self.store.save_translation_batch(
+                generation["id"],
+                batch_index=next_batch_index,
+                generation_attempt=generation_attempt,
+                kind="final",
+                items=self._translation_item_records(segments, final_changes),
+            )
+        completed_translations = self.store.complete_translation_generation(
+            generation["id"],
+            expected_id_list,
         )
-        self._raise_if_job_stop_requested(job.id)
-        write_json_atomic(
+        self._write_translation_generation_snapshot(
             translation_path,
-            {
-                "schema_version": TRANSLATION_SCHEMA_VERSION,
-                "status": "completed",
-                "transcript_job_id": transcript_payload["job_id"],
-                "model": servers.lm_model,
-                "translations": translations,
-            },
+            generation,
+            transcript_job_id=str(transcript_payload["job_id"]),
+            status="completed",
+            translations=completed_translations,
         )
         refreshed = self.store.get(job.id)
         self.store.update(
@@ -2518,7 +3006,9 @@ class SubtitleOrchestrator:
         self.store.add_event(
             job.id,
             "info",
-            f"translation completed ({len(translations)} segments)",
+            "translation generation "
+            f"{generation['generation_number']} completed "
+            f"({len(completed_translations)} segments)",
         )
 
     def _render(self, job: PipelineJob) -> None:
