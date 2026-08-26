@@ -21,6 +21,7 @@ LOGGER = logging.getLogger(__name__)
 TRANSCRIPTION_FAILURE_SCOPES = frozenset(
     {"job", "backend", "service", "configuration"}
 )
+RequestObserver = Callable[[Mapping[str, Any]], None]
 
 
 def _optional_bool(value: Any) -> bool | None:
@@ -115,6 +116,8 @@ class RetryingJSONClient:
         read_timeout: float = 120.0,
         attempts: int = 3,
         request_limiter: RequestConcurrencyLimiter | None = None,
+        service_name: str = "external",
+        request_observer: RequestObserver | None = None,
     ) -> None:
         if attempts < 1:
             raise ValueError("attempts must be at least 1")
@@ -122,6 +125,8 @@ class RetryingJSONClient:
         self.timeout = (connect_timeout, read_timeout)
         self.attempts = attempts
         self.request_limiter = request_limiter
+        self.service_name = service_name.strip() or "external"
+        self.request_observer = request_observer
         self._session_local = threading.local()
 
     @property
@@ -141,8 +146,12 @@ class RetryingJSONClient:
 
     def request(self, method: str, url: str, **kwargs: Any) -> requests.Response:
         transient_statuses = {408, 429, 500, 502, 503, 504}
+        metric_operation = str(
+            kwargs.pop("metric_operation", method.lower())
+        ).strip() or method.lower()
         last_error: BaseException | None = None
         for attempt in range(1, self.attempts + 1):
+            started = time.monotonic()
             try:
                 request_slot: ContextManager[None] = (
                     self.request_limiter.slot()
@@ -156,13 +165,39 @@ class RetryingJSONClient:
                         timeout=self.timeout,
                         **kwargs,
                     )
-                if (
-                    response.status_code not in transient_statuses
-                    or attempt == self.attempts
-                ):
+                retrying = (
+                    response.status_code in transient_statuses
+                    and attempt < self.attempts
+                )
+                if 200 <= response.status_code < 400:
+                    outcome = "success"
+                elif retrying:
+                    outcome = "retry"
+                elif response.status_code in transient_statuses:
+                    outcome = "exhausted"
+                else:
+                    outcome = "http_error"
+                self._observe_request(
+                    operation=metric_operation,
+                    outcome=outcome,
+                    attempt=attempt,
+                    elapsed_seconds=time.monotonic() - started,
+                    status_code=response.status_code,
+                )
+                if not retrying:
                     return response
+                response.close()
             except requests.RequestException as error:
                 last_error = error
+                self._observe_request(
+                    operation=metric_operation,
+                    outcome=(
+                        "retry" if attempt < self.attempts else "exhausted"
+                    ),
+                    attempt=attempt,
+                    elapsed_seconds=time.monotonic() - started,
+                    error_type=error.__class__.__name__,
+                )
                 if attempt == self.attempts:
                     break
             delay = float(2 ** (attempt - 1))
@@ -178,6 +213,34 @@ class RetryingJSONClient:
             f"{last_error}"
         ) from last_error
 
+    def _observe_request(
+        self,
+        *,
+        operation: str,
+        outcome: str,
+        attempt: int,
+        elapsed_seconds: float,
+        status_code: int | None = None,
+        error_type: str | None = None,
+    ) -> None:
+        if self.request_observer is None:
+            return
+        observation: dict[str, Any] = {
+            "service": self.service_name,
+            "operation": operation,
+            "outcome": outcome,
+            "attempt": attempt,
+            "elapsed_seconds": max(0.0, elapsed_seconds),
+        }
+        if status_code is not None:
+            observation["status_code"] = status_code
+        if error_type is not None:
+            observation["error_type"] = error_type
+        try:
+            self.request_observer(observation)
+        except Exception:
+            LOGGER.exception("external request observer failed")
+
 
 class STTAPIClient(RetryingJSONClient):
     def __init__(
@@ -186,11 +249,14 @@ class STTAPIClient(RetryingJSONClient):
         token: str,
         *,
         attempts: int = 3,
+        request_observer: RequestObserver | None = None,
     ) -> None:
         super().__init__(
             token=token,
             read_timeout=300.0,
             attempts=attempts,
+            service_name="stt",
+            request_observer=request_observer,
         )
         self.base_url = base_url.rstrip("/")
 
@@ -199,6 +265,7 @@ class STTAPIClient(RetryingJSONClient):
             "GET",
             f"{self.base_url}/readyz",
             headers=self.headers,
+            metric_operation="readiness",
         )
         if response.status_code != 200:
             raise ExternalServiceError(
@@ -303,6 +370,7 @@ class STTAPIClient(RetryingJSONClient):
             "GET",
             f"{self.base_url}/v1/transcriptions/{job_id}/result",
             headers=self.headers,
+            metric_operation="result",
         )
         if response.status_code != 200:
             if response.status_code in {401, 403}:
@@ -338,6 +406,7 @@ class STTAPIClient(RetryingJSONClient):
             "POST",
             f"{self.base_url}/v1/transcriptions/{job_id}/cancel",
             headers=self.headers,
+            metric_operation="cancel",
         )
         if response.status_code != 200:
             raise ExternalServiceError(
@@ -460,6 +529,7 @@ class STTAPIClient(RetryingJSONClient):
                 f"{self.base_url}/v1/transcriptions/{job_id}/events",
                 headers={**self.headers, "Accept": "text/event-stream"},
                 stream=True,
+                metric_operation="status_stream",
             )
             if response.status_code != 200:
                 try:
@@ -482,6 +552,8 @@ class STTAPIClient(RetryingJSONClient):
                     f"HTTP {response.status_code}: {detail}"
                 )
             data_lines: list[str] = []
+            stream_started = time.monotonic()
+            stream_error: BaseException | None = None
             try:
                 for raw_line in response.iter_lines(
                     chunk_size=1,
@@ -519,8 +591,22 @@ class STTAPIClient(RetryingJSONClient):
                         return
             except requests.RequestException as error:
                 last_error = error
+                stream_error = error
             finally:
                 response.close()
+            self._observe_request(
+                operation="status_stream_disconnect",
+                outcome=(
+                    "retry" if attempt < self.attempts else "exhausted"
+                ),
+                attempt=attempt,
+                elapsed_seconds=time.monotonic() - stream_started,
+                error_type=(
+                    stream_error.__class__.__name__
+                    if stream_error is not None
+                    else "StreamEnded"
+                ),
+            )
             if attempt < self.attempts:
                 delay = float(2 ** (attempt - 1))
                 LOGGER.warning(
@@ -554,6 +640,7 @@ class STTAPIClient(RetryingJSONClient):
         transient_statuses = {408, 429, 500, 502, 503, 504}
         for attempt in range(1, self.attempts + 1):
             response = None
+            started = time.monotonic()
             try:
                 with audio_path.open("rb") as audio_stream:
                     multipart = MultipartEncoder(
@@ -580,11 +667,38 @@ class STTAPIClient(RetryingJSONClient):
                     )
             except requests.RequestException as error:
                 last_error = error
-            if response is not None and (
-                response.status_code not in transient_statuses
-                or attempt == self.attempts
-            ):
-                break
+                self._observe_request(
+                    operation="submit",
+                    outcome=(
+                        "retry" if attempt < self.attempts else "exhausted"
+                    ),
+                    attempt=attempt,
+                    elapsed_seconds=time.monotonic() - started,
+                    error_type=error.__class__.__name__,
+                )
+            if response is not None:
+                retrying = (
+                    response.status_code in transient_statuses
+                    and attempt < self.attempts
+                )
+                if 200 <= response.status_code < 400:
+                    outcome = "success"
+                elif retrying:
+                    outcome = "retry"
+                elif response.status_code in transient_statuses:
+                    outcome = "exhausted"
+                else:
+                    outcome = "http_error"
+                self._observe_request(
+                    operation="submit",
+                    outcome=outcome,
+                    attempt=attempt,
+                    elapsed_seconds=time.monotonic() - started,
+                    status_code=response.status_code,
+                )
+                if not retrying:
+                    break
+                response.close()
             if attempt < self.attempts:
                 delay = float(2 ** (attempt - 1))
                 LOGGER.warning(
@@ -712,17 +826,21 @@ def list_openai_compatible_models(
     token: str,
     *,
     attempts: int = 1,
+    request_observer: RequestObserver | None = None,
 ) -> list[str]:
     """Return model identifiers exposed by an OpenAI-compatible server."""
     client = RetryingJSONClient(
         token=token,
         read_timeout=30.0,
         attempts=attempts,
+        service_name="translation_lm",
+        request_observer=request_observer,
     )
     response = client.request(
         "GET",
         f"{base_url.rstrip('/')}/models",
         headers=client.headers,
+        metric_operation="models",
     )
     if response.status_code != 200:
         raise ExternalServiceError(
@@ -761,8 +879,21 @@ def list_openai_compatible_models(
 class SubtitleValidationClient(RetryingJSONClient):
     """Run one explicit structured subtitle review against a paid LLM."""
 
-    def __init__(self, base_url: str, token: str, model: str) -> None:
-        super().__init__(token=token, read_timeout=180.0, attempts=1)
+    def __init__(
+        self,
+        base_url: str,
+        token: str,
+        model: str,
+        *,
+        request_observer: RequestObserver | None = None,
+    ) -> None:
+        super().__init__(
+            token=token,
+            read_timeout=180.0,
+            attempts=1,
+            service_name="subtitle_validator",
+            request_observer=request_observer,
+        )
         if not model.strip():
             raise ValueError("subtitle validator model name is required")
         self.base_url = base_url.rstrip("/")
@@ -836,6 +967,7 @@ class SubtitleValidationClient(RetryingJSONClient):
             f"{self.base_url}/chat/completions",
             headers={**self.headers, "Content-Type": "application/json"},
             json=payload,
+            metric_operation="validation",
         )
         if response.status_code != 200:
             raise ExternalServiceError(
@@ -914,12 +1046,15 @@ class OpenAICompatibleClient(RetryingJSONClient):
         max_characters: int = 6000,
         attempts: int = 3,
         request_limiter: RequestConcurrencyLimiter | None = None,
+        request_observer: RequestObserver | None = None,
     ) -> None:
         super().__init__(
             token=token,
             read_timeout=600.0,
             attempts=attempts,
             request_limiter=request_limiter,
+            service_name="translation_lm",
+            request_observer=request_observer,
         )
         if not model.strip():
             raise ValueError("OpenAI-compatible model name is required")
@@ -1389,6 +1524,9 @@ class OpenAICompatibleClient(RetryingJSONClient):
             f"{self.base_url}/chat/completions",
             headers={**self.headers, "Content-Type": "application/json"},
             json=request_payload,
+            metric_operation=(
+                "review" if "review" in schema_name else "translation"
+            ),
         )
         if response.status_code != 200:
             raise ExternalServiceError(

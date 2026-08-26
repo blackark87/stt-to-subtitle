@@ -3140,7 +3140,11 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                 lm_base_url,
                 "OPENAI_COMPATIBLE_BASE_URL",
             )
-            models = list_openai_compatible_models(base_url, token)
+            models = list_openai_compatible_models(
+                base_url,
+                token,
+                request_observer=orchestrator(request).record_external_request,
+            )
         except (ValueError, ExternalServiceError) as error:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,

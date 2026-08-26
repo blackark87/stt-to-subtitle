@@ -670,6 +670,8 @@ class TranscriptionService:
         self._stopping = threading.Event()
         self._process_lock = threading.Lock()
         self._active_processes: dict[str, subprocess.Popen[str]] = {}
+        self._activity_lock = threading.Lock()
+        self._active_job_id: str | None = None
         self._worker = threading.Thread(
             target=self._worker_loop,
             name="stt-api-worker",
@@ -783,10 +785,12 @@ class TranscriptionService:
         )
 
     def health(self) -> dict[str, Any]:
+        queue_snapshot = self.queue_snapshot()
         return {
             "status": "ok",
             "uptime_seconds": round(time.time() - self._started_at, 3),
-            "queued_jobs": self._queue.qsize(),
+            "queued_jobs": queue_snapshot["queued"],
+            "queue": queue_snapshot,
             "loaded_backend": "kotoba" if self._pipeline is not None else None,
             "model_idle_timeout_seconds": (
                 self.settings.model_idle_timeout_seconds
@@ -803,6 +807,7 @@ class TranscriptionService:
             "device": self.settings.device,
             "diarization_device": self.settings.diarization_device,
             "hf_token_configured": bool(self.settings.hf_token.strip()),
+            "queue": self.queue_snapshot(),
             "backends": {
                 "hybrid": {"status": "ready"},
                 "kotoba": {"status": "ready"},
@@ -814,6 +819,7 @@ class TranscriptionService:
             detail["status"] = "not_ready"
             detail["reason"] = "HF_TOKEN is not configured"
             return False, detail
+
         try:
             import torch
         except ImportError:
@@ -850,6 +856,17 @@ class TranscriptionService:
             }
         detail["status"] = "ready"
         return True, detail
+
+    def queue_snapshot(self) -> dict[str, Any]:
+        counts = self.store.status_counts()
+        with self._activity_lock:
+            active_job_id = self._active_job_id
+        return {
+            "queued": counts["queued"],
+            "running": counts["running"],
+            "cancel_requested": counts["cancel_requested"],
+            "active_job_id": active_job_id,
+        }
 
     def backend_unavailable_reason(self, backend: str) -> str | None:
         if backend == "kotoba":
@@ -1287,9 +1304,13 @@ class TranscriptionService:
             try:
                 if job_id is None:
                     return
+                with self._activity_lock:
+                    self._active_job_id = job_id
                 with self._pipeline_lock:
                     self._run_job(job_id)
             finally:
+                with self._activity_lock:
+                    self._active_job_id = None
                 self._pipeline_idle_since = time.monotonic()
                 self._queue.task_done()
 

@@ -1569,10 +1569,14 @@ class WebAppTests(unittest.TestCase):
             self.assertEqual(service.lm_gate_state, "offline")
             self.assertEqual(persisted_gate["state"], "offline")
             self.assertEqual(persisted_gate["reason_code"], "manual_stop")
-            models.assert_called_once_with(
-                "http://lm.test/v1",
-                "",
-                attempts=1,
+            models.assert_called_once()
+            self.assertEqual(
+                models.call_args.args,
+                ("http://lm.test/v1", ""),
+            )
+            self.assertEqual(models.call_args.kwargs["attempts"], 1)
+            self.assertTrue(
+                callable(models.call_args.kwargs["request_observer"])
             )
 
     def test_transcription_gate_requires_explicit_readiness_after_loss(
@@ -1742,6 +1746,7 @@ class WebAppTests(unittest.TestCase):
                         "cleanup_token": cleanup_token,
                     },
                 )
+                measurements = service.store.operational_measurements()
 
             self.assertIn("산출물 보존", settings_page.text)
             self.assertNotIn("deleted-job/old.json", settings_page.text)
@@ -1756,6 +1761,21 @@ class WebAppTests(unittest.TestCase):
             self.assertFalse(old_orphan.exists())
             self.assertTrue(recent_orphan.exists())
             self.assertTrue(referenced.exists())
+            metric_labels = {
+                (
+                    measurement["metric"],
+                    tuple(sorted(measurement["labels"].items())),
+                )
+                for measurement in measurements
+            }
+            self.assertIn(
+                ("artifact.audit.files", (("state", "orphan"),)),
+                metric_labels,
+            )
+            self.assertIn(
+                ("artifact.cleanup.files", (("outcome", "removed"),)),
+                metric_labels,
+            )
 
     def test_manages_prompt_categories(self) -> None:
         with TemporaryDirectory() as directory:
@@ -1901,9 +1921,16 @@ class WebAppTests(unittest.TestCase):
                 response.json(),
                 {"models": ["model-a", "model-b"]},
             )
-            list_models.assert_called_once_with(
-                "http://translation.test:1234/v1",
-                "lookup-token",
+            list_models.assert_called_once()
+            self.assertEqual(
+                list_models.call_args.args,
+                (
+                    "http://translation.test:1234/v1",
+                    "lookup-token",
+                ),
+            )
+            self.assertTrue(
+                callable(list_models.call_args.kwargs["request_observer"])
             )
             self.assertIn("OpenAI 호환 API 주소", page.text)
             self.assertIn('name="lm_model"', page.text)
@@ -1947,6 +1974,8 @@ class WebAppTests(unittest.TestCase):
             self.assertEqual(payload["jobs"]["by_state"]["waiting"], 1)
             self.assertEqual(payload["events"]["by_code"]["job.created"], 1)
             self.assertIn("extraction", payload["events"]["stages"])
+            self.assertIn("remote_stt", payload)
+            self.assertIn("measurements", payload)
 
     def test_recent_jobs_and_history_use_readable_responsive_layout(self) -> None:
         with TemporaryDirectory() as directory:

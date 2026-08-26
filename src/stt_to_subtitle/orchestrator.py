@@ -470,6 +470,7 @@ class SubtitleOrchestrator:
             settings.base_url,
             settings.token,
             settings.model,
+            request_observer=self.record_external_request,
         ).validate(payload)
         updated = self.store.save_subtitle_llm_validation(
             validation_id,
@@ -488,6 +489,65 @@ class SubtitleOrchestrator:
     def stt_gate_state(self) -> str:
         with self._stt_gate_lock:
             return self._stt_gate_state
+
+    def record_external_request(self, observation: Mapping[str, Any]) -> None:
+        labels: dict[str, str | int | bool] = {
+            "service": str(observation.get("service", "external")),
+            "operation": str(observation.get("operation", "request")),
+            "outcome": str(observation.get("outcome", "unknown")),
+            "attempt": int(observation.get("attempt", 1)),
+        }
+        if observation.get("status_code") is not None:
+            labels["status_code"] = int(observation["status_code"])
+        if observation.get("error_type") is not None:
+            labels["error_type"] = str(observation["error_type"])
+        self.store.record_operational_measurement(
+            "external.request.duration_seconds",
+            max(0.0, float(observation.get("elapsed_seconds", 0.0))),
+            labels=labels,
+        )
+
+    def _record_stt_queue_snapshot(self, readiness: Mapping[str, Any]) -> None:
+        queue = readiness.get("queue")
+        if not isinstance(queue, Mapping):
+            return
+        for state in ("queued", "running", "cancel_requested"):
+            value = queue.get(state)
+            if isinstance(value, int) and value >= 0:
+                self.store.record_operational_measurement(
+                    "remote_stt.queue.jobs",
+                    value,
+                    labels={"state": state},
+                )
+
+    def _record_artifact_audit(self, audit: Mapping[str, object]) -> None:
+        for state, key in (
+            ("total", "total_files"),
+            ("referenced", "referenced_files"),
+            ("missing", "missing_count"),
+            ("orphan", "orphan_count"),
+            ("cleanup_eligible", "cleanup_eligible_count"),
+            ("skipped_symlink", "skipped_symlinks"),
+        ):
+            value = audit.get(key)
+            if isinstance(value, int) and value >= 0:
+                self.store.record_operational_measurement(
+                    "artifact.audit.files",
+                    value,
+                    labels={"state": state},
+                )
+        for state, key in (
+            ("total", "total_bytes"),
+            ("orphan", "orphan_bytes"),
+            ("cleanup_eligible", "cleanup_eligible_bytes"),
+        ):
+            value = audit.get(key)
+            if isinstance(value, int) and value >= 0:
+                self.store.record_operational_measurement(
+                    "artifact.audit.bytes",
+                    value,
+                    labels={"state": state},
+                )
 
     def _set_stt_gate(
         self,
@@ -535,7 +595,8 @@ class SubtitleOrchestrator:
             self._stt_gate_state = "checking"
             self._stt_gate_message = "연결 확인 중"
         try:
-            self.stt_client.check_readiness()
+            readiness = self.stt_client.check_readiness()
+            self._record_stt_queue_snapshot(readiness)
         except ExternalServiceError as error:
             message = self._sanitize_error(str(error))
             self._set_stt_gate(
@@ -575,6 +636,7 @@ class SubtitleOrchestrator:
                 servers.lm_base_url,
                 servers.lm_token,
                 attempts=1,
+                request_observer=self.record_external_request,
             )
             if servers.lm_model not in models:
                 raise ExternalServiceError(
@@ -636,6 +698,7 @@ class SubtitleOrchestrator:
             self.store.artifact_references(),
             minimum_age_days=minimum_age_days,
         )
+        self._record_artifact_audit(audit.to_view())
         return audit.to_view()
 
     def cleanup_artifacts(
@@ -649,11 +712,27 @@ class SubtitleOrchestrator:
             self.store.artifact_references(),
             minimum_age_days=minimum_age_days,
         )
+        self._record_artifact_audit(audit.to_view())
         if not expected_token or audit.cleanup_token != expected_token:
             raise ValueError(
                 "산출물 감사 결과가 변경되었습니다. 다시 감사를 실행하세요."
             )
         cleanup = cleanup_orphan_artifacts(audit)
+        self.store.record_operational_measurement(
+            "artifact.cleanup.files",
+            cleanup.removed_files,
+            labels={"outcome": "removed"},
+        )
+        self.store.record_operational_measurement(
+            "artifact.cleanup.bytes",
+            cleanup.removed_bytes,
+            labels={"outcome": "removed"},
+        )
+        self.store.record_operational_measurement(
+            "artifact.cleanup.files",
+            len(cleanup.failed_files),
+            labels={"outcome": "failed"},
+        )
         return {
             "removed_files": cleanup.removed_files,
             "removed_bytes": cleanup.removed_bytes,
@@ -787,6 +866,7 @@ class SubtitleOrchestrator:
         stt_client = STTAPIClient(
             normalized.stt_base_url,
             normalized.stt_token,
+            request_observer=self.record_external_request,
         )
         lm_client = OpenAICompatibleClient(
             normalized.lm_base_url,
@@ -795,6 +875,7 @@ class SubtitleOrchestrator:
             max_segments=self.settings.translation_batch_segments,
             max_characters=self.settings.translation_batch_characters,
             request_limiter=self._translation_request_limiter,
+            request_observer=self.record_external_request,
         )
         if persist:
             self.store.save_remote_server_settings(
@@ -838,6 +919,10 @@ class SubtitleOrchestrator:
                 repaired_publications,
             )
         recovered = self._reconcile_interrupted_jobs()
+        self.store.record_operational_measurement(
+            "recovery.pipeline_jobs",
+            recovered,
+        )
         if recovered:
             LOGGER.warning(
                 "reconciled %d interrupted job(s) from persisted checkpoints",
@@ -845,6 +930,14 @@ class SubtitleOrchestrator:
             )
         translation_recovery = (
             self.store.reconcile_interrupted_translation_attempts()
+        )
+        self.store.record_operational_measurement(
+            "recovery.translation_generations",
+            translation_recovery["generation_count"],
+        )
+        self.store.record_operational_measurement(
+            "recovery.translation_batches",
+            translation_recovery["batch_count"],
         )
         if translation_recovery["generation_count"]:
             LOGGER.warning(
@@ -3485,6 +3578,7 @@ class SubtitleOrchestrator:
             max_segments=self.settings.translation_batch_segments,
             max_characters=self.settings.translation_batch_characters,
             request_limiter=self._translation_request_limiter,
+            request_observer=self.record_external_request,
         )
 
     def _translation_generation_contract(
@@ -4167,6 +4261,7 @@ class SubtitleOrchestrator:
 
     def _reconcile_subtitle_publications(self) -> int:
         repaired = 0
+        failed = 0
         with self._subtitle_publication_lock:
             for generation in (
                 self.store.list_recoverable_subtitle_generations()
@@ -4178,6 +4273,7 @@ class SubtitleOrchestrator:
                         )
                     )
                 except (OSError, RuntimeError, ValueError):
+                    failed += 1
                     LOGGER.exception(
                         "subtitle generation recovery failed for %s",
                         generation["source_rel"],
@@ -4188,10 +4284,21 @@ class SubtitleOrchestrator:
                         self._reconcile_subtitle_publication(publication)
                     )
                 except (OSError, RuntimeError, ValueError):
+                    failed += 1
                     LOGGER.exception(
                         "subtitle publication reconcile failed for %s",
                         publication["source_rel"],
                     )
+        self.store.record_operational_measurement(
+            "recovery.subtitle_publications",
+            repaired,
+            labels={"outcome": "repaired"},
+        )
+        self.store.record_operational_measurement(
+            "recovery.subtitle_publications",
+            failed,
+            labels={"outcome": "failed"},
+        )
         return repaired
 
     def _recover_subtitle_generation_publication(

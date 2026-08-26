@@ -171,6 +171,7 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                 "http://lm.test/v1",
                 "secret",
                 attempts=1,
+                request_observer=ANY,
             )
 
     def test_manual_lm_gate_starts_closed_after_process_restart(self) -> None:
@@ -266,12 +267,34 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                 )
 
                 orchestrator.stt_client.check_readiness = Mock(
-                    return_value={"status": "ready"}
+                    return_value={
+                        "status": "ready",
+                        "queue": {
+                            "queued": 4,
+                            "running": 1,
+                            "cancel_requested": 2,
+                        },
+                    }
                 )
                 resumed = orchestrator.activate_transcription_stt()
                 self.assertEqual(resumed, 1)
                 self.assertEqual(orchestrator.stt_gate_state, "ready")
                 orchestrator.stt_client.check_readiness.assert_called_once_with()
+                queue_measurements = {
+                    measurement["labels"]["state"]: measurement["last_value"]
+                    for measurement in (
+                        orchestrator.store.operational_measurements()
+                    )
+                    if measurement["metric"] == "remote_stt.queue.jobs"
+                }
+                self.assertEqual(
+                    queue_measurements,
+                    {
+                        "queued": 4.0,
+                        "running": 1.0,
+                        "cancel_requested": 2.0,
+                    },
+                )
             finally:
                 orchestrator.stop()
 

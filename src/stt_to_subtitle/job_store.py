@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 import hashlib
 import json
+import math
 from pathlib import Path
 import re
 import sqlite3
@@ -815,6 +816,18 @@ class JobStore:
                 CREATE TABLE IF NOT EXISTS schema_migrations (
                     name TEXT PRIMARY KEY,
                     applied_at REAL NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS operational_measurements (
+                    metric TEXT NOT NULL,
+                    labels_json TEXT NOT NULL,
+                    sample_count INTEGER NOT NULL,
+                    total REAL NOT NULL,
+                    maximum REAL NOT NULL,
+                    last_value REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY (metric, labels_json),
+                    CHECK (sample_count >= 1)
                 );
 
                 CREATE INDEX IF NOT EXISTS jobs_status_idx
@@ -4931,7 +4944,8 @@ class JobStore:
             jobs = connection.execute(
                 """
                 SELECT phase, state, reason_code, attempt, status,
-                       status_updated_at, lease_owner, lease_expires_at
+                       status_updated_at, lease_owner, lease_expires_at,
+                       stt_job_id, job_stop_requested
                 FROM jobs
                 """
             ).fetchall()
@@ -4985,6 +4999,8 @@ class JobStore:
         expired_running_leases = 0
         total_retries = 0
         max_attempt = 0
+        remote_running_job_ids: list[str] = []
+        remote_cancel_pending_job_ids: list[str] = []
         for row in jobs:
             phase = str(row["phase"])
             state = str(row["state"])
@@ -5011,6 +5027,14 @@ class JobStore:
                     active_leases += 1
                 elif str(row["status"]) in RUNNING_JOB_STATUSES:
                     expired_running_leases += 1
+            if (
+                str(row["status"]) == "transcription_running"
+                and row["stt_job_id"] is not None
+            ):
+                remote_job_id = str(row["stt_job_id"])
+                remote_running_job_ids.append(remote_job_id)
+                if bool(row["job_stop_requested"]):
+                    remote_cancel_pending_job_ids.append(remote_job_id)
 
         event_code_counts = {
             str(row["event_code"]): int(row["event_count"])
@@ -5111,6 +5135,12 @@ class JobStore:
                 "expired_running": expired_running_leases,
             },
             "database": database_integrity,
+            "remote_stt": {
+                "running_job_ids": sorted(remote_running_job_ids),
+                "cancel_pending_job_ids": sorted(
+                    remote_cancel_pending_job_ids
+                ),
+            },
             "dependencies": [
                 {
                     "dependency": str(row["dependency"]),
@@ -5128,6 +5158,7 @@ class JobStore:
                 "by_code": dict(sorted(event_code_counts.items())),
                 "stages": summarized_stages,
             },
+            "measurements": self.operational_measurements(),
         }
 
     def database_integrity(self) -> dict[str, Any]:
@@ -5152,3 +5183,105 @@ class JobStore:
             "foreign_key_violation_count": len(violations),
             "valid": check_result == "ok" and not violations,
         }
+
+    def record_operational_measurement(
+        self,
+        metric: str,
+        value: float,
+        *,
+        labels: Mapping[str, str | int | bool] | None = None,
+    ) -> None:
+        normalized_metric = metric.strip().lower()
+        if (
+            not normalized_metric
+            or len(normalized_metric) > 100
+            or EVENT_CODE_PATTERN.fullmatch(normalized_metric) is None
+        ):
+            raise ValueError("invalid operational metric")
+        numeric_value = float(value)
+        if not math.isfinite(numeric_value) or numeric_value < 0:
+            raise ValueError(
+                "operational metric value must be finite and nonnegative"
+            )
+        normalized_labels: dict[str, str | int | bool] = {}
+        credential_suffixes = tuple(
+            f"_{part}" for part in SENSITIVE_EVENT_KEY_PARTS
+        )
+        for key, label_value in dict(labels or {}).items():
+            normalized_key = str(key).strip().lower()
+            if (
+                not normalized_key
+                or len(normalized_key) > 50
+                or EVENT_CODE_PATTERN.fullmatch(normalized_key) is None
+            ):
+                raise ValueError("invalid operational metric label")
+            if (
+                normalized_key in SENSITIVE_EVENT_KEY_PARTS
+                or normalized_key.endswith(credential_suffixes)
+            ):
+                raise ValueError("sensitive metric labels are not allowed")
+            if not isinstance(label_value, (str, int, bool)):
+                raise ValueError("operational metric labels must be scalar")
+            normalized_value = (
+                label_value.strip()
+                if isinstance(label_value, str)
+                else label_value
+            )
+            if len(str(normalized_value)) > 100:
+                raise ValueError("operational metric label is too long")
+            normalized_labels[normalized_key] = normalized_value
+        if len(normalized_labels) > 8:
+            raise ValueError("operational metrics support at most 8 labels")
+        labels_json = json.dumps(
+            normalized_labels,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        now = time.time()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO operational_measurements (
+                    metric, labels_json, sample_count, total,
+                    maximum, last_value, updated_at
+                ) VALUES (?, ?, 1, ?, ?, ?, ?)
+                ON CONFLICT(metric, labels_json) DO UPDATE SET
+                    sample_count = sample_count + 1,
+                    total = total + excluded.last_value,
+                    maximum = MAX(maximum, excluded.last_value),
+                    last_value = excluded.last_value,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    normalized_metric,
+                    labels_json,
+                    numeric_value,
+                    numeric_value,
+                    numeric_value,
+                    now,
+                ),
+            )
+
+    def operational_measurements(self) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT metric, labels_json, sample_count, total,
+                       maximum, last_value, updated_at
+                FROM operational_measurements
+                ORDER BY metric, labels_json
+                """
+            ).fetchall()
+        return [
+            {
+                "metric": str(row["metric"]),
+                "labels": json.loads(str(row["labels_json"])),
+                "sample_count": int(row["sample_count"]),
+                "total": float(row["total"]),
+                "maximum": float(row["maximum"]),
+                "last_value": float(row["last_value"]),
+                "updated_at": float(row["updated_at"]),
+            }
+            for row in rows
+        ]

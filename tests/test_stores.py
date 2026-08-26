@@ -65,6 +65,28 @@ class TranscriptionStoreTests(unittest.TestCase):
 
             self.assertEqual(changed_job_ids, ["job-1"] * 4)
 
+    def test_counts_transcription_queue_states(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = TranscriptionStore(Path(directory) / "jobs.sqlite3")
+            for job_id in ("queued", "running", "cancel-requested"):
+                store.create(
+                    job_id=job_id,
+                    idempotency_key=f"{job_id}-key",
+                    audio_path=Path(directory) / f"{job_id}.wav",
+                    audio_sha256="abc",
+                    options={},
+                )
+            store.update("running", status="running")
+            store.update("cancel-requested", status="running")
+            store.request_cancel("cancel-requested")
+
+            counts = store.status_counts()
+
+            self.assertEqual(counts["queued"], 1)
+            self.assertEqual(counts["running"], 1)
+            self.assertEqual(counts["cancel_requested"], 1)
+            self.assertEqual(counts["completed"], 0)
+
     def test_marks_running_jobs_failed_after_restart(self) -> None:
         with TemporaryDirectory() as directory:
             store = TranscriptionStore(Path(directory) / "jobs.sqlite3")
@@ -662,9 +684,30 @@ class JobStoreTests(unittest.TestCase):
                 from_state="running",
                 phase="extraction",
             )
+            store.record_operational_measurement(
+                "external.request.duration_seconds",
+                1.25,
+                labels={
+                    "service": "translation_lm",
+                    "operation": "translation",
+                    "outcome": "retry",
+                    "attempt": 1,
+                },
+            )
+            store.record_operational_measurement(
+                "external.request.duration_seconds",
+                0.75,
+                labels={
+                    "service": "translation_lm",
+                    "operation": "translation",
+                    "outcome": "retry",
+                    "attempt": 1,
+                },
+            )
 
             snapshot = store.operational_metrics()
             extraction = snapshot["events"]["stages"]["extraction"]
+            measurement = snapshot["measurements"][0]
 
             self.assertEqual(snapshot["schema_version"], 1)
             self.assertEqual(snapshot["jobs"]["total"], 1)
@@ -682,6 +725,58 @@ class JobStoreTests(unittest.TestCase):
             )
             self.assertTrue(snapshot["database"]["foreign_keys_enabled"])
             self.assertTrue(snapshot["database"]["valid"])
+            self.assertEqual(
+                measurement["metric"],
+                "external.request.duration_seconds",
+            )
+            self.assertEqual(measurement["sample_count"], 2)
+            self.assertEqual(measurement["total"], 2.0)
+            self.assertEqual(measurement["maximum"], 1.25)
+            self.assertEqual(measurement["last_value"], 0.75)
+            with self.assertRaisesRegex(ValueError, "sensitive metric"):
+                store.record_operational_measurement(
+                    "external.request.duration_seconds",
+                    1,
+                    labels={"api_token": "must-not-be-stored"},
+                )
+
+    def test_reports_remote_transcription_and_cancel_pending_ids(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = JobStore(Path(directory) / "jobs.sqlite3")
+            running = store.create(
+                job_id="running-job",
+                source_rel="running.mkv",
+                force_overwrite=False,
+                options={},
+            )
+            cancelling = store.create(
+                job_id="cancelling-job",
+                source_rel="cancelling.mkv",
+                force_overwrite=False,
+                options={},
+            )
+            store.update(
+                running.id,
+                status="transcription_running",
+                stt_job_id="remote-running",
+            )
+            store.update(
+                cancelling.id,
+                status="transcription_running",
+                stt_job_id="remote-cancelling",
+                job_stop_requested=1,
+            )
+
+            remote_stt = store.operational_metrics()["remote_stt"]
+
+            self.assertEqual(
+                remote_stt["running_job_ids"],
+                ["remote-cancelling", "remote-running"],
+            )
+            self.assertEqual(
+                remote_stt["cancel_pending_job_ids"],
+                ["remote-cancelling"],
+            )
 
     def test_enforces_database_references_and_job_projection(self) -> None:
         with TemporaryDirectory() as directory:

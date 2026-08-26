@@ -1321,6 +1321,15 @@ class STTAPIRouteTests(unittest.TestCase):
 
             self.assertEqual(health.status_code, 200)
             self.assertEqual(health.json()["status"], "ok")
+            self.assertEqual(
+                health.json()["queue"],
+                {
+                    "queued": 0,
+                    "running": 0,
+                    "cancel_requested": 0,
+                    "active_job_id": None,
+                },
+            )
             self.assertEqual(unauthorized.status_code, 401)
 
     def test_blank_api_token_disables_bearer_authentication(self) -> None:

@@ -64,6 +64,57 @@ class AuthenticationHeaderTests(unittest.TestCase):
 
         self.assertEqual(client.headers, {"Accept": "application/json"})
 
+    def test_observes_each_request_attempt_without_request_secrets(self) -> None:
+        observations: list[dict[str, object]] = []
+        unavailable = Mock(status_code=503)
+        completed = Mock(status_code=200)
+        client = RetryingJSONClient(
+            token="secret",
+            attempts=2,
+            service_name="translation_lm",
+            request_observer=lambda value: observations.append(dict(value)),
+        )
+
+        with patch.object(
+            client.session,
+            "request",
+            side_effect=[unavailable, completed],
+        ), patch("stt_to_subtitle.service_clients.time.sleep"):
+            response = client.request(
+                "POST",
+                "http://translation.test/v1/chat/completions",
+                headers=client.headers,
+                json={"private": "request body"},
+                metric_operation="translation",
+            )
+
+        self.assertIs(response, completed)
+        self.assertEqual(
+            [observation["outcome"] for observation in observations],
+            ["retry", "success"],
+        )
+        self.assertEqual(
+            [observation["attempt"] for observation in observations],
+            [1, 2],
+        )
+        self.assertTrue(
+            all(
+                observation["operation"] == "translation"
+                and observation["service"] == "translation_lm"
+                for observation in observations
+            )
+        )
+        self.assertTrue(
+            all(
+                "url" not in observation
+                and "headers" not in observation
+                and "json" not in observation
+                and "token" not in observation
+                for observation in observations
+            )
+        )
+        unavailable.close.assert_called_once()
+
 
 class OpenAICompatibleModelTests(unittest.TestCase):
     def test_lists_unique_model_ids_in_stable_order(self) -> None:
@@ -95,6 +146,7 @@ class OpenAICompatibleModelTests(unittest.TestCase):
                 "Accept": "application/json",
                 "Authorization": "Bearer secret",
             },
+            metric_operation="models",
         )
 
     def test_rejects_an_invalid_model_list(self) -> None:
@@ -221,6 +273,7 @@ class STTAPIClientProgressTests(unittest.TestCase):
                 "Accept": "application/json",
                 "Authorization": "Bearer token",
             },
+            metric_operation="readiness",
         )
 
     def test_stops_event_stream_when_requested(self) -> None:

@@ -296,6 +296,30 @@ class TranscriptionStore:
             ).fetchall()
         return [str(row["id"]) for row in rows]
 
+    def status_counts(self) -> dict[str, int]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT status, COUNT(*) AS job_count
+                FROM transcription_jobs
+                GROUP BY status
+                """
+            ).fetchall()
+        counts = {
+            status: 0
+            for status in (
+                "queued",
+                "running",
+                "cancel_requested",
+                "cancelled",
+                "completed",
+                "failed",
+            )
+        }
+        for row in rows:
+            counts[str(row["status"])] = int(row["job_count"])
+        return counts
+
     def create(
         self,
         *,
