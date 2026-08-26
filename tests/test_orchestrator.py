@@ -165,6 +165,68 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                 attempts=1,
             )
 
+    def test_stt_gate_stops_queue_cascade_until_explicit_preflight(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            orchestrator = self.make_orchestrator(root, media_root)
+            try:
+                running = orchestrator.store.create(
+                    job_id="stt-running",
+                    source_rel="running.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                waiting = orchestrator.store.create(
+                    job_id="stt-waiting",
+                    source_rel="waiting.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                orchestrator.store.update(
+                    running.id,
+                    status="transcription_running",
+                )
+                orchestrator.store.update(waiting.id, status="audio_ready")
+                orchestrator._stt_executor.submit = Mock()
+
+                orchestrator._run_stage(
+                    running.id,
+                    "transcription",
+                    Mock(side_effect=ExternalServiceError("connection refused")),
+                )
+                orchestrator._scheduler_tick()
+
+                self.assertEqual(orchestrator.stt_gate_state, "lost")
+                self.assertEqual(
+                    orchestrator.store.get(waiting.id).status,
+                    "audio_ready",
+                )
+                orchestrator._stt_executor.submit.assert_not_called()
+                persisted = orchestrator.store.get_dependency_state("stt")
+                self.assertEqual(persisted["state"], "lost")
+                self.assertEqual(
+                    persisted["reason_code"],
+                    "stt_unavailable",
+                )
+
+                orchestrator.stt_client.check_readiness = Mock(
+                    return_value={"status": "ready"}
+                )
+                resumed = orchestrator.activate_transcription_stt()
+                self.assertEqual(resumed, 1)
+                self.assertEqual(orchestrator.stt_gate_state, "ready")
+                orchestrator.stt_client.check_readiness.assert_called_once_with()
+            finally:
+                orchestrator.stop()
+
+            reloaded = self.make_orchestrator(root, media_root)
+            try:
+                self.assertEqual(reloaded.stt_gate_state, "ready")
+            finally:
+                reloaded.stop()
+
     def test_paid_subtitle_validation_is_cached_by_payload_and_model(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)

@@ -349,6 +349,16 @@ class JobStore:
                     updated_at REAL NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS dependency_states (
+                    dependency TEXT PRIMARY KEY,
+                    state TEXT NOT NULL,
+                    reason_code TEXT,
+                    last_error TEXT,
+                    updated_at REAL NOT NULL,
+                    CHECK (dependency IN ('stt', 'translation_lm')),
+                    CHECK (state IN ('unknown', 'ready', 'lost', 'offline'))
+                );
+
                 CREATE TABLE IF NOT EXISTS subtitle_validator_settings (
                     id INTEGER PRIMARY KEY CHECK (id = 1),
                     base_url TEXT NOT NULL,
@@ -1032,6 +1042,67 @@ class JobStore:
             "lm_model": str(row["lm_model"]),
             "translation_workers": int(row["translation_workers"]),
         }
+
+    def get_dependency_state(self, dependency: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT dependency, state, reason_code, last_error, updated_at
+                FROM dependency_states
+                WHERE dependency = ?
+                """,
+                (dependency,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "dependency": str(row["dependency"]),
+            "state": str(row["state"]),
+            "reason_code": (
+                str(row["reason_code"])
+                if row["reason_code"] is not None
+                else None
+            ),
+            "last_error": (
+                str(row["last_error"])
+                if row["last_error"] is not None
+                else None
+            ),
+            "updated_at": float(row["updated_at"]),
+        }
+
+    def save_dependency_state(
+        self,
+        dependency: str,
+        *,
+        state: str,
+        reason_code: str | None = None,
+        error: str | None = None,
+    ) -> None:
+        if dependency not in {"stt", "translation_lm"}:
+            raise ValueError("unsupported dependency state")
+        if state not in {"unknown", "ready", "lost", "offline"}:
+            raise ValueError("unsupported dependency status")
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO dependency_states (
+                    dependency, state, reason_code, last_error, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(dependency) DO UPDATE SET
+                    state = excluded.state,
+                    reason_code = excluded.reason_code,
+                    last_error = excluded.last_error,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    dependency,
+                    state,
+                    reason_code,
+                    error[:2000] if error else None,
+                    time.time(),
+                ),
+            )
 
     def save_remote_server_settings(
         self,

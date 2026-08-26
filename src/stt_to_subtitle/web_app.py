@@ -2798,9 +2798,11 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         saved: bool = False,
         prompt_saved: bool = False,
         path_saved: bool = False,
+        stt_started: bool = False,
         lm_started: bool = False,
         lm_stopped: bool = False,
         validator_saved: bool = False,
+        stt_resumed: int = 0,
         resumed: int = 0,
     ) -> Any:
         if not is_authenticated(request):
@@ -2812,6 +2814,15 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                 request,
                 notice=(
                     (
+                        "전사 서버 연결을 확인했습니다."
+                        + (
+                            f" 중단 작업 {stt_resumed}건을 재개했습니다."
+                            if stt_resumed
+                            else ""
+                        )
+                    )
+                    if stt_started
+                    else (
                         "번역 서버 연결을 확인했습니다."
                         + (f" 중단 작업 {resumed}건을 재개했습니다." if resumed else "")
                     )
@@ -2829,6 +2840,28 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                     else None
                 ),
             ),
+        )
+
+    @app.post("/settings/transcription/start", response_class=HTMLResponse)
+    def start_transcription_stt(
+        request: Request,
+        csrf_token: str = Form(""),
+    ) -> Any:
+        if not is_authenticated(request):
+            return login_redirect()
+        validate_csrf(request, csrf_token)
+        try:
+            resumed = orchestrator(request).activate_transcription_stt()
+        except (ValueError, ExternalServiceError) as error:
+            return TEMPLATES.TemplateResponse(
+                request,
+                "settings.html",
+                settings_context(request, error=str(error)),
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+        return RedirectResponse(
+            f"/settings?stt_started=true&stt_resumed={resumed}",
+            status_code=status.HTTP_303_SEE_OTHER,
         )
 
     @app.post("/settings/translation/start", response_class=HTMLResponse)

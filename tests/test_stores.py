@@ -651,6 +651,24 @@ class JobStoreTests(unittest.TestCase):
                 },
             )
 
+    def test_persists_dependency_gate_state_without_credentials(self) -> None:
+        with TemporaryDirectory() as directory:
+            database_path = Path(directory) / "jobs.sqlite3"
+            store = JobStore(database_path)
+
+            store.save_dependency_state(
+                "stt",
+                state="lost",
+                reason_code="stt_unavailable",
+                error="connection refused",
+            )
+
+            state = JobStore(database_path).get_dependency_state("stt")
+            self.assertEqual(state["dependency"], "stt")
+            self.assertEqual(state["state"], "lost")
+            self.assertEqual(state["reason_code"], "stt_unavailable")
+            self.assertEqual(state["last_error"], "connection refused")
+
     def test_persists_subtitle_validator_settings(self) -> None:
         with TemporaryDirectory() as directory:
             database_path = Path(directory) / "jobs.sqlite3"

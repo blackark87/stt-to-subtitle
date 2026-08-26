@@ -204,6 +204,24 @@ class STTAPIClientProgressTests(unittest.TestCase):
         response.iter_lines.return_value = lines
         return response
 
+    def test_checks_transcription_readiness_once_per_explicit_call(self) -> None:
+        response = Mock(status_code=200)
+        response.json.return_value = {"status": "ready", "backends": {}}
+        client = STTAPIClient("http://stt.test", "token")
+        client.request = Mock(return_value=response)
+
+        payload = client.check_readiness()
+
+        self.assertEqual(payload["status"], "ready")
+        client.request.assert_called_once_with(
+            "GET",
+            "http://stt.test/readyz",
+            headers={
+                "Accept": "application/json",
+                "Authorization": "Bearer token",
+            },
+        )
+
     def test_stops_event_stream_when_requested(self) -> None:
         running = self.event_stream({"status": "running"})
         cancelled = Mock(status_code=200)

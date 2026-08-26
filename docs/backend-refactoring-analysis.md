@@ -6,7 +6,7 @@
 
 ### 구현 진행 상태
 
-현재 작업 트리에는 계획의 일곱 번째 수직 슬라이스까지 반영됐다.
+현재 작업 트리에는 계획의 여덟 번째 수직 슬라이스까지 반영됐다.
 
 | 항목 | 반영 상태 | 남은 범위 |
 |---|---|---|
@@ -20,6 +20,7 @@
 | 원격 STT 취소 | 멱등 cancel API, `cancel_requested/cancelled` 영속 상태, 웹의 취소 호출·최종 확인, WhisperX/JAV process group 종료, Kotoba 청크 경계 취소 | Kotoba diarization/postprocess 즉시 중단·실제 GPU 자원 fault test |
 | 시작 복구 | 추출 재대기, 원격 STT 재연결·유실 ID 멱등 재제출, 번역 체크포인트 대기 복원, 검증된 전사·번역 산출물 기반 렌더 재개, 중지 요청 보존 | worker lease·렌더 publication pair manifest reconcile·강제 종료 fault test |
 | STT 실패 계약 | STT DB·API의 `failure_code`, 원격 실패 전용 예외, segment/schema 오류의 `failed/model_output_invalid`, 연결 오류의 `blocked/stt_unavailable` 분리 | backend OOM·인증·입력 오류 세분화와 `retryable/failure_scope` |
+| STT dispatch gate | 첫 연결 실패 시 영속 gate 차단, 뒤 작업 `audio_ready` 유지, 명시적 연결 확인의 제한된 3회 요청 후 중단 작업 재개 | 자동 recovery mode가 실제로 필요한지 운영 검증·회로 메트릭 |
 
 이하의 문제 분석은 최초 분석 시점 구조를 기준으로 하되, 구현이 끝난 절은 현재
 동작과 남은 범위로 갱신했다.
@@ -39,6 +40,7 @@
 7. 번역 결과는 generation·batch·segment 단위로 DB에 저장되고 JSON을 재생성할 수 있게 됐다. 다만 실행 중 프로세스 종료를 자동 reconcile하는 worker lease는 아직 없다.
 8. 프롬프트를 바꾼 재번역과 직접 편집은 별도 translation generation으로 보존하고, SRT/ASS도 generation별 보존·재게시할 수 있다. immutable prompt revision과 파일/DB startup reconcile은 아직 없다.
 9. 미디어 옆의 `<filename>.srt/.vtt/.ass` 외부 자막 탐지·재생·로컬 비교는 추가됐지만 asset/revision/publication 관계와 증분 catalog는 아직 없다.
+10. STT 연결 실패는 영속 dispatch gate를 닫아 뒤 작업의 연쇄 실패를 막는다. 자동 background probe는 하지 않으며 사용자가 연결 확인/재개를 실행할 때만 제한된 확인 후 gate를 연다.
 
 가장 먼저 해야 할 일은 UI 확장이 아니라 상태 모델과 스케줄러 제어의 정리다. `phase`, `state`, `reason_code`, `attempt`을 분리하고, 의존성별 수동·자동 복구 정책과 단계별 복구 정책을 추가해야 한다. 반복 번역·자막 재생성을 제품의 기본 사용 방식으로 보고 transcript revision, translation generation, subtitle asset/publication/validation도 영속 도메인으로 관리해야 한다.
 
@@ -250,7 +252,7 @@ stateDiagram-v2
 2. `completed`이면 결과를 회수하고 다음 단계로 이동한다.
 3. `queued/running`이면 SSE 또는 polling을 재연결한다.
 4. `failed/cancelled/not_found`이면 원인에 따라 재제출 또는 명시적 실패 처리한다.
-5. STT 서비스 자체가 불가하면 해당 작업을 `blocked/stt_unavailable`로 내린다. 전체 STT dispatch gate는 아직 남은 범위다.
+5. STT 서비스 자체가 불가하면 해당 작업을 `blocked/stt_unavailable`로 내리고 영속 dispatch gate를 닫아 나머지 `audio_ready` 작업을 실행하지 않는다. 사용자가 연결 확인/재개를 요청한 경우에만 제한된 readiness 확인 후 중단 작업을 재개한다.
 
 ## 7. 일시정지·중지·중단·실패의 계약
 
@@ -607,7 +609,7 @@ jobs(
 - 단계별 대기 시간과 처리 시간
 - 상태별 작업 수 및 가장 오래된 대기 작업 나이
 - 외부 API 요청·재시도·소진 횟수
-- STT 회로 상태와 다음 자동 probe 시각, LLM 수동 gate 상태와 마지막 사용자 확인 결과
+- STT 영속 gate 상태와 마지막 명시적 readiness 결과, LLM 수동 gate 상태와 마지막 사용자 확인 결과
 - 작업별 attempt 수와 reason code 분포
 - lease 만료·복구·중복 실행 방지 횟수
 - 원격 STT 큐 길이, 실행 작업 ID, 취소 대기 수

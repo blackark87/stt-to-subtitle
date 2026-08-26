@@ -174,6 +174,29 @@ class STTAPIClient(RetryingJSONClient):
         )
         self.base_url = base_url.rstrip("/")
 
+    def check_readiness(self) -> Mapping[str, Any]:
+        response = self.request(
+            "GET",
+            f"{self.base_url}/readyz",
+            headers=self.headers,
+        )
+        if response.status_code != 200:
+            raise ExternalServiceError(
+                "transcription server is not ready: "
+                f"HTTP {response.status_code}: {_safe_error(response)}"
+            )
+        try:
+            payload = response.json()
+        except ValueError as error:
+            raise ExternalServiceError(
+                "transcription readiness response is invalid"
+            ) from error
+        if not isinstance(payload, Mapping) or payload.get("status") != "ready":
+            raise ExternalServiceError(
+                "transcription readiness response is invalid"
+            )
+        return payload
+
     def transcribe(
         self,
         audio_path: Path,

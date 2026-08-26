@@ -267,6 +267,7 @@ class SubtitleOrchestrator:
             OpenAICompatibleClient | None,
             RemoteServerSettings,
         ] = (None, None, initial_servers)
+        self._stt_gate_lock = threading.RLock()
         self._lm_gate_lock = threading.RLock()
         self._subtitle_publication_lock = threading.RLock()
         self._lm_gate_state = (
@@ -278,6 +279,20 @@ class SubtitleOrchestrator:
             "사용자가 번역 서버를 시작할 때까지 대기합니다."
             if self._lm_gate_state == "offline"
             else "번역 서버 자동 시작 모드입니다."
+        )
+        saved_stt_gate = self.store.get_dependency_state("stt")
+        self._stt_gate_state = (
+            str(saved_stt_gate["state"])
+            if saved_stt_gate is not None
+            else "ready"
+            if initial_servers.is_complete
+            else "unknown"
+        )
+        self._stt_gate_message = (
+            str(saved_stt_gate.get("last_error") or "연결 확인이 필요합니다.")
+            if saved_stt_gate is not None
+            and self._stt_gate_state in {"lost", "unknown"}
+            else "사용 가능"
         )
         if initial_servers.is_complete:
             try:
@@ -331,6 +346,9 @@ class SubtitleOrchestrator:
 
     def remote_servers_view(self) -> dict[str, Any]:
         servers = self.remote_servers
+        with self._stt_gate_lock:
+            stt_gate_state = self._stt_gate_state
+            stt_gate_message = self._stt_gate_message
         with self._lm_gate_lock:
             lm_gate_state = self._lm_gate_state
             lm_gate_message = self._lm_gate_message
@@ -342,6 +360,8 @@ class SubtitleOrchestrator:
             "lm_model": servers.lm_model,
             "translation_workers": servers.translation_workers,
             "configured": self.remote_servers_configured,
+            "stt_gate_state": stt_gate_state,
+            "stt_gate_message": stt_gate_message,
             "lm_manual_start": self.settings.lm_manual_start,
             "lm_gate_state": lm_gate_state,
             "lm_gate_message": lm_gate_message,
@@ -410,6 +430,65 @@ class SubtitleOrchestrator:
     def lm_gate_state(self) -> str:
         with self._lm_gate_lock:
             return self._lm_gate_state
+
+    @property
+    def stt_gate_state(self) -> str:
+        with self._stt_gate_lock:
+            return self._stt_gate_state
+
+    def _set_stt_gate(
+        self,
+        state: str,
+        message: str,
+        *,
+        reason_code: str | None = None,
+        persist: bool = True,
+    ) -> None:
+        with self._stt_gate_lock:
+            self._stt_gate_state = state
+            self._stt_gate_message = message
+        if persist:
+            self.store.save_dependency_state(
+                "stt",
+                state=state,
+                reason_code=reason_code,
+                error=message if state in {"lost", "unknown"} else None,
+            )
+
+    def activate_transcription_stt(self) -> int:
+        """Open the STT gate after one explicit readiness check."""
+        if self.stt_client is None:
+            raise ValueError("전사 서버 설정을 먼저 저장하세요.")
+        with self._stt_gate_lock:
+            self._stt_gate_state = "checking"
+            self._stt_gate_message = "연결 확인 중"
+        try:
+            self.stt_client.check_readiness()
+        except ExternalServiceError as error:
+            message = self._sanitize_error(str(error))
+            self._set_stt_gate(
+                "lost",
+                message,
+                reason_code=JobReason.STT_UNAVAILABLE.value,
+            )
+            raise
+        self._set_stt_gate("ready", "사용 가능")
+
+        retried = 0
+        for job_id in self.store.ids_with_status("blocked"):
+            job = self.store.get(job_id)
+            if (
+                job is None
+                or job.blocked_stage != "transcription"
+                or job.state == JobState.STOPPED
+            ):
+                continue
+            try:
+                self.retry(job.id)
+            except ValueError:
+                continue
+            retried += 1
+        return retried
 
     def activate_translation_lm(self) -> int:
         """Open the manual translation gate after one explicit preflight."""
@@ -572,6 +651,11 @@ class SubtitleOrchestrator:
             normalized.translation_workers
         )
         self._remote_runtime = (stt_client, lm_client, normalized)
+        if persist:
+            self._set_stt_gate(
+                "unknown",
+                "연결 확인이 필요합니다.",
+            )
         with self._lm_gate_lock:
             self._lm_gate_state = (
                 "offline" if self.settings.lm_manual_start else "ready"
@@ -2278,7 +2362,10 @@ class SubtitleOrchestrator:
                 self._extract,
             ):
                 break
-        if not self.store.ids_with_status("transcription_running"):
+        if (
+            self.stt_gate_state == "ready"
+            and not self.store.ids_with_status("transcription_running")
+        ):
             self._dispatch_one(
                 "audio_ready",
                 "transcription_running",
@@ -2360,6 +2447,12 @@ class SubtitleOrchestrator:
             LOGGER.error("job %s %s failed: %s", job_id, stage, message)
         except ExternalServiceError as error:
             message = self._sanitize_error(str(error))
+            if stage == "transcription":
+                self._set_stt_gate(
+                    "lost",
+                    message,
+                    reason_code=JobReason.STT_UNAVAILABLE.value,
+                )
             if stage == "translation" and self.settings.lm_manual_start:
                 with self._lm_gate_lock:
                     self._lm_gate_state = "lost"

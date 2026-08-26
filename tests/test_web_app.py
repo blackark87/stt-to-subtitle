@@ -1569,6 +1569,41 @@ class WebAppTests(unittest.TestCase):
                 attempts=1,
             )
 
+    def test_transcription_gate_requires_explicit_readiness_after_loss(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+
+            with TestClient(
+                create_app(self.settings(root, media_root))
+            ) as client:
+                service = client.app.state.orchestrator
+                service._set_stt_gate(
+                    "lost",
+                    "connection refused",
+                    reason_code="stt_unavailable",
+                )
+                page = client.get("/settings")
+                service.stt_client.check_readiness = Mock(
+                    return_value={"status": "ready"}
+                )
+                started = client.post(
+                    "/settings/transcription/start",
+                    follow_redirects=False,
+                )
+
+            self.assertIn("전사 연결 확인/재개", page.text)
+            self.assertEqual(started.status_code, 303)
+            self.assertEqual(
+                started.headers["location"],
+                "/settings?stt_started=true&stt_resumed=0",
+            )
+            self.assertEqual(service.stt_gate_state, "ready")
+            service.stt_client.check_readiness.assert_called_once_with()
+
     def test_manages_path_display_rules_and_shortens_job_paths(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
