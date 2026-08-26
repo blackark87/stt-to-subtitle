@@ -57,6 +57,36 @@ RUNNING_JOB_STATUSES = {
     "translation_running",
     "rendering",
 }
+JOB_OPERATIONS = {"extract", "transcribe", "translate", "full"}
+JOB_STATUSES = {
+    "queued",
+    "extracting",
+    "audio_ready",
+    "transcription_running",
+    "transcribed",
+    "translation_running",
+    "translated",
+    "rendering",
+    "audio_completed",
+    "transcription_completed",
+    "translation_paused",
+    "blocked",
+    "failed",
+    "completed",
+}
+NONNEGATIVE_JOB_FIELDS = {
+    "chunks_created",
+    "chunks_completed",
+    "chunks_total_estimate",
+    "translation_chunks_total",
+    "translation_chunks_completed",
+    "lease_token",
+}
+BOOLEAN_JOB_FIELDS = {
+    "force_overwrite",
+    "translation_pause_requested",
+    "job_stop_requested",
+}
 PROMPT_NAME_MAX_LENGTH = 80
 PROMPT_TEXT_MAX_LENGTH = 50_000
 DEFAULT_PATH_DISPLAY_RULE_ID = "default-actress-content"
@@ -496,6 +526,11 @@ class JobStore:
     def _connect(self) -> Iterator[sqlite3.Connection]:
         connection = sqlite3.connect(self.database_path, timeout=30)
         connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        foreign_keys = connection.execute("PRAGMA foreign_keys").fetchone()
+        if foreign_keys is None or int(foreign_keys[0]) != 1:
+            connection.close()
+            raise RuntimeError("SQLite foreign key enforcement is unavailable")
         try:
             with connection:
                 yield connection
@@ -1041,6 +1076,7 @@ class JobStore:
                     "ALTER TABLE remote_server_settings ADD COLUMN "
                     "translation_workers INTEGER NOT NULL DEFAULT 1"
                 )
+            self._repair_referential_integrity(connection)
             now = time.time()
             connection.executemany(
                 """
@@ -1185,6 +1221,511 @@ class JobStore:
                     "VALUES (?, ?)",
                     (corrected_rule_migration, now),
                 )
+            self._install_integrity_triggers(connection)
+            self._assert_foreign_key_integrity(connection)
+
+    @staticmethod
+    def _repair_referential_integrity(
+        connection: sqlite3.Connection,
+    ) -> None:
+        migration = "referential_integrity_v1"
+        applied = connection.execute(
+            "SELECT 1 FROM schema_migrations WHERE name = ?",
+            (migration,),
+        ).fetchone()
+        if applied is not None:
+            return
+        connection.executescript(
+            """
+            UPDATE jobs
+            SET audio_revision_id = NULL
+            WHERE audio_revision_id IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM audio_revisions
+                  WHERE audio_revisions.id = jobs.audio_revision_id
+              );
+
+            UPDATE jobs
+            SET transcript_revision_id = NULL
+            WHERE transcript_revision_id IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM transcript_revisions
+                  WHERE transcript_revisions.id = jobs.transcript_revision_id
+              );
+
+            DELETE FROM job_events
+            WHERE NOT EXISTS (
+                SELECT 1 FROM jobs WHERE jobs.id = job_events.job_id
+            );
+
+            DELETE FROM subtitle_validations
+            WHERE NOT EXISTS (
+                SELECT 1 FROM jobs
+                WHERE jobs.id = subtitle_validations.job_id
+            );
+
+            DELETE FROM subtitle_publications
+            WHERE NOT EXISTS (
+                SELECT 1 FROM jobs
+                WHERE jobs.id = subtitle_publications.job_id
+            ) OR NOT EXISTS (
+                SELECT 1 FROM subtitle_generations
+                WHERE subtitle_generations.id =
+                    subtitle_publications.subtitle_generation_id
+                  AND subtitle_generations.job_id =
+                    subtitle_publications.job_id
+            ) OR NOT EXISTS (
+                SELECT 1 FROM jobs
+                WHERE jobs.id = subtitle_publications.job_id
+                  AND jobs.source_rel = subtitle_publications.source_rel
+            );
+
+            UPDATE subtitle_generations
+            SET translation_generation_id = NULL
+            WHERE translation_generation_id IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM translation_generations
+                  WHERE translation_generations.id =
+                      subtitle_generations.translation_generation_id
+                    AND translation_generations.job_id =
+                      subtitle_generations.job_id
+              );
+
+            UPDATE subtitle_generations
+            SET supersedes_generation_id = NULL
+            WHERE supersedes_generation_id IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM subtitle_generations AS superseded
+                  WHERE superseded.id =
+                      subtitle_generations.supersedes_generation_id
+                    AND superseded.job_id = subtitle_generations.job_id
+              );
+
+            DELETE FROM subtitle_generations
+            WHERE NOT EXISTS (
+                SELECT 1 FROM jobs
+                WHERE jobs.id = subtitle_generations.job_id
+            );
+
+            DELETE FROM translation_items
+            WHERE NOT EXISTS (
+                SELECT 1 FROM translation_generations
+                WHERE translation_generations.id =
+                    translation_items.generation_id
+            );
+
+            DELETE FROM translation_batches
+            WHERE NOT EXISTS (
+                SELECT 1 FROM translation_generations
+                WHERE translation_generations.id =
+                    translation_batches.generation_id
+            );
+
+            UPDATE translation_generations
+            SET transcript_revision_id = NULL
+            WHERE transcript_revision_id IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM transcript_revisions
+                  WHERE transcript_revisions.id =
+                      translation_generations.transcript_revision_id
+                    AND transcript_revisions.created_by_job_id =
+                      translation_generations.job_id
+              );
+
+            UPDATE translation_generations
+            SET prompt_revision_id = NULL
+            WHERE prompt_revision_id IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM prompt_revisions
+                  JOIN prompt_categories
+                    ON prompt_categories.id = prompt_revisions.category_id
+                  WHERE prompt_revisions.id =
+                      translation_generations.prompt_revision_id
+              );
+
+            UPDATE translation_generations
+            SET supersedes_generation_id = NULL
+            WHERE supersedes_generation_id IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM translation_generations AS superseded
+                  WHERE superseded.id =
+                      translation_generations.supersedes_generation_id
+                    AND superseded.job_id = translation_generations.job_id
+              );
+
+            DELETE FROM translation_generations
+            WHERE NOT EXISTS (
+                SELECT 1 FROM jobs
+                WHERE jobs.id = translation_generations.job_id
+            );
+
+            UPDATE transcript_revisions
+            SET audio_revision_id = NULL
+            WHERE audio_revision_id IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM audio_revisions
+                  WHERE audio_revisions.id =
+                      transcript_revisions.audio_revision_id
+              );
+
+            UPDATE prompt_categories
+            SET active_revision_id = NULL
+            WHERE active_revision_id IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM prompt_revisions
+                  WHERE prompt_revisions.id =
+                      prompt_categories.active_revision_id
+                    AND prompt_revisions.category_id = prompt_categories.id
+              );
+
+            DELETE FROM prompt_revisions
+            WHERE NOT EXISTS (
+                SELECT 1 FROM prompt_categories
+                WHERE prompt_categories.id = prompt_revisions.category_id
+            );
+            """
+        )
+        connection.execute(
+            "INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)",
+            (migration, time.time()),
+        )
+
+    @staticmethod
+    def _install_integrity_triggers(connection: sqlite3.Connection) -> None:
+        connection.executescript(
+            """
+            CREATE TRIGGER IF NOT EXISTS jobs_domain_insert_guard
+            BEFORE INSERT ON jobs
+            WHEN NEW.operation NOT IN ('extract', 'transcribe', 'translate', 'full')
+              OR NEW.status NOT IN (
+                  'queued', 'extracting', 'audio_ready',
+                  'transcription_running', 'transcribed',
+                  'translation_running', 'translated', 'rendering',
+                  'audio_completed', 'transcription_completed',
+                  'translation_paused', 'blocked', 'failed', 'completed'
+              )
+              OR NEW.phase NOT IN (
+                  'extraction', 'transcription', 'translation',
+                  'render', 'complete'
+              )
+              OR NEW.state NOT IN (
+                  'waiting', 'running', 'paused', 'blocked',
+                  'stopped', 'failed', 'done'
+              )
+              OR (
+                  NEW.reason_code IS NOT NULL
+                  AND NEW.reason_code NOT IN (
+                      'user_stop', 'lm_unavailable', 'stt_unavailable',
+                      'service_restarted', 'artifact_missing',
+                      'model_output_invalid', 'invalid_input',
+                      'auth_required', 'resource_exhausted',
+                      'transcription_processing_error', 'internal_error'
+                  )
+              )
+              OR NEW.attempt < 1
+              OR NEW.chunks_created < 0
+              OR NEW.chunks_completed < 0
+              OR NEW.chunks_total_estimate < 0
+              OR NEW.chunk_progress_every < 1
+              OR NEW.translation_chunks_total < 0
+              OR NEW.translation_chunks_completed < 0
+              OR NEW.lease_token < 0
+              OR NEW.force_overwrite NOT IN (0, 1)
+              OR NEW.translation_pause_requested NOT IN (0, 1)
+              OR NEW.job_stop_requested NOT IN (0, 1)
+            BEGIN
+                SELECT RAISE(ABORT, 'invalid jobs domain values');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS jobs_domain_update_guard
+            BEFORE UPDATE OF operation, status, phase, state, reason_code,
+                             attempt, chunks_created, chunks_completed,
+                             chunks_total_estimate, chunk_progress_every,
+                             translation_chunks_total,
+                             translation_chunks_completed, lease_token,
+                             force_overwrite, translation_pause_requested,
+                             job_stop_requested
+            ON jobs
+            WHEN NEW.operation NOT IN ('extract', 'transcribe', 'translate', 'full')
+              OR NEW.status NOT IN (
+                  'queued', 'extracting', 'audio_ready',
+                  'transcription_running', 'transcribed',
+                  'translation_running', 'translated', 'rendering',
+                  'audio_completed', 'transcription_completed',
+                  'translation_paused', 'blocked', 'failed', 'completed'
+              )
+              OR NEW.phase NOT IN (
+                  'extraction', 'transcription', 'translation',
+                  'render', 'complete'
+              )
+              OR NEW.state NOT IN (
+                  'waiting', 'running', 'paused', 'blocked',
+                  'stopped', 'failed', 'done'
+              )
+              OR (
+                  NEW.reason_code IS NOT NULL
+                  AND NEW.reason_code NOT IN (
+                      'user_stop', 'lm_unavailable', 'stt_unavailable',
+                      'service_restarted', 'artifact_missing',
+                      'model_output_invalid', 'invalid_input',
+                      'auth_required', 'resource_exhausted',
+                      'transcription_processing_error', 'internal_error'
+                  )
+              )
+              OR NEW.attempt < 1
+              OR NEW.chunks_created < 0
+              OR NEW.chunks_completed < 0
+              OR NEW.chunks_total_estimate < 0
+              OR NEW.chunk_progress_every < 1
+              OR NEW.translation_chunks_total < 0
+              OR NEW.translation_chunks_completed < 0
+              OR NEW.lease_token < 0
+              OR NEW.force_overwrite NOT IN (0, 1)
+              OR NEW.translation_pause_requested NOT IN (0, 1)
+              OR NEW.job_stop_requested NOT IN (0, 1)
+            BEGIN
+                SELECT RAISE(ABORT, 'invalid jobs domain values');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS jobs_projection_insert_guard
+            BEFORE INSERT ON jobs
+            WHEN NOT (
+                (NEW.status = 'queued' AND NEW.state = 'waiting'
+                 AND NEW.phase = CASE WHEN NEW.operation = 'translate'
+                                      THEN 'translation' ELSE 'extraction' END)
+                OR (NEW.status = 'extracting' AND NEW.phase = 'extraction'
+                    AND NEW.state = 'running')
+                OR (NEW.status = 'audio_ready' AND NEW.phase = 'transcription'
+                    AND NEW.state = 'waiting')
+                OR (NEW.status = 'transcription_running'
+                    AND NEW.phase = 'transcription' AND NEW.state = 'running')
+                OR (NEW.status = 'transcribed' AND NEW.phase = 'translation'
+                    AND NEW.state = 'waiting')
+                OR (NEW.status = 'translation_running'
+                    AND NEW.phase = 'translation' AND NEW.state = 'running')
+                OR (NEW.status = 'translated' AND NEW.phase = 'render'
+                    AND NEW.state = 'waiting')
+                OR (NEW.status = 'rendering' AND NEW.phase = 'render'
+                    AND NEW.state = 'running')
+                OR (NEW.status IN (
+                        'audio_completed', 'transcription_completed', 'completed'
+                    ) AND NEW.phase = 'complete' AND NEW.state = 'done')
+                OR (NEW.status = 'translation_paused'
+                    AND NEW.phase = 'translation' AND NEW.state = 'paused')
+                OR (NEW.status = 'blocked' AND NEW.phase != 'complete'
+                    AND NEW.state IN ('blocked', 'stopped'))
+                OR (NEW.status = 'failed' AND NEW.phase != 'complete'
+                    AND NEW.state = 'failed')
+            ) OR (NEW.state = 'stopped'
+                  AND NEW.reason_code IS NOT 'user_stop')
+              OR (NEW.state IN ('blocked', 'failed')
+                  AND NEW.reason_code IS NULL)
+              OR (NEW.state IN ('waiting', 'running', 'paused', 'done')
+                  AND NEW.reason_code IS NOT NULL)
+            BEGIN
+                SELECT RAISE(ABORT, 'inconsistent jobs status projection');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS jobs_projection_update_guard
+            BEFORE UPDATE OF operation, status, phase, state, reason_code
+            ON jobs
+            WHEN NOT (
+                (NEW.status = 'queued' AND NEW.state = 'waiting'
+                 AND NEW.phase = CASE WHEN NEW.operation = 'translate'
+                                      THEN 'translation' ELSE 'extraction' END)
+                OR (NEW.status = 'extracting' AND NEW.phase = 'extraction'
+                    AND NEW.state = 'running')
+                OR (NEW.status = 'audio_ready' AND NEW.phase = 'transcription'
+                    AND NEW.state = 'waiting')
+                OR (NEW.status = 'transcription_running'
+                    AND NEW.phase = 'transcription' AND NEW.state = 'running')
+                OR (NEW.status = 'transcribed' AND NEW.phase = 'translation'
+                    AND NEW.state = 'waiting')
+                OR (NEW.status = 'translation_running'
+                    AND NEW.phase = 'translation' AND NEW.state = 'running')
+                OR (NEW.status = 'translated' AND NEW.phase = 'render'
+                    AND NEW.state = 'waiting')
+                OR (NEW.status = 'rendering' AND NEW.phase = 'render'
+                    AND NEW.state = 'running')
+                OR (NEW.status IN (
+                        'audio_completed', 'transcription_completed', 'completed'
+                    ) AND NEW.phase = 'complete' AND NEW.state = 'done')
+                OR (NEW.status = 'translation_paused'
+                    AND NEW.phase = 'translation' AND NEW.state = 'paused')
+                OR (NEW.status = 'blocked' AND NEW.phase != 'complete'
+                    AND NEW.state IN ('blocked', 'stopped'))
+                OR (NEW.status = 'failed' AND NEW.phase != 'complete'
+                    AND NEW.state = 'failed')
+            ) OR (NEW.state = 'stopped'
+                  AND NEW.reason_code IS NOT 'user_stop')
+              OR (NEW.state IN ('blocked', 'failed')
+                  AND NEW.reason_code IS NULL)
+              OR (NEW.state IN ('waiting', 'running', 'paused', 'done')
+                  AND NEW.reason_code IS NOT NULL)
+            BEGIN
+                SELECT RAISE(ABORT, 'inconsistent jobs status projection');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS jobs_revision_pointer_insert_guard
+            BEFORE INSERT ON jobs
+            WHEN (NEW.audio_revision_id IS NOT NULL AND NOT EXISTS (
+                      SELECT 1 FROM audio_revisions
+                      WHERE id = NEW.audio_revision_id
+                  ))
+              OR (NEW.transcript_revision_id IS NOT NULL AND NOT EXISTS (
+                      SELECT 1 FROM transcript_revisions
+                      WHERE id = NEW.transcript_revision_id
+                  ))
+            BEGIN
+                SELECT RAISE(ABORT, 'job revision pointer does not exist');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS jobs_revision_pointer_update_guard
+            BEFORE UPDATE OF audio_revision_id, transcript_revision_id ON jobs
+            WHEN (NEW.audio_revision_id IS NOT NULL AND NOT EXISTS (
+                      SELECT 1 FROM audio_revisions
+                      WHERE id = NEW.audio_revision_id
+                  ))
+              OR (NEW.transcript_revision_id IS NOT NULL AND NOT EXISTS (
+                      SELECT 1 FROM transcript_revisions
+                      WHERE id = NEW.transcript_revision_id
+                  ))
+            BEGIN
+                SELECT RAISE(ABORT, 'job revision pointer does not exist');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS translation_revision_insert_guard
+            BEFORE INSERT ON translation_generations
+            WHEN (NEW.transcript_revision_id IS NOT NULL AND NOT EXISTS (
+                      SELECT 1 FROM transcript_revisions
+                      WHERE id = NEW.transcript_revision_id
+                        AND created_by_job_id = NEW.job_id
+                  ))
+              OR (NEW.supersedes_generation_id IS NOT NULL AND NOT EXISTS (
+                      SELECT 1 FROM translation_generations
+                      WHERE id = NEW.supersedes_generation_id
+                        AND job_id = NEW.job_id
+                  ))
+            BEGIN
+                SELECT RAISE(ABORT, 'translation generation ownership mismatch');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS translation_revision_update_guard
+            BEFORE UPDATE OF transcript_revision_id,
+                             supersedes_generation_id, job_id
+            ON translation_generations
+            WHEN (NEW.transcript_revision_id IS NOT NULL AND NOT EXISTS (
+                      SELECT 1 FROM transcript_revisions
+                      WHERE id = NEW.transcript_revision_id
+                        AND created_by_job_id = NEW.job_id
+                  ))
+              OR (NEW.supersedes_generation_id IS NOT NULL AND NOT EXISTS (
+                      SELECT 1 FROM translation_generations
+                      WHERE id = NEW.supersedes_generation_id
+                        AND job_id = NEW.job_id
+                  ))
+            BEGIN
+                SELECT RAISE(ABORT, 'translation generation ownership mismatch');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS subtitle_generation_insert_guard
+            BEFORE INSERT ON subtitle_generations
+            WHEN (NEW.translation_generation_id IS NOT NULL AND NOT EXISTS (
+                      SELECT 1 FROM translation_generations
+                      WHERE id = NEW.translation_generation_id
+                        AND job_id = NEW.job_id
+                  ))
+              OR (NEW.supersedes_generation_id IS NOT NULL AND NOT EXISTS (
+                      SELECT 1 FROM subtitle_generations
+                      WHERE id = NEW.supersedes_generation_id
+                        AND job_id = NEW.job_id
+                  ))
+            BEGIN
+                SELECT RAISE(ABORT, 'subtitle generation ownership mismatch');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS subtitle_generation_update_guard
+            BEFORE UPDATE OF translation_generation_id,
+                             supersedes_generation_id, job_id
+            ON subtitle_generations
+            WHEN (NEW.translation_generation_id IS NOT NULL AND NOT EXISTS (
+                      SELECT 1 FROM translation_generations
+                      WHERE id = NEW.translation_generation_id
+                        AND job_id = NEW.job_id
+                  ))
+              OR (NEW.supersedes_generation_id IS NOT NULL AND NOT EXISTS (
+                      SELECT 1 FROM subtitle_generations
+                      WHERE id = NEW.supersedes_generation_id
+                        AND job_id = NEW.job_id
+                  ))
+            BEGIN
+                SELECT RAISE(ABORT, 'subtitle generation ownership mismatch');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS prompt_active_revision_insert_guard
+            BEFORE INSERT ON prompt_categories
+            WHEN NEW.active_revision_id IS NOT NULL AND NOT EXISTS (
+                SELECT 1 FROM prompt_revisions
+                WHERE id = NEW.active_revision_id
+                  AND category_id = NEW.id
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'prompt active revision mismatch');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS prompt_active_revision_update_guard
+            BEFORE UPDATE OF active_revision_id ON prompt_categories
+            WHEN NEW.active_revision_id IS NOT NULL AND NOT EXISTS (
+                SELECT 1 FROM prompt_revisions
+                WHERE id = NEW.active_revision_id
+                  AND category_id = NEW.id
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'prompt active revision mismatch');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS subtitle_publication_insert_guard
+            BEFORE INSERT ON subtitle_publications
+            WHEN NOT EXISTS (
+                SELECT 1
+                FROM jobs
+                JOIN subtitle_generations
+                  ON subtitle_generations.job_id = jobs.id
+                WHERE jobs.id = NEW.job_id
+                  AND jobs.source_rel = NEW.source_rel
+                  AND subtitle_generations.id = NEW.subtitle_generation_id
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'subtitle publication ownership mismatch');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS subtitle_publication_update_guard
+            BEFORE UPDATE ON subtitle_publications
+            WHEN NOT EXISTS (
+                SELECT 1
+                FROM jobs
+                JOIN subtitle_generations
+                  ON subtitle_generations.job_id = jobs.id
+                WHERE jobs.id = NEW.job_id
+                  AND jobs.source_rel = NEW.source_rel
+                  AND subtitle_generations.id = NEW.subtitle_generation_id
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'subtitle publication ownership mismatch');
+            END;
+            """
+        )
+
+    @staticmethod
+    def _assert_foreign_key_integrity(connection: sqlite3.Connection) -> None:
+        violation = connection.execute("PRAGMA foreign_key_check").fetchone()
+        if violation is None:
+            return
+        raise RuntimeError(
+            "SQLite foreign key violation remains after migration: "
+            f"table={violation['table']}, rowid={violation['rowid']}"
+        )
 
     @staticmethod
     def _prompt_category_from_row(
@@ -1286,9 +1827,9 @@ class JobStore:
                     INSERT INTO prompt_categories (
                         id, name, translation_prompt, review_prompt,
                         active_revision_id, archived, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, 0, ?, ?)
+                    ) VALUES (?, ?, ?, ?, NULL, 0, ?, ?)
                     """,
-                    (category_id, *values, revision_id, now, now),
+                    (category_id, *values, now, now),
                 )
                 connection.execute(
                     """
@@ -1311,6 +1852,14 @@ class JobStore:
                         ),
                         now,
                     ),
+                )
+                connection.execute(
+                    """
+                    UPDATE prompt_categories
+                    SET active_revision_id = ?
+                    WHERE id = ?
+                    """,
+                    (revision_id, category_id),
                 )
         except sqlite3.IntegrityError as error:
             raise ValueError("같은 이름의 프롬프트 카테고리가 있습니다.") from error
@@ -1826,12 +2375,26 @@ class JobStore:
         transcript_revision_id: str | None = None,
         chunks_total_estimate: int = 0,
     ) -> PipelineJob:
+        if operation not in JOB_OPERATIONS:
+            raise ValueError("unsupported job operation")
+        if status not in JOB_STATUSES:
+            raise ValueError("unsupported job status")
         now = time.time()
         projected = structured_state_from_legacy(
             status=status,
             operation=operation,
         )
         with self._connect() as connection:
+            if audio_revision_id is not None and connection.execute(
+                "SELECT 1 FROM audio_revisions WHERE id = ?",
+                (audio_revision_id,),
+            ).fetchone() is None:
+                raise ValueError("audio revision not found")
+            if transcript_revision_id is not None and connection.execute(
+                "SELECT 1 FROM transcript_revisions WHERE id = ?",
+                (transcript_revision_id,),
+            ).fetchone() is None:
+                raise ValueError("transcript revision not found")
             connection.execute(
                 """
                 INSERT INTO jobs (
@@ -2495,6 +3058,11 @@ class JobStore:
             ).fetchone()
             if job is None:
                 raise ValueError("job not found")
+            if audio_revision_id is not None and connection.execute(
+                "SELECT 1 FROM audio_revisions WHERE id = ?",
+                (audio_revision_id,),
+            ).fetchone() is None:
+                raise ValueError("audio revision not found")
             if lease_owner is not None and lease_token is not None:
                 owned = connection.execute(
                     """
@@ -2722,6 +3290,13 @@ class JobStore:
     @staticmethod
     def _validate_structured_fields(fields: Mapping[str, Any]) -> None:
         try:
+            if (
+                "operation" in fields
+                and str(fields["operation"]) not in JOB_OPERATIONS
+            ):
+                raise ValueError("unsupported job operation")
+            if "status" in fields and str(fields["status"]) not in JOB_STATUSES:
+                raise ValueError("unsupported job status")
             if "phase" in fields:
                 JobPhase(str(fields["phase"]))
             if "state" in fields:
@@ -2732,6 +3307,17 @@ class JobStore:
             raise ValueError("invalid structured job state") from error
         if "attempt" in fields and int(fields["attempt"]) < 1:
             raise ValueError("job attempt must be at least 1")
+        if (
+            "chunk_progress_every" in fields
+            and int(fields["chunk_progress_every"]) < 1
+        ):
+            raise ValueError("chunk progress interval must be at least 1")
+        for field in NONNEGATIVE_JOB_FIELDS & fields.keys():
+            if int(fields[field]) < 0:
+                raise ValueError(f"{field} must not be negative")
+        for field in BOOLEAN_JOB_FIELDS & fields.keys():
+            if int(fields[field]) not in {0, 1}:
+                raise ValueError(f"{field} must be boolean")
 
     def delete(self, job_id: str) -> bool:
         with self._connect() as connection:
@@ -2747,8 +3333,13 @@ class JobStore:
                 ).fetchall()
             ]
             connection.execute(
-                "DELETE FROM subtitle_publications WHERE job_id = ?",
-                (job_id,),
+                """
+                DELETE FROM subtitle_publications
+                WHERE job_id = ? OR subtitle_generation_id IN (
+                    SELECT id FROM subtitle_generations WHERE job_id = ?
+                )
+                """,
+                (job_id, job_id),
             )
             connection.execute(
                 "DELETE FROM subtitle_generations WHERE job_id = ?",
@@ -2775,6 +3366,45 @@ class JobStore:
                 "DELETE FROM jobs WHERE id = ?",
                 (job_id,),
             )
+            if result.rowcount == 1:
+                connection.execute(
+                    """
+                    DELETE FROM transcript_revisions
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM jobs
+                        WHERE jobs.id =
+                            transcript_revisions.created_by_job_id
+                    )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM jobs
+                          WHERE jobs.transcript_revision_id =
+                              transcript_revisions.id
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM translation_generations
+                          WHERE translation_generations.transcript_revision_id =
+                              transcript_revisions.id
+                      )
+                    """
+                )
+                connection.execute(
+                    """
+                    DELETE FROM audio_revisions
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM jobs
+                        WHERE jobs.id = audio_revisions.created_by_job_id
+                    )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM jobs
+                          WHERE jobs.audio_revision_id = audio_revisions.id
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM transcript_revisions
+                          WHERE transcript_revisions.audio_revision_id =
+                              audio_revisions.id
+                      )
+                    """
+                )
         deleted = result.rowcount == 1
         if deleted:
             self._notify_change(job_id)
@@ -2807,6 +3437,23 @@ class JobStore:
             ).fetchone()
             if job is None:
                 raise ValueError("job not found")
+            if transcript_revision_id is not None:
+                transcript_revision = connection.execute(
+                    """
+                    SELECT 1 FROM transcript_revisions
+                    WHERE id = ? AND created_by_job_id = ?
+                    """,
+                    (transcript_revision_id, job_id),
+                ).fetchone()
+                if transcript_revision is None:
+                    raise ValueError(
+                        "transcript revision does not belong to job"
+                    )
+            if prompt_revision_id is not None and connection.execute(
+                "SELECT 1 FROM prompt_revisions WHERE id = ?",
+                (prompt_revision_id,),
+            ).fetchone() is None:
+                raise ValueError("prompt revision not found")
             latest = connection.execute(
                 """
                 SELECT * FROM translation_generations
@@ -4279,6 +4926,7 @@ class JobStore:
         if window_seconds <= 0:
             raise ValueError("metrics window must be positive")
         now = time.time()
+        database_integrity = self.database_integrity()
         with self._connect() as connection:
             jobs = connection.execute(
                 """
@@ -4462,6 +5110,7 @@ class JobStore:
                 "active": active_leases,
                 "expired_running": expired_running_leases,
             },
+            "database": database_integrity,
             "dependencies": [
                 {
                     "dependency": str(row["dependency"]),
@@ -4479,4 +5128,27 @@ class JobStore:
                 "by_code": dict(sorted(event_code_counts.items())),
                 "stages": summarized_stages,
             },
+        }
+
+    def database_integrity(self) -> dict[str, Any]:
+        with self._connect() as connection:
+            foreign_keys = connection.execute(
+                "PRAGMA foreign_keys"
+            ).fetchone()
+            quick_check = connection.execute(
+                "PRAGMA quick_check(1)"
+            ).fetchone()
+            violations = connection.execute(
+                "PRAGMA foreign_key_check"
+            ).fetchall()
+        check_result = (
+            str(quick_check[0]) if quick_check is not None else "unavailable"
+        )
+        return {
+            "foreign_keys_enabled": bool(
+                foreign_keys is not None and int(foreign_keys[0]) == 1
+            ),
+            "quick_check": check_result,
+            "foreign_key_violation_count": len(violations),
+            "valid": check_result == "ok" and not violations,
         }

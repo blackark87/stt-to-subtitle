@@ -680,6 +680,130 @@ class JobStoreTests(unittest.TestCase):
                 extraction["processing_seconds"]["samples"],
                 1,
             )
+            self.assertTrue(snapshot["database"]["foreign_keys_enabled"])
+            self.assertTrue(snapshot["database"]["valid"])
+
+    def test_enforces_database_references_and_job_projection(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = JobStore(Path(directory) / "jobs.sqlite3")
+            job = store.create(
+                job_id="job-1",
+                source_rel="movie.mkv",
+                force_overwrite=False,
+                options={},
+            )
+
+            with self.assertRaises(sqlite3.IntegrityError):
+                with store._connect() as connection:
+                    connection.execute(
+                        """
+                        INSERT INTO job_events (
+                            job_id, level, message, created_at
+                        ) VALUES ('missing-job', 'info', 'invalid', ?)
+                        """,
+                        (time.time(),),
+                    )
+            with self.assertRaisesRegex(
+                sqlite3.IntegrityError,
+                "inconsistent jobs status projection",
+            ):
+                with store._connect() as connection:
+                    connection.execute(
+                        "UPDATE jobs SET state = 'done' WHERE id = ?",
+                        (job.id,),
+                    )
+            with self.assertRaisesRegex(ValueError, "must not be negative"):
+                store.update(job.id, chunks_completed=-1)
+
+            integrity = store.database_integrity()
+
+            self.assertTrue(integrity["foreign_keys_enabled"])
+            self.assertEqual(integrity["quick_check"], "ok")
+            self.assertEqual(integrity["foreign_key_violation_count"], 0)
+            self.assertTrue(integrity["valid"])
+
+    def test_keeps_shared_audio_revision_until_its_last_job_is_deleted(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            store = JobStore(Path(directory) / "jobs.sqlite3")
+            owner = store.create(
+                job_id="owner",
+                source_rel="movie.mkv",
+                force_overwrite=False,
+                options={},
+                operation="extract",
+            )
+            store.record_audio_revision(
+                revision_id="audio-1",
+                job_id=owner.id,
+                source_rel=owner.source_rel,
+                source_hash="source-hash",
+                extraction_hash="extraction-hash",
+                artifact_path="/work/audio.wav",
+                content_hash="audio-hash",
+                duration_seconds=60,
+                status="audio_completed",
+                chunks_total_estimate=1,
+            )
+            borrower = store.create(
+                job_id="borrower",
+                source_rel="movie.mkv",
+                force_overwrite=False,
+                options={},
+                operation="transcribe",
+                status="audio_ready",
+                audio_path="/work/audio.wav",
+                audio_sha256="audio-hash",
+                audio_revision_id="audio-1",
+            )
+
+            self.assertTrue(store.delete(owner.id))
+            self.assertIsNotNone(store.get_audio_revision("audio-1"))
+            self.assertEqual(store.get(borrower.id).audio_revision_id, "audio-1")
+
+            self.assertTrue(store.delete(borrower.id))
+            self.assertIsNone(store.get_audio_revision("audio-1"))
+
+    def test_repairs_legacy_dangling_references_before_reenabling_guards(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            database_path = Path(directory) / "jobs.sqlite3"
+            store = JobStore(database_path)
+            job = store.create(
+                job_id="job-1",
+                source_rel="movie.mkv",
+                force_overwrite=False,
+                options={},
+            )
+            with sqlite3.connect(database_path) as connection:
+                connection.execute(
+                    "DROP TRIGGER jobs_revision_pointer_update_guard"
+                )
+                connection.execute(
+                    "DELETE FROM schema_migrations WHERE name = ?",
+                    ("referential_integrity_v1",),
+                )
+                connection.execute(
+                    "UPDATE jobs SET audio_revision_id = 'missing-audio' "
+                    "WHERE id = ?",
+                    (job.id,),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO job_events (
+                        job_id, level, message, created_at
+                    ) VALUES ('missing-job', 'warning', 'orphan', ?)
+                    """,
+                    (time.time(),),
+                )
+
+            repaired = JobStore(database_path)
+
+            self.assertIsNone(repaired.get(job.id).audio_revision_id)
+            self.assertEqual(repaired.events("missing-job"), [])
+            self.assertTrue(repaired.database_integrity()["valid"])
 
     def test_seeds_edits_and_archives_prompt_categories(self) -> None:
         with TemporaryDirectory() as directory:
@@ -1912,7 +2036,14 @@ class JobStoreTests(unittest.TestCase):
     def test_adds_structured_columns_to_existing_job_events(self) -> None:
         with TemporaryDirectory() as directory:
             database_path = Path(directory) / "jobs.sqlite3"
+            JobStore(database_path).create(
+                job_id="legacy-job",
+                source_rel="movie.mkv",
+                force_overwrite=False,
+                options={},
+            )
             with sqlite3.connect(database_path) as connection:
+                connection.execute("DROP TABLE job_events")
                 connection.execute(
                     """
                     CREATE TABLE job_events (
