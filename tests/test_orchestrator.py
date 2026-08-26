@@ -16,6 +16,7 @@ from stt_to_subtitle.orchestrator import (
     estimate_transcription_chunks,
 )
 from stt_to_subtitle.job_store import JobStore
+from stt_to_subtitle.files import sha256_file
 from stt_to_subtitle.service_clients import (
     ExternalServiceError,
     RemoteTranscriptionFailed,
@@ -2942,6 +2943,170 @@ class SubtitleOrchestratorTests(unittest.TestCase):
             self.assertEqual(repaired_srt, generated_srt)
             self.assertIn("새 번역", repaired_ass)
             self.assertTrue(manifest_path.is_file())
+
+    def test_recovers_subtitle_publication_at_each_file_cutpoint(self) -> None:
+        for cutpoint in (
+            "generation_recorded",
+            "srt_replaced",
+            "pair_replaced",
+            "manifest_written",
+        ):
+            with self.subTest(cutpoint=cutpoint), TemporaryDirectory() as directory:
+                root = Path(directory)
+                media_root = root / "media"
+                media_root.mkdir()
+                source = media_root / "movie.mkv"
+                source.write_bytes(b"media")
+                orchestrator = self.make_orchestrator(root, media_root)
+                try:
+                    job = orchestrator.store.create(
+                        job_id=f"render-{cutpoint}",
+                        source_rel="movie.mkv",
+                        force_overwrite=True,
+                        options={},
+                        status="translated",
+                    )
+                    orchestrator.store.update(job.id, status="rendering")
+                    generation_id = f"subtitle-{cutpoint}"
+                    srt_artifact, ass_artifact = (
+                        orchestrator._subtitle_generation_artifact_paths(
+                            job.id,
+                            generation_id,
+                        )
+                    )
+                    srt_artifact.parent.mkdir(parents=True)
+                    srt_artifact.write_text(
+                        f"new srt {cutpoint}",
+                        encoding="utf-8",
+                    )
+                    ass_artifact.write_text(
+                        f"new ass {cutpoint}",
+                        encoding="utf-8",
+                    )
+                    generation = (
+                        orchestrator.store.create_subtitle_generation(
+                            generation_id=generation_id,
+                            job_id=job.id,
+                            translation_generation_id=None,
+                            transcript_hash="transcript-hash",
+                            translation_hash="translation-hash",
+                            renderer_version="1",
+                            render_hash=f"render-{cutpoint}",
+                            srt_artifact_path=str(srt_artifact),
+                            ass_artifact_path=str(ass_artifact),
+                            srt_hash=sha256_file(srt_artifact),
+                            ass_hash=sha256_file(ass_artifact),
+                            origin="rendered",
+                        )
+                    )
+                    srt_path = media_root / "movie.ko.srt"
+                    ass_path = media_root / "movie.ko.ass"
+                    if cutpoint in {
+                        "srt_replaced",
+                        "pair_replaced",
+                        "manifest_written",
+                    }:
+                        srt_path.write_bytes(srt_artifact.read_bytes())
+                    if cutpoint == "srt_replaced":
+                        ass_path.write_text("old ass", encoding="utf-8")
+                    if cutpoint in {"pair_replaced", "manifest_written"}:
+                        ass_path.write_bytes(ass_artifact.read_bytes())
+                    if cutpoint == "manifest_written":
+                        orchestrator._write_subtitle_publication_manifest(
+                            orchestrator.store.get(job.id),
+                            generation,
+                            srt_path=srt_path,
+                            ass_path=ass_path,
+                        )
+
+                    repaired = orchestrator._reconcile_subtitle_publications()
+
+                    recovered_job = orchestrator.store.get(job.id)
+                    publication = (
+                        orchestrator.store.published_subtitle_generation(
+                            job.id
+                        )
+                    )
+                    manifest = json.loads(
+                        orchestrator._subtitle_publication_manifest_path(
+                            job.source_rel
+                        ).read_text(encoding="utf-8")
+                    )
+                    self.assertEqual(repaired, 1)
+                    self.assertEqual(srt_path.read_bytes(), srt_artifact.read_bytes())
+                    self.assertEqual(ass_path.read_bytes(), ass_artifact.read_bytes())
+                    self.assertEqual(publication["id"], generation_id)
+                    self.assertEqual(
+                        manifest["subtitle_generation_id"],
+                        generation_id,
+                    )
+                    self.assertEqual(recovered_job.status, "completed")
+                    self.assertEqual(recovered_job.phase, "complete")
+                    self.assertEqual(recovered_job.state, "done")
+                    self.assertIsNone(recovered_job.lease_owner)
+                finally:
+                    orchestrator.stop()
+
+    def test_does_not_recover_render_owned_by_an_active_worker(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            (media_root / "movie.mkv").write_bytes(b"media")
+            orchestrator = self.make_orchestrator(root, media_root)
+            try:
+                job = orchestrator.store.create(
+                    job_id="active-render",
+                    source_rel="movie.mkv",
+                    force_overwrite=True,
+                    options={},
+                    status="translated",
+                )
+                orchestrator.store.claim_for_dispatch(
+                    job.id,
+                    "translated",
+                    "rendering",
+                    lease_owner="other-worker",
+                    lease_seconds=60,
+                )
+                generation_id = "subtitle-active-render"
+                srt_artifact, ass_artifact = (
+                    orchestrator._subtitle_generation_artifact_paths(
+                        job.id,
+                        generation_id,
+                    )
+                )
+                srt_artifact.parent.mkdir(parents=True)
+                srt_artifact.write_text("new srt", encoding="utf-8")
+                ass_artifact.write_text("new ass", encoding="utf-8")
+                orchestrator.store.create_subtitle_generation(
+                    generation_id=generation_id,
+                    job_id=job.id,
+                    translation_generation_id=None,
+                    transcript_hash="transcript-hash",
+                    translation_hash="translation-hash",
+                    renderer_version="1",
+                    render_hash="render-hash",
+                    srt_artifact_path=str(srt_artifact),
+                    ass_artifact_path=str(ass_artifact),
+                    srt_hash=sha256_file(srt_artifact),
+                    ass_hash=sha256_file(ass_artifact),
+                    origin="rendered",
+                )
+
+                repaired = orchestrator._reconcile_subtitle_publications()
+
+                active_job = orchestrator.store.get(job.id)
+                self.assertEqual(repaired, 0)
+                self.assertEqual(active_job.status, "rendering")
+                self.assertEqual(active_job.lease_owner, "other-worker")
+                self.assertIsNone(
+                    orchestrator.store.published_subtitle_generation(job.id)
+                )
+                self.assertFalse((media_root / "movie.ko.srt").exists())
+                self.assertFalse((media_root / "movie.ko.ass").exists())
+            finally:
+                orchestrator.stop()
 
     def test_restart_translation_rejects_an_incomplete_job(self) -> None:
         with TemporaryDirectory() as directory:

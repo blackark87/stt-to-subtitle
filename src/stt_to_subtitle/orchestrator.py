@@ -3859,6 +3859,20 @@ class SubtitleOrchestrator:
     def _reconcile_subtitle_publications(self) -> int:
         repaired = 0
         with self._subtitle_publication_lock:
+            for generation in (
+                self.store.list_recoverable_subtitle_generations()
+            ):
+                try:
+                    repaired += int(
+                        self._recover_subtitle_generation_publication(
+                            generation
+                        )
+                    )
+                except (OSError, RuntimeError, ValueError):
+                    LOGGER.exception(
+                        "subtitle generation recovery failed for %s",
+                        generation["source_rel"],
+                    )
             for publication in self.store.list_subtitle_publications():
                 try:
                     repaired += int(
@@ -3870,6 +3884,48 @@ class SubtitleOrchestrator:
                         publication["source_rel"],
                     )
         return repaired
+
+    def _recover_subtitle_generation_publication(
+        self,
+        generation: Mapping[str, Any],
+    ) -> bool:
+        source_rel = str(generation["source_rel"])
+        job_id = str(generation["job_id"])
+        lease_token = self.store.claim_recovery_lease(
+            job_id,
+            "rendering",
+            lease_owner=self._worker_id,
+            lease_seconds=JOB_LEASE_SECONDS,
+        )
+        if lease_token is None:
+            return False
+        job = self.store.get(job_id)
+        if job is None or job.source_rel != source_rel:
+            self.store.release_job_lease(
+                job_id,
+                lease_owner=self._worker_id,
+                lease_token=lease_token,
+            )
+            raise RuntimeError("render recovery job is unavailable")
+        source = self.library.resolve_file(source_rel)
+        srt_path = source.with_name(f"{source.stem}.ko.srt")
+        ass_path = source.with_name(f"{source.stem}.ko.ass")
+        try:
+            self._publish_subtitle_pair_locked(
+                job,
+                generation,
+                srt_path=srt_path,
+                ass_path=ass_path,
+                overwrite=True,
+            )
+        except BaseException:
+            self.store.release_job_lease(
+                job_id,
+                lease_owner=self._worker_id,
+                lease_token=lease_token,
+            )
+            raise
+        return True
 
     def _reconcile_subtitle_publication(
         self,

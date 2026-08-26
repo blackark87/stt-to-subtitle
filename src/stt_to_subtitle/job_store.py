@@ -3408,6 +3408,38 @@ class JobStore:
             publications.append(publication)
         return publications
 
+    def list_recoverable_subtitle_generations(self) -> list[dict[str, Any]]:
+        """Return completed render artifacts abandoned by an expired worker."""
+
+        now = time.time()
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT generation.*, 0 AS is_published,
+                       job.source_rel AS recovery_source_rel
+                FROM subtitle_generations AS generation
+                JOIN jobs AS job ON job.id = generation.job_id
+                WHERE job.status = 'rendering'
+                  AND (
+                      job.lease_expires_at IS NULL
+                      OR job.lease_expires_at <= ?
+                  )
+                  AND generation.generation_number = (
+                      SELECT MAX(latest.generation_number)
+                      FROM subtitle_generations AS latest
+                      WHERE latest.job_id = generation.job_id
+                  )
+                ORDER BY generation.created_at
+                """,
+                (now,),
+            ).fetchall()
+        candidates: list[dict[str, Any]] = []
+        for row in rows:
+            candidate = self._subtitle_generation_from_row(row)
+            candidate["source_rel"] = str(row["recovery_source_rel"])
+            candidates.append(candidate)
+        return candidates
+
     def publish_subtitle_generation(
         self,
         generation_id: str,
@@ -3423,7 +3455,7 @@ class JobStore:
         with self._connect() as connection:
             generation = connection.execute(
                 """
-                SELECT generation.*, job.source_rel
+                SELECT generation.*, job.source_rel, job.operation
                 FROM subtitle_generations AS generation
                 JOIN jobs AS job ON job.id = generation.job_id
                 WHERE generation.id = ?
@@ -3434,6 +3466,10 @@ class JobStore:
                 raise ValueError("subtitle generation not found")
             job_id = str(generation["job_id"])
             source_rel = str(generation["source_rel"])
+            projected = structured_state_from_legacy(
+                status="completed",
+                operation=str(generation["operation"]),
+            )
             if lease_owner is not None and lease_token is not None:
                 owned = connection.execute(
                     """
@@ -3470,13 +3506,27 @@ class JobStore:
             connection.execute(
                 """
                 UPDATE jobs
-                SET status = 'completed', srt_path = ?, ass_path = ?,
+                SET status = 'completed', phase = ?, state = ?,
+                    reason_code = ?, srt_path = ?, ass_path = ?,
                     blocked_stage = NULL, error = NULL,
                     lease_owner = NULL, lease_expires_at = NULL,
                     status_updated_at = ?, updated_at = ?
                 WHERE id = ?
                 """,
-                (srt_path, ass_path, now, now, job_id),
+                (
+                    projected.phase.value,
+                    projected.state.value,
+                    (
+                        projected.reason_code.value
+                        if projected.reason_code is not None
+                        else None
+                    ),
+                    srt_path,
+                    ass_path,
+                    now,
+                    now,
+                    job_id,
+                ),
             )
             published = connection.execute(
                 """
