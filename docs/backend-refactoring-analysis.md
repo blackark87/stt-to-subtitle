@@ -16,8 +16,10 @@
 4. 사용자 정지를 독립 상태가 아니라 `blocked + 특정 한국어 오류 문구`로 저장한다. UI와 필터가 문구 일치에 의존한다.
 5. 2D 대시보드, 3D 대시보드, 작업 목록이 동일한 원천 상태를 각자 다시 분류해 상태 수와 필터 의미가 달라질 수 있다.
 6. 전사 중지 요청은 웹의 대기 루프만 중지하고 원격 STT 작업을 취소하지 않아 GPU 작업이 계속될 수 있다.
+7. 번역 청크의 실제 결과는 DB가 아니라 하나의 부분 번역 JSON에 누적되며, DB에는 청크 총량과 완료량만 저장된다. generation·batch·segment별 재시도와 호환성을 DB에서 추적할 수 없다.
+8. 프롬프트를 바꿔 재번역하면 기존 전사본은 유지하지만 번역 JSON과 배포된 SRT/ASS는 같은 경로에서 덮어쓴다. 이전 번역과 자막을 비교·복구·재게시할 revision 계약이 없다.
 
-가장 먼저 해야 할 일은 UI 확장이 아니라 상태 모델과 스케줄러 제어의 정리다. `phase`, `state`, `reason_code`, `attempt`, `next_retry_at`을 분리하고, 외부 서비스별 회로 차단기와 단계별 복구 정책을 추가해야 한다.
+가장 먼저 해야 할 일은 UI 확장이 아니라 상태 모델과 스케줄러 제어의 정리다. `phase`, `state`, `reason_code`, `attempt`, `next_retry_at`을 분리하고, 외부 서비스별 회로 차단기와 단계별 복구 정책을 추가해야 한다. 반복 번역·자막 재생성을 제품의 기본 사용 방식으로 보고 transcript revision, translation generation, subtitle publication도 영속 도메인으로 관리해야 한다.
 
 ## 2. 현재 구조
 
@@ -121,11 +123,11 @@ stateDiagram-v2
 | 외부 서비스 장애 | 작업별로 재시도 후 `blocked` | STT/LM별 회로 차단기, 대기열 dispatch gate, half-open probe | P0 |
 | 재시작 복구 | 웹 실행 중 상태를 일괄 `blocked` | 단계별 복구·원격 상태 재조회·산출물 검증·자동 재개 | P0 |
 | 원격 STT 제어 | 제출·조회·SSE 진행률 | 원격 취소 API, 취소 멱등성, 취소 완료 확인 | P0 |
-| 번역 체크포인트 | 번역 ID 단위 부분 저장 | 모델·프롬프트·언어·원문·배치 설정 지문 검증 | P1 |
+| 번역 체크포인트 | DB에는 청크 수만 저장하고 실제 결과는 동일 JSON 전체를 배치마다 원자 교체 | translation generation·batch·segment 영속화, 모델·프롬프트·원문·배치 설정 지문 검증 | P0–P1 |
 | 스케줄링 | 생성 시각 FIFO, 단계별 제한 | 의존성별 admission control, 우선순위·공정성, starvation 방지 | P1 |
 | 종료 처리 | 짧은 join 후 executor 취소 | graceful drain, lease 만료, 종료 체크포인트, 재시작 소유권 회수 | P1 |
-| 오디오 산출물 | FFmpeg가 목적 파일에 직접 기록 | 임시 파일 생성 후 검증·원자 교체, 잔여 파일 정리 | P1 |
-| 자막 산출물 | SRT/ASS 각각 임시 저장 | 한 generation manifest로 두 파일의 일관성 검증·복구 | P1 |
+| 오디오·전사 산출물 | 작업 디렉터리에 지속되지만 같은 작업 재시도 시 같은 경로를 재사용 | immutable revision과 retention 정책, 임시 WAV 검증·원자 교체 | P1 |
+| 자막 산출물 | SRT/ASS 각각 임시 저장하며 재번역 시 기존 배포 파일을 덮어씀 | versioned generation, publication pointer, rollback, 한 manifest로 파일 쌍 검증 | P0–P1 |
 | 화면 집계 | 화면별 상태 재분류 | 공통 projection DTO, 동일한 phase/state 필터 계약 | P0 |
 | 이벤트·관측성 | 자유 형식 이벤트와 기본 진행률 | 이벤트 코드, attempt/correlation ID, 단계 시간·대기 시간·회로 상태 메트릭 | P1 |
 | DB 스키마 | 코드 내부 수동 컬럼 추가 | 버전 마이그레이션, 제약 조건, 인덱스, 외래키 활성화 | P1 |
@@ -172,6 +174,8 @@ sequenceDiagram
 
 회로 상태와 `next_probe_at`은 프로세스 재시작 후에도 유지되도록 DB에 저장한다. 메모리 전용 회로 차단기는 재시작 직후 장애 요청 폭주를 다시 발생시킨다.
 
+`next_probe_at`은 고정 주기로 모든 실패 작업을 계속 재시도한다는 뜻이 아니다. 회로가 열려 있고 해당 의존성을 기다리는 작업이 있을 때, 의존성별로 단 하나의 가벼운 probe만 예약하는 시각이다. 예를 들어 `30초 → 1분 → 2분 → 5분 → 10분`처럼 지수 백오프와 jitter를 적용하고 상한을 둔다. probe가 성공한 경우에만 실제 작업을 한 건 재개한다. 인증·잘못된 모델명·잘못된 URL처럼 설정 변경이 필요한 오류에는 `next_probe_at`을 두지 않고, 설정 저장이나 운영자의 명시적 재확인을 트리거로 사용한다.
+
 ## 6. 재시작·장애 복구 전략
 
 현재 웹 오케스트레이터는 시작할 때 실행 중 상태를 모두 `blocked`로 바꾸고 수동 재시도를 요구한다. STT 서비스는 실행 중 작업을 `failed`로 바꾼다. 같은 파이프라인 안에서 복구 의미가 일치하지 않는다.
@@ -188,7 +192,9 @@ sequenceDiagram
 | 사용자 중지 | 명시적 `stopped` | 자동 재개하지 않음 | 중지 |
 | 비재시도 실패 | `failed + reason_code` | 자동 재개하지 않음 | 실패 |
 
-전사에는 번역처럼 세그먼트 체크포인트를 억지로 도입할 필요가 없다. 모델이 중간 재개를 보장하지 않으므로 원격 작업 ID 재연결과 입력 WAV 기준 재실행이 더 안전하다. 알려진 모델 타임스탬프 보정은 기존 원칙대로 transcript normalization 경계에서 수행해야 한다.
+현재 전사 요청은 backend와 관계없이 하나의 WAV를 전달하고, Kotoba·WhisperX의 청크는 모델 내부에서 생성된다. WhisperJAV도 자체 scene/speech segmentation을 worker 내부에서 수행한다. 따라서 취소 API를 만드는 것과 사전 세그먼트 계산은 별개의 기능이다.
+
+다만 장시간 미디어의 재시작 비용을 줄이려는 명확한 요구가 있다면 `transcription_work_units`를 별도 기능으로 도입할 수 있다. 이때 사전에 확정할 수 있는 것은 최종 자막 segment가 아니라 `start/end/overlap/input_hash`를 가진 오디오 작업 단위다. 각 단위 결과를 저장한 뒤 중첩 구간 제거, 절대 타임스탬프 복원, 화자 연속성 보정, 최종 normalization을 수행해야 한다. 이 계약 없이 파일만 잘라 backend에 보내면 문장 경계·화자 배정·타임스탬프 품질이 달라진다. 알려진 모델 타임스탬프 보정은 기존 원칙대로 transcript normalization 경계에서 수행한다.
 
 웹 작업이 원격 STT를 기다리다 재시작한 경우에는 다음 순서로 reconcile한다.
 
@@ -214,6 +220,19 @@ sequenceDiagram
 
 타임아웃은 그 자체로 `paused`가 아니다. 짧은 네트워크 타임아웃은 내부 재시도 대상이고, 재시도 소진 후 외부 서비스 장애로 판단되면 `blocked`다. 사용자가 작업을 종료한 경우만 `stopped`다.
 
+Whisper 계열의 segment 오류도 오류가 발생한 위치가 아니라 복구 가능성으로 분류한다.
+
+| 사례 | 권장 분류 | 이유 |
+|---|---|---|
+| STT 서버 연결 단절·일시적 5xx | `blocked/stt_unavailable` | 입력과 설정은 유효하며 의존성 회복 후 재개 가능 |
+| CUDA OOM이고 batch/chunk 축소 정책이 남아 있음 | 내부 자동 재시도 후 필요 시 `blocked/resource_unavailable` | 자원 조건 또는 자동 완화로 회복 가능 |
+| 완화 재시도 후에도 같은 CUDA OOM 반복 | `failed/resource_exhausted` | 현재 설정으로는 자동 성공을 기대할 수 없음 |
+| segment ID 누락·중복, 음수/역전 타임스탬프, 응답 schema 위반 | `failed/model_output_invalid` | 동일 산출물을 다음 단계로 넘길 수 없는 결정적 계약 오류 |
+| 특정 입력에서 backend 코드가 항상 예외 발생 | `failed/transcription_processing_error` | 코드·입력·모델 변경이 필요 |
+| worker 프로세스 유실·서비스 재시작 | reconcile 후 재실행, 불가할 때 `blocked/service_restarted` | 먼저 원격 상태와 산출물을 확인해야 함 |
+
+현재 STT 서비스는 backend 예외를 거의 모두 remote `failed`로 저장하고, 웹은 그 원격 실패를 `ExternalServiceError`로 받아 `blocked`로 바꿀 수 있다. 동일 오류가 두 서비스에서 다르게 표현될 수 있으므로 STT API가 `error_code`, `retryable`, `failure_scope`를 구조적으로 반환해야 한다.
+
 버튼도 상태 수와 일대일로 만들 필요가 없다.
 
 - 실행 중: `일시정지`는 안전한 체크포인트가 있는 번역에서만 노출, `중지`는 모든 취소 가능한 단계에 노출
@@ -238,11 +257,62 @@ POST /v1/transcriptions/{job_id}/cancel
 - 프로세스 재시작 시 취소 요청도 reconcile
 - GPU 프로세스를 강제 종료해야만 취소할 수 있는 backend라면 다른 작업 영향과 worker 재기동 정책을 명시
 
+현재 backend별 취소 가능 범위는 다음과 같다.
+
+| backend/상태 | 현재 구조 | 구현 가능한 취소 방식 | 제한 |
+|---|---|---|---|
+| STT 큐 대기 | `queue.Queue`와 DB `queued` | DB를 `cancelled`로 바꾸고 worker가 dequeue 시 건너뜀 | 큐 내부 항목을 물리적으로 제거하지 않아도 됨 |
+| WhisperX 실행 | 별도 프로세스를 `subprocess.run`으로 동기 대기 | `Popen`으로 전환하고 process group에 `SIGTERM`, 유예 후 `SIGKILL` | 처리 중 결과는 재사용하지 못하며 GPU 정리 확인 필요 |
+| WhisperJAV 실행 | WhisperJAV와 speaker worker를 순차 subprocess 실행 | 현재 실행 중인 process group 종료, 다음 worker 시작 금지 | 두 subprocess 사이 취소 경합 처리 필요 |
+| Kotoba 실행 | STT API 프로세스 안에서 pipeline 직접 호출 | preprocess/forward 청크 경계에 cancellation token 검사 또는 Kotoba 자체를 subprocess로 격리 | diarization/postprocess 구간은 즉시 취소되지 않을 수 있음 |
+| 외부 STT provider | provider API에 의존 | provider cancel endpoint 호출 | provider가 지원하지 않으면 로컬 구독 중단만 가능 |
+
+따라서 “이미 모델에 들어간 작업은 절대 취소할 수 없다”기보다는, 현재 구현에 취소 신호와 실행 핸들이 없어서 취소하지 못하는 상태다. 강제 종료는 가능하지만 부분 전사 재개를 자동으로 제공하지 않는다. 안정성을 우선하면 모든 GPU backend를 job subprocess로 격리하고 부모 STT 서비스가 PID/process group과 취소 상태를 관리하는 구조가 가장 일관된다.
+
 ## 9. 체크포인트와 산출물 일관성
 
 ### 9.1 번역 체크포인트
 
-현재 번역 ID를 기준으로 완료 결과를 재사용하는 방식은 적절하다. 다만 다음 값의 지문을 체크포인트에 함께 저장해야 한다.
+현재 DB의 `translation_chunks_total/completed`는 진행률만 저장한다. 실제 부분 번역은 `<job>/<stem>_result_ko.json` 하나에 `status=partial`과 현재까지 완료된 모든 번역 항목을 넣고, 논리 배치가 끝날 때마다 파일 전체를 원자 교체한다. 재개할 때는 transcript에 존재하는 ID의 번역만 `existing`으로 읽어 나머지를 다시 요청한다.
+
+이 방식은 단일 프로세스 재개에는 유효하지만 다음 정보를 잃는다.
+
+- 어느 논리 배치가 몇 번째 시도에서 성공·실패했는지
+- 병렬 배치가 진행 중일 때 어떤 배치가 lease를 보유하는지
+- 부분 결과가 어느 prompt/model/transcript revision에서 생성됐는지
+- JSON 교체와 DB 진행률 갱신 사이의 crash를 어떻게 reconcile할지
+- 프롬프트 변경 후 이전 부분 결과를 폐기·비교·재사용할지
+
+부분 JSON의 관리 방법은 반드시 알아야 하며 공개된 영속 계약으로 만들어야 한다. 권장 구조는 DB를 실행·revision의 원장으로 사용하고 JSON을 특정 generation의 편집·교환 가능한 snapshot으로 취급하는 것이다.
+
+```sql
+transcript_revisions(
+  id, media_id, audio_revision_id, content_hash,
+  backend, model_revision, options_hash, artifact_path, created_at
+)
+
+translation_generations(
+  id, job_id, transcript_revision_id, prompt_revision_id,
+  endpoint_key, model, config_hash, state,
+  supersedes_generation_id, artifact_path, created_at, completed_at
+)
+
+translation_batches(
+  generation_id, batch_index, input_hash, segment_ids_json,
+  state, attempt, next_retry_at, output_hash, error_code, updated_at,
+  UNIQUE(generation_id, batch_index)
+)
+
+translation_items(
+  generation_id, segment_id, source_hash, translated_text,
+  batch_index, updated_at,
+  PRIMARY KEY(generation_id, segment_id)
+)
+```
+
+배치 성공 시 `translation_items`와 `translation_batches`를 한 DB 트랜잭션으로 확정한다. 부분 JSON은 이 DB snapshot에서 원자적으로 다시 생성한다. 사용자가 JSON을 직접 편집하면 별도의 manual revision으로 import하고 계약 검증 후 새 generation 또는 draft revision으로 저장한다. DB와 JSON 양쪽을 독립 원장으로 두어서는 안 된다.
+
+다음 값의 지문을 generation에 함께 저장해야 한다.
 
 - 원문 transcript 내용 또는 canonical hash
 - source/target language
@@ -261,6 +331,55 @@ POST /v1/transcriptions/{job_id}/cancel
 - 재시작 시 manifest가 없거나 hash가 맞지 않으면 전체 렌더 단계를 다시 실행한다.
 
 파일 생성과 DB 상태 갱신은 하나의 ACID 트랜잭션이 될 수 없으므로, “파일을 먼저 안전하게 완성 → manifest 확정 → DB 완료 처리” 순서와 재시작 reconcile로 일관성을 보장한다.
+
+### 9.3 프롬프트 변경 후 재번역·재게시
+
+현재 `restart_translation()`은 완료 작업의 transcript JSON을 검증해 그대로 보존하고, 선택한 prompt category snapshot을 `options_json`에 넣은 다음 기존 translation JSON을 빈 `partial` 문서로 즉시 덮어쓴다. 재번역이 끝나면 같은 JSON이 `completed`로 바뀌고 기존 `<media>.ko.srt/.ass`도 덮어쓴다. 테스트는 전사본 보존과 새 자막 덮어쓰기를 보장하지만 이전 번역·프롬프트·자막의 이력과 rollback은 보장하지 않는다.
+
+일회성 생성기가 아니라면 다음 publication workflow가 필요하다.
+
+```mermaid
+flowchart LR
+    T[Transcript revision 3] --> G1[Translation generation 7<br/>prompt revision 4]
+    T --> G2[Translation generation 8<br/>prompt revision 5]
+    G1 --> S1[Subtitle generation 7]
+    G2 --> S2[Subtitle generation 8]
+    S1 --> P{Published pointer}
+    S2 --> P
+    P --> M[media.ko.srt / media.ko.ass]
+```
+
+1. prompt category 수정은 기존 행 덮어쓰기가 아니라 immutable `prompt_revision`을 생성한다.
+2. 재번역은 같은 transcript revision을 참조하는 새 `translation_generation`을 생성한다.
+3. 새 generation의 부분 결과와 자막은 generation별 경로에 기록한다. 현재 배포 자막은 그대로 유지한다.
+4. 새 번역과 SRT/ASS가 모두 검증된 뒤에만 `published_generation_id`를 한 번에 전환하고 미디어 옆 파일을 원자 교체한다.
+5. 실패하거나 중지하면 기존 배포 자막은 유지한다.
+6. 사용자는 generation 간 비교, 재게시, rollback, 보존 기간 만료 후 정리를 수행할 수 있어야 한다.
+
+`재시도`는 동일 generation에서 transient failure를 이어가는 동작이고, `프롬프트 변경 후 재번역`은 입력 계약이 달라졌으므로 새 generation을 만드는 동작이다. 두 동작을 같은 버튼이나 같은 상태 전이로 처리하면 안 된다.
+
+### 9.4 WAV·전사본의 영속성과 덮어쓰기
+
+현재 WAV와 transcript JSON은 persistent volume 아래에 저장되므로 컨테이너 재시작 후에도 남는다. 그러나 immutable 영속 데이터나 보존 정책으로 모델링되어 있지는 않다.
+
+| 동작 | 현재 WAV | 현재 transcript JSON |
+|---|---|---|
+| 같은 작업의 수동 retry | 유효한 WAV가 있으면 재사용 | 유효하면 전사 단계를 건너뛰고 재사용 |
+| 완료된 전사 작업에서 전사 재요청 | 최신 작업의 WAV를 같은 job에서 재사용 가능 | `transcript_path`를 비운 뒤 같은 job 경로에 새 결과를 원자 교체하므로 이전 내용 소실 |
+| 번역만 재시작 | 그대로 유지 | 그대로 유지 |
+| 새 full reprocess | 새 job 디렉터리에 다시 추출 | 새 job 디렉터리에 새 전사본 생성 |
+| 같은 job에서 추출 단계 재실행 | `audio.16k.wav`에 FFmpeg `-y`로 직접 덮어씀 | 이후 전사 시 같은 job transcript 경로를 덮어쓸 수 있음 |
+| 작업 DB 레코드 삭제 | 현재 구현은 DB 행만 삭제 | artifact 디렉터리가 남아 orphan이 될 수 있음 |
+
+권장 계약은 다음과 같다.
+
+- WAV를 `audio_revision`으로 관리하고 `source hash + extraction options hash`가 같을 때만 재사용한다.
+- transcript는 `audio_revision + backend/model/options hash`별 immutable `transcript_revision`으로 저장한다.
+- 재전사는 기존 revision을 덮어쓰지 않고 새 revision을 만든다.
+- translation과 subtitle generation은 참조한 transcript revision을 고정한다.
+- UI에는 현재 active revision과 과거 revision을 구분해 비교·재사용·삭제할 수 있게 한다.
+- retention 정책은 `published`, `referenced`, `draft`, `orphan`을 구분하고 참조 중인 WAV·전사본은 삭제하지 않는다.
+- WAV staged write와 artifact garbage collector를 추가해 부분 파일과 DB 삭제 후 orphan을 안전하게 정리한다.
 
 ## 10. 2D·3D 대시보드와 작업 목록 Projection
 
@@ -344,6 +463,8 @@ jobs(
 - job event에는 `event_code`, `from_state`, `to_state`, `phase`, `attempt`, `correlation_id`, `payload_json`을 둔다.
 - 기존 `blocked + 사용자 중지 오류 문구` 데이터는 배포 마이그레이션에서 `stopped + user_stop`으로 변환한다.
 - 알 수 없는 레거시 오류는 억지 분류하지 않고 `blocked + legacy_unclassified`로 보존해 운영자가 검토할 수 있게 한다.
+- `jobs`는 실행 상태만 담당하고 transcript revision, translation generation/batch/item, subtitle publication은 별도 테이블로 분리한다.
+- 활성 산출물은 `media_assets.published_subtitle_generation_id` 같은 명시적 참조로 가리키며, 파일 존재 여부만으로 최신 버전을 추론하지 않는다.
 
 단일 웹 인스턴스에서는 SQLite를 유지할 수 있다. 다중 웹 스케줄러를 실제로 운영해야 할 때 lease 경쟁, 알림 지연, 쓰기 경합을 측정한 뒤 PostgreSQL이나 브로커 전환을 판단한다.
 
@@ -430,6 +551,7 @@ src/stt_to_subtitle/
 - 레거시 상태 변환 및 rollback 가능한 migration 작성
 - 정지 오류 문구 판별 제거
 - 공통 projection과 phase/state 필터 도입
+- transcript revision·translation generation·subtitle publication의 식별자와 관계 정의
 
 완료 기준: 같은 fixture에서 작업 목록·2D·3D의 상태 수와 filter URL 결과가 동일하다.
 
@@ -447,7 +569,8 @@ src/stt_to_subtitle/
 - 단계별 startup reconcile
 - 원격 STT 취소 API와 웹 연동
 - graceful shutdown과 worker lease
-- 번역 체크포인트 지문
+- 번역 generation·batch·segment 영속화와 체크포인트 지문
+- prompt revision 및 자막 publish/rollback workflow
 
 완료 기준: 각 단계에서 프로세스를 강제 종료해도 중복 산출물·유실 없이 정의된 지점에서 자동 복구한다.
 
@@ -455,6 +578,7 @@ src/stt_to_subtitle/
 
 - WAV staged write
 - SRT/ASS generation manifest
+- audio/transcript revision retention과 orphan collector
 - 구조화 이벤트와 운영 메트릭
 - DB 제약·인덱스·외래키 정비
 
@@ -482,19 +606,40 @@ src/stt_to_subtitle/
 12. 레거시 사용자 정지 데이터가 `stopped/user_stop`으로 정확히 마이그레이션되는지 확인
 13. 변경된 런타임 토큰이 예외·이벤트·로그에서 마스킹되는지 확인
 14. 잘못된 상태 전이와 중복 worker claim이 거부되는지 확인
+15. 병렬 번역 배치 완료와 프로세스 종료가 겹쳐도 DB translation item과 부분 JSON snapshot이 일치하는지 확인
+16. 프롬프트 변경 재번역이 새 generation을 만들고, 완료 전에는 기존 게시 자막을 유지하는지 확인
+17. 새 generation 게시와 rollback이 SRT/ASS 쌍을 같은 세대로 전환하는지 확인
+18. WhisperX·WhisperJAV subprocess 취소 후 자식 프로세스와 GPU 자원이 남지 않는지 확인
+19. Kotoba 취소 요청이 정의된 청크 경계에서 종료되고 해당 작업만 `stopped`가 되는지 확인
+20. segment 계약 오류가 `failed/model_output_invalid`, 서버 단절이 `blocked/stt_unavailable`로 일관되게 전달되는지 확인
+21. 재전사 시 기존 transcript revision과 이를 참조하는 과거 번역·자막 generation이 보존되는지 확인
 
 ## 18. 피해야 할 변경
 
-- 번역 일시정지와 UI 대칭성을 맞추기 위해 전사 모델에 임의의 세그먼트 체크포인트를 추가하지 않는다.
+- 취소 기능을 만들 수 있다는 이유만으로 최종 자막 segment를 전사 전에 확정하지 않는다. 재개형 전사가 필요하면 overlap·화자 연속성·merge 계약을 가진 오디오 work unit으로 별도 설계한다.
 - `attention`을 저장 상태나 상위 phase로 만들지 않는다.
 - 사용자 정지를 지역화된 오류 문구로 판별하지 않는다.
 - 화면마다 상태를 별도로 재분류하지 않는다.
 - 외부 서비스 장애 중 대기 작업을 하나씩 실행해 동일 실패를 반복하지 않는다.
+- prompt가 달라진 재번역을 동일 generation의 단순 retry로 처리하지 않는다.
+- 부분 JSON과 DB translation item을 서로 독립적인 원장으로 운영하지 않는다.
+- 새 재번역이 완료되기 전에 현재 게시 중인 SRT/ASS를 비우거나 덮어쓰지 않는다.
 - 현재 단일 인스턴스 요구만으로 PostgreSQL·Redis·메시지 브로커 전환부터 시작하지 않는다.
 - 기존 transcript/translation ID와 자막 overlap 규칙을 상태 리팩터링 과정에서 변경하지 않는다.
 
-## 19. 최종 권고
+## 19. 추가 질의별 최종 판단
 
-이 프로젝트의 다음 리팩터링 단위는 “화면별 상태 라벨 수정”이 아니라 “작업 실행 계약의 재정의”여야 한다. 먼저 명시적 상태 모델과 공통 projection을 도입하고, 외부 서비스 장애를 작업 큐 전체로 전파하지 않는 회로 차단기, 단계별 재시작 복구, 원격 STT 취소를 구현해야 한다.
+| 질의 | 현재 코드 기준 답변 | 보고서 권고 |
+|---|---|---|
+| 번역 청크 DB 저장이 없어도 되는가 | 안 된다. 현재 DB에는 진행률 숫자만 있고 실제 부분 결과는 하나의 JSON 전체 교체로 관리된다. 단순 재개는 가능하지만 배치 시도·generation·호환성·crash reconcile을 설명하지 못한다. | translation generation/batch/item을 DB에 저장하고 JSON은 versioned snapshot으로 생성한다. |
+| 이미 요청된 Whisper/Kotoba/WhisperJAV를 취소할 수 있는가 | 현재는 취소 API와 실행 핸들이 없어 불가능하다. 대기 작업은 즉시 취소 가능하고, WhisperX/JAV는 subprocess 종료, Kotoba는 cooperative hook 또는 subprocess 격리로 구현할 수 있다. | backend별 취소 adapter와 멱등 cancel API를 만든다. 취소와 사전 segmentation은 별도 요구다. |
+| 자막이 있는 상태에서 prompt 변경 재시도는 어떻게 되는가 | transcript는 유지되지만 translation JSON과 SRT/ASS가 기존 경로에서 덮어써지고 이력·rollback은 없다. | 새 prompt revision과 translation/subtitle generation을 만든 후 검증된 결과만 publish한다. 실패 시 기존 자막을 유지한다. |
+| `next_probe_at`은 계속 재시도한다는 뜻인가 | 자동 확인은 맞지만 모든 job의 고정 주기 재시도는 아니다. | 의존성별 단일 half-open probe만 지수 백오프로 실행한다. auth/config 오류는 자동 probe하지 않는다. |
+| 중단과 실패는 어떻게 구분하는가 | 현재 STT `failed`가 웹에서 `blocked`가 될 수 있어 일관되지 않다. | 외부 조건이 회복되면 그대로 재개 가능한 경우 `blocked`, 입력·모델 출력·코드 계약 오류처럼 변경이 필요한 경우 `failed`다. segment 구조 오류는 기본적으로 `failed/model_output_invalid`다. |
+| WAV와 transcript는 영속 데이터인가 | persistent volume에는 남지만 immutable revision은 아니다. 같은 job을 재사용하는 재전사·재추출에서는 같은 경로가 덮어써질 수 있고 DB 레코드 삭제 후 orphan도 남을 수 있다. | audio/transcript를 immutable revision으로 만들고 hash 기반 재사용, 참조 무결성, retention, garbage collection을 적용한다. |
 
-이 네 가지가 갖춰지면 2D와 3D는 동일한 수치와 용어를 안정적으로 표현할 수 있고, 대기 작업이 많은 운영 환경에서도 재시작·모델 교체·외부 서비스 장애를 수동 정리 없이 처리할 수 있다.
+## 20. 최종 권고
+
+이 프로젝트의 다음 리팩터링 단위는 “화면별 상태 라벨 수정”이 아니라 “작업 실행 및 산출물 revision 계약의 재정의”여야 한다. 먼저 명시적 상태 모델과 공통 projection을 도입하고, 외부 서비스 장애를 작업 큐 전체로 전파하지 않는 회로 차단기, 단계별 재시작 복구, backend별 STT 취소를 구현해야 한다.
+
+동시에 transcript revision, translation generation/batch/item, subtitle publication을 영속 모델로 추가해야 한다. 그래야 프롬프트 수정 재번역, 부분 번역 재개, 자막 비교·게시·rollback, WAV·전사본 재사용을 데이터 손실 없이 반복할 수 있다. 이 기반이 갖춰지면 2D와 3D도 동일한 수치와 용어를 안정적으로 표현하고, 대기 작업이 많은 운영 환경에서 재시작·모델 교체·외부 서비스 장애를 수동 정리 없이 처리할 수 있다.
