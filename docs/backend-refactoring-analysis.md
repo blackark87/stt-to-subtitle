@@ -11,7 +11,7 @@
 | 항목 | 반영 상태 | 남은 범위 |
 |---|---|---|
 | 작업 상태 계약 | `phase/state/reason_code/attempt` 영속 컬럼과 레거시 마이그레이션, 명시적 `stopped/user_stop`, 2D·3D·목록 공통 상태 집계, 단계+상태 결합 필터, 구조화 전이 이벤트 | 스케줄러의 레거시 `status` 제거·DB 전이 제약 |
-| 번역 LLM 수동 gate | 사용자가 시작할 때 `/models` 1회 확인, 연결 실패 시 gate 차단, 번역 중단 작업 수동 재개, dependency state·reason 영속화, 재시작 시 자동 호출 없이 gate 닫기, 명시적 요청의 attempt·결과·소요 시간 계측 | 실환경 장애 복구 검증 |
+| 번역 LLM circuit | 별도 서버 시작 없이 대기 작업 dispatch, 요청 3회 실패 시 현재 작업만 중단하고 뒤 작업 보존, 번역 작업 재시도로 circuit 복구, dependency state·reason 영속화, background probe 제거, 요청 attempt·결과·소요 시간 계측 | 실환경 장애 복구 검증 |
 | 외부 자막 | 같은 stem의 SRT/VTT/ASS 탐지, `외부 자막` 표시, 기본 WebVTT 재생 | 증분 asset/revision catalog·사용자별 재생 선택 |
 | 로컬 비교 | 시간 중첩 정렬, coverage·문장 유사도·경계 오차, 파일 해시별 SQLite 결과, 완료·실패 계측 | generation/publication FK·검증 알고리즘 version migration |
 | 상용 LLM 검증 | 번역 LLM과 분리된 설정, 명시적 1회 호출, 구조화 결과, 입력·모델 cache와 완료·실패·cache hit 계측 | provider별 adapter·비용/사용량 관측 |
@@ -23,7 +23,7 @@
 | 오디오·전사 revision | source·추출 설정 hash 기반 WAV 재사용, immutable WAV·전사 JSON 경로, DB revision 원장·활성 포인터, 직접 편집·비교 선택의 별도 전사 revision, 번역 generation의 transcript revision 참조, 전체 DB 참조 기반 감사·명시적 orphan 정리, 과거 전사 revision 선택·무결성 검증·새 번역 generation 연동 | revision 간 전사 내용 비교가 필요하면 후속 추가 |
 | STT 실패 계약 | STT DB·API의 `failure_code/retryable/failure_scope`, segment/schema·OOM·인증·입력·처리·재시작 오류 분류, retryable 실패만 원격 재제출 | 실제 배포 이미지의 계약 drift 해소 후 backend별 fault test·오류 코드 운영 지표 |
 | STT dispatch gate | 첫 연결 실패 시 영속 gate 차단, 뒤 작업 `audio_ready` 유지, 명시적 연결 확인의 제한된 3회 요청 후 중단 작업 재개 | 자동 recovery mode가 실제로 필요한지 운영 검증·회로 메트릭 |
-| 이벤트·관측성 | 구조화 전이 이벤트, 단계 대기·처리 시간, 외부 API attempt별 결과·소요 시간, dependency readiness·gate 전이, STT 큐와 원격 실행·취소 수, artifact 감사·정리, startup reconcile, lease fencing 거부, 번역 checkpoint와 자막 검증 결과를 SQLite에 누적하고 JSON·Prometheus text로 제공 | lease 복구·중복 실행 방지 세부 counter |
+| 이벤트·관측성 | 구조화 전이 이벤트, 단계 대기·처리 시간, 외부 API attempt별 결과·소요 시간, dependency readiness·circuit 전이, STT 큐와 원격 실행·취소 수, artifact 감사·정리, startup reconcile, lease fencing 거부, 번역 checkpoint와 자막 검증 결과를 SQLite에 누적하고 JSON·Prometheus text로 제공 | lease 복구·중복 실행 방지 세부 counter |
 | DB 무결성 | 외래키 활성화, 레거시 dangling 참조 정리, 상태 projection/domain·원장 소유 관계 guard, 공유 WAV 참조 보존, 순번·이름 ledger와 migration별 savepoint rollback, 레거시 ledger sequence backfill, quick/FK/migration 운영 지표, 원본 무변경 SQLite backup dry-run CLI와 실제 JobStore 검증 | - |
 
 이하의 문제 분석은 최초 분석 시점 구조를 기준으로 하되, 구현이 끝난 절은 현재
@@ -36,7 +36,7 @@
 그러나 작업이 많거나 외부 서비스가 내려간 상황에서 안정적으로 운영하려면 다음 문제를 우선 해결해야 한다.
 
 1. 사용자 표시와 필터는 `phase/state/reason_code/attempt`로 분리됐지만 스케줄러 실행 전이는 아직 레거시 `status`를 호환 필드로 함께 사용한다.
-2. 언어 모델 수동 gate와 마지막 상태·사유를 영속화했다. 웹 재시작 시 마지막 `offline/lost`를 복원하고, 이전 상태가 `ready`였어도 자동 호출·dispatch 없이 `offline/manual_start_required`로 시작한다.
+2. 언어 모델 circuit과 마지막 상태·사유를 영속화했다. 설정이 유효하면 별도 시작 명령 없이 대기 작업을 dispatch하고, 연결 실패가 확정되면 `lost`를 복원해 작업 재시도 전까지 뒤 작업을 보존한다.
 3. 웹 프로세스 재시작 시 실행 중 작업을 단계별로 reconcile한다. 원격 STT는 기존 ID에 재연결하고 ID가 유실됐으면 동일 멱등 키로 재제출한다. 번역 LLM은 자동 호출하지 않고 체크포인트를 대기로 복원하며, 실행 중이던 generation·batch attempt는 `interrupted`로 확정한다.
 4. 사용자 정지는 신규 작업에서 명시적 `stopped/user_stop`으로 저장한다. 기존 한국어 오류 문구 판별은 과거 DB를 한 번 마이그레이션할 때만 사용한다.
 5. 2D 대시보드, 3D 대시보드, 작업 목록은 영속 `state`를 공통 원천으로 사용하고 작업 목록은 `phase + state` 결합 필터를 지원한다.
@@ -52,7 +52,7 @@
 ### 1.1 확정된 운영 전제
 
 - 번역용 LLM은 고사양 Windows PC에서 실행되며 평소에는 꺼져 있다. LLM offline은 장애가 아니라 정상 운영 상태다.
-- LLM에 대한 주기적 `next_probe_at` 호출은 사용하지 않는다. 연결 확인과 번역 재개는 사용자가 명시적으로 시작한다.
+- LLM에 대한 주기적 `next_probe_at` 호출은 사용하지 않는다. 번역 대기 작업의 실제 요청으로만 가용성을 확인하고, 장애 후 복구는 작업 목록의 번역 재시도로 시작한다.
 - 미디어 `<filename>.*`에 대응하는 `<filename>.srt`, `<filename>.vtt`, `<filename>.ass`는 모두 한국어 `외부 자막`이다.
 - 외부 자막은 비교 기준이면서 영상 재생에 사용하는 기본 자막이다. 시스템 생성 자막과 별도 자산으로 보존한다.
 - 시스템은 내부망 전용이며 웹 로그인·사용자별 권한 같은 별도 애플리케이션 인증은 요구하지 않는다.
@@ -197,40 +197,39 @@ sequenceDiagram
 
 이는 “대기 중인 작업은 그대로 대기한다”는 운영 기대와 맞지 않는다. 요청 재시도와 서비스 장애 제어는 별도 계층이어야 한다.
 
-현재 구현은 첫 번역 연결 실패에서 수동 gate를 닫아 나머지 작업을 `transcribed/waiting`으로 유지한다. gate 상태와 마지막 사유는 SQLite에 저장하며, 웹 재시작 후에도 background probe 없이 사용자의 `번역 시작/재개` 명령만 preflight를 수행한다.
+현재 구현은 첫 번역 연결 실패에서 내부 circuit을 열어 나머지 작업을 `transcribed/waiting`으로 유지한다. circuit 상태와 마지막 사유는 SQLite에 저장하며 background probe는 수행하지 않는다. 번역 서버 설정과 작업 실행은 분리되어 있으며, 설정 화면에는 서버 시작·중지나 원문 오류를 노출하지 않는다. 사용자가 작업 목록에서 번역 작업을 재시도하면 circuit을 다시 닫고 실제 번역 요청으로 가용성을 확인한다.
 
 ### 5.2 의존성별 복구 모드
 
-모든 외부 의존성에 같은 회로 차단 정책을 적용하면 안 된다. 다음 설정을 의존성 단위로 둔다.
+모든 외부 의존성에 같은 회로 차단 정책을 적용하면 안 된다. 번역 LLM은 실제 작업 요청으로만 가용성을 판단하는 수동 복구 circuit을 사용한다.
 
 ```text
-recovery_mode: manual | automatic
-availability:  offline | checking | ready | lost
+recovery_mode: manual_retry | automatic
+availability:  offline | ready | lost
 ```
 
-번역 LLM은 `recovery_mode=manual`로 고정한다.
+번역 LLM은 `recovery_mode=manual_retry`로 고정한다.
 
-1. Windows LLM PC가 꺼진 평상시에는 `offline`이며 번역 작업은 `waiting(reason=lm_offline)`에 둔다.
-2. 이 상태에서는 health check, `/models`, 번역 요청을 포함한 어떤 주기적 호출도 하지 않는다.
-3. 사용자가 `연결 확인` 또는 `번역 시작/재개`를 누를 때만 한 번의 preflight를 수행한다.
-4. 사용자가 명시적으로 시작한 세션에서는 제한된 요청 단위 재시도를 허용할 수 있다. 연결 거부처럼 PC가 꺼진 것이 명확한 오류는 즉시 중단한다.
-5. preflight가 성공하면 `ready`로 전환하고 번역 dispatch를 연다.
-6. 번역 중 연결이 끊기면 현재 generation의 확정 배치를 보존하고 현재 작업만 `blocked(reason=lm_disconnected)`로 전환한다. 나머지 작업은 `waiting`을 유지한다.
-7. 이후 자동 probe하지 않으며 다음 사용자 명령에서 중단 작업부터 재개한다.
+1. 설정이 유효하면 별도 시작 명령 없이 번역 dispatch를 허용한다.
+2. 번역 대기 작업이 있을 때만 실제 번역 요청을 보내며 `/models`나 health check를 주기적으로 호출하지 않는다.
+3. 각 HTTP 요청은 일시적 오류에 대해 최대 3회 재시도한다.
+4. 재시도가 모두 실패하면 현재 generation의 확정 배치를 보존하고 현재 작업만 `blocked(reason=lm_unavailable)`로 전환한다.
+5. 동시에 circuit을 `lost`로 전환하여 나머지 번역 작업은 `waiting`으로 유지한다.
+6. 사용자가 작업 목록에서 번역 작업을 재시도하거나 번역 서버 주소·토큰·모델을 변경하면 circuit을 `ready`로 되돌린다.
+7. 이후 실제 번역 요청이 성공하면 대기열을 계속 처리하고, 실패하면 다시 현재 작업만 중단한다.
 
-선택적으로 Wake-on-LAN을 붙이더라도 사용자가 누른 시작 동작 안에서만 수행한다. 부팅 확인은 제한 시간·제한 횟수로 끝내며 background polling으로 남기지 않는다.
+선택적으로 Wake-on-LAN을 붙이더라도 작업 재시도 동작과 명확히 분리하고 background polling으로 남기지 않는다.
 
 STT처럼 상시 가동을 전제로 하는 의존성은 필요할 때만 `recovery_mode=automatic`과 `next_probe_at`을 사용할 수 있다. 즉 `next_probe_at`은 공통 jobs 필수 필드가 아니라 자동 복구를 선택한 dependency 상태에만 존재하는 선택 필드다.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> offline
-    offline --> checking: 사용자 연결 확인
-    checking --> ready: preflight 성공
-    checking --> offline: 실패·시간 초과
+    [*] --> ready: 설정 완료
     ready --> lost: 실행 중 연결 단절
-    lost --> checking: 사용자 재개
-    ready --> offline: 사용자 사용 중지
+    lost --> ready: 번역 작업 재시도
+    lost --> ready: 번역 서버 설정 변경
+    [*] --> offline: 설정 없음
+    offline --> ready: 서버 설정 저장
 ```
 
 ## 6. 재시작·장애 복구 전략
@@ -244,7 +243,7 @@ stateDiagram-v2
 | 대기 | DB 행 | 그대로 유지 | 대기 |
 | 오디오 추출 | 없음 | `queued`로 되돌려 단계 처음부터 자동 재실행 | 대기 → 진행 |
 | 전사 | 원격 `stt_job_id`, 원본 WAV | 원격 상태 조회 후 완료 결과 회수 또는 실행 재연결. 원격 작업 유실 시 동일 멱등 키로 재제출 | 진행 또는 외부 서비스 중단 |
-| 번역 | generation·batch·segment 원장 | transcript를 검증하고 `transcribed`로 복원. 실행 중 attempt와 batch는 `interrupted`로 확정하고 수동 LLM gate가 열릴 때 새 attempt로 미완료 segment부터 재개 | 대기 또는 일시정지 |
+| 번역 | generation·batch·segment 원장 | transcript를 검증하고 `transcribed`로 복원. 실행 중 attempt와 batch는 `interrupted`로 확정하고 번역 작업 재시도 시 새 attempt로 미완료 segment부터 재개 | 대기 또는 일시정지 |
 | 렌더 | transcript/translation과 generation 원장 | 두 JSON 계약을 검증해 `translated`로 복원하고 전체 재렌더 | 대기 → 진행 → 완료 |
 | 사용자 중지 | 명시적 `stopped` | 자동 재개하지 않음 | 중지 |
 | 비재시도 실패 | `failed + reason_code` | 자동 재개하지 않음 | 실패 |
@@ -708,7 +707,7 @@ src/stt_to_subtitle/
 ├── integrations/
 │   ├── stt_client.py
 │   ├── lm_client.py
-│   ├── dependency_gate.py    # manual/automatic 복구 모드
+│   ├── dependency_circuit.py # manual_retry/automatic 복구 모드
 │   └── commercial_validator.py
 ├── projections/
 │   └── job_projection.py     # 목록·2D·3D 공통 집계
@@ -738,13 +737,14 @@ src/stt_to_subtitle/
 ### 2단계 — 장애 전파 차단(P0)
 
 - 오류를 transient/auth/config/input/internal로 분류
-- dependency별 `manual/automatic` recovery mode와 영속 dispatch gate 추가
-- 번역 LLM은 `manual`로 고정하고 `offline`에서 어떤 자동 호출도 하지 않음
-- 사용자 `연결 확인`, `번역 시작/재개`, `사용 중지` 명령 추가
+- dependency별 `manual_retry/automatic` recovery mode와 영속 circuit 추가
+- 번역 LLM은 실제 대기 작업이 있을 때만 호출하고 주기적 probe를 수행하지 않음
+- 설정 화면의 번역 시작·중지와 서버 원문 오류 노출 제거
+- 번역 실패 시 circuit을 열고 작업 목록의 번역 재시도로만 다시 실행
 - STT에만 필요 시 `attempt/next_retry_at` 기반 자동 복구 적용
 - 10건 이상 대기열에서 의존성 장애가 나도 현재 작업만 중단되고 나머지는 대기로 남도록 보장
 
-완료 기준: LLM PC가 꺼져 있는 동안 번역 관련 네트워크 호출은 0건이며 모든 작업이 대기를 유지한다. 사용자가 재개를 요청해 preflight가 성공한 경우에만 중단 generation부터 처리한다.
+완료 기준: LLM PC가 꺼져 있으면 첫 작업의 제한된 재시도 후 해당 작업만 중단되고 나머지는 대기를 유지한다. 작업 목록에서 번역 재시도를 요청하면 중단 generation부터 처리한다.
 
 ### 3단계 — 외부 자막·비교 검증(P0–P1)
 
@@ -785,9 +785,9 @@ src/stt_to_subtitle/
 
 ## 17. 필수 테스트 시나리오
 
-1. LM gate가 `offline`인 동안 번역 10건을 넣고 충분히 기다려도 네트워크 요청이 0건이며 모두 `waiting`인지 확인
-2. 사용자가 `번역 시작/재개`를 요청한 경우에만 preflight 후 체크포인트부터 재개되고 대기열 순서가 보존되는지 확인
-3. preflight 실패와 실행 중 연결 단절 후 자동 probe가 발생하지 않고 다음 사용자 명령까지 대기하는지 확인
+1. 번역 10건 중 첫 작업의 요청이 3회 실패하면 해당 작업만 `blocked`이고 나머지는 `waiting`인지 확인
+2. 작업 목록에서 번역 재시도를 요청하면 별도 preflight 없이 체크포인트부터 재개되고 대기열 순서가 보존되는지 확인
+3. 실행 중 연결 단절 후 자동 probe가 발생하지 않고 다음 번역 작업 재시도까지 대기하는지 확인
 4. 전사 실행 중 웹만 재시작해 원격 작업에 재연결하는지 확인
 5. STT 서비스 재시작으로 원격 작업이 유실될 때 동일 멱등 키로 안전하게 재처리하는지 확인
 6. 실행 중·대기 중·일시정지 작업을 각각 중지했을 때 모두 `stopped`로 일관되게 끝나는지 확인

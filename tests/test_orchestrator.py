@@ -121,7 +121,7 @@ class SubtitleOrchestratorTests(unittest.TestCase):
             )
         )
 
-    def test_manual_lm_gate_dispatches_only_after_explicit_preflight(self) -> None:
+    def test_translation_dispatches_without_server_start_action(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
             media_root = root / "media"
@@ -138,7 +138,6 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                     lm_base_url="http://lm.test/v1",
                     lm_token="secret",
                     lm_model="model",
-                    lm_manual_start=True,
                 )
             )
             try:
@@ -150,63 +149,24 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                 orchestrator.store.update(job.id, status="transcribed")
                 orchestrator._translation_executor.submit = Mock()
 
-                self.assertEqual(orchestrator._dispatch_translations(), 0)
-                with patch(
-                    "stt_to_subtitle.orchestrator.list_openai_compatible_models",
-                    return_value=["model"],
-                ) as models:
-                    resumed = orchestrator.activate_translation_lm()
                 dispatched = orchestrator._dispatch_translations()
-                persisted_gate = orchestrator.store.get_dependency_state(
+                persisted_circuit = orchestrator.store.get_dependency_state(
                     "translation_lm"
                 )
-                dependency_measurements = [
-                    measurement
-                    for measurement in (
-                        orchestrator.store.operational_measurements()
-                    )
-                    if measurement["metric"].startswith("dependency.")
-                ]
             finally:
                 orchestrator.stop()
 
-            self.assertEqual(resumed, 0)
             self.assertEqual(dispatched, 1)
-            self.assertEqual(orchestrator.lm_gate_state, "ready")
-            self.assertEqual(persisted_gate["state"], "ready")
-            self.assertIsNone(persisted_gate["reason_code"])
-            models.assert_called_once_with(
-                "http://lm.test/v1",
-                "secret",
-                attempts=1,
-                request_observer=ANY,
-            )
-            self.assertTrue(
-                any(
-                    measurement["metric"]
-                    == "dependency.readiness_checks"
-                    and measurement["labels"]
-                    == {
-                        "dependency": "translation_lm",
-                        "outcome": "ready",
-                    }
-                    for measurement in dependency_measurements
-                )
-            )
-            self.assertTrue(
-                any(
-                    measurement["metric"]
-                    == "dependency.gate.transitions"
-                    and measurement["labels"]["to_state"] == "checking"
-                    for measurement in dependency_measurements
-                )
-            )
+            self.assertEqual(orchestrator.translation_circuit_state, "ready")
+            self.assertEqual(persisted_circuit["state"], "ready")
+            orchestrator._translation_executor.submit.assert_called_once()
 
-    def test_manual_lm_gate_starts_closed_after_process_restart(self) -> None:
+    def test_translation_failure_circuit_reopens_on_job_retry(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
             media_root = root / "media"
             media_root.mkdir()
+            (media_root / "movie.mkv").write_bytes(b"media")
             settings = WebSettings(
                 state_dir=root / "state",
                 media_root=media_root,
@@ -217,34 +177,79 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                 lm_base_url="http://lm.test/v1",
                 lm_token="secret",
                 lm_model="model",
-                lm_manual_start=True,
             )
             first = SubtitleOrchestrator(settings)
             try:
-                with patch(
-                    "stt_to_subtitle.orchestrator.list_openai_compatible_models",
-                    return_value=["model"],
-                ):
-                    first.activate_translation_lm()
-                self.assertEqual(first.lm_gate_state, "ready")
+                job = first.create_job(
+                    "movie.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                transcript = root / "state" / "jobs" / job.id / "transcript.json"
+                transcript.parent.mkdir(parents=True, exist_ok=True)
+                transcript.write_text(
+                    json.dumps(
+                        {
+                            "schema_version": 1,
+                            "job_id": job.id,
+                            "segments": [
+                                {
+                                    "id": "segment-000001",
+                                    "start": 0,
+                                    "end": 1,
+                                    "speaker": "SPEAKER_00",
+                                    "text": "text",
+                                }
+                            ],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                first.store.update(
+                    job.id,
+                    status="blocked",
+                    blocked_stage="translation",
+                    transcript_path=str(transcript),
+                    error="server unavailable",
+                )
+                first._set_translation_circuit(
+                    "lost",
+                    reason_code="lm_unavailable",
+                    error="server unavailable",
+                )
             finally:
                 first.stop()
 
-            with patch(
-                "stt_to_subtitle.orchestrator.list_openai_compatible_models"
-            ) as models:
-                restarted = SubtitleOrchestrator(settings)
+            restarted = SubtitleOrchestrator(settings)
             try:
+                restarted._translation_executor.submit = Mock()
                 persisted = restarted.store.get_dependency_state(
                     "translation_lm"
                 )
-                self.assertEqual(restarted.lm_gate_state, "offline")
-                self.assertEqual(persisted["state"], "offline")
-                self.assertEqual(
-                    persisted["reason_code"],
-                    "manual_start_required",
+                self.assertEqual(restarted.translation_circuit_state, "lost")
+                self.assertEqual(persisted["state"], "lost")
+                self.assertEqual(restarted._dispatch_translations(), 0)
+                restarted.update_remote_servers(
+                    RemoteServerSettings(
+                        stt_base_url="http://new-stt.test",
+                        stt_token="",
+                        lm_base_url="http://lm.test/v1",
+                        lm_token="secret",
+                        lm_model="model",
+                    )
                 )
-                models.assert_not_called()
+                self.assertEqual(restarted.translation_circuit_state, "lost")
+
+                retried = restarted.retry(job.id)
+                dispatched = restarted._dispatch_translations()
+
+                self.assertEqual(retried.status, "transcribed")
+                self.assertEqual(
+                    restarted.translation_circuit_state,
+                    "ready",
+                )
+                self.assertEqual(dispatched, 1)
+                restarted._translation_executor.submit.assert_called_once()
             finally:
                 restarted.stop()
 
@@ -1558,6 +1563,13 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                     status="translation_running",
                     transcript_path=str(transcript_path),
                 )
+                waiting = orchestrator.store.create(
+                    job_id="waiting-translation",
+                    source_rel="waiting.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                orchestrator.store.update(waiting.id, status="transcribed")
                 translation_client = Mock()
 
                 def fail_batch(_segments, **kwargs):
@@ -1574,13 +1586,16 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                 orchestrator._make_translation_client = Mock(
                     return_value=translation_client
                 )
+                orchestrator._translation_executor.submit = Mock()
 
                 orchestrator._run_stage(
                     job.id,
                     "translation",
                     orchestrator._translate,
                 )
+                orchestrator._scheduler_tick()
                 blocked = orchestrator.store.get(job.id)
+                waiting = orchestrator.store.get(waiting.id)
                 generation = (
                     orchestrator.store.latest_translation_generation(job.id)
                 )
@@ -1591,6 +1606,9 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                 orchestrator.stop()
 
             self.assertEqual(blocked.status, "blocked")
+            self.assertEqual(orchestrator.translation_circuit_state, "lost")
+            self.assertEqual(waiting.status, "transcribed")
+            orchestrator._translation_executor.submit.assert_not_called()
             self.assertEqual(generation["state"], "blocked")
             self.assertEqual(batches[0]["state"], "failed")
             self.assertEqual(batches[0]["error"], "server offline")

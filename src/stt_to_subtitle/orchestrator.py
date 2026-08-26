@@ -60,7 +60,6 @@ from .service_clients import (
     STTAPIClient,
     SubtitleValidationClient,
     TranslationPaused,
-    list_openai_compatible_models,
 )
 from .subtitle import write_styled_subtitles_atomic
 from .subtitle_validation import build_subtitle_validator_payload
@@ -290,48 +289,30 @@ class SubtitleOrchestrator:
             RemoteServerSettings,
         ] = (None, None, initial_servers)
         self._stt_gate_lock = threading.RLock()
-        self._lm_gate_lock = threading.RLock()
+        self._translation_circuit_lock = threading.RLock()
         self._subtitle_publication_lock = threading.RLock()
         self._stage_futures_lock = threading.RLock()
         self._stage_futures: set[Future[Any]] = set()
         self._worker_id = f"web-{uuid4().hex}"
-        saved_lm_gate = self.store.get_dependency_state("translation_lm")
-        if settings.lm_manual_start:
-            saved_lm_state = (
-                str(saved_lm_gate["state"])
-                if saved_lm_gate is not None
-                else "offline"
-            )
-            self._lm_gate_state = (
-                saved_lm_state
-                if saved_lm_state in {"offline", "lost"}
-                else "offline"
-            )
-            self._lm_gate_message = (
-                str(saved_lm_gate.get("last_error"))
-                if saved_lm_gate is not None
-                and saved_lm_gate.get("last_error")
-                and saved_lm_state in {"offline", "lost"}
-                else "사용자가 번역 서버를 시작할 때까지 대기합니다."
-            )
-            if (
-                saved_lm_gate is None
-                or saved_lm_state not in {"offline", "lost"}
-            ):
-                self.store.save_dependency_state(
-                    "translation_lm",
-                    state="offline",
-                    reason_code="manual_start_required",
-                    error=self._lm_gate_message,
-                )
-        else:
-            self._lm_gate_state = (
-                "ready" if initial_servers.is_complete else "offline"
-            )
-            self._lm_gate_message = (
-                "번역 서버 자동 시작 모드입니다."
-                if self._lm_gate_state == "ready"
-                else "번역 서버 설정이 필요합니다."
+        saved_translation_state = self.store.get_dependency_state(
+            "translation_lm"
+        )
+        saved_translation_state_name = (
+            str(saved_translation_state["state"])
+            if saved_translation_state is not None
+            else None
+        )
+        self._translation_circuit_state = (
+            "lost"
+            if saved_translation_state_name == "lost"
+            else "ready"
+            if initial_servers.is_complete
+            else "offline"
+        )
+        if saved_translation_state_name != self._translation_circuit_state:
+            self.store.save_dependency_state(
+                "translation_lm",
+                state=self._translation_circuit_state,
             )
         saved_stt_gate = self.store.get_dependency_state("stt")
         self._stt_gate_state = (
@@ -402,9 +383,6 @@ class SubtitleOrchestrator:
         with self._stt_gate_lock:
             stt_gate_state = self._stt_gate_state
             stt_gate_message = self._stt_gate_message
-        with self._lm_gate_lock:
-            lm_gate_state = self._lm_gate_state
-            lm_gate_message = self._lm_gate_message
         return {
             "stt_base_url": servers.stt_base_url,
             "stt_token_configured": bool(servers.stt_token),
@@ -415,9 +393,6 @@ class SubtitleOrchestrator:
             "configured": self.remote_servers_configured,
             "stt_gate_state": stt_gate_state,
             "stt_gate_message": stt_gate_message,
-            "lm_manual_start": self.settings.lm_manual_start,
-            "lm_gate_state": lm_gate_state,
-            "lm_gate_message": lm_gate_message,
         }
 
     def subtitle_validator_view(self) -> dict[str, Any]:
@@ -487,9 +462,9 @@ class SubtitleOrchestrator:
         return updated, False
 
     @property
-    def lm_gate_state(self) -> str:
-        with self._lm_gate_lock:
-            return self._lm_gate_state
+    def translation_circuit_state(self) -> str:
+        with self._translation_circuit_lock:
+            return self._translation_circuit_state
 
     @property
     def stt_gate_state(self) -> str:
@@ -638,28 +613,25 @@ class SubtitleOrchestrator:
                 },
             )
 
-    def _set_lm_gate(
+    def _set_translation_circuit(
         self,
         state: str,
-        message: str,
         *,
         reason_code: str | None = None,
-        persist: bool = True,
+        error: str | None = None,
     ) -> None:
-        with self._lm_gate_lock:
-            previous_state = self._lm_gate_state
-            self._lm_gate_state = state
-            self._lm_gate_message = message
-        if persist:
-            self.store.save_dependency_state(
-                "translation_lm",
-                state=state,
-                reason_code=reason_code,
-                error=message if state in {"lost", "offline"} else None,
-            )
+        with self._translation_circuit_lock:
+            previous_state = self._translation_circuit_state
+            self._translation_circuit_state = state
+        self.store.save_dependency_state(
+            "translation_lm",
+            state=state,
+            reason_code=reason_code,
+            error=error if state == "lost" else None,
+        )
         if previous_state != state:
             self._record_measurement(
-                "dependency.gate.transitions",
+                "dependency.circuit.transitions",
                 1,
                 labels={
                     "dependency": "translation_lm",
@@ -704,68 +676,6 @@ class SubtitleOrchestrator:
                 continue
             retried += 1
         return retried
-
-    def activate_translation_lm(self) -> int:
-        """Open the manual translation gate after one explicit preflight."""
-        servers = self.remote_servers
-        if self.lm_client is None:
-            raise ValueError("번역 서버 설정을 먼저 저장하세요.")
-        self._set_lm_gate(
-            "checking",
-            "번역 서버 연결을 확인하고 있습니다.",
-            persist=False,
-        )
-        try:
-            models = list_openai_compatible_models(
-                servers.lm_base_url,
-                servers.lm_token,
-                attempts=1,
-                request_observer=self.record_external_request,
-            )
-            if servers.lm_model not in models:
-                raise ExternalServiceError(
-                    f"설정된 번역 모델을 찾을 수 없습니다: {servers.lm_model}"
-                )
-        except (ValueError, ExternalServiceError) as error:
-            self._record_dependency_readiness(
-                "translation_lm",
-                "unavailable",
-            )
-            self._set_lm_gate(
-                "offline",
-                self._sanitize_error(str(error)),
-                reason_code=JobReason.LM_UNAVAILABLE.value,
-            )
-            raise
-        self._record_dependency_readiness("translation_lm", "ready")
-        self._set_lm_gate(
-            "ready",
-            f"번역 서버가 준비되었습니다: {servers.lm_model}",
-        )
-
-        retried = 0
-        for job_id in self.store.ids_with_status("blocked"):
-            job = self.store.get(job_id)
-            if (
-                job is None
-                or job.blocked_stage != "translation"
-                or job.state == JobState.STOPPED
-            ):
-                continue
-            try:
-                self.retry(job.id)
-            except ValueError:
-                continue
-            retried += 1
-        return retried
-
-    def deactivate_translation_lm(self) -> None:
-        """Close the gate without making any network request."""
-        self._set_lm_gate(
-            "offline",
-            "번역 서버 사용이 중지되었습니다. 새 번역을 시작하지 않습니다.",
-            reason_code="manual_stop",
-        )
 
     def active_prompt_categories(self) -> list[PromptCategory]:
         return self.store.list_prompt_categories()
@@ -952,6 +862,16 @@ class SubtitleOrchestrator:
         persist: bool,
     ) -> RemoteServerSettings:
         normalized = settings.normalized()
+        previous = self.remote_servers
+        translation_settings_changed = (
+            normalized.lm_base_url,
+            normalized.lm_token,
+            normalized.lm_model,
+        ) != (
+            previous.lm_base_url,
+            previous.lm_token,
+            previous.lm_model,
+        )
         stt_client = STTAPIClient(
             normalized.stt_base_url,
             normalized.stt_token,
@@ -984,20 +904,8 @@ class SubtitleOrchestrator:
                 "unknown",
                 "연결 확인이 필요합니다.",
             )
-        if persist:
-            self._set_lm_gate(
-                "offline" if self.settings.lm_manual_start else "ready",
-                (
-                    "설정을 저장했습니다. 번역 시작/재개를 눌러 연결을 확인하세요."
-                    if self.settings.lm_manual_start
-                    else "번역 서버 자동 시작 모드입니다."
-                ),
-                reason_code=(
-                    "configuration_changed"
-                    if self.settings.lm_manual_start
-                    else None
-                ),
-            )
+        if persist and translation_settings_changed:
+            self._set_translation_circuit("ready")
         return normalized
 
     def start(self) -> None:
@@ -2308,6 +2216,8 @@ class SubtitleOrchestrator:
                 )
             )
         self.store.update(job.id, **retry_fields)
+        if job.phase == "translation" or job.blocked_stage == "translation":
+            self._set_translation_circuit("ready")
         if chunk_adjusted:
             self.store.add_event(
                 job.id,
@@ -2984,7 +2894,7 @@ class SubtitleOrchestrator:
         self._dispatch_translations()
 
     def _dispatch_translations(self) -> int:
-        if self.settings.lm_manual_start and self.lm_gate_state != "ready":
+        if self.translation_circuit_state != "ready":
             return 0
         if self.store.ids_with_status("translation_running"):
             return 0
@@ -3193,11 +3103,11 @@ class SubtitleOrchestrator:
                     message,
                     reason_code=JobReason.STT_UNAVAILABLE.value,
                 )
-            if stage == "translation" and self.settings.lm_manual_start:
-                self._set_lm_gate(
+            if stage == "translation":
+                self._set_translation_circuit(
                     "lost",
-                    message,
                     reason_code=JobReason.LM_UNAVAILABLE.value,
+                    error=message,
                 )
             self.store.add_event(
                 job_id,

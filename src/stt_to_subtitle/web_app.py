@@ -3298,11 +3298,8 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         prompt_saved: bool = False,
         path_saved: bool = False,
         stt_started: bool = False,
-        lm_started: bool = False,
-        lm_stopped: bool = False,
         validator_saved: bool = False,
         stt_resumed: int = 0,
-        resumed: int = 0,
         artifact_audit: bool = False,
         artifact_cleanup_run: bool = False,
         artifact_cleaned: int = 0,
@@ -3331,12 +3328,6 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             page_notice = "전사 서버 연결을 확인했습니다."
             if stt_resumed:
                 page_notice += f" 중단 작업 {stt_resumed}건을 재개했습니다."
-        elif lm_started:
-            page_notice = "번역 서버 연결을 확인했습니다."
-            if resumed:
-                page_notice += f" 중단 작업 {resumed}건을 재개했습니다."
-        elif lm_stopped:
-            page_notice = "번역 서버 사용을 중지했습니다."
         elif saved:
             page_notice = "서버 설정을 저장했습니다."
         elif validator_saved:
@@ -3432,42 +3423,6 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             status_code=status.HTTP_303_SEE_OTHER,
         )
 
-    @app.post("/settings/translation/start", response_class=HTMLResponse)
-    def start_translation_lm(
-        request: Request,
-        csrf_token: str = Form(""),
-    ) -> Any:
-        if not is_authenticated(request):
-            return login_redirect()
-        validate_csrf(request, csrf_token)
-        try:
-            resumed = orchestrator(request).activate_translation_lm()
-        except (ValueError, ExternalServiceError) as error:
-            return TEMPLATES.TemplateResponse(
-                request,
-                "settings.html",
-                settings_context(request, error=str(error)),
-                status_code=status.HTTP_400_BAD_REQUEST,
-            )
-        return RedirectResponse(
-            f"/settings?lm_started=true&resumed={resumed}",
-            status_code=status.HTTP_303_SEE_OTHER,
-        )
-
-    @app.post("/settings/translation/stop")
-    def stop_translation_lm(
-        request: Request,
-        csrf_token: str = Form(""),
-    ) -> Any:
-        if not is_authenticated(request):
-            return login_redirect()
-        validate_csrf(request, csrf_token)
-        orchestrator(request).deactivate_translation_lm()
-        return RedirectResponse(
-            "/settings?lm_stopped=true",
-            status_code=status.HTTP_303_SEE_OTHER,
-        )
-
     @app.post("/settings/translation-models")
     def translation_models(
         request: Request,
@@ -3498,10 +3453,19 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                 token,
                 request_observer=orchestrator(request).record_external_request,
             )
-        except (ValueError, ExternalServiceError) as error:
+        except ValueError as error:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=str(error),
+            ) from error
+        except ExternalServiceError as error:
+            LOGGER.warning(
+                "translation model lookup failed: %s",
+                orchestrator(request).sanitize_external_error(str(error)),
+            )
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="번역 서버에서 모델 목록을 조회할 수 없습니다.",
             ) from error
         return {"models": models}
 

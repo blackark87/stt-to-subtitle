@@ -91,35 +91,6 @@
           </p>
         </div>
       </div>
-      {% if remote_servers.lm_manual_start %}
-        <div class="notice">
-          <strong>
-            {% if remote_servers.lm_gate_state == "ready" %}사용 중
-            {% elif remote_servers.lm_gate_state == "checking" %}연결 확인 중
-            {% elif remote_servers.lm_gate_state == "lost" %}연결 끊김
-            {% else %}사용 중지{% endif %}
-          </strong>
-          <span>{{ remote_servers.lm_gate_message }}</span>
-          <div class="submit-row">
-            {% if remote_servers.lm_gate_state != "ready" %}
-              <button
-                type="submit"
-                formaction="/settings/translation/start"
-                formmethod="post"
-                formnovalidate
-              >번역 시작/재개</button>
-            {% else %}
-              <button
-                type="submit"
-                class="secondary"
-                formaction="/settings/translation/stop"
-                formmethod="post"
-                formnovalidate
-              >번역 서버 사용 중지</button>
-            {% endif %}
-          </div>
-        </div>
-      {% endif %}
       <label>OpenAI 호환 API 주소
         <input
           name="lm_base_url"

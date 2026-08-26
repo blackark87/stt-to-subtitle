@@ -78,15 +78,12 @@ document.addEventListener("DOMContentLoaded", () => {
           : "서버가 조회 가능한 모델을 반환하지 않았습니다.",
         models.length === 0
       );
-    } catch (error) {
-      showStatus(`모델 조회 실패: ${error.message}`, true);
+    } catch (_error) {
+      showStatus("모델 목록을 조회할 수 없습니다.", true);
     } finally {
       refresh.disabled = false;
     }
   };
 
   refresh.addEventListener("click", loadModels);
-  if (baseURL.value.trim()) {
-    loadModels();
-  }
 });

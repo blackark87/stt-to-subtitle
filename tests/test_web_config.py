@@ -801,7 +801,6 @@ class WebSettingsTests(unittest.TestCase):
             Path("/var/lib/stt"),
         )
         self.assertEqual(settings.jobs_dir, Path("/var/lib/stt/jobs"))
-        self.assertTrue(settings.lm_manual_start)
 
     def test_reads_a_separate_web_work_directory(self) -> None:
         with patch.dict(

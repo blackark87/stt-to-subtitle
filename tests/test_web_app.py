@@ -21,6 +21,7 @@ from stt_to_subtitle.web_config import WebSettings
 from stt_to_subtitle.files import sha256_file
 from stt_to_subtitle.gpu_monitoring import GpuDevice, GpuSnapshot
 from stt_to_subtitle.job_state import structured_state_from_legacy
+from stt_to_subtitle.service_clients import ExternalServiceError
 
 if WEB_TESTS_AVAILABLE:
     from stt_to_subtitle.web_app import (
@@ -1552,51 +1553,38 @@ class WebAppTests(unittest.TestCase):
             self.assertIn("상용 LLM 검증 설정을 저장했습니다.", refreshed.text)
             self.assertNotIn("paid-secret", refreshed.text)
 
-    def test_translation_manual_gate_starts_and_stops_explicitly(self) -> None:
+    def test_translation_settings_hide_runtime_controls_and_errors(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
             media_root = root / "media"
             media_root.mkdir()
-            settings = replace(
-                self.settings(root, media_root),
-                lm_manual_start=True,
-            )
-
-            with patch(
-                "stt_to_subtitle.orchestrator.list_openai_compatible_models",
-                return_value=["model"],
-            ) as models, TestClient(create_app(settings)) as client:
+            with TestClient(
+                create_app(self.settings(root, media_root))
+            ) as client:
+                service = client.app.state.orchestrator
+                service._set_translation_circuit(
+                    "lost",
+                    reason_code="lm_unavailable",
+                    error="translation-server-internal-error",
+                )
                 page = client.get("/settings")
                 started = client.post(
                     "/settings/translation/start",
                     follow_redirects=False,
                 )
-                service = client.app.state.orchestrator
-                ready_state = service.lm_gate_state
                 stopped = client.post(
                     "/settings/translation/stop",
                     follow_redirects=False,
                 )
-                persisted_gate = service.store.get_dependency_state(
-                    "translation_lm"
-                )
 
-            self.assertIn("번역 시작/재개", page.text)
-            self.assertEqual(started.status_code, 303)
-            self.assertEqual(ready_state, "ready")
-            self.assertEqual(stopped.status_code, 303)
-            self.assertEqual(service.lm_gate_state, "offline")
-            self.assertEqual(persisted_gate["state"], "offline")
-            self.assertEqual(persisted_gate["reason_code"], "manual_stop")
-            models.assert_called_once()
-            self.assertEqual(
-                models.call_args.args,
-                ("http://lm.test/v1", ""),
-            )
-            self.assertEqual(models.call_args.kwargs["attempts"], 1)
-            self.assertTrue(
-                callable(models.call_args.kwargs["request_observer"])
-            )
+            self.assertIn("<h2>번역 서버</h2>", page.text)
+            self.assertIn('name="lm_base_url"', page.text)
+            self.assertIn('name="lm_model"', page.text)
+            self.assertNotIn("번역 시작/재개", page.text)
+            self.assertNotIn("번역 서버 사용 중지", page.text)
+            self.assertNotIn("translation-server-internal-error", page.text)
+            self.assertEqual(started.status_code, 404)
+            self.assertEqual(stopped.status_code, 404)
 
     def test_transcription_gate_requires_explicit_readiness_after_loss(
         self,
@@ -1934,27 +1922,52 @@ class WebAppTests(unittest.TestCase):
                         "lm_token": "lookup-token",
                     },
                 )
+                script = client.get("/static/server-settings.js")
+                list_models.side_effect = ExternalServiceError(
+                    "translation-server-internal-error"
+                )
+                failed = client.post(
+                    "/settings/translation-models",
+                    data={
+                        "lm_base_url": "http://translation.test:1234/v1/",
+                        "lm_token": "lookup-token",
+                    },
+                )
 
             self.assertEqual(response.status_code, 200)
             self.assertEqual(
                 response.json(),
                 {"models": ["model-a", "model-b"]},
             )
-            list_models.assert_called_once()
+            self.assertEqual(list_models.call_count, 2)
             self.assertEqual(
-                list_models.call_args.args,
+                list_models.call_args_list[0].args,
                 (
                     "http://translation.test:1234/v1",
                     "lookup-token",
                 ),
             )
             self.assertTrue(
-                callable(list_models.call_args.kwargs["request_observer"])
+                callable(
+                    list_models.call_args_list[0].kwargs["request_observer"]
+                )
+            )
+            self.assertEqual(failed.status_code, 502)
+            self.assertEqual(
+                failed.json()["detail"],
+                "번역 서버에서 모델 목록을 조회할 수 없습니다.",
+            )
+            self.assertNotIn(
+                "translation-server-internal-error",
+                failed.text,
             )
             self.assertIn("OpenAI 호환 API 주소", page.text)
             self.assertIn('name="lm_model"', page.text)
             self.assertIn("모델 조회", page.text)
             self.assertIn("server-settings.js", page.text)
+            self.assertNotIn("error.message", script.text)
+            self.assertNotIn("loadModels();", script.text)
+            self.assertIn("모델 목록을 조회할 수 없습니다.", script.text)
 
     def test_main_trusts_the_configured_reverse_proxy(self) -> None:
         with patch.dict(

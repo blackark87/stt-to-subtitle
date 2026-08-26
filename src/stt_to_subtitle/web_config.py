@@ -357,7 +357,6 @@ class WebSettings:
     translation_batch_characters: int = 6000
     audio_workers: int = 1
     work_dir: Path | None = None
-    lm_manual_start: bool = False
 
     @classmethod
     def from_env(cls) -> WebSettings:
@@ -414,7 +413,6 @@ class WebSettings:
                 os.environ.get("TRANSLATION_BATCH_CHARACTERS", "6000")
             ),
             audio_workers=int(os.environ.get("WEB_AUDIO_WORKERS", "1")),
-            lm_manual_start=_env_bool("LM_MANUAL_START", True),
         )
 
     @property
