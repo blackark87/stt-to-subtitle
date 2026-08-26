@@ -24,7 +24,7 @@
 | STT 실패 계약 | STT DB·API의 `failure_code/retryable/failure_scope`, segment/schema·OOM·인증·입력·처리·재시작 오류 분류, retryable 실패만 원격 재제출 | 실제 backend별 fault test·오류 코드 운영 지표 |
 | STT dispatch gate | 첫 연결 실패 시 영속 gate 차단, 뒤 작업 `audio_ready` 유지, 명시적 연결 확인의 제한된 3회 요청 후 중단 작업 재개 | 자동 recovery mode가 실제로 필요한지 운영 검증·회로 메트릭 |
 | 이벤트·관측성 | 구조화 전이 이벤트, 단계 대기·처리 시간, 외부 API attempt별 결과·소요 시간, dependency readiness·gate 전이, STT 큐와 원격 실행·취소 수, artifact 감사·정리, startup reconcile, lease fencing 거부, 번역 checkpoint와 자막 검증 결과를 SQLite에 누적하고 JSON·Prometheus text로 제공 | lease 복구·중복 실행 방지 세부 counter |
-| DB 무결성 | 외래키 활성화, 레거시 dangling 참조 정리, 상태 projection/domain·원장 소유 관계 guard, 공유 WAV 참조 보존, 순번·이름 ledger와 migration별 savepoint rollback, 레거시 ledger sequence backfill, quick/FK/migration 운영 지표, 원본 무변경 SQLite backup dry-run CLI | 실제 운영 DB 사본으로 배포 전 실행 |
+| DB 무결성 | 외래키 활성화, 레거시 dangling 참조 정리, 상태 projection/domain·원장 소유 관계 guard, 공유 WAV 참조 보존, 순번·이름 ledger와 migration별 savepoint rollback, 레거시 ledger sequence backfill, quick/FK/migration 운영 지표, 원본 무변경 SQLite backup dry-run CLI와 실제 JobStore 검증 | - |
 
 이하의 문제 분석은 최초 분석 시점 구조를 기준으로 하되, 구현이 끝난 절은 현재
 동작과 남은 범위로 갱신했다.
@@ -625,6 +625,8 @@ jobs(
 
 `stt-check-migrations <jobs.sqlite3>`는 SQLite backup API로 WAL을 포함한 일관된 임시 사본을 만든 뒤 동일한 JobStore 초기화와 quick/FK/migration 검사를 실행한다. 출력은 새로 적용된 migration과 sequence backfill, 무결성 요약만 포함하고 원본 DB·WAL을 변경하거나 원본 경로·서버 설정·credential을 출력하지 않는다.
 
+2026-08-26 실제 JobStore를 대상으로 한 backup dry-run에서는 원본 quick check가 통과했고, 임시 사본에 누락 migration 3개 적용과 기존 marker 2개의 sequence backfill을 수행한 뒤 quick check 통과·FK 위반 0건·미지정 sequence 0건을 확인했다.
+
 단일 웹 인스턴스에서는 SQLite를 유지할 수 있다. 다중 웹 스케줄러를 실제로 운영해야 할 때 lease 경쟁, 알림 지연, 쓰기 경합을 측정한 뒤 PostgreSQL이나 브로커 전환을 판단한다.
 
 현재 `jobs.lease_owner/lease_expires_at/lease_token`과 `(status, lease_expires_at)` 인덱스를 추가했다. dispatch와 startup recovery는 조건부 갱신으로 lease를 claim하면서 token을 증가시키고, 실행 중 heartbeat와 단계 상태 반영은 `owner + token`이 모두 일치할 때만 성공한다. 자막 게시는 프로세스 간 파일 잠금 안에서 lease를 재검증하고 DB 게시도 같은 token으로 확정해 구 worker의 늦은 게시를 차단한다. 종료 시 scheduler와 신규 Future를 닫은 뒤 실행 Future를 제한 시간 동안 drain하며, 완료되지 않은 작업은 lease 만료 후 시작 복구가 회수한다. 별도 worker 프로세스를 SIGKILL한 테스트에서도 만료 뒤 새 token으로 회수됨을 검증했다.
@@ -854,6 +856,6 @@ src/stt_to_subtitle/
 
 ## 20. 최종 권고
 
-명시적 상태 모델과 공통 projection, 번역 LLM·STT dispatch gate, worker lease·fencing·graceful drain 및 번역 attempt reconcile 기반 단계별 재시작 복구, 비교·선택 가능한 immutable prompt revision, 세그먼트 ID 기반 translation generation 비교, 선택·재사용 가능한 immutable audio/transcript revision, 참조 기반 artifact 보존·수동 orphan 정리, 최초·재게시 cutpoint를 포함한 자막 pair manifest reconcile, backend별 STT 취소·실패 계약, 구조화 전이 이벤트, 외부 요청·dependency gate·원격 STT 큐·artifact/startup reconcile·lease fencing·checkpoint·자막 검증 영속 measurement, JSON·Prometheus 운영 스냅샷, 순번형 migration runner와 원본 무변경 dry-run, SQLite 외래키·상태 projection·원장 소유 관계 guard는 반영됐다. 다음 검증 단위는 실제 운영 DB 사본 dry-run과 파일시스템·GPU worker fault test다. 자동 회복은 상시 가동 의존성에만 선택적으로 적용한다.
+명시적 상태 모델과 공통 projection, 번역 LLM·STT dispatch gate, worker lease·fencing·graceful drain 및 번역 attempt reconcile 기반 단계별 재시작 복구, 비교·선택 가능한 immutable prompt revision, 세그먼트 ID 기반 translation generation 비교, 선택·재사용 가능한 immutable audio/transcript revision, 참조 기반 artifact 보존·수동 orphan 정리, 최초·재게시 cutpoint를 포함한 자막 pair manifest reconcile, backend별 STT 취소·실패 계약, 구조화 전이 이벤트, 외부 요청·dependency gate·원격 STT 큐·artifact/startup reconcile·lease fencing·checkpoint·자막 검증 영속 measurement, JSON·Prometheus 운영 스냅샷, 순번형 migration runner와 실제 JobStore 원본 무변경 dry-run, SQLite 외래키·상태 projection·원장 소유 관계 guard는 반영됐다. 남은 검증 단위는 실제 파일시스템·GPU worker fault test다. 자동 회복은 상시 가동 의존성에만 선택적으로 적용한다.
 
 동시에 transcript revision, translation generation/batch/item, external/generated subtitle asset, publication, validation을 영속 모델로 추가해야 한다. 그래야 프롬프트 수정 재번역, 부분 번역 재개, 외부 자막 재생·비교, 선택적 상용 LLM 평가, 자막 게시·rollback, WAV·전사본 재사용을 데이터 손실 없이 반복할 수 있다. 내부망 무인증 운영은 그대로 유지하고 인증보다 실행·파일·참조 무결성에 구현 역량을 집중한다.
