@@ -87,6 +87,31 @@ class InvalidTranscriptionOutput(RuntimeError):
     """A backend returned data that violates the transcript contract."""
 
 
+_RESOURCE_EXHAUSTION_MARKERS = (
+    "cuda out of memory",
+    "mps backend out of memory",
+    "cublas_status_alloc_failed",
+    "cudaerrorinvaliddevice",
+    "parallel_for failed",
+    "cannot allocate memory",
+    "outofmemoryerror",
+)
+
+
+def _classify_transcription_failure(
+    error: BaseException,
+) -> tuple[str, bool, str]:
+    """Return failure code, retryability, and the smallest affected scope."""
+    normalized = (
+        f"{error.__class__.__name__}: {error}"
+    ).casefold()
+    if isinstance(error, MemoryError) or any(
+        marker in normalized for marker in _RESOURCE_EXHAUSTION_MARKERS
+    ):
+        return "resource_exhausted", False, "backend"
+    return "transcription_processing_error", False, "job"
+
+
 class TranscriptionChangeHook:
     """Bridge transcription-store changes from worker threads to SSE clients."""
 
@@ -1909,6 +1934,8 @@ class TranscriptionService:
                 status="failed",
                 error=message[:2000] or error.__class__.__name__,
                 failure_code="model_output_invalid",
+                retryable=False,
+                failure_scope="job",
             )
             LOGGER.exception("transcription job %s returned invalid output", job.id)
         except BaseException as error:
@@ -1916,12 +1943,17 @@ class TranscriptionService:
             if self.store.mark_cancelled(job.id):
                 LOGGER.info("transcription job %s cancelled", job.id)
             else:
+                failure_code, retryable, failure_scope = (
+                    _classify_transcription_failure(error)
+                )
                 self.store.update_if_status(
                     job.id,
                     {"running"},
                     status="failed",
                     error=message[:2000] or error.__class__.__name__,
-                    failure_code="internal_error",
+                    failure_code=failure_code,
+                    retryable=retryable,
+                    failure_scope=failure_scope,
                 )
                 LOGGER.exception("transcription job %s failed", job.id)
         finally:

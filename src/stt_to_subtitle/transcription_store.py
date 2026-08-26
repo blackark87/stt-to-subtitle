@@ -32,6 +32,8 @@ class TranscriptionJob:
     cancel_requested_at: float | None = None
     cancelled_at: float | None = None
     failure_code: str | None = None
+    retryable: bool | None = None
+    failure_scope: str | None = None
 
     def public_dict(self, *, report_every: int = 10) -> dict[str, Any]:
         in_progress = max(0, self.chunks_created - self.chunks_completed)
@@ -52,6 +54,8 @@ class TranscriptionJob:
                 else None
             ),
             "failure_code": self.failure_code,
+            "retryable": self.retryable,
+            "failure_scope": self.failure_scope,
             "chunk_progress": {
                 "created": self.chunks_created,
                 "completed": self.chunks_completed,
@@ -145,6 +149,8 @@ class TranscriptionStore:
                     cancel_requested_at REAL,
                     cancelled_at REAL,
                     failure_code TEXT,
+                    retryable INTEGER,
+                    failure_scope TEXT,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL
                 )
@@ -198,6 +204,20 @@ class TranscriptionStore:
                     ADD COLUMN failure_code TEXT
                     """
                 )
+            if "retryable" not in columns:
+                connection.execute(
+                    """
+                    ALTER TABLE transcription_jobs
+                    ADD COLUMN retryable INTEGER
+                    """
+                )
+            if "failure_scope" not in columns:
+                connection.execute(
+                    """
+                    ALTER TABLE transcription_jobs
+                    ADD COLUMN failure_scope TEXT
+                    """
+                )
 
     @staticmethod
     def _from_row(row: sqlite3.Row | None) -> TranscriptionJob | None:
@@ -232,6 +252,16 @@ class TranscriptionStore:
             failure_code=(
                 str(row["failure_code"])
                 if row["failure_code"] is not None
+                else None
+            ),
+            retryable=(
+                bool(row["retryable"])
+                if row["retryable"] is not None
+                else None
+            ),
+            failure_scope=(
+                str(row["failure_scope"])
+                if row["failure_scope"] is not None
                 else None
             ),
         )
@@ -308,13 +338,16 @@ class TranscriptionStore:
         result_path: Path | None = None,
         error: str | None = None,
         failure_code: str | None = None,
+        retryable: bool | None = None,
+        failure_scope: str | None = None,
     ) -> None:
         with self._connect() as connection:
             result = connection.execute(
                 """
                 UPDATE transcription_jobs
                 SET status = ?, result_path = COALESCE(?, result_path),
-                    error = ?, failure_code = ?, updated_at = ?
+                    error = ?, failure_code = ?, retryable = ?,
+                    failure_scope = ?, updated_at = ?
                 WHERE id = ?
                 """,
                 (
@@ -322,6 +355,8 @@ class TranscriptionStore:
                     str(result_path) if result_path is not None else None,
                     error,
                     failure_code,
+                    int(retryable) if retryable is not None else None,
+                    failure_scope,
                     time.time(),
                     job_id,
                 ),
@@ -338,6 +373,8 @@ class TranscriptionStore:
         result_path: Path | None = None,
         error: str | None = None,
         failure_code: str | None = None,
+        retryable: bool | None = None,
+        failure_scope: str | None = None,
     ) -> bool:
         if not expected_statuses:
             return False
@@ -347,6 +384,8 @@ class TranscriptionStore:
             str(result_path) if result_path is not None else None,
             error,
             failure_code,
+            int(retryable) if retryable is not None else None,
+            failure_scope,
             time.time(),
             job_id,
             *sorted(expected_statuses),
@@ -356,7 +395,8 @@ class TranscriptionStore:
                 f"""
                 UPDATE transcription_jobs
                 SET status = ?, result_path = COALESCE(?, result_path),
-                    error = ?, failure_code = ?, updated_at = ?
+                    error = ?, failure_code = ?, retryable = ?,
+                    failure_scope = ?, updated_at = ?
                 WHERE id = ? AND status IN ({placeholders})
                 """,
                 parameters,
@@ -383,6 +423,7 @@ class TranscriptionStore:
                     UPDATE transcription_jobs
                     SET status = 'cancelled', cancel_requested_at = ?,
                         cancelled_at = ?, error = NULL, failure_code = NULL,
+                        retryable = NULL, failure_scope = NULL,
                         updated_at = ?
                     WHERE id = ? AND status = 'queued'
                     """,
@@ -393,7 +434,8 @@ class TranscriptionStore:
                     """
                     UPDATE transcription_jobs
                     SET status = 'cancel_requested', cancel_requested_at = ?,
-                        error = NULL, failure_code = NULL, updated_at = ?
+                        error = NULL, failure_code = NULL, retryable = NULL,
+                        failure_scope = NULL, updated_at = ?
                     WHERE id = ? AND status = 'running'
                     """,
                     (now, now, job_id),
@@ -413,6 +455,7 @@ class TranscriptionStore:
                 SET status = 'cancelled',
                     cancel_requested_at = COALESCE(cancel_requested_at, ?),
                     cancelled_at = ?, error = NULL, failure_code = NULL,
+                    retryable = NULL, failure_scope = NULL,
                     updated_at = ?
                 WHERE id = ?
                   AND status = 'cancel_requested'
@@ -442,6 +485,7 @@ class TranscriptionStore:
                 f"""
                 UPDATE transcription_jobs
                 SET status = 'queued', error = NULL, failure_code = NULL,
+                    retryable = NULL, failure_scope = NULL,
                     chunks_created = 0, chunks_completed = 0,
                     attempt = attempt + 1,
                     cancel_requested_at = NULL, cancelled_at = NULL,
@@ -490,6 +534,14 @@ class TranscriptionStore:
                     failure_code = CASE
                         WHEN status = 'cancel_requested' THEN NULL
                         ELSE 'service_restarted'
+                    END,
+                    retryable = CASE
+                        WHEN status = 'cancel_requested' THEN NULL
+                        ELSE 1
+                    END,
+                    failure_scope = CASE
+                        WHEN status = 'cancel_requested' THEN NULL
+                        ELSE 'service'
                     END,
                     cancelled_at = CASE
                         WHEN status = 'cancel_requested' THEN ?

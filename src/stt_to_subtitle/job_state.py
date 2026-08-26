@@ -37,6 +37,8 @@ class JobReason(StrEnum):
     MODEL_OUTPUT_INVALID = "model_output_invalid"
     INVALID_INPUT = "invalid_input"
     AUTH_REQUIRED = "auth_required"
+    RESOURCE_EXHAUSTED = "resource_exhausted"
+    TRANSCRIPTION_PROCESSING_ERROR = "transcription_processing_error"
     INTERNAL_ERROR = "internal_error"
 
 

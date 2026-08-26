@@ -18,6 +18,17 @@ from .contracts import validate_transcript, validate_translation_items
 from .translation_prompt import KOREAN_JAV_SYSTEM_PROMPT
 
 LOGGER = logging.getLogger(__name__)
+TRANSCRIPTION_FAILURE_SCOPES = frozenset(
+    {"job", "backend", "service", "configuration"}
+)
+
+
+def _optional_bool(value: Any) -> bool | None:
+    return value if isinstance(value, bool) else None
+
+
+def _optional_failure_scope(value: Any) -> str | None:
+    return value if value in TRANSCRIPTION_FAILURE_SCOPES else None
 
 
 class ExternalServiceError(RuntimeError):
@@ -31,9 +42,18 @@ class RemoteTranscriptionNotFound(ExternalServiceError):
 class RemoteTranscriptionFailed(RuntimeError):
     """The remote worker completed with a non-recoverable job failure."""
 
-    def __init__(self, message: str, *, failure_code: str | None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        failure_code: str | None,
+        retryable: bool | None = None,
+        failure_scope: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.failure_code = failure_code
+        self.retryable = retryable
+        self.failure_scope = failure_scope
 
 
 class TranslationResponseIDError(ExternalServiceError):
@@ -250,17 +270,32 @@ class STTAPIClient(RetryingJSONClient):
                     continue
                 raise OperationStopped("remote transcription was cancelled")
             if remote_status == "failed":
-                if may_requeue_existing:
+                failure_code = (
+                    str(status_payload["failure_code"])
+                    if status_payload.get("failure_code") is not None
+                    else None
+                )
+                retryable = _optional_bool(status_payload.get("retryable"))
+                if (
+                    may_requeue_existing
+                    and (
+                        retryable is True
+                        or (
+                            retryable is None
+                            and failure_code == "service_restarted"
+                        )
+                    )
+                ):
                     may_requeue_existing = False
                     job_id = None
                     continue
                 raise RemoteTranscriptionFailed(
                     "transcription job failed: "
                     f"{status_payload.get('error', 'unknown remote error')}",
-                    failure_code=(
-                        str(status_payload["failure_code"])
-                        if status_payload.get("failure_code") is not None
-                        else None
+                    failure_code=failure_code,
+                    retryable=retryable,
+                    failure_scope=_optional_failure_scope(
+                        status_payload.get("failure_scope")
                     ),
                 )
 
@@ -270,6 +305,13 @@ class STTAPIClient(RetryingJSONClient):
             headers=self.headers,
         )
         if response.status_code != 200:
+            if response.status_code in {401, 403}:
+                raise RemoteTranscriptionFailed(
+                    "transcription API authentication failed",
+                    failure_code="auth_required",
+                    retryable=False,
+                    failure_scope="configuration",
+                )
             raise ExternalServiceError(
                 "transcription result request failed: "
                 f"HTTP {response.status_code}: {_safe_error(response)}"
@@ -286,6 +328,8 @@ class STTAPIClient(RetryingJSONClient):
             raise RemoteTranscriptionFailed(
                 "transcription API returned an invalid transcript",
                 failure_code="model_output_invalid",
+                retryable=False,
+                failure_scope="job",
             ) from error
         return payload
 
@@ -426,6 +470,13 @@ class STTAPIClient(RetryingJSONClient):
                     raise RemoteTranscriptionNotFound(
                         "remote transcription job was not found"
                     )
+                if response.status_code in {401, 403}:
+                    raise RemoteTranscriptionFailed(
+                        "transcription API authentication failed",
+                        failure_code="auth_required",
+                        retryable=False,
+                        failure_scope="configuration",
+                    )
                 raise ExternalServiceError(
                     "transcription status request failed: "
                     f"HTTP {response.status_code}: {detail}"
@@ -549,6 +600,21 @@ class STTAPIClient(RetryingJSONClient):
                 f"{self.attempts} upload attempts: {last_error}"
             ) from last_error
         if response.status_code != 202:
+            if response.status_code in {400, 413, 422}:
+                raise RemoteTranscriptionFailed(
+                    "transcription request was rejected: "
+                    f"HTTP {response.status_code}: {_safe_error(response)}",
+                    failure_code="invalid_input",
+                    retryable=False,
+                    failure_scope="job",
+                )
+            if response.status_code in {401, 403}:
+                raise RemoteTranscriptionFailed(
+                    "transcription API authentication failed",
+                    failure_code="auth_required",
+                    retryable=False,
+                    failure_scope="configuration",
+                )
             raise ExternalServiceError(
                 "transcription submission failed: "
                 f"HTTP {response.status_code}: {_safe_error(response)}"

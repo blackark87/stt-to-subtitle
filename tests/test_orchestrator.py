@@ -1100,6 +1100,47 @@ class SubtitleOrchestratorTests(unittest.TestCase):
             self.assertEqual(failed.reason_code, "model_output_invalid")
             self.assertEqual(failed.blocked_stage, "transcription")
 
+    def test_remote_transcription_auth_error_blocks_configuration(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            orchestrator = self.make_orchestrator(root, media_root)
+            try:
+                job = orchestrator.store.create(
+                    job_id="stt-auth-error",
+                    source_rel="movie.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                orchestrator.store.update(
+                    job.id,
+                    status="transcription_running",
+                )
+
+                orchestrator._run_stage(
+                    job.id,
+                    "transcription",
+                    Mock(
+                        side_effect=RemoteTranscriptionFailed(
+                            "authentication failed",
+                            failure_code="auth_required",
+                            retryable=False,
+                            failure_scope="configuration",
+                        )
+                    ),
+                )
+                blocked = orchestrator.store.get(job.id)
+                gate = orchestrator.store.get_dependency_state("stt")
+            finally:
+                orchestrator.stop()
+
+            self.assertEqual(blocked.status, "blocked")
+            self.assertEqual(blocked.state, "blocked")
+            self.assertEqual(blocked.reason_code, "auth_required")
+            self.assertEqual(orchestrator.stt_gate_state, "lost")
+            self.assertEqual(gate["reason_code"], "auth_required")
+
     def test_translation_persists_a_failed_logical_batch(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)

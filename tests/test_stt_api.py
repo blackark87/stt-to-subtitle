@@ -79,10 +79,54 @@ class STTAPIHelpersTests(unittest.TestCase):
             failed = service.store.get("invalid-output")
             self.assertEqual(failed.status, "failed")
             self.assertEqual(failed.failure_code, "model_output_invalid")
+            self.assertFalse(failed.retryable)
+            self.assertEqual(failed.failure_scope, "job")
             self.assertEqual(
                 failed.public_dict()["failure_code"],
                 "model_output_invalid",
             )
+            self.assertFalse(failed.public_dict()["retryable"])
+            self.assertEqual(failed.public_dict()["failure_scope"], "job")
+
+    def test_exhausted_backend_resource_has_structured_failure_scope(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            audio_path = root / "audio.wav"
+            with wave.open(str(audio_path), "wb") as wav_file:
+                wav_file.setnchannels(1)
+                wav_file.setsampwidth(2)
+                wav_file.setframerate(16000)
+                wav_file.writeframes(b"\x00\x00" * 16000)
+            settings = STTAPISettings(
+                state_dir=root / "state",
+                api_token="",
+                hf_token="hf-token",
+                device="cpu",
+                diarization_device="cpu",
+            )
+            service = TranscriptionService(settings)
+            service.store.create(
+                job_id="oom",
+                idempotency_key="oom-key",
+                audio_path=audio_path,
+                audio_sha256="abc",
+                options=_parse_options("{}", settings),
+            )
+
+            with patch.object(service, "_get_pipeline", return_value=Mock()):
+                with patch(
+                    "stt_to_subtitle.stt_api.run_pipeline",
+                    side_effect=RuntimeError("CUDA out of memory"),
+                ):
+                    service._run_job("oom")
+
+            failed = service.store.get("oom")
+            self.assertEqual(failed.status, "failed")
+            self.assertEqual(failed.failure_code, "resource_exhausted")
+            self.assertFalse(failed.retryable)
+            self.assertEqual(failed.failure_scope, "backend")
 
     def test_service_uses_separate_work_storage_and_rebases_uploads(
         self,

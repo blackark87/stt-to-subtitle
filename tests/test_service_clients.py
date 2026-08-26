@@ -2,6 +2,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 import json
+from tempfile import TemporaryDirectory
 import threading
 import unittest
 from unittest.mock import Mock, patch
@@ -307,6 +308,8 @@ class STTAPIClientProgressTests(unittest.TestCase):
             {
                 "status": "failed",
                 "failure_code": "model_output_invalid",
+                "retryable": False,
+                "failure_scope": "job",
                 "error": "segments must be a list",
             }
         )
@@ -322,7 +325,106 @@ class STTAPIClientProgressTests(unittest.TestCase):
             )
 
         self.assertEqual(caught.exception.failure_code, "model_output_invalid")
+        self.assertFalse(caught.exception.retryable)
+        self.assertEqual(caught.exception.failure_scope, "job")
         self.assertIn("segments must be a list", str(caught.exception))
+
+    def test_does_not_resubmit_non_retryable_existing_failure(self) -> None:
+        failed = self.event_stream(
+            {
+                "status": "failed",
+                "failure_code": "model_output_invalid",
+                "retryable": False,
+                "failure_scope": "job",
+                "error": "segments must be a list",
+            }
+        )
+        client = STTAPIClient("http://stt.test", "")
+        client.request = Mock(return_value=failed)
+        client._submit = Mock(return_value="replacement-job")
+
+        with self.assertRaises(RemoteTranscriptionFailed):
+            client.transcribe(
+                Path("/not-read.wav"),
+                options={},
+                idempotency_key="key",
+                existing_job_id="failed-job",
+            )
+
+        client._submit.assert_not_called()
+
+    def test_resubmits_retryable_existing_service_failure(self) -> None:
+        failed = self.event_stream(
+            {
+                "status": "failed",
+                "failure_code": "service_restarted",
+                "retryable": True,
+                "failure_scope": "service",
+                "error": "service restarted",
+            }
+        )
+        completed = self.event_stream({"status": "completed"})
+        result = Mock(status_code=200)
+        result.json.return_value = {
+            "schema_version": 1,
+            "job_id": "replacement-job",
+            "segments": [],
+        }
+        client = STTAPIClient("http://stt.test", "")
+        client.request = Mock(side_effect=[failed, completed, result])
+        client._submit = Mock(return_value="replacement-job")
+
+        payload = client.transcribe(
+            Path("/not-read.wav"),
+            options={},
+            idempotency_key="key",
+            existing_job_id="failed-job",
+        )
+
+        self.assertEqual(payload["job_id"], "replacement-job")
+        client._submit.assert_called_once()
+
+    def test_classifies_remote_authentication_failure(self) -> None:
+        unauthorized = Mock(status_code=401)
+        unauthorized.json.return_value = {"detail": "invalid bearer token"}
+        unauthorized.close = Mock()
+        client = STTAPIClient("http://stt.test", "wrong-token")
+        client.request = Mock(return_value=unauthorized)
+        client._submit = Mock(return_value="remote-job")
+
+        with self.assertRaises(RemoteTranscriptionFailed) as caught:
+            client.transcribe(
+                Path("/not-read.wav"),
+                options={},
+                idempotency_key="key",
+            )
+
+        self.assertEqual(caught.exception.failure_code, "auth_required")
+        self.assertFalse(caught.exception.retryable)
+        self.assertEqual(caught.exception.failure_scope, "configuration")
+
+    def test_classifies_rejected_transcription_input(self) -> None:
+        rejected = Mock(status_code=400)
+        rejected.json.return_value = {"detail": "invalid WAV header"}
+        client = STTAPIClient("http://stt.test", "")
+        with TemporaryDirectory() as directory:
+            audio_path = Path(directory) / "audio.wav"
+            audio_path.write_bytes(b"invalid")
+            with patch.object(
+                client.session,
+                "request",
+                return_value=rejected,
+            ):
+                with self.assertRaises(RemoteTranscriptionFailed) as caught:
+                    client._submit(
+                        audio_path,
+                        options={},
+                        idempotency_key="key",
+                    )
+
+        self.assertEqual(caught.exception.failure_code, "invalid_input")
+        self.assertFalse(caught.exception.retryable)
+        self.assertEqual(caught.exception.failure_scope, "job")
 
     def test_forwards_changed_chunk_progress_from_event_stream(self) -> None:
         events = self.event_stream(

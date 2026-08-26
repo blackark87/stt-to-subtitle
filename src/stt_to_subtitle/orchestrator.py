@@ -2485,19 +2485,47 @@ class SubtitleOrchestrator:
             reason_by_failure_code = {
                 "invalid_input": JobReason.INVALID_INPUT.value,
                 "model_output_invalid": JobReason.MODEL_OUTPUT_INVALID.value,
+                "auth_required": JobReason.AUTH_REQUIRED.value,
+                "resource_exhausted": JobReason.RESOURCE_EXHAUSTED.value,
+                "service_restarted": JobReason.SERVICE_RESTARTED.value,
+                "transcription_processing_error": (
+                    JobReason.TRANSCRIPTION_PROCESSING_ERROR.value
+                ),
             }
+            reason_code = reason_by_failure_code.get(
+                error.failure_code,
+                JobReason.INTERNAL_ERROR.value,
+            )
+            blocked = bool(error.retryable) or (
+                error.failure_code == "auth_required"
+            )
+            if error.failure_code == "auth_required":
+                self._set_stt_gate(
+                    "lost",
+                    message,
+                    reason_code=JobReason.AUTH_REQUIRED.value,
+                )
             self.store.update(
                 job_id,
-                status="failed",
+                status="blocked" if blocked else "failed",
                 blocked_stage=stage,
-                reason_code=reason_by_failure_code.get(
-                    error.failure_code,
-                    JobReason.INTERNAL_ERROR.value,
-                ),
+                reason_code=reason_code,
                 error=message,
             )
-            self.store.add_event(job_id, "error", f"{stage} failed: {message}")
-            LOGGER.error("job %s %s failed: %s", job_id, stage, message)
+            outcome = "blocked" if blocked else "failed"
+            level = "warning" if blocked else "error"
+            self.store.add_event(
+                job_id,
+                level,
+                f"{stage} {outcome}: {message}",
+            )
+            getattr(LOGGER, level)(
+                "job %s %s %s: %s",
+                job_id,
+                stage,
+                outcome,
+                message,
+            )
         except ExternalServiceError as error:
             message = self._sanitize_error(str(error))
             if stage == "transcription":

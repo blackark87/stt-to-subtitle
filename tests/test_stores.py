@@ -83,8 +83,12 @@ class TranscriptionStoreTests(unittest.TestCase):
             recovered = store.get("job-1")
             self.assertEqual(recovered.status, "failed")
             self.assertEqual(recovered.failure_code, "service_restarted")
+            self.assertTrue(recovered.retryable)
+            self.assertEqual(recovered.failure_scope, "service")
             public_job = recovered.public_dict()
             self.assertEqual(public_job["failure_code"], "service_restarted")
+            self.assertTrue(public_job["retryable"])
+            self.assertEqual(public_job["failure_scope"], "service")
             self.assertEqual(
                 public_job["chunk_progress"],
                 {
@@ -112,6 +116,14 @@ class TranscriptionStoreTests(unittest.TestCase):
                 created=100,
                 completed=90,
             )
+            store.update(
+                "job-1",
+                status="failed",
+                error="temporary failure",
+                failure_code="service_restarted",
+                retryable=True,
+                failure_scope="service",
+            )
 
             store.requeue(
                 "job-1",
@@ -123,6 +135,9 @@ class TranscriptionStoreTests(unittest.TestCase):
             self.assertEqual(job.chunks_completed, 0)
             self.assertEqual(job.attempt, 2)
             self.assertEqual(job.options["chunk_length_seconds"], 30)
+            self.assertIsNone(job.failure_code)
+            self.assertIsNone(job.retryable)
+            self.assertIsNone(job.failure_scope)
 
     def test_cancels_queued_job_immediately_and_running_job_cooperatively(
         self,
@@ -210,6 +225,8 @@ class TranscriptionStoreTests(unittest.TestCase):
             self.assertEqual(job.chunks_created, 0)
             self.assertEqual(job.chunks_completed, 0)
             self.assertEqual(job.attempt, 1)
+            self.assertIsNone(job.retryable)
+            self.assertIsNone(job.failure_scope)
 
 
 class JobStoreTests(unittest.TestCase):
