@@ -623,7 +623,7 @@ jobs(
 
 현재 순서는 `5 legacy_schema_columns_v1 → 10 structured_job_state_v1 → 20 referential_integrity_v1 → 30 default_path_display_rule_v1 → 40 correct_default_path_display_rule_v2`다. 기존 name-only ledger는 시작 시 알려진 migration의 sequence를 backfill하고 sequence 변경·중복을 거부한다. `referential_integrity_v1`은 존재하지 않는 WAV/전사 선택 포인터를 `NULL`로 되돌리고, job/generation/category가 없는 종속 event·validation·batch·item·publication 원장을 정리한다. 선택 가능한 FK는 산출물 hash 원장을 보존하도록 `NULL` 처리하며, 마이그레이션 뒤 `PRAGMA foreign_key_check`가 남으면 시작을 중단한다. 신규 쓰기는 trigger로 job revision 존재 여부, translation/subtitle generation의 같은 job 소유 관계, publication의 source/job/generation 일치를 검증한다. 작업 레코드 삭제 시 공유 WAV revision은 다른 job이나 transcript가 참조하는 동안 유지하고 마지막 참조가 사라진 뒤에만 원장에서 제거한다.
 
-`stt-check-migrations <jobs.sqlite3>`는 SQLite backup API로 WAL을 포함한 일관된 임시 사본을 만든 뒤 동일한 JobStore 초기화와 quick/FK/migration 검사를 실행한다. 출력은 새로 적용된 migration과 sequence backfill, 무결성 요약만 포함하고 원본 DB·WAL을 변경하거나 원본 경로·서버 설정·credential을 출력하지 않는다.
+`stt-check-migrations <jobs.sqlite3>`는 SQLite backup API로 WAL을 포함한 일관된 임시 사본을 만든 뒤 동일한 JobStore 초기화와 quick/FK/migration 검사를 실행한다. checkpoint가 끝난 DB는 immutable read-only로 열어 `-wal`/`-shm`을 생성하지 않고, 실행 중 WAL은 이미 존재하는 shared-memory 파일이 있을 때만 연다. WAL만 남은 불완전한 조합은 원본 디렉터리를 변경하지 않고 거부한다. Compose에서는 반드시 `--entrypoint stt-check-migrations`로 실행해 별도 웹 인스턴스가 시작되지 않게 한다. 출력은 새로 적용된 migration과 sequence backfill, 무결성 요약만 포함하고 원본 DB·WAL을 변경하거나 원본 경로·서버 설정·credential을 출력하지 않는다.
 
 2026-08-26 실제 JobStore를 대상으로 한 backup dry-run에서는 원본 quick check가 통과했고, 임시 사본에 누락 migration 3개 적용과 기존 marker 2개의 sequence backfill을 수행한 뒤 quick check 통과·FK 위반 0건·미지정 sequence 0건을 확인했다.
 
@@ -845,9 +845,18 @@ src/stt_to_subtitle/
 
 검증 당시 실행 중이던 배포 이미지는 현재 소스의
 `failure_code/retryable/failure_scope` migration 이전 계약이었다. 따라서
-물리적 재시작과 비정형 `failed/error` 복구는 확인됐지만, 현재 소스 이미지를
-배포한 뒤 `service_restarted/true/service` 응답까지 같은 시나리오로 다시
-확인해야 한다.
+물리적 재시작과 비정형 `failed/error` 복구는 확인됐다. 후속 재빌드에서는 웹과
+STT 이미지의 소스 hash, 구조화 실패 컬럼, migration 5/10/20/30/40 적용을
+확인했다. 현재 계약의 `service_restarted/true/service` 응답을 실제 SIGKILL로
+재현하는 검증만 남아 있다.
+
+같은 날 migration 검증 명령에서 Compose entrypoint를 덮어쓰지 않아 별도 웹
+인스턴스가 운영 DB에 연결된 채 남았고, 이후 호스트 UID로 WAL mode DB를 열면서
+운영 UID가 쓸 수 없는 `-wal`/`-shm`이 생성돼 재빌드한 웹이 쓰기 권한 오류로
+재시작했다. 일관된 backup을 확보한 뒤 DB/sidecar 소유권 복구, WAL checkpoint,
+검증용 인스턴스 제거로 복구했다. 재발 방지를 위해 migration dry-run은
+checkpoint된 DB를 immutable로 열고, 불완전한 WAL 조합을 거부하며, `stt-web`은
+잘못 전달된 command 인자를 무시하지 않고 종료한다.
 
 ## 18. 피해야 할 변경
 

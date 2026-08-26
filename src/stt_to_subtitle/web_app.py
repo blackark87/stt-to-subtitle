@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from contextlib import asynccontextmanager
@@ -5326,9 +5327,13 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
 app = create_app()
 
 
-def main() -> None:
+def main(argv: Sequence[str] | None = None) -> None:
     import uvicorn
 
+    parser = argparse.ArgumentParser(
+        description="Run the stt-to-subtitle web orchestrator.",
+    )
+    parser.parse_args(argv)
     configure_kst_logging(
         os.environ.get("LOG_LEVEL", "INFO").upper(),
     )

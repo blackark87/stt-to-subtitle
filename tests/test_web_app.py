@@ -1943,10 +1943,17 @@ class WebAppTests(unittest.TestCase):
             {"WEB_FORWARDED_ALLOW_IPS": "*"},
             clear=False,
         ), patch("uvicorn.run") as run:
-            main()
+            main([])
 
         self.assertTrue(run.call_args.kwargs["proxy_headers"])
         self.assertEqual(run.call_args.kwargs["forwarded_allow_ips"], "*")
+
+    def test_main_rejects_unexpected_container_command_arguments(self) -> None:
+        with patch("uvicorn.run") as run, self.assertRaises(SystemExit) as raised:
+            main(["python", "-m", "stt_to_subtitle.migration_check"])
+
+        self.assertEqual(raised.exception.code, 2)
+        run.assert_not_called()
 
     def test_exposes_operational_metrics_as_structured_json(self) -> None:
         with TemporaryDirectory() as directory:

@@ -12,6 +12,22 @@ from typing import Any
 from .job_store import JobStore
 
 
+def _source_connection_uri(source_path: Path) -> str:
+    """Open a source snapshot without creating SQLite WAL sidecars."""
+
+    wal_path = source_path.with_name(f"{source_path.name}-wal")
+    shm_path = source_path.with_name(f"{source_path.name}-shm")
+    if wal_path.is_file() and wal_path.stat().st_size > 0:
+        if not shm_path.is_file():
+            raise RuntimeError(
+                "database has an active WAL without its shared-memory file; "
+                "run the check as the database service user or checkpoint "
+                "the database first"
+            )
+        return f"{source_path.as_uri()}?mode=ro"
+    return f"{source_path.as_uri()}?mode=ro&immutable=1"
+
+
 def _migration_rows(connection: sqlite3.Connection) -> list[dict[str, Any]]:
     table = connection.execute(
         "SELECT 1 FROM sqlite_master "
@@ -48,7 +64,10 @@ def dry_run_job_store_migrations(database_path: Path) -> dict[str, Any]:
         raise ValueError("job database file does not exist")
     with TemporaryDirectory(prefix="stt-job-store-migration-") as directory:
         copied_path = Path(directory) / "jobs.sqlite3"
-        source = sqlite3.connect(f"{source_path.as_uri()}?mode=ro", uri=True)
+        source = sqlite3.connect(
+            _source_connection_uri(source_path),
+            uri=True,
+        )
         target = sqlite3.connect(copied_path)
         try:
             source_check = str(

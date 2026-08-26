@@ -408,6 +408,19 @@ cd /path/to/runtime
 stt-check-migrations /path/to/jobs.sqlite3
 ```
 
+Compose 운영 DB는 웹 entrypoint를 덮어써 같은 UID/GID와 볼륨에서 검사합니다.
+`--entrypoint`를 생략하면 `stt-web`이 잘못 전달된 명령 인자를 거부합니다.
+
+```bash
+docker compose run --rm --entrypoint stt-check-migrations web \
+  /var/lib/stt/jobs.sqlite3
+```
+
+checkpoint가 끝난 WAL 없는 DB는 immutable read-only로 열어 원본 디렉터리에
+`-wal`/`-shm` 파일을 만들지 않습니다. 실행 중 WAL이 있으면 기존 sidecar를
+통해 읽으며, WAL만 있고 shared-memory 파일이 없으면 원본 변경 대신 검사를
+중단합니다.
+
 운영 스냅샷은 `/api/operations/metrics` JSON과
 `/api/operations/metrics/prometheus` Prometheus text로 제공합니다. 웹 인증을
 켠 구성에서는 두 경로에도 인증이 필요합니다.
