@@ -1676,6 +1676,86 @@ class WebAppTests(unittest.TestCase):
             )
             self.assertEqual(created.status_code, 303)
 
+    def test_audits_and_explicitly_cleans_unreferenced_artifacts(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+
+            with TestClient(
+                create_app(self.settings(root, media_root))
+            ) as client:
+                service = client.app.state.orchestrator
+                service.stop()
+                job = service.store.create(
+                    job_id="retained-job",
+                    source_rel="movie.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                referenced = (
+                    service.settings.jobs_dir / job.id / "transcript.json"
+                )
+                referenced.parent.mkdir(parents=True)
+                referenced.write_text("retained", encoding="utf-8")
+                service.store.update(
+                    job.id,
+                    status="transcription_completed",
+                    transcript_path=str(referenced),
+                )
+                old_orphan = (
+                    service.settings.jobs_dir / "deleted-job" / "old.json"
+                )
+                recent_orphan = (
+                    service.settings.jobs_dir / "deleted-job" / "recent.json"
+                )
+                old_orphan.parent.mkdir(parents=True)
+                old_orphan.write_text("old", encoding="utf-8")
+                recent_orphan.write_text("recent", encoding="utf-8")
+                os.utime(old_orphan, (0, 0))
+
+                settings_page = client.get("/settings")
+                audit_page = client.get(
+                    "/settings?artifact_audit=true#artifact-retention"
+                )
+                cleanup_token = service.artifact_audit()["cleanup_token"]
+                invalid = client.post(
+                    "/settings/artifacts/cleanup",
+                    data={
+                        "minimum_age_days": "0",
+                        "cleanup_token": cleanup_token,
+                    },
+                )
+                cleaned = client.post(
+                    "/settings/artifacts/cleanup",
+                    data={
+                        "minimum_age_days": "7",
+                        "cleanup_token": cleanup_token,
+                    },
+                    follow_redirects=False,
+                )
+                stale_cleanup = client.post(
+                    "/settings/artifacts/cleanup",
+                    data={
+                        "minimum_age_days": "7",
+                        "cleanup_token": cleanup_token,
+                    },
+                )
+
+            self.assertIn("산출물 보존", settings_page.text)
+            self.assertNotIn("deleted-job/old.json", settings_page.text)
+            self.assertIn("deleted-job/old.json", audit_page.text)
+            self.assertIn("deleted-job/recent.json", audit_page.text)
+            self.assertIn("DB 참조", audit_page.text)
+            self.assertEqual(invalid.status_code, 400)
+            self.assertEqual(cleaned.status_code, 303)
+            self.assertEqual(stale_cleanup.status_code, 409)
+            self.assertIn("artifact_cleanup_run=true", cleaned.headers["location"])
+            self.assertIn("artifact_cleaned=1", cleaned.headers["location"])
+            self.assertFalse(old_orphan.exists())
+            self.assertTrue(recent_orphan.exists())
+            self.assertTrue(referenced.exists())
+
     def test_manages_prompt_categories(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)

@@ -54,6 +54,7 @@ from .web_config import (
 from .orchestrator import (
     COMPARISON_AUDIO_SOURCE_JOB_ID_OPTION,
     COMPARISON_PARENT_ID_OPTION,
+    DEFAULT_ARTIFACT_CLEANUP_AGE_DAYS,
     SubtitleOrchestrator,
     TRANSCRIPTION_COMPARISON_BACKENDS,
 )
@@ -1252,6 +1253,22 @@ TEMPLATES.env.filters["datetime_iso"] = format_kst_iso
 TEMPLATES.env.filters["filesize"] = lambda value: (
     f"{float(value) / 1024 / 1024 / 1024:.2f} GiB"
 )
+
+
+def format_storage_size(value: object) -> str:
+    size = max(0.0, float(value))
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if size < 1024 or unit == "TiB":
+            return (
+                f"{size:.0f} {unit}"
+                if unit == "B"
+                else f"{size:.2f} {unit}"
+            )
+        size /= 1024
+    return "0 B"
+
+
+TEMPLATES.env.filters["storage_size"] = format_storage_size
 TEMPLATES.env.filters["job_status"] = lambda value: JOB_STATUS_LABELS.get(
     str(value),
     str(value),
@@ -2777,6 +2794,8 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         error: str | None = None,
         notice: str | None = None,
         values: Mapping[str, Any] | None = None,
+        include_artifact_audit: bool = False,
+        artifact_minimum_age_days: int = DEFAULT_ARTIFACT_CLEANUP_AGE_DAYS,
     ) -> dict[str, Any]:
         service = orchestrator(request)
         server_values = service.remote_servers_view()
@@ -2798,6 +2817,13 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                 )
                 for category in service.all_prompt_categories()
             },
+            "artifact_audit": (
+                service.artifact_audit(
+                    minimum_age_days=artifact_minimum_age_days,
+                )
+                if include_artifact_audit
+                else None
+            ),
         }
 
     @app.get("/settings", response_class=HTMLResponse)
@@ -2812,42 +2838,111 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         validator_saved: bool = False,
         stt_resumed: int = 0,
         resumed: int = 0,
+        artifact_audit: bool = False,
+        artifact_cleanup_run: bool = False,
+        artifact_cleaned: int = 0,
+        artifact_reclaimed_bytes: int = 0,
+        artifact_cleanup_failed: int = 0,
+        artifact_minimum_age_days: int = DEFAULT_ARTIFACT_CLEANUP_AGE_DAYS,
     ) -> Any:
         if not is_authenticated(request):
             return login_redirect()
+        artifact_error = None
+        if artifact_audit and not 1 <= artifact_minimum_age_days <= 3650:
+            artifact_error = "정리 보류기간은 1~3650일이어야 합니다."
+            artifact_audit = False
+        artifact_cleanup_notice = None
+        if artifact_cleanup_run:
+            artifact_cleanup_notice = (
+                f"미참조 산출물 {artifact_cleaned}개를 정리했습니다"
+                f" ({format_storage_size(artifact_reclaimed_bytes)})."
+            )
+            if artifact_cleanup_failed:
+                artifact_cleanup_notice += (
+                    f" 정리하지 못한 파일은 {artifact_cleanup_failed}개입니다."
+                )
+        page_notice = artifact_cleanup_notice
+        if stt_started:
+            page_notice = "전사 서버 연결을 확인했습니다."
+            if stt_resumed:
+                page_notice += f" 중단 작업 {stt_resumed}건을 재개했습니다."
+        elif lm_started:
+            page_notice = "번역 서버 연결을 확인했습니다."
+            if resumed:
+                page_notice += f" 중단 작업 {resumed}건을 재개했습니다."
+        elif lm_stopped:
+            page_notice = "번역 서버 사용을 중지했습니다."
+        elif saved:
+            page_notice = "서버 설정을 저장했습니다."
+        elif validator_saved:
+            page_notice = "상용 LLM 검증 설정을 저장했습니다."
+        elif path_saved:
+            page_notice = "경로 표시 규칙을 저장했습니다."
+        elif prompt_saved:
+            page_notice = "번역 프롬프트 설정을 저장했습니다."
         return TEMPLATES.TemplateResponse(
             request,
             "settings.html",
             settings_context(
                 request,
-                notice=(
-                    (
-                        "전사 서버 연결을 확인했습니다."
-                        + (
-                            f" 중단 작업 {stt_resumed}건을 재개했습니다."
-                            if stt_resumed
-                            else ""
-                        )
-                    )
-                    if stt_started
-                    else (
-                        "번역 서버 연결을 확인했습니다."
-                        + (f" 중단 작업 {resumed}건을 재개했습니다." if resumed else "")
-                    )
-                    if lm_started
-                    else "번역 서버 사용을 중지했습니다."
-                    if lm_stopped
-                    else "서버 설정을 저장했습니다."
-                    if saved
-                    else "상용 LLM 검증 설정을 저장했습니다."
-                    if validator_saved
-                    else "경로 표시 규칙을 저장했습니다."
-                    if path_saved
-                    else "번역 프롬프트 설정을 저장했습니다."
-                    if prompt_saved
-                    else None
-                ),
+                error=artifact_error,
+                notice=page_notice,
+                include_artifact_audit=artifact_audit,
+                artifact_minimum_age_days=artifact_minimum_age_days,
             ),
+        )
+
+    @app.post("/settings/artifacts/cleanup", response_class=HTMLResponse)
+    def cleanup_artifact_storage(
+        request: Request,
+        csrf_token: str = Form(""),
+        minimum_age_days: int = Form(DEFAULT_ARTIFACT_CLEANUP_AGE_DAYS),
+        cleanup_token: str = Form(""),
+    ) -> Any:
+        if not is_authenticated(request):
+            return login_redirect()
+        validate_csrf(request, csrf_token)
+        if not 1 <= minimum_age_days <= 3650:
+            return TEMPLATES.TemplateResponse(
+                request,
+                "settings.html",
+                settings_context(
+                    request,
+                    error="정리 보류기간은 1~3650일이어야 합니다.",
+                    include_artifact_audit=True,
+                ),
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            cleanup = orchestrator(request).cleanup_artifacts(
+                minimum_age_days=minimum_age_days,
+                expected_token=cleanup_token,
+            )
+        except ValueError as error:
+            return TEMPLATES.TemplateResponse(
+                request,
+                "settings.html",
+                settings_context(
+                    request,
+                    error=str(error),
+                    include_artifact_audit=True,
+                    artifact_minimum_age_days=minimum_age_days,
+                ),
+                status_code=status.HTTP_409_CONFLICT,
+            )
+        query = urlencode(
+            {
+                "artifact_audit": "true",
+                "artifact_cleanup_run": "true",
+                "artifact_cleaned": cleanup["removed_files"],
+                "artifact_reclaimed_bytes": cleanup["removed_bytes"],
+                "artifact_cleanup_failed": len(cleanup["failed_files"]),
+                "artifact_minimum_age_days": minimum_age_days,
+            }
+        )
+        return RedirectResponse(
+            f"/settings?{query}#artifact-retention",
+            status_code=status.HTTP_303_SEE_OTHER,
         )
 
     @app.post("/settings/transcription/start", response_class=HTMLResponse)

@@ -15,6 +15,10 @@ from typing import Any, Callable, Mapping, Sequence
 from uuid import uuid4
 import wave
 
+from .artifact_retention import (
+    audit_artifacts,
+    cleanup_orphan_artifacts,
+)
 from .artifacts import artifact_filename, artifact_path
 from .audio import AudioExtraction, extract_audio
 from .contracts import (
@@ -79,6 +83,7 @@ from .whisperjav_worker import (
 
 LOGGER = logging.getLogger(__name__)
 MAX_EDITABLE_JSON_BYTES = 20 * 1024 * 1024
+DEFAULT_ARTIFACT_CLEANUP_AGE_DAYS = 7
 WAITING_STAGE_BY_STATUS = {
     "queued": "audio extraction",
     "audio_ready": "transcription",
@@ -613,6 +618,40 @@ class SubtitleOrchestrator:
     @property
     def path_display_rules(self) -> tuple[PathDisplayRule, ...]:
         return self._path_display_rules
+
+    def artifact_audit(
+        self,
+        *,
+        minimum_age_days: int = DEFAULT_ARTIFACT_CLEANUP_AGE_DAYS,
+    ) -> dict[str, object]:
+        audit = audit_artifacts(
+            self.settings.jobs_dir,
+            self.store.artifact_references(),
+            minimum_age_days=minimum_age_days,
+        )
+        return audit.to_view()
+
+    def cleanup_artifacts(
+        self,
+        *,
+        minimum_age_days: int = DEFAULT_ARTIFACT_CLEANUP_AGE_DAYS,
+        expected_token: str,
+    ) -> dict[str, object]:
+        audit = audit_artifacts(
+            self.settings.jobs_dir,
+            self.store.artifact_references(),
+            minimum_age_days=minimum_age_days,
+        )
+        if not expected_token or audit.cleanup_token != expected_token:
+            raise ValueError(
+                "산출물 감사 결과가 변경되었습니다. 다시 감사를 실행하세요."
+            )
+        cleanup = cleanup_orphan_artifacts(audit)
+        return {
+            "removed_files": cleanup.removed_files,
+            "removed_bytes": cleanup.removed_bytes,
+            "failed_files": cleanup.failed_files,
+        }
 
     def create_path_display_rule(
         self,

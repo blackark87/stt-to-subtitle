@@ -6,7 +6,7 @@
 
 ### 구현 진행 상태
 
-현재 작업 트리에는 계획의 스무 번째 수직 슬라이스까지 반영됐다.
+현재 작업 트리에는 계획의 스물한 번째 수직 슬라이스까지 반영됐다.
 
 | 항목 | 반영 상태 | 남은 범위 |
 |---|---|---|
@@ -17,10 +17,10 @@
 | 상용 LLM 검증 | 번역 LLM과 분리된 설정, 명시적 1회 호출, 구조화 결과, 입력·모델 cache | provider별 adapter·비용/사용량 관측 |
 | 프롬프트 revision | 카테고리 생성·수정·보관·복원, 본문 변경별 immutable revision, 현재/과거 본문 비교, 새 작업·재번역의 과거 revision 선택, 작업 snapshot·translation generation 고정 참조 | revision별 번역 결과 비교 |
 | 번역 generation | generation·batch·segment SQLite 원장, 입력 지문, prompt·transcript revision 참조, 배치 시도·실패, DB 기반 JSON 복구, 재번역·직접 편집 이력, generation attempt fencing, startup generation·batch reconcile | 강제 종료 시점별 실환경 fault test |
-| 자막 publication | source별 단일 게시 포인터, generation별 SRT/ASS와 해시, 다운로드·과거 버전 재게시, pair manifest·파일/DB startup reconcile, 최초 게시 4개 교체 지점 fault matrix, 활성 worker lease 보호 | retention·실제 파일시스템 장애 주입 |
+| 자막 publication | source별 단일 게시 포인터, generation별 SRT/ASS와 해시, 다운로드·과거 버전 재게시, pair manifest·파일/DB startup reconcile, 최초 게시 4개 교체 지점 fault matrix, 활성 worker lease 보호 | 실제 파일시스템 장애 주입 |
 | 원격 STT 취소 | 멱등 cancel API, `cancel_requested/cancelled` 영속 상태, 웹의 취소 호출·최종 확인, WhisperX/JAV process group 종료, Kotoba 청크 경계 취소 | Kotoba diarization/postprocess 즉시 중단·실제 GPU 자원 fault test |
 | 시작 복구 | 추출 재대기, 원격 STT 재연결·유실 ID 멱등 재제출, 번역 체크포인트 대기 복원, generation·batch 중단 attempt 확정, 복구 lease 즉시 반환, 검증된 전사·번역 산출물 기반 렌더 재개, 미완료 최초 게시 generation 완결, 게시 자막 pair reconcile, worker lease claim·heartbeat·만료 회수, 단조 증가 fencing token, 제한 시간 graceful drain, SIGKILL 뒤 lease 회수 test, 중지 요청 보존 | 실제 파일시스템·GPU worker fault test |
-| 오디오·전사 revision | source·추출 설정 hash 기반 WAV 재사용, immutable WAV·전사 JSON 경로, DB revision 원장·활성 포인터, 직접 편집·비교 선택의 별도 전사 revision, 번역 generation의 transcript revision 참조 | retention·orphan collector·과거 revision 선택 UI |
+| 오디오·전사 revision | source·추출 설정 hash 기반 WAV 재사용, immutable WAV·전사 JSON 경로, DB revision 원장·활성 포인터, 직접 편집·비교 선택의 별도 전사 revision, 번역 generation의 transcript revision 참조, 전체 DB 참조 기반 감사·명시적 orphan 정리 | 과거 revision 선택 UI |
 | STT 실패 계약 | STT DB·API의 `failure_code/retryable/failure_scope`, segment/schema·OOM·인증·입력·처리·재시작 오류 분류, retryable 실패만 원격 재제출 | 실제 backend별 fault test·오류 코드 운영 지표 |
 | STT dispatch gate | 첫 연결 실패 시 영속 gate 차단, 뒤 작업 `audio_ready` 유지, 명시적 연결 확인의 제한된 3회 요청 후 중단 작업 재개 | 자동 recovery mode가 실제로 필요한지 운영 검증·회로 메트릭 |
 
@@ -160,7 +160,7 @@ stateDiagram-v2
 | 번역 체크포인트 | DB에는 청크 수만 저장하고 실제 결과는 동일 JSON 전체를 배치마다 원자 교체 | translation generation·batch·segment 영속화, 모델·프롬프트·원문·배치 설정 지문 검증 | P0–P1 |
 | 스케줄링 | 생성 시각 FIFO, 단계별 제한 | 의존성별 admission control, 우선순위·공정성, starvation 방지 | P1 |
 | 종료 처리 | scheduler 중지 후 executor 신규 작업 취소, 실행 작업 lease heartbeat·만료 회수·fencing token, 실행 Future 제한 시간 drain, worker SIGKILL 회수 test | artifact 교체 지점별 fault matrix, 종료 지표 | P1 |
-| 오디오·전사 산출물 | immutable revision 원장·고유 경로, source·추출 설정 hash 기반 WAV 재사용, 직접 편집·비교 import revision, translation generation 참조 | retention 정책, orphan collector, 과거 revision 선택 UI | P1 |
+| 오디오·전사 산출물 | immutable revision 원장·고유 경로, source·추출 설정 hash 기반 WAV 재사용, 직접 편집·비교 import revision, translation generation 참조, 참조 artifact 무기한 보존·보류기간 기반 수동 orphan 정리 | 과거 revision 선택 UI | P1 |
 | 자막 산출물 | SRT/ASS 각각 임시 저장하며 재번역 시 기존 배포 파일을 덮어씀 | versioned generation, publication pointer, rollback, 한 manifest로 파일 쌍 검증 | P0–P1 |
 | 외부 자막 | `<filename>.ko.srt/.ko.ass`만 생성 자막처럼 탐지하고 VTT·출처·비교 관계가 없음 | `<filename>.srt/.vtt/.ass`를 `외부 자막`으로 등록, 기본 재생, 로컬 비교 검증, 선택적 상용 LLM 평가 | P0–P1 |
 | 화면 집계 | 화면별 상태 재분류 | 공통 projection DTO, 동일한 phase/state 필터 계약 | P0 |
@@ -345,7 +345,6 @@ generation은 실제 실행이 시작되지 않았으므로 복구 대상에서 
 
 현재 수직 슬라이스 이후에도 다음 범위는 남는다.
 
-- revision·generation retention과 orphan 정리 정책
 - generation·batch 강제 종료 시점별 실환경 fault test
 
 부분 JSON의 관리 방법은 반드시 알아야 하며 공개된 영속 계약으로 만들어야 한다. 권장 구조는 DB를 실행·revision의 원장으로 사용하고 JSON을 특정 generation의 편집·교환 가능한 snapshot으로 취급하는 것이다.
@@ -445,7 +444,7 @@ flowchart LR
 
 ### 9.4 WAV·전사본의 영속성과 덮어쓰기
 
-현재 WAV와 transcript JSON은 persistent volume 아래의 revision별 고유 경로에 저장되고 SQLite 원장과 작업의 active revision 포인터로 연결된다. 보존·정리 정책과 과거 revision 선택 UI는 아직 없다.
+현재 WAV와 transcript JSON은 persistent volume 아래의 revision별 고유 경로에 저장되고 SQLite 원장과 작업의 active revision 포인터로 연결된다. DB가 참조하는 revision·generation artifact는 기간 제한 없이 보호한다. 작업 루트 안에서 어떤 DB 행도 참조하지 않는 파일만 설정 화면 감사에 표시하며, 기본 7일 보류 후 사용자가 확인한 감사 집합에 한해서만 명시적으로 정리한다. 과거 transcript revision 선택 UI는 아직 없다.
 
 | 동작 | 현재 WAV | 현재 transcript JSON |
 |---|---|---|
@@ -454,7 +453,7 @@ flowchart LR
 | 번역만 재시작 | 그대로 유지 | 그대로 유지 |
 | 새 full reprocess | 동일 지문 revision이 유효하면 재사용, 아니면 새 revision 생성 | 새 transcript revision 생성 |
 | 같은 job에서 추출 단계 재실행 | revision별 고유 경로에 생성 | 기존 transcript revision은 유지 |
-| 작업 DB 레코드 삭제 | revision retention 미구현 | artifact와 revision 원장이 남아 orphan이 될 수 있음 |
+| 작업 DB 레코드 삭제 | audio revision 원장과 참조 파일 유지 | 삭제된 translation/subtitle 행의 파일은 orphan 후보로 전환 |
 
 현재 반영된 계약과 남은 범위는 다음과 같다.
 
@@ -462,9 +461,10 @@ flowchart LR
 - transcript는 `audio_revision + backend/model/options hash`별 immutable `transcript_revision`으로 저장한다.
 - 재전사는 기존 revision을 덮어쓰지 않고 새 revision을 만든다.
 - translation과 subtitle generation은 참조한 transcript revision을 고정한다.
-- UI에는 현재 active revision과 과거 revision을 구분해 비교·재사용·삭제할 수 있게 한다.
-- retention 정책은 `published`, `referenced`, `draft`, `orphan`을 구분하고 참조 중인 WAV·전사본은 삭제하지 않는다.
-- WAV staged write와 artifact garbage collector를 추가해 부분 파일과 DB 삭제 후 orphan을 안전하게 정리한다.
+- UI에는 현재 active revision과 과거 revision을 구분해 비교·재사용할 수 있게 한다.
+- 현재 작업 포인터, audio/transcript revision, translation/subtitle generation, validation이 참조하는 파일은 정리하지 않는다.
+- 미참조 파일은 자동 삭제하지 않는다. 사용자가 감사 결과와 보류기간을 확인한 뒤 같은 감사 token으로 요청한 경우에만 삭제한다.
+- 심볼릭 링크, 작업 루트 외부 경로, 감사 후 inode·크기·수정 시각이 달라진 파일은 정리에서 제외한다.
 
 ### 9.5 외부 자막 등록·재생·비교 검증
 
@@ -793,6 +793,7 @@ src/stt_to_subtitle/
 26. 상용 LLM 검증은 명시적 요청에서만 호출되며 동일 input/model/prompt version은 cache를 재사용하는지 확인
 27. 상용 LLM 오류가 기존 외부 자막 재생과 로컬 비교 결과에 영향을 주지 않는지 확인
 28. `WEB_ADMIN_PASSWORD`가 없는 내부망 모드에서 로그인 없이 모든 지원 기능을 사용하고 별도 권한 분기가 생기지 않는지 확인
+29. 과거 revision·generation 파일은 DB 참조가 남아 있으면 보존되고, 미참조 파일만 보류기간·감사 token 검증 후 명시적으로 정리되는지 확인
 
 ## 18. 피해야 할 변경
 
@@ -820,12 +821,12 @@ src/stt_to_subtitle/
 | 자막이 있는 상태에서 prompt 변경 재시도는 어떻게 되는가 | transcript와 기존 prompt·번역·자막 generation을 보존하고 새 prompt revision·translation generation으로 처리한다. 현재/과거 prompt 본문을 비교하고 원하는 revision을 재번역에 선택할 수 있으며, 새 번역 완료 전 기존 게시본을 유지하고 과거 SRT/ASS를 다시 게시할 수 있다. | generation 간 번역 결과 비교 UI를 추가한다. |
 | `next_probe_at`은 계속 재시도한다는 뜻인가 | 번역 LLM이 평소 꺼져 있는 운영 환경에서는 호출 자체가 불필요하다. | LM은 manual gate로 두고 `next_probe_at`을 사용하지 않는다. STT처럼 자동 복구를 선택한 의존성에만 제한적으로 사용한다. |
 | 중단과 실패는 어떻게 구분하는가 | 외부 연결 불가는 `blocked/stt_unavailable`, 인증 설정 오류는 `blocked/auth_required`, 원격 segment/schema 계약 오류는 `failed/model_output_invalid`, 완화가 끝난 OOM은 `failed/resource_exhausted`로 전달하며 `retryable/failure_scope`를 함께 제공한다. | 실환경 backend fault test와 오류 코드별 운영 지표를 추가한다. |
-| WAV와 transcript는 영속 데이터인가 | `audio_revisions`와 `transcript_revisions` 원장 및 고유 artifact 경로로 영속화했다. 같은 source·추출 설정 hash의 검증된 WAV만 재사용하고 재전사·직접 편집은 새 revision을 만든다. | retention, orphan garbage collection, 과거 revision 선택·삭제 정책을 적용한다. |
+| WAV와 transcript는 영속 데이터인가 | `audio_revisions`와 `transcript_revisions` 원장 및 고유 artifact 경로로 영속화했다. 같은 source·추출 설정 hash의 검증된 WAV만 재사용하고 재전사·직접 편집은 새 revision을 만든다. DB 참조 파일은 무기한 보호하고 미참조 파일만 감사 token과 최소 보류기간을 확인해 수동 정리한다. | 과거 revision 선택 UI를 추가한다. |
 | 외부 자막은 어떻게 다루는가 | `<filename>.srt/.vtt/.ass`를 한국어 `외부 자막`으로 탐지해 기본 재생하고, 생성 자막과 시간 기반 로컬 비교 및 선택적 상용 LLM 검증을 수행한다. | hash 기반 immutable external subtitle revision과 증분 catalog로 확장한다. |
 | 내부망에서도 인증이 필요한가 | 현재도 비밀번호가 비어 있으면 인증이 꺼지지만 공식 운영 계약으로 강조되지 않았다. | 별도 웹 인증은 추가하지 않는다. 무인증 모드를 테스트로 고정하고 경로·입력·로그·파일 무결성만 보호한다. |
 
 ## 20. 최종 권고
 
-명시적 상태 모델과 공통 projection, 번역 LLM·STT dispatch gate, worker lease·fencing·graceful drain 및 번역 attempt reconcile 기반 단계별 재시작 복구, 비교·선택 가능한 immutable prompt revision, immutable audio/transcript revision, 최초·재게시 cutpoint를 포함한 자막 pair manifest reconcile, backend별 STT 취소·실패 계약은 반영됐다. 다음 리팩터링 단위는 revision retention/orphan collector와 generation 간 번역 결과 비교다. 자동 회복은 상시 가동 의존성에만 선택적으로 적용한다.
+명시적 상태 모델과 공통 projection, 번역 LLM·STT dispatch gate, worker lease·fencing·graceful drain 및 번역 attempt reconcile 기반 단계별 재시작 복구, 비교·선택 가능한 immutable prompt revision, immutable audio/transcript revision, 참조 기반 artifact 보존·수동 orphan 정리, 최초·재게시 cutpoint를 포함한 자막 pair manifest reconcile, backend별 STT 취소·실패 계약은 반영됐다. 다음 리팩터링 단위는 generation 간 번역 결과 비교와 과거 transcript revision 선택이다. 자동 회복은 상시 가동 의존성에만 선택적으로 적용한다.
 
 동시에 transcript revision, translation generation/batch/item, external/generated subtitle asset, publication, validation을 영속 모델로 추가해야 한다. 그래야 프롬프트 수정 재번역, 부분 번역 재개, 외부 자막 재생·비교, 선택적 상용 LLM 평가, 자막 게시·rollback, WAV·전사본 재사용을 데이터 손실 없이 반복할 수 있다. 내부망 무인증 운영은 그대로 유지하고 인증보다 실행·파일·참조 무결성에 구현 역량을 집중한다.

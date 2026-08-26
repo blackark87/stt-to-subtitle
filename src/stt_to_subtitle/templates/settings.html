@@ -287,6 +287,105 @@
     </details>
   </section>
 
+  <section class="stack" id="artifact-retention">
+    <div class="section-heading">
+      <div>
+        <h2>산출물 보존</h2>
+        <p class="muted settings-description">
+          DB가 참조하는 WAV·전사·번역·자막 리비전은 정리 대상에서 제외됩니다.
+        </p>
+      </div>
+      <a class="button secondary" href="/settings?artifact_audit=true#artifact-retention">감사 실행</a>
+    </div>
+
+    {% if artifact_audit %}
+      <article class="card settings-card stack">
+        <div class="path-rule-grid">
+          <div><strong>전체 파일</strong><br>{{ artifact_audit.total_files }}개 · {{ artifact_audit.total_bytes|storage_size }}</div>
+          <div><strong>DB 참조</strong><br>{{ artifact_audit.referenced_files }}개</div>
+          <div><strong>누락 참조</strong><br>{{ artifact_audit.missing_count }}개</div>
+          <div><strong>미참조</strong><br>{{ artifact_audit.orphan_count }}개 · {{ artifact_audit.orphan_bytes|storage_size }}</div>
+        </div>
+
+        {% if artifact_audit.missing_sample %}
+          <details>
+            <summary>
+              누락 참조 {{ artifact_audit.missing_count }}개
+              {% if artifact_audit.missing_count > artifact_audit.missing_sample|length %}
+                · {{ artifact_audit.missing_sample|length }}개 표시
+              {% endif %}
+            </summary>
+            <ul>
+              {% for artifact in artifact_audit.missing_sample %}
+                <li><code>{{ artifact.relative_path }}</code></li>
+              {% endfor %}
+            </ul>
+          </details>
+        {% endif %}
+
+        {% if artifact_audit.orphan_sample %}
+          <details>
+            <summary>
+              미참조 파일 {{ artifact_audit.orphan_count }}개
+              {% if artifact_audit.orphan_count > artifact_audit.orphan_sample|length %}
+                · {{ artifact_audit.orphan_sample|length }}개 표시
+              {% endif %}
+            </summary>
+            <ul>
+              {% for artifact in artifact_audit.orphan_sample %}
+                <li>
+                  <code>{{ artifact.relative_path }}</code>
+                  · {{ artifact.size|storage_size }}
+                  {% if artifact.cleanup_eligible %}· 정리 가능{% endif %}
+                </li>
+              {% endfor %}
+            </ul>
+          </details>
+        {% endif %}
+
+        {% if artifact_audit.skipped_symlinks %}
+          <p class="alert">심볼릭 링크 {{ artifact_audit.skipped_symlinks }}개는 검사·정리에서 제외했습니다.</p>
+        {% endif %}
+
+        <form method="get" action="/settings" class="stack">
+          <input type="hidden" name="artifact_audit" value="true">
+          <label>정리 보류기간
+            <input
+              name="artifact_minimum_age_days"
+              type="number"
+              min="1"
+              max="3650"
+              value="{{ artifact_audit.minimum_age_days }}"
+              required
+            >
+            <span class="muted">일</span>
+          </label>
+          <div class="submit-row">
+            <button type="submit" class="secondary">보류기간 다시 계산</button>
+          </div>
+        </form>
+        <form
+          method="post"
+          action="/settings/artifacts/cleanup"
+          class="stack"
+          data-confirm-message="DB가 참조하지 않고 보류기간이 지난 산출물을 정리하시겠습니까?"
+        >
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <input type="hidden" name="minimum_age_days" value="{{ artifact_audit.minimum_age_days }}">
+          <input type="hidden" name="cleanup_token" value="{{ artifact_audit.cleanup_token }}">
+          <div class="submit-row">
+            <button
+              type="submit"
+              class="danger secondary"
+              {% if artifact_audit.cleanup_eligible_count == 0 %}disabled{% endif %}
+            >정리 가능 {{ artifact_audit.cleanup_eligible_count }}개 삭제</button>
+            <span class="muted">{{ artifact_audit.cleanup_eligible_bytes|storage_size }}</span>
+          </div>
+        </form>
+      </article>
+    {% endif %}
+  </section>
+
   <section class="stack prompt-settings" id="prompt-categories">
     <div class="section-heading">
       <div>

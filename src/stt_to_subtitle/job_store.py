@@ -12,6 +12,7 @@ import time
 from typing import Any, Callable, Collection, Iterator, Mapping, Sequence
 from uuid import uuid4
 
+from .artifact_retention import ArtifactReference
 from .path_display import (
     PathDisplayRule,
     normalize_path_display_patterns,
@@ -372,6 +373,106 @@ class JobStore:
                 )
                 changed += 1
         return changed
+
+    def artifact_references(self) -> list[ArtifactReference]:
+        """Return every persisted path that must survive orphan cleanup."""
+        references: list[ArtifactReference] = []
+
+        def append_reference(
+            path: object,
+            *,
+            kind: str,
+            record_id: object,
+            expected: bool = True,
+        ) -> None:
+            if path is None or not str(path).strip():
+                return
+            references.append(
+                ArtifactReference(
+                    path=str(path),
+                    kind=kind,
+                    record_id=str(record_id),
+                    expected=expected,
+                )
+            )
+
+        with self._connect() as connection:
+            for row in connection.execute(
+                """
+                SELECT id, audio_path, transcript_path, translation_path,
+                       srt_path, ass_path
+                FROM jobs
+                """
+            ).fetchall():
+                for field in (
+                    "audio_path",
+                    "transcript_path",
+                    "translation_path",
+                    "srt_path",
+                    "ass_path",
+                ):
+                    append_reference(
+                        row[field],
+                        kind=f"job.{field}",
+                        record_id=row["id"],
+                    )
+            for table, kind in (
+                ("audio_revisions", "audio_revision"),
+                ("transcript_revisions", "transcript_revision"),
+            ):
+                for row in connection.execute(
+                    f"SELECT id, artifact_path FROM {table}"
+                ).fetchall():
+                    append_reference(
+                        row["artifact_path"],
+                        kind=kind,
+                        record_id=row["id"],
+                    )
+            for row in connection.execute(
+                """
+                SELECT id, state, artifact_path
+                FROM translation_generations
+                """
+            ).fetchall():
+                append_reference(
+                    row["artifact_path"],
+                    kind="translation_generation",
+                    record_id=row["id"],
+                    expected=str(row["state"]) == "completed",
+                )
+            for row in connection.execute(
+                """
+                SELECT id, srt_artifact_path, ass_artifact_path
+                FROM subtitle_generations
+                """
+            ).fetchall():
+                append_reference(
+                    row["srt_artifact_path"],
+                    kind="subtitle_generation.srt",
+                    record_id=row["id"],
+                )
+                append_reference(
+                    row["ass_artifact_path"],
+                    kind="subtitle_generation.ass",
+                    record_id=row["id"],
+                )
+            for row in connection.execute(
+                """
+                SELECT id, external_path, candidate_path
+                FROM subtitle_validations
+                """
+            ).fetchall():
+                append_reference(
+                    row["external_path"],
+                    kind="subtitle_validation.external",
+                    record_id=row["id"],
+                )
+                append_reference(
+                    row["candidate_path"],
+                    kind="subtitle_validation.candidate",
+                    record_id=row["id"],
+                )
+        return references
 
     def _notify_change(self, job_id: str) -> None:
         if self._change_hook is not None:

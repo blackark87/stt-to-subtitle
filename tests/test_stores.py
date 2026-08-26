@@ -347,6 +347,103 @@ class JobStoreTests(unittest.TestCase):
                 "/var/lib/stt-work/job-1/subtitle-1.ass",
             )
 
+    def test_artifact_references_include_current_and_historical_outputs(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = JobStore(root / "jobs.sqlite3")
+            job = store.create(
+                job_id="job-1",
+                source_rel="movie.mkv",
+                force_overwrite=False,
+                options={},
+            )
+            historical_audio = root / "jobs" / job.id / "audio-v1.wav"
+            historical_transcript = (
+                root / "jobs" / job.id / "transcript-v1.json"
+            )
+            current_audio = root / "jobs" / job.id / "audio-v2.wav"
+            current_transcript = (
+                root / "jobs" / job.id / "transcript-v2.json"
+            )
+            translation = root / "jobs" / job.id / "translation-v1.json"
+            subtitle_srt = root / "jobs" / job.id / "subtitle-v1.srt"
+            subtitle_ass = root / "jobs" / job.id / "subtitle-v1.ass"
+            store.record_audio_revision(
+                revision_id="audio-v1",
+                job_id=job.id,
+                source_rel=job.source_rel,
+                source_hash="source-hash",
+                extraction_hash="extraction-hash",
+                artifact_path=str(historical_audio),
+                content_hash="audio-hash",
+                duration_seconds=60,
+                status="audio_completed",
+                chunks_total_estimate=1,
+            )
+            store.record_transcript_revision(
+                revision_id="transcript-v1",
+                job_id=job.id,
+                audio_revision_id="audio-v1",
+                remote_job_id="remote-1",
+                backend="whisperx",
+                model_revision="model-v1",
+                options_hash="options-hash",
+                artifact_path=str(historical_transcript),
+                content_hash="transcript-hash",
+                origin="automatic",
+                status="transcription_completed",
+                chunks_total=1,
+            )
+            store.update(
+                job.id,
+                audio_path=str(current_audio),
+                transcript_path=str(current_transcript),
+            )
+            generation = store.create_translation_generation(
+                generation_id="translation-v1",
+                job_id=job.id,
+                transcript_job_id="remote-1",
+                transcript_hash="transcript-hash",
+                prompt_hash="prompt-hash",
+                endpoint_key="http://lm.test/v1",
+                model="model",
+                config_hash="config-hash",
+                artifact_path=str(translation),
+                origin="automatic",
+            )
+            store.create_subtitle_generation(
+                generation_id="subtitle-v1",
+                job_id=job.id,
+                translation_generation_id=generation["id"],
+                transcript_hash="transcript-hash",
+                translation_hash="translation-hash",
+                renderer_version="1",
+                render_hash="render-hash",
+                srt_artifact_path=str(subtitle_srt),
+                ass_artifact_path=str(subtitle_ass),
+                srt_hash="srt-hash",
+                ass_hash="ass-hash",
+                origin="rendered",
+            )
+
+            references = store.artifact_references()
+            by_path = {reference.path: reference for reference in references}
+
+            for path in (
+                historical_audio,
+                historical_transcript,
+                current_audio,
+                current_transcript,
+                translation,
+                subtitle_srt,
+                subtitle_ass,
+            ):
+                self.assertIn(str(path), by_path)
+            self.assertFalse(by_path[str(translation)].expected)
+            self.assertTrue(by_path[str(subtitle_srt)].expected)
+
     def test_lists_and_counts_jobs_by_status(self) -> None:
         with TemporaryDirectory() as directory:
             store = JobStore(Path(directory) / "jobs.sqlite3")
