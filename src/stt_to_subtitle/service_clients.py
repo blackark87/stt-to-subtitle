@@ -176,25 +176,38 @@ class STTAPIClient(RetryingJSONClient):
         job_id = existing_job_id
         may_requeue_existing = existing_job_id is not None
         while True:
-            if should_stop is not None and should_stop():
-                raise OperationStopped("transcription stop requested")
-            if job_id is None:
-                job_id = self._submit(
-                    audio_path,
-                    options=options,
-                    idempotency_key=idempotency_key,
-                )
-                if on_job_created is not None:
-                    on_job_created(job_id)
+            stop_initiated = False
+            try:
+                if should_stop is not None and should_stop():
+                    raise OperationStopped("transcription stop requested")
+                if job_id is None:
+                    job_id = self._submit(
+                        audio_path,
+                        options=options,
+                        idempotency_key=idempotency_key,
+                    )
+                    if on_job_created is not None:
+                        on_job_created(job_id)
 
-            status_payload = self._wait_for_terminal_status(
-                job_id,
-                on_progress=on_progress,
-                should_stop=should_stop,
-            )
+                status_payload = self._wait_for_terminal_status(
+                    job_id,
+                    on_progress=on_progress,
+                    should_stop=should_stop,
+                )
+            except OperationStopped:
+                if job_id is None:
+                    raise
+                stop_initiated = True
+                status_payload = self._cancel_and_wait(job_id)
             remote_status = str(status_payload["status"])
             if remote_status == "completed":
                 break
+            if remote_status == "cancelled":
+                if may_requeue_existing and not stop_initiated:
+                    may_requeue_existing = False
+                    job_id = None
+                    continue
+                raise OperationStopped("remote transcription was cancelled")
             if remote_status == "failed":
                 if may_requeue_existing:
                     may_requeue_existing = False
@@ -205,8 +218,6 @@ class STTAPIClient(RetryingJSONClient):
                     f"{status_payload.get('error', 'unknown remote error')}"
                 )
 
-        if should_stop is not None and should_stop():
-            raise OperationStopped("transcription stop requested")
         response = self.request(
             "GET",
             f"{self.base_url}/v1/transcriptions/{job_id}/result",
@@ -226,6 +237,47 @@ class STTAPIClient(RetryingJSONClient):
         validate_transcript(payload)
         return payload
 
+    def cancel_job(self, job_id: str) -> Mapping[str, Any]:
+        response = self.request(
+            "POST",
+            f"{self.base_url}/v1/transcriptions/{job_id}/cancel",
+            headers=self.headers,
+        )
+        if response.status_code != 200:
+            raise ExternalServiceError(
+                "transcription cancellation failed: "
+                f"HTTP {response.status_code}: {_safe_error(response)}"
+            )
+        try:
+            payload = response.json()
+        except ValueError as error:
+            raise ExternalServiceError(
+                "transcription API returned invalid cancellation JSON"
+            ) from error
+        if not isinstance(payload, Mapping) or not isinstance(
+            payload.get("status"), str
+        ):
+            raise ExternalServiceError(
+                "transcription API returned an invalid cancellation response"
+            )
+        return payload
+
+    def _cancel_and_wait(self, job_id: str) -> Mapping[str, Any]:
+        payload = self.cancel_job(job_id)
+        remote_status = str(payload["status"])
+        if remote_status in {"cancelled", "completed", "failed"}:
+            return payload
+        if remote_status not in {"cancel_requested", "queued", "running"}:
+            raise ExternalServiceError(
+                "transcription cancellation returned unknown status "
+                f"{remote_status}"
+            )
+        return self._wait_for_terminal_status(
+            job_id,
+            on_progress=None,
+            should_stop=None,
+        )
+
     def _wait_for_terminal_status(
         self,
         job_id: str,
@@ -244,7 +296,14 @@ class STTAPIClient(RetryingJSONClient):
                 raise ExternalServiceError(
                     "transcription API returned an invalid status event"
                 ) from error
-            if remote_status not in {"queued", "running", "completed", "failed"}:
+            if remote_status not in {
+                "cancel_requested",
+                "cancelled",
+                "queued",
+                "running",
+                "completed",
+                "failed",
+            }:
                 raise ExternalServiceError(
                     f"transcription job returned unknown status {remote_status}"
                 )
@@ -284,7 +343,7 @@ class STTAPIClient(RetryingJSONClient):
                             "final": current_progress[4],
                         }
                     )
-            if remote_status in {"completed", "failed"}:
+            if remote_status in {"cancelled", "completed", "failed"}:
                 return status_payload
         raise ExternalServiceError(
             "transcription event stream ended before a terminal status"
@@ -345,7 +404,11 @@ class STTAPIClient(RetryingJSONClient):
                             "transcription status event must be an object"
                         )
                     yield payload
-                    if str(payload.get("status", "")) in {"completed", "failed"}:
+                    if str(payload.get("status", "")) in {
+                        "cancelled",
+                        "completed",
+                        "failed",
+                    }:
                         return
             except requests.RequestException as error:
                 last_error = error

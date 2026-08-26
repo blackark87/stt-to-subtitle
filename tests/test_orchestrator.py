@@ -1227,6 +1227,10 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                 orchestrator.store.update(
                     running.id,
                     status="transcription_running",
+                    stt_job_id="remote-running",
+                )
+                orchestrator.stt_client.cancel_job = Mock(
+                    return_value={"status": "cancel_requested"}
                 )
                 paused = orchestrator.store.create(
                     job_id="paused",
@@ -1266,6 +1270,9 @@ class SubtitleOrchestratorTests(unittest.TestCase):
             self.assertEqual(running_after_stop.reason_code, "user_stop")
             self.assertFalse(running_after_stop.job_stop_requested)
             self.assertEqual(paused_after_request.status, "translation_paused")
+            orchestrator.stt_client.cancel_job.assert_called_once_with(
+                "remote-running"
+            )
 
     def test_stops_only_selected_jobs(self) -> None:
         with TemporaryDirectory() as directory:

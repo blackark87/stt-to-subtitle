@@ -121,6 +121,55 @@ class TranscriptionStoreTests(unittest.TestCase):
             self.assertEqual(job.attempt, 2)
             self.assertEqual(job.options["chunk_length_seconds"], 30)
 
+    def test_cancels_queued_job_immediately_and_running_job_cooperatively(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            store = TranscriptionStore(Path(directory) / "jobs.sqlite3")
+            for job_id in ("queued", "running"):
+                store.create(
+                    job_id=job_id,
+                    idempotency_key=f"{job_id}-key",
+                    audio_path=Path(directory) / f"{job_id}.wav",
+                    audio_sha256="abc",
+                    options={},
+                )
+            store.update("running", status="running")
+
+            queued = store.request_cancel("queued")
+            running = store.request_cancel("running")
+
+            self.assertEqual(queued.status, "cancelled")
+            self.assertIsNotNone(queued.cancel_requested_at)
+            self.assertIsNotNone(queued.cancelled_at)
+            self.assertEqual(running.status, "cancel_requested")
+            self.assertIsNotNone(running.cancel_requested_at)
+            self.assertIsNone(running.cancelled_at)
+
+            self.assertTrue(store.mark_cancelled("running"))
+            cancelled = store.request_cancel("running")
+            self.assertEqual(cancelled.status, "cancelled")
+            self.assertIsNotNone(cancelled.cancelled_at)
+
+    def test_restart_confirms_persisted_cancellation_request(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = TranscriptionStore(Path(directory) / "jobs.sqlite3")
+            store.create(
+                job_id="job-1",
+                idempotency_key="key-1",
+                audio_path=Path(directory) / "audio.wav",
+                audio_sha256="abc",
+                options={},
+            )
+            store.update("job-1", status="running")
+            store.request_cancel("job-1")
+
+            self.assertEqual(store.fail_interrupted_jobs(), 1)
+            recovered = store.get("job-1")
+            self.assertEqual(recovered.status, "cancelled")
+            self.assertIsNone(recovered.error)
+            self.assertIsNotNone(recovered.cancelled_at)
+
     def test_adds_chunk_columns_to_an_existing_database(self) -> None:
         with TemporaryDirectory() as directory:
             database_path = Path(directory) / "jobs.sqlite3"

@@ -205,8 +205,10 @@ class STTAPIClientProgressTests(unittest.TestCase):
 
     def test_stops_event_stream_when_requested(self) -> None:
         running = self.event_stream({"status": "running"})
+        cancelled = Mock(status_code=200)
+        cancelled.json.return_value = {"status": "cancelled"}
         client = STTAPIClient("http://stt.test", "")
-        client.request = Mock(return_value=running)
+        client.request = Mock(side_effect=[running, cancelled])
         should_stop = Mock(side_effect=[False, False, True])
 
         with self.assertRaises(OperationStopped):
@@ -218,11 +220,40 @@ class STTAPIClientProgressTests(unittest.TestCase):
                 should_stop=should_stop,
             )
 
-        client.request.assert_called_once()
+        self.assertEqual(client.request.call_count, 2)
         self.assertEqual(
-            client.request.call_args.args[1],
+            client.request.call_args_list[0].args[1],
             "http://stt.test/v1/transcriptions/remote-job/events",
         )
+        self.assertEqual(client.request.call_args_list[1].args[0], "POST")
+        self.assertEqual(
+            client.request.call_args_list[1].args[1],
+            "http://stt.test/v1/transcriptions/remote-job/cancel",
+        )
+
+    def test_waits_for_remote_cancellation_confirmation(self) -> None:
+        running = self.event_stream({"status": "running"})
+        requested = Mock(status_code=200)
+        requested.json.return_value = {"status": "cancel_requested"}
+        confirmation = self.event_stream({"status": "cancelled"})
+        client = STTAPIClient("http://stt.test", "")
+        client.request = Mock(
+            side_effect=[running, requested, confirmation]
+        )
+        should_stop = Mock(side_effect=[False, False, True])
+
+        with self.assertRaises(OperationStopped):
+            client.transcribe(
+                Path("/not-read.wav"),
+                options={},
+                idempotency_key="key",
+                existing_job_id="remote-job",
+                should_stop=should_stop,
+            )
+
+        self.assertEqual(client.request.call_count, 3)
+        self.assertEqual(client.request.call_args_list[1].args[0], "POST")
+        self.assertEqual(client.request.call_args_list[2].args[0], "GET")
 
     def test_forwards_changed_chunk_progress_from_event_stream(self) -> None:
         events = self.event_stream(

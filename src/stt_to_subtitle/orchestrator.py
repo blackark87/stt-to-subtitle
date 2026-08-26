@@ -1908,6 +1908,21 @@ class SubtitleOrchestrator:
                     **fields,
                 ):
                     self.store.add_event(job.id, "warning", event_message)
+                    if (
+                        job.status == "transcription_running"
+                        and job.stt_job_id
+                        and self.stt_client is not None
+                    ):
+                        try:
+                            self.stt_client.cancel_job(job.stt_job_id)
+                        except ExternalServiceError as error:
+                            message = self._sanitize_error(str(error))
+                            self.store.add_event(
+                                job.id,
+                                "warning",
+                                "remote transcription cancellation is "
+                                f"pending: {message}",
+                            )
                     stopped_count += 1
                     break
         return stopped_count

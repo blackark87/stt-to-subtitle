@@ -525,7 +525,7 @@ class STTAPIHelpersTests(unittest.TestCase):
                 updated_at=0.0,
             )
 
-            def fake_run(command, **kwargs):
+            def fake_run(job_id, command, *, environment):
                 output = Path(command[command.index("--output") + 1])
                 output.write_text(
                     json.dumps(
@@ -543,14 +543,16 @@ class STTAPIHelpersTests(unittest.TestCase):
 
             with patch.object(service, "_release_pipeline") as release:
                 with patch(
-                    "stt_to_subtitle.stt_api.subprocess.run",
+                    "stt_to_subtitle.stt_api.TranscriptionService."
+                    "_run_worker_process",
                     side_effect=fake_run,
                 ) as run:
                     result = service._run_whisperx_worker(job)
 
             release.assert_called_once_with()
-            command = run.call_args.args[0]
-            environment = run.call_args.kwargs["env"]
+            self.assertEqual(run.call_args.args[0], "job-id")
+            command = run.call_args.args[1]
+            environment = run.call_args.kwargs["environment"]
             self.assertNotIn("secret-hf-token", command)
             self.assertEqual(
                 environment.get("PYTHONPATH"),
@@ -558,13 +560,12 @@ class STTAPIHelpersTests(unittest.TestCase):
             )
             self.assertEqual(environment["HF_TOKEN"], "secret-hf-token")
             self.assertEqual(environment["PYTHONIOENCODING"], "utf-8")
-            self.assertEqual(run.call_args.kwargs["encoding"], "utf-8")
-            self.assertEqual(run.call_args.kwargs["errors"], "replace")
             self.assertEqual(result["model"]["id"], "large-v3")
 
             with patch.object(service, "_release_pipeline") as release:
                 with patch(
-                    "stt_to_subtitle.stt_api.subprocess.run",
+                    "stt_to_subtitle.stt_api.TranscriptionService."
+                    "_run_worker_process",
                     side_effect=fake_run,
                 ) as run:
                     service._run_whisperx_worker(
@@ -577,7 +578,7 @@ class STTAPIHelpersTests(unittest.TestCase):
                     )
 
             release.assert_not_called()
-            command = run.call_args.args[0]
+            command = run.call_args.args[1]
             worker_options = json.loads(
                 command[command.index("--options") + 1]
             )
@@ -617,8 +618,8 @@ class STTAPIHelpersTests(unittest.TestCase):
 
             commands = []
 
-            def fake_run(command, **kwargs):
-                commands.append((command, kwargs))
+            def fake_run(job_id, command, *, environment):
+                commands.append((job_id, command, environment))
                 output = Path(command[command.index("--output") + 1])
                 if "stt_to_subtitle.whisperjav_worker" in command:
                     output.write_text('{"words":[]}', encoding="utf-8")
@@ -640,22 +641,24 @@ class STTAPIHelpersTests(unittest.TestCase):
 
             with patch.object(service, "_release_pipeline") as release:
                 with patch(
-                    "stt_to_subtitle.stt_api.subprocess.run",
+                    "stt_to_subtitle.stt_api.TranscriptionService."
+                    "_run_worker_process",
                     side_effect=fake_run,
                 ):
                     result = service._run_whisperjav_worker(job)
 
             release.assert_called_once_with()
             self.assertEqual(len(commands), 2)
-            self.assertEqual(commands[0][0][0], str(whisperjav_python))
-            self.assertEqual(commands[1][0][0], str(whisperx_python))
+            self.assertEqual(commands[0][0], "whisperjav-job")
+            self.assertEqual(commands[0][1][0], str(whisperjav_python))
+            self.assertEqual(commands[1][1][0], str(whisperx_python))
             self.assertIn(
-                "stt_to_subtitle.whisperjav_worker", commands[0][0]
+                "stt_to_subtitle.whisperjav_worker", commands[0][1]
             )
-            self.assertIn("stt_to_subtitle.speaker_worker", commands[1][0])
-            self.assertNotIn("secret-hf-token", commands[0][0])
+            self.assertIn("stt_to_subtitle.speaker_worker", commands[1][1])
+            self.assertNotIn("secret-hf-token", commands[0][1])
             self.assertEqual(
-                commands[0][1]["env"]["HF_TOKEN"], "secret-hf-token"
+                commands[0][2]["HF_TOKEN"], "secret-hf-token"
             )
             self.assertEqual(result["model"]["id"], "whisperjav-domain-ensemble")
 
@@ -1170,6 +1173,53 @@ class STTAPIRouteTests(unittest.TestCase):
             self.assertIn("event: transcription", body)
             self.assertIn('"status":"completed"', body)
             self.assertEqual(response.headers["x-accel-buffering"], "no")
+
+    def test_cancel_route_is_idempotent_for_queued_and_running_jobs(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings = STTAPISettings(
+                state_dir=root,
+                api_token="api-token",
+                hf_token="hf-token",
+            )
+            headers = {"Authorization": "Bearer api-token"}
+            with TestClient(create_app(settings)) as client:
+                service = client.app.state.transcription_service
+                for job_id in ("queued", "running"):
+                    service.store.create(
+                        job_id=job_id,
+                        idempotency_key=f"{job_id}-key",
+                        audio_path=root / f"{job_id}.wav",
+                        audio_sha256="abc",
+                        options={},
+                    )
+                service.store.update("running", status="running")
+
+                queued = client.post(
+                    "/v1/transcriptions/queued/cancel",
+                    headers=headers,
+                )
+                with patch.object(
+                    service,
+                    "_terminate_active_process",
+                ) as terminate:
+                    running = client.post(
+                        "/v1/transcriptions/running/cancel",
+                        headers=headers,
+                    )
+                    repeated = client.post(
+                        "/v1/transcriptions/running/cancel",
+                        headers=headers,
+                    )
+
+            self.assertEqual(queued.status_code, 200)
+            self.assertEqual(queued.json()["status"], "cancelled")
+            self.assertEqual(running.status_code, 200)
+            self.assertEqual(running.json()["status"], "cancel_requested")
+            self.assertEqual(repeated.json()["status"], "cancel_requested")
+            self.assertEqual(terminate.call_count, 2)
 
     def test_health_is_public_and_job_status_requires_bearer_token(self) -> None:
         with TemporaryDirectory() as directory:

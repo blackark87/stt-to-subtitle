@@ -6,7 +6,7 @@
 
 ### 구현 진행 상태
 
-현재 작업 트리에는 계획의 네 번째 수직 슬라이스까지 반영됐다.
+현재 작업 트리에는 계획의 다섯 번째 수직 슬라이스까지 반영됐다.
 
 | 항목 | 반영 상태 | 남은 범위 |
 |---|---|---|
@@ -17,6 +17,7 @@
 | 상용 LLM 검증 | 번역 LLM과 분리된 설정, 명시적 1회 호출, 구조화 결과, 입력·모델 cache | provider별 adapter·비용/사용량 관측 |
 | 번역 generation | generation·batch·segment SQLite 원장, 입력 지문, 배치 시도·실패, DB 기반 JSON 복구, 재번역·직접 편집 이력 | immutable prompt revision·startup reconcile |
 | 자막 publication | source별 단일 게시 포인터, generation별 SRT/ASS와 해시, 다운로드·과거 버전 재게시 | pair manifest·파일/DB startup reconcile·retention |
+| 원격 STT 취소 | 멱등 cancel API, `cancel_requested/cancelled` 영속 상태, 웹의 취소 호출·최종 확인, WhisperX/JAV process group 종료, Kotoba 청크 경계 취소 | Kotoba diarization/postprocess 즉시 중단·실제 GPU 자원 fault test |
 
 이하의 문제 분석은 최초 분석 시점 구조를 기준으로 하되, 구현이 끝난 절은 현재
 동작과 남은 범위로 갱신했다.
@@ -32,7 +33,7 @@
 3. 웹 프로세스 재시작 시 실행 중이던 모든 작업을 일괄 `blocked`로 바꾸며, 단계별 자동 복구나 원격 STT 작업 재연결이 없다.
 4. 사용자 정지는 신규 작업에서 명시적 `stopped/user_stop`으로 저장한다. 기존 한국어 오류 문구 판별은 과거 DB를 한 번 마이그레이션할 때만 사용한다.
 5. 2D 대시보드, 3D 대시보드, 작업 목록은 영속 `state`를 공통 원천으로 사용하고 작업 목록은 `phase + state` 결합 필터를 지원한다.
-6. 전사 중지 요청은 웹의 대기 루프만 중지하고 원격 STT 작업을 취소하지 않아 GPU 작업이 계속될 수 있다.
+6. 전사 중지는 원격 STT cancel API를 호출하고 `cancelled` 확인 뒤 웹 작업을 `stopped/user_stop`으로 확정한다. WhisperX/JAV는 process group을 종료하고 Kotoba는 청크 경계에서 협력적으로 중지한다.
 7. 번역 결과는 generation·batch·segment 단위로 DB에 저장되고 JSON을 재생성할 수 있게 됐다. 다만 실행 중 프로세스 종료를 자동 reconcile하는 worker lease는 아직 없다.
 8. 프롬프트를 바꾼 재번역과 직접 편집은 별도 translation generation으로 보존하고, SRT/ASS도 generation별 보존·재게시할 수 있다. immutable prompt revision과 파일/DB startup reconcile은 아직 없다.
 9. 미디어 옆의 `<filename>.srt/.vtt/.ass` 외부 자막 탐지·재생·로컬 비교는 추가됐지만 asset/revision/publication 관계와 증분 catalog는 아직 없다.
@@ -142,7 +143,7 @@ stateDiagram-v2
 ## 4. 기능별 추가 개발 평가
 
 | 기능 | 현재 구현 | 추가로 필요한 기능 | 우선순위 |
-|---|---|---|---|
+|---|---|---|
 | 작업 상태 | 단일 `status`, `blocked_stage`, 자유 형식 `error` | `operation/phase/state/reason_code` 분리, 전이 검증, 기존 데이터 마이그레이션 | P0 |
 | 사용자 중지 | `blocked`와 고정 오류 문구로 표현 | 명시적 `stopped`, 요청 시각·확인 시각·요청자 기록 | P0 |
 | 번역 일시정지 | 논리 배치 체크포인트 후 정지 | 체크포인트 호환성 지문, 일시정지 작업의 중지 지원 | P0–P1 |
@@ -287,32 +288,32 @@ Whisper 계열의 segment 오류도 오류가 발생한 위치가 아니라 복�
 
 ## 8. 원격 STT 취소
 
-현재 웹에서 전사를 중지하면 로컬 진행 대기만 종료되고 원격 GPU 작업은 계속될 수 있다. 다음 API 계약이 필요하다.
+웹과 STT 서비스에는 다음 취소 계약이 구현됐다.
 
 ```http
 POST /v1/transcriptions/{job_id}/cancel
 ```
 
-요구 사항:
+현재 동작:
 
 - 이미 취소·완료된 요청에도 안전한 멱등 응답
 - `cancel_requested`와 최종 `cancelled` 구분
-- 실행 전이면 큐에서 제거, 실행 중이면 backend가 제공하는 안전한 취소 지점에서 종료
-- 웹은 취소 확인 전까지 `stopping` 같은 별도 사용자 상태를 늘리기보다 `running`에 `stop_requested_at`을 부가 정보로 유지
-- 프로세스 재시작 시 취소 요청도 reconcile
-- GPU 프로세스를 강제 종료해야만 취소할 수 있는 backend라면 다른 작업 영향과 worker 재기동 정책을 명시
+- 실행 전이면 DB 상태로 실행 대상에서 제외하고, 실행 중이면 backend가 제공하는 안전한 취소 지점에서 종료
+- 웹은 취소 확인 전까지 `running + job_stop_requested`를 유지하고 STT 작업은 `cancel_requested_at`을 기록
+- STT 서비스 재시작 시 남은 `cancel_requested`를 `cancelled`로 확정
+- WhisperX·WhisperJAV process group은 `SIGTERM` 후 유예 시간 내 종료되지 않으면 `SIGKILL`
 
 현재 backend별 취소 가능 범위는 다음과 같다.
 
-| backend/상태 | 현재 구조 | 구현 가능한 취소 방식 | 제한 |
-|---|---|---|---|
-| STT 큐 대기 | `queue.Queue`와 DB `queued` | DB를 `cancelled`로 바꾸고 worker가 dequeue 시 건너뜀 | 큐 내부 항목을 물리적으로 제거하지 않아도 됨 |
-| WhisperX 실행 | 별도 프로세스를 `subprocess.run`으로 동기 대기 | `Popen`으로 전환하고 process group에 `SIGTERM`, 유예 후 `SIGKILL` | 처리 중 결과는 재사용하지 못하며 GPU 정리 확인 필요 |
-| WhisperJAV 실행 | WhisperJAV와 speaker worker를 순차 subprocess 실행 | 현재 실행 중인 process group 종료, 다음 worker 시작 금지 | 두 subprocess 사이 취소 경합 처리 필요 |
-| Kotoba 실행 | STT API 프로세스 안에서 pipeline 직접 호출 | preprocess/forward 청크 경계에 cancellation token 검사 또는 Kotoba 자체를 subprocess로 격리 | diarization/postprocess 구간은 즉시 취소되지 않을 수 있음 |
-| 외부 STT provider | provider API에 의존 | provider cancel endpoint 호출 | provider가 지원하지 않으면 로컬 구독 중단만 가능 |
+| backend/상태 | 현재 취소 방식 | 제한 |
+|---|---|---|
+| STT 큐 대기 | DB를 즉시 `cancelled`로 바꾸고 worker가 dequeue 시 건너뜀 | 큐 내부 항목은 물리적으로 제거하지 않음 |
+| WhisperX 실행 | `Popen` process group에 `SIGTERM`, 유예 후 `SIGKILL` | 처리 중 결과는 재사용하지 않으며 GPU 자원 실환경 검증 필요 |
+| WhisperJAV 실행 | 현재 process group 종료, 두 subprocess 사이에는 다음 실행 전 취소 상태 확인 | 처리 중 부분 결과는 재사용하지 않음 |
+| Kotoba 실행 | preprocess/forward 진행 콜백에서 영속 취소 상태 확인 | 모델 로드·diarization·postprocess 구간은 즉시 취소되지 않을 수 있음 |
+| 외부 STT provider | 아직 별도 provider adapter 없음 | provider가 취소 API를 지원하지 않으면 실제 원격 취소 불가 |
 
-따라서 “이미 모델에 들어간 작업은 절대 취소할 수 없다”기보다는, 현재 구현에 취소 신호와 실행 핸들이 없어서 취소하지 못하는 상태다. 강제 종료는 가능하지만 부분 전사 재개를 자동으로 제공하지 않는다. 안정성을 우선하면 모든 GPU backend를 job subprocess로 격리하고 부모 STT 서비스가 PID/process group과 취소 상태를 관리하는 구조가 가장 일관된다.
+취소와 부분 전사 재개는 별개다. 현재 취소는 실행을 종료하지만 처리 중 결과를 체크포인트로 재사용하지 않는다. Kotoba까지 즉시 중단해야 한다면 별도 job subprocess로 격리하는 후속 변경이 필요하다.
 
 ## 9. 체크포인트와 산출물 일관성
 
@@ -794,7 +795,7 @@ src/stt_to_subtitle/
 | 질의 | 현재 코드 기준 답변 | 보고서 권고 |
 |---|---|---|
 | 번역 청크 DB 저장이 없어도 되는가 | 안 된다. 현재 generation·batch·item 원장을 추가해 성공·실패 시도와 부분 결과를 저장하고 JSON을 snapshot으로 재생성한다. | startup reconcile, lease, immutable prompt revision, publication까지 확장한다. |
-| 이미 요청된 Whisper/Kotoba/WhisperJAV를 취소할 수 있는가 | 현재는 취소 API와 실행 핸들이 없어 불가능하다. 대기 작업은 즉시 취소 가능하고, WhisperX/JAV는 subprocess 종료, Kotoba는 cooperative hook 또는 subprocess 격리로 구현할 수 있다. | backend별 취소 adapter와 멱등 cancel API를 만든다. 취소와 사전 segmentation은 별도 요구다. |
+| 이미 요청된 Whisper/Kotoba/WhisperJAV를 취소할 수 있는가 | 가능하다. 대기 작업은 즉시 취소하고 WhisperX/JAV는 process group을 종료하며 Kotoba는 청크 경계에서 중지한다. 웹은 원격 `cancelled`를 확인한다. | Kotoba의 모델 로드·diarization·postprocess 즉시 중단이 필요하면 subprocess 격리를 추가한다. 취소와 사전 segmentation은 별도 요구다. |
 | 자막이 있는 상태에서 prompt 변경 재시도는 어떻게 되는가 | transcript와 기존 번역·자막 generation을 보존하고 새 generation으로 처리한다. 새 번역 완료 전 기존 게시본을 유지하며 과거 SRT/ASS를 다시 게시할 수 있다. | immutable prompt revision, 번역 비교 UI, publication startup reconcile을 추가한다. |
 | `next_probe_at`은 계속 재시도한다는 뜻인가 | 번역 LLM이 평소 꺼져 있는 운영 환경에서는 호출 자체가 불필요하다. | LM은 manual gate로 두고 `next_probe_at`을 사용하지 않는다. STT처럼 자동 복구를 선택한 의존성에만 제한적으로 사용한다. |
 | 중단과 실패는 어떻게 구분하는가 | 현재 STT `failed`가 웹에서 `blocked`가 될 수 있어 일관되지 않다. | 외부 조건이 회복되면 그대로 재개 가능한 경우 `blocked`, 입력·모델 출력·코드 계약 오류처럼 변경이 필요한 경우 `failed`다. segment 구조 오류는 기본적으로 `failed/model_output_invalid`다. |

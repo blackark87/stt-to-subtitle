@@ -29,6 +29,8 @@ class TranscriptionJob:
     created_at: float
     updated_at: float
     attempt: int = 1
+    cancel_requested_at: float | None = None
+    cancelled_at: float | None = None
 
     def public_dict(self, *, report_every: int = 10) -> dict[str, Any]:
         in_progress = max(0, self.chunks_created - self.chunks_completed)
@@ -38,6 +40,16 @@ class TranscriptionJob:
             "audio_sha256": self.audio_sha256,
             "error": self.error,
             "attempt": self.attempt,
+            "cancel_requested_at": (
+                format_kst_iso(self.cancel_requested_at)
+                if self.cancel_requested_at is not None
+                else None
+            ),
+            "cancelled_at": (
+                format_kst_iso(self.cancelled_at)
+                if self.cancelled_at is not None
+                else None
+            ),
             "chunk_progress": {
                 "created": self.chunks_created,
                 "completed": self.chunks_completed,
@@ -128,6 +140,8 @@ class TranscriptionStore:
                     chunks_created INTEGER NOT NULL DEFAULT 0,
                     chunks_completed INTEGER NOT NULL DEFAULT 0,
                     attempt INTEGER NOT NULL DEFAULT 1,
+                    cancel_requested_at REAL,
+                    cancelled_at REAL,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL
                 )
@@ -160,6 +174,20 @@ class TranscriptionStore:
                     ADD COLUMN attempt INTEGER NOT NULL DEFAULT 1
                     """
                 )
+            if "cancel_requested_at" not in columns:
+                connection.execute(
+                    """
+                    ALTER TABLE transcription_jobs
+                    ADD COLUMN cancel_requested_at REAL
+                    """
+                )
+            if "cancelled_at" not in columns:
+                connection.execute(
+                    """
+                    ALTER TABLE transcription_jobs
+                    ADD COLUMN cancelled_at REAL
+                    """
+                )
 
     @staticmethod
     def _from_row(row: sqlite3.Row | None) -> TranscriptionJob | None:
@@ -181,6 +209,16 @@ class TranscriptionStore:
             created_at=float(row["created_at"]),
             updated_at=float(row["updated_at"]),
             attempt=int(row["attempt"]),
+            cancel_requested_at=(
+                float(row["cancel_requested_at"])
+                if row["cancel_requested_at"] is not None
+                else None
+            ),
+            cancelled_at=(
+                float(row["cancelled_at"])
+                if row["cancelled_at"] is not None
+                else None
+            ),
         )
 
     def get(self, job_id: str) -> TranscriptionJob | None:
@@ -274,6 +312,97 @@ class TranscriptionStore:
         if result.rowcount == 1:
             self._notify_change(job_id)
 
+    def update_if_status(
+        self,
+        job_id: str,
+        expected_statuses: set[str],
+        *,
+        status: str,
+        result_path: Path | None = None,
+        error: str | None = None,
+    ) -> bool:
+        if not expected_statuses:
+            return False
+        placeholders = ", ".join("?" for _ in expected_statuses)
+        parameters: tuple[object, ...] = (
+            status,
+            str(result_path) if result_path is not None else None,
+            error,
+            time.time(),
+            job_id,
+            *sorted(expected_statuses),
+        )
+        with self._connect() as connection:
+            result = connection.execute(
+                f"""
+                UPDATE transcription_jobs
+                SET status = ?, result_path = COALESCE(?, result_path),
+                    error = ?, updated_at = ?
+                WHERE id = ? AND status IN ({placeholders})
+                """,
+                parameters,
+            )
+        changed = result.rowcount == 1
+        if changed:
+            self._notify_change(job_id)
+        return changed
+
+    def request_cancel(self, job_id: str) -> TranscriptionJob | None:
+        """Persist an idempotent cancellation request for one job."""
+        now = time.time()
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT status FROM transcription_jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            current = str(row["status"])
+            if current == "queued":
+                result = connection.execute(
+                    """
+                    UPDATE transcription_jobs
+                    SET status = 'cancelled', cancel_requested_at = ?,
+                        cancelled_at = ?, error = NULL, updated_at = ?
+                    WHERE id = ? AND status = 'queued'
+                    """,
+                    (now, now, now, job_id),
+                )
+            elif current == "running":
+                result = connection.execute(
+                    """
+                    UPDATE transcription_jobs
+                    SET status = 'cancel_requested', cancel_requested_at = ?,
+                        error = NULL, updated_at = ?
+                    WHERE id = ? AND status = 'running'
+                    """,
+                    (now, now, job_id),
+                )
+            else:
+                result = None
+        if result is not None and result.rowcount == 1:
+            self._notify_change(job_id)
+        return self.get(job_id)
+
+    def mark_cancelled(self, job_id: str) -> bool:
+        now = time.time()
+        with self._connect() as connection:
+            result = connection.execute(
+                """
+                UPDATE transcription_jobs
+                SET status = 'cancelled',
+                    cancel_requested_at = COALESCE(cancel_requested_at, ?),
+                    cancelled_at = ?, error = NULL, updated_at = ?
+                WHERE id = ?
+                  AND status = 'cancel_requested'
+                """,
+                (now, now, now, job_id),
+            )
+        changed = result.rowcount == 1
+        if changed:
+            self._notify_change(job_id)
+        return changed
+
     def requeue(
         self,
         job_id: str,
@@ -294,6 +423,7 @@ class TranscriptionStore:
                 SET status = 'queued', error = NULL,
                     chunks_created = 0, chunks_completed = 0,
                     attempt = attempt + 1,
+                    cancel_requested_at = NULL, cancelled_at = NULL,
                     updated_at = ?{options_assignment}
                 WHERE id = ?
                 """,
@@ -328,11 +458,21 @@ class TranscriptionStore:
             cursor = connection.execute(
                 """
                 UPDATE transcription_jobs
-                SET status = 'failed',
-                    error = 'service restarted while transcription was running',
+                SET status = CASE
+                        WHEN status = 'cancel_requested' THEN 'cancelled'
+                        ELSE 'failed'
+                    END,
+                    error = CASE
+                        WHEN status = 'cancel_requested' THEN NULL
+                        ELSE 'service restarted while transcription was running'
+                    END,
+                    cancelled_at = CASE
+                        WHEN status = 'cancel_requested' THEN ?
+                        ELSE cancelled_at
+                    END,
                     updated_at = ?
-                WHERE status = 'running'
+                WHERE status IN ('running', 'cancel_requested')
                 """,
-                (time.time(),),
+                (time.time(), time.time()),
             )
         return cursor.rowcount

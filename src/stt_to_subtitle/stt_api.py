@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import platform
 import queue
+import signal
 import subprocess
 import tempfile
 import threading
@@ -76,6 +77,10 @@ from .whisperjav_worker import WhisperJAVOptions
 
 LOGGER = logging.getLogger(__name__)
 STT_BACKENDS = {"hybrid", "kotoba", "whisperjav", "whisperx"}
+
+
+class TranscriptionCancelled(RuntimeError):
+    """Raised when a persisted remote cancellation reaches a safe boundary."""
 
 
 class TranscriptionChangeHook:
@@ -634,6 +639,8 @@ class TranscriptionService:
         self._pipeline_lock = threading.RLock()
         self._pipeline_idle_since = time.monotonic()
         self._stopping = threading.Event()
+        self._process_lock = threading.Lock()
+        self._active_processes: dict[str, subprocess.Popen[str]] = {}
         self._worker = threading.Thread(
             target=self._worker_loop,
             name="stt-api-worker",
@@ -662,6 +669,89 @@ class TranscriptionService:
         self._worker.join(timeout=5)
         if self._idle_reaper.is_alive():
             self._idle_reaper.join(timeout=5)
+
+    def cancel(self, job_id: str) -> TranscriptionJob | None:
+        job = self.store.request_cancel(job_id)
+        if job is None:
+            return None
+        if job.status == "cancel_requested":
+            self._terminate_active_process(job_id)
+        return self.store.get(job_id)
+
+    def _raise_if_cancel_requested(self, job_id: str) -> None:
+        job = self.store.get(job_id)
+        if job is not None and job.status in {"cancel_requested", "cancelled"}:
+            raise TranscriptionCancelled("transcription cancelled by user")
+
+    def _terminate_active_process(self, job_id: str) -> None:
+        with self._process_lock:
+            process = self._active_processes.get(job_id)
+        if process is None or process.poll() is not None:
+            return
+        self._signal_process(process, signal.SIGTERM)
+
+    @staticmethod
+    def _signal_process(
+        process: subprocess.Popen[str],
+        requested_signal: signal.Signals,
+    ) -> None:
+        try:
+            os.killpg(process.pid, requested_signal)
+        except OSError:
+            try:
+                if requested_signal == signal.SIGKILL:
+                    process.kill()
+                else:
+                    process.terminate()
+            except OSError:
+                return
+
+    def _run_worker_process(
+        self,
+        job_id: str,
+        command: Sequence[str],
+        *,
+        environment: Mapping[str, str],
+    ) -> subprocess.CompletedProcess[str]:
+        self._raise_if_cancel_requested(job_id)
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=dict(environment),
+            start_new_session=True,
+        )
+        with self._process_lock:
+            self._active_processes[job_id] = process
+        try:
+            try:
+                while True:
+                    try:
+                        stdout, stderr = process.communicate(timeout=0.5)
+                        break
+                    except subprocess.TimeoutExpired:
+                        self._raise_if_cancel_requested(job_id)
+            except TranscriptionCancelled:
+                self._signal_process(process, signal.SIGTERM)
+                try:
+                    process.communicate(timeout=5.0)
+                except subprocess.TimeoutExpired:
+                    self._signal_process(process, signal.SIGKILL)
+                    process.communicate()
+                raise
+        finally:
+            with self._process_lock:
+                self._active_processes.pop(job_id, None)
+        self._raise_if_cancel_requested(job_id)
+        return subprocess.CompletedProcess(
+            command,
+            process.returncode,
+            stdout,
+            stderr,
+        )
 
     def health(self) -> dict[str, Any]:
         return {
@@ -754,9 +844,11 @@ class TranscriptionService:
         existing = self.store.get_by_idempotency_key(key)
         if existing is not None:
             await upload.close()
-            if existing.status == "failed":
+            if existing.status in {"cancelled", "failed"}:
                 if not Path(existing.audio_path).is_file():
-                    raise ValueError("saved upload for the failed job is unavailable")
+                    raise ValueError(
+                        "saved upload for the retryable job is unavailable"
+                    )
                 self.store.requeue(existing.id, options=options)
                 self._queue.put(existing.id)
                 requeued = self.store.get(existing.id)
@@ -1030,14 +1122,10 @@ class TranscriptionService:
                 ]
             )
         try:
-            completed = subprocess.run(
+            completed = self._run_worker_process(
+                job.id,
                 command,
-                check=False,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                env=environment,
+                environment=environment,
             )
             if completed.returncode != 0:
                 detail = (completed.stderr or completed.stdout).strip()
@@ -1136,14 +1224,10 @@ class TranscriptionService:
                     environment,
                 ),
             ):
-                completed = subprocess.run(
+                completed = self._run_worker_process(
+                    job.id,
                     command,
-                    check=False,
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    env=worker_environment,
+                    environment=worker_environment,
                 )
                 if completed.returncode != 0:
                     detail = (completed.stderr or completed.stdout).strip()
@@ -1214,7 +1298,12 @@ class TranscriptionService:
         job = self.store.get(job_id)
         if job is None or job.status != "queued":
             return
-        self.store.update(job_id, status="running")
+        if not self.store.update_if_status(
+            job_id,
+            {"queued"},
+            status="running",
+        ):
+            return
         started = time.monotonic()
         heartbeat_stop = threading.Event()
         heartbeat = threading.Thread(
@@ -1225,6 +1314,7 @@ class TranscriptionService:
         )
         heartbeat.start()
         try:
+            self._raise_if_cancel_requested(job_id)
             backend = str(job.options.get("backend", "kotoba"))
             audio_duration = _wav_duration(Path(job.audio_path))
             warm_start = (
@@ -1718,6 +1808,7 @@ class TranscriptionService:
             }
             if words:
                 payload["words"] = words
+            self._raise_if_cancel_requested(job.id)
             result_path = self.result_dir / f"{job.id}.json"
             write_json_atomic(result_path, payload)
             if artifact_dir is not None:
@@ -1754,11 +1845,15 @@ class TranscriptionService:
                         if key in {"encoding_warning", "repetition"}
                     },
                 )
-            self.store.update(
+            if not self.store.update_if_status(
                 job.id,
+                {"running"},
                 status="completed",
                 result_path=result_path,
-            )
+            ):
+                result_path.unlink(missing_ok=True)
+                self._raise_if_cancel_requested(job.id)
+                raise RuntimeError("transcription status changed before completion")
             LOGGER.info(
                 "transcription job %s completed with %d segments using %s",
                 job.id,
@@ -1777,14 +1872,21 @@ class TranscriptionService:
                     job.id,
                     removed_count,
                 )
+        except TranscriptionCancelled:
+            self.store.mark_cancelled(job.id)
+            LOGGER.info("transcription job %s cancelled", job.id)
         except BaseException as error:
             message = str(error).replace(self.settings.hf_token, "[redacted]")
-            self.store.update(
-                job.id,
-                status="failed",
-                error=message[:2000] or error.__class__.__name__,
-            )
-            LOGGER.exception("transcription job %s failed", job.id)
+            if self.store.mark_cancelled(job.id):
+                LOGGER.info("transcription job %s cancelled", job.id)
+            else:
+                self.store.update_if_status(
+                    job.id,
+                    {"running"},
+                    status="failed",
+                    error=message[:2000] or error.__class__.__name__,
+                )
+                LOGGER.exception("transcription job %s failed", job.id)
         finally:
             heartbeat_stop.set()
             heartbeat.join()
@@ -1794,6 +1896,7 @@ class TranscriptionService:
         job_id: str,
         progress: ChunkProgress,
     ) -> None:
+        self._raise_if_cancel_requested(job_id)
         previous = self.store.get(job_id)
         self.store.update_chunk_progress(
             job_id,
@@ -1981,6 +2084,22 @@ def create_app(
             report_every=service.settings.chunk_progress_every,
         )
 
+    @app.post(
+        "/v1/transcriptions/{job_id}/cancel",
+        dependencies=[Depends(require_bearer)],
+        name="cancel_transcription",
+    )
+    def cancel_transcription(
+        job_id: str,
+        service: TranscriptionService = Depends(get_service),
+    ) -> dict[str, Any]:
+        job = service.cancel(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="job not found")
+        return job.public_dict(
+            report_every=service.settings.chunk_progress_every,
+        )
+
     @app.get(
         "/v1/transcriptions/{job_id}/events",
         dependencies=[Depends(require_bearer)],
@@ -2011,7 +2130,7 @@ def create_app(
             )
             yield f"id: {version}\nevent: transcription\ndata: {payload}\n\n"
             while True:
-                if job.status in {"completed", "failed"}:
+                if job.status in {"cancelled", "completed", "failed"}:
                     return
                 updated_version = await change_hook.wait(job_id, version)
                 if updated_version == version:
