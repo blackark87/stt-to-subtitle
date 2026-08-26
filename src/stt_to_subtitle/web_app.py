@@ -267,7 +267,7 @@ JOB_PHASE_LABELS = {
     "extraction": "추출",
     "transcription": "전사",
     "translation": "번역",
-    "render": "작업 완료",
+    "render": "자막 생성",
     "complete": "완료",
 }
 MEDIA_PROCESSING_LABELS = {
@@ -296,6 +296,12 @@ JOB_OPERATION_LABELS = {
     "translate": "번역",
     "full": "전체",
 }
+JOB_COMPLETION_LABELS = {
+    "extract": "추출 완료",
+    "transcribe": "전사 완료",
+    "translate": "자막 완료",
+    "full": "작업 완료",
+}
 JOB_OPERATION_FILTER_NAV = (
     {"key": "extract", "label": "추출 요청"},
     {"key": "transcribe", "label": "전사 요청"},
@@ -310,13 +316,13 @@ JOB_PHASE_FILTERS = {
     "extraction": {"phases": {"extraction"}},
     "transcription": {"phases": {"transcription"}},
     "translation": {"phases": {"translation"}},
-    "completion": {"phases": {"render", "complete"}},
+    "completion": {"phases": {"render"}},
 }
 JOB_PHASE_FILTER_LABELS = {
     "extraction": "추출",
     "transcription": "전사",
     "translation": "번역",
-    "completion": "작업 완료",
+    "completion": "자막 생성",
 }
 JOB_PHASE_FILTER_NAV = tuple(
     {"key": key, "label": label}
@@ -351,7 +357,7 @@ JOB_STAGE_LABELS = {
     "audio extraction": "추출",
     "transcription": "전사",
     "translation": "번역",
-    "render": "작업 완료",
+    "render": "자막 생성",
 }
 PHASE_SEQUENCE = (
     "audio extraction",
@@ -446,9 +452,43 @@ def _job_progress_step(
         if uses_stage_progress
         else ""
     )
+    operation = str(job.operation)
+    endpoint_is_subtitle = kind == "endpoint" and operation == "translate"
+    step_label = (
+        "자막 생성"
+        if endpoint_is_subtitle
+        else (
+            "작업 완료"
+            if kind == "endpoint"
+            else JOB_STAGE_LABELS.get(key, key)
+        )
+    )
+    endpoint_display_label = (
+        {
+            "done": "자막 완료",
+            "running": "자막 생성 중",
+            "waiting": "자막 생성 대기",
+            "pending": "자막 생성 대기",
+            "paused": "자막 생성 일시 정지",
+            "blocked": "자막 생성 중단",
+            "stopped": "자막 생성 정지",
+            "failed": "자막 생성 실패",
+        }[state]
+        if endpoint_is_subtitle
+        else {
+            "done": "작업 완료",
+            "running": "작업 마무리 중",
+            "waiting": "작업 완료 대기",
+            "pending": "작업 완료 대기",
+            "paused": "작업 일시 정지",
+            "blocked": "작업 중단",
+            "stopped": "작업 정지",
+            "failed": "작업 실패",
+        }[state]
+    )
     return {
         "key": key,
-        "label": JOB_STAGE_LABELS.get(key, key),
+        "label": step_label,
         "kind": kind,
         "state": state,
         "state_label": STAGE_STATE_LABELS[state],
@@ -472,18 +512,9 @@ def _job_progress_step(
             if part
         ),
         "display_label": (
-            {
-                "done": "작업 완료",
-                "running": "작업 마무리 중",
-                "waiting": "작업 완료 대기",
-                "pending": "작업 완료 대기",
-                "paused": "작업 일시 정지",
-                "blocked": "작업 중단",
-                "stopped": "작업 정지",
-                "failed": "작업 실패",
-            }[state]
+            endpoint_display_label
             if kind == "endpoint"
-            else JOB_STAGE_LABELS.get(key, key)
+            else step_label
         ),
     }
 
@@ -531,7 +562,7 @@ def job_pipeline_phase_view(job: Any) -> list[dict[str, Any]]:
 
 
 def job_stage_view(job: Any) -> list[dict[str, Any]]:
-    """선택한 phase와 작업 완료 endpoint를 사용자 표시용으로 돌려준다."""
+    """요청한 phase와 필요한 결과 생성 endpoint를 표시한다."""
     operation = str(job.operation)
     phases_by_key = {
         str(phase["key"]): phase for phase in job_pipeline_phase_view(job)
@@ -551,6 +582,9 @@ def job_stage_view(job: Any) -> list[dict[str, Any]]:
             "waiting",
             kind="phase",
         )
+
+    if operation in {"extract", "transcribe"}:
+        return phases
 
     phase = str(job.phase)
     state = str(job.state)
@@ -611,6 +645,10 @@ def job_progress_view(job: Any) -> dict[str, Any]:
         "endpoint": endpoint,
         "percent": percent,
         "current": current,
+        "completion_label": JOB_COMPLETION_LABELS.get(
+            str(job.operation),
+            "완료",
+        ),
         "complete": bool(stages) and all(
             stage["state"] == "done" for stage in stages
         ),
@@ -620,7 +658,7 @@ def job_progress_view(job: Any) -> dict[str, Any]:
 def job_contract_status_label(job: Any) -> str:
     """Render the stable phase/state contract without exposing legacy status."""
     if str(job.state) == JobState.DONE:
-        return JOB_STATUS_LABELS.get(str(job.status), "완료")
+        return JOB_COMPLETION_LABELS.get(str(job.operation), "완료")
     phase = JOB_PHASE_LABELS.get(str(job.phase), str(job.phase))
     state = JOB_STATE_LABELS.get(str(job.state), str(job.state))
     return " · ".join(part for part in (phase, state) if part)
@@ -931,7 +969,7 @@ def webgpu_scene_context(
     completed_jobs = [job for job in jobs if job.state == JobState.DONE]
     completed = []
     for job in completed_jobs[:WEBGPU_COMPLETED_LIMIT]:
-        detail = [JOB_STATUS_LABELS.get(job.status, job.status)]
+        detail = [job_contract_status_label(job)]
         backend_label = _webgpu_backend_label(job)
         if backend_label:
             detail.append(backend_label)
@@ -947,10 +985,20 @@ def webgpu_scene_context(
         for job in jobs
         if job.phase == "render" and job.state == JobState.RUNNING
     ]
+    rendering_endpoint = (
+        job_progress_view(rendering_jobs[0])["endpoint"]
+        if rendering_jobs
+        else None
+    ) or {}
     rendering = (
         {
             "source_rel": rendering_jobs[0].source_rel,
             "detail": JOB_STATUS_LABELS["rendering"],
+            "endpoint": rendering_endpoint.get("label", "자막 생성"),
+            "display_label": rendering_endpoint.get(
+                "display_label",
+                JOB_STATUS_LABELS["rendering"],
+            ),
         }
         if rendering_jobs
         else None
@@ -1236,7 +1284,6 @@ def dashboard_job_view(job: Any, *, now: float) -> dict[str, Any]:
         else ""
     )
     metadata = [
-        JOB_OPERATION_LABELS.get(str(job.operation), str(job.operation)),
         backend,
         prompt,
     ]
@@ -1353,11 +1400,10 @@ def dashboard_2d_data(
     completed_views = []
     for job in completed[:DASHBOARD_COMPLETED_LIMIT]:
         view = dashboard_job_view(job, now=now)
-        view["result_label"] = {
-            "audio_completed": "추출 완료",
-            "transcription_completed": "전사 완료",
-            "completed": "자막 완료",
-        }.get(job.status, view["status_label"])
+        view["result_label"] = JOB_COMPLETION_LABELS.get(
+            str(job.operation),
+            view["status_label"],
+        )
         completed_views.append(view)
 
     queue_views = []
@@ -1824,7 +1870,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                     None,
                 ),
                 "transcription_completed": (
-                    "completion",
+                    None,
                     "done",
                     "transcribe",
                 ),
@@ -1840,11 +1886,11 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                     None,
                 ),
                 "translation_completed": (
-                    "completion",
                     None,
+                    "done",
                     None,
                 ),
-                "completed": ("completion", "done", None),
+                "completed": (None, "done", None),
             }[stage_filter]
             phase_filter = phase_filter or legacy_phase
             state_filter = state_filter or legacy_state
@@ -1995,18 +2041,8 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
 
         groups = [
             {
-                "key": "operation",
-                "label": "요청 범위",
-                "selected": operation_filter is not None,
-                "clear_url": clear_dimension_url("operation"),
-                "options": options_for(
-                    "operation",
-                    JOB_OPERATION_FILTER_NAV,
-                ),
-            },
-            {
                 "key": "phase",
-                "label": "현재 단계",
+                "label": "단계",
                 "selected": phase_filter is not None,
                 "clear_url": clear_dimension_url("phase"),
                 "options": options_for("phase", JOB_PHASE_FILTER_NAV),

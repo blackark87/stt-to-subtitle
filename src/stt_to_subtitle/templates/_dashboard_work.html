@@ -109,14 +109,13 @@
       <h2>최근 완료</h2>
       <a class="button secondary compact" href="/jobs?state=done">전체 보기{{ icons.chevron_right(13) }}</a>
     </header>
-    <div class="ob-table" role="table" aria-label="최근 완료 작업">
+    <div class="ob-table" role="table" aria-label="최근 완료 내역">
       <div class="ob-table-row ob-table-head ob-completed-grid" role="row">
-        <span>작업</span><span>처리 범위</span><span>결과</span><span>완료 시각</span><span>동작</span>
+        <span>작업</span><span>결과</span><span>완료 시각</span><span>동작</span>
       </div>
       {% for job in completed_jobs %}
         <article class="ob-table-row ob-completed-grid is-completed" role="row">
           <span class="ob-job-name"><a href="/jobs/{{ job.id }}" title="{{ job.source_rel|display_path }}">{{ job.source_rel|filename }}</a><span>{{ job.source_rel|parent_path }}</span></span>
-          <span>{{ job.metadata }}</span>
           <span class="ob-badge is-completed">{{ job.result_label }}</span>
           <time datetime="{{ job.changed_at|datetime_iso }}">{{ job.changed_at|datetime }}</time>
           <span class="ob-actions is-end">
@@ -129,7 +128,7 @@
           </span>
         </article>
       {% else %}
-        <div class="ob-empty-row">완료된 작업 없음</div>
+        <div class="ob-empty-row">완료 내역 없음</div>
       {% endfor %}
     </div>
   </section>

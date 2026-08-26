@@ -1064,13 +1064,13 @@ if (DATA.rendering) {
   rendering.position.set(ROOMS.done.cx, 0.67, ROOM_CZ - 0.62);
   rendering.traverse((o) => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; o.userData.pickRoot = rendering; } });
   rendering.userData = {
-    kind: "job", endpoint: "작업 완료",
+    kind: "job", endpoint: DATA.rendering.endpoint,
     title: DATA.rendering.source_rel.split("/").pop(),
     detail: DATA.rendering.detail,
   };
   layers.done.add(rendering);
   pickable.push(rendering);
-  pin(`${dot(CSS.accent)}작업 마무리 중 <span class="n">${h(rendering.userData.title.slice(0, 22))}</span>`,
+  pin(`${dot(CSS.accent)}${h(DATA.rendering.display_label)} <span class="n">${h(rendering.userData.title.slice(0, 22))}</span>`,
       rendering, 1.15, "sm", "done");
 }
 

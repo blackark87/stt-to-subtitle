@@ -80,7 +80,7 @@
           <span>전체 진행률</span>
           <strong>{{ pipeline.percent }}%</strong>
           {% if pipeline.complete %}
-            <span class="job-progress-current">작업 완료</span>
+            <span class="job-progress-current">{{ pipeline.completion_label }}</span>
           {% elif pipeline.current %}
             <span class="job-progress-current">
               {% if pipeline.current.kind == 'endpoint' %}{{ pipeline.current.display_label }}{% else %}현재 단계 {{ pipeline.current.label }} · {{ pipeline.current.state_label }}{% endif %}
@@ -137,7 +137,7 @@
         <div class="job-endpoint is-{{ pipeline.endpoint.state }}">
           <span class="job-stage-icon" aria-hidden="true">{% if pipeline.endpoint.state == 'done' %}{{ icons.check(13) }}{% elif pipeline.endpoint.state == 'running' %}{{ icons.activity(13) }}{% else %}{{ icons.clock(13) }}{% endif %}</span>
           <strong>{{ pipeline.endpoint.display_label }}</strong>
-          <progress value="{{ pipeline.endpoint.percent }}" max="100" aria-label="작업 완료 상태 {{ pipeline.endpoint.percent }}%"></progress>
+          <progress value="{{ pipeline.endpoint.percent }}" max="100" aria-label="{{ pipeline.endpoint.label }} 상태 {{ pipeline.endpoint.percent }}%"></progress>
         </div>
       {% endif %}
       </div>

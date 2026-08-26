@@ -135,19 +135,16 @@ class JobStageViewTests(unittest.TestCase):
             ],
         )
 
-    def test_operation_exposes_selected_phase_and_job_endpoint(self) -> None:
+    def test_operation_exposes_only_its_relevant_endpoint(self) -> None:
         from stt_to_subtitle.web_app import job_pipeline_phase_view
 
         self.assertEqual(
             self.states(status="transcription_completed", operation="transcribe"),
-            [
-                ("전사", "done"),
-                ("작업 완료", "done"),
-            ],
+            [("전사", "done")],
         )
         self.assertEqual(
             self.states(status="extracting", operation="transcribe"),
-            [("전사", "waiting"), ("작업 완료", "pending")],
+            [("전사", "waiting")],
         )
         self.assertEqual(
             [
@@ -166,12 +163,12 @@ class JobStageViewTests(unittest.TestCase):
             self.states(status="queued", operation="translate"),
             [
                 ("번역", "waiting"),
-                ("작업 완료", "pending"),
+                ("자막 생성", "pending"),
             ],
         )
         self.assertEqual(
             self.states(status="queued", operation="extract"),
-            [("추출", "waiting"), ("작업 완료", "pending")],
+            [("추출", "waiting")],
         )
 
     def test_job_endpoint_tracks_internal_completion_states(self) -> None:
@@ -179,11 +176,11 @@ class JobStageViewTests(unittest.TestCase):
 
         self.assertEqual(
             self.states(status="translated", operation="translate"),
-            [("번역", "done"), ("작업 완료", "waiting")],
+            [("번역", "done"), ("자막 생성", "waiting")],
         )
         self.assertEqual(
             self.states(status="rendering", operation="translate"),
-            [("번역", "done"), ("작업 완료", "running")],
+            [("번역", "done"), ("자막 생성", "running")],
         )
         progress = job_progress_view(
             _StageJob(status="rendering", operation="translate")
@@ -195,8 +192,26 @@ class JobStageViewTests(unittest.TestCase):
         self.assertEqual(progress["endpoint"]["kind"], "endpoint")
         self.assertEqual(
             progress["endpoint"]["display_label"],
-            "작업 마무리 중",
+            "자막 생성 중",
         )
+        self.assertEqual(progress["completion_label"], "자막 완료")
+
+    def test_phase_only_completion_is_not_a_full_job_endpoint(self) -> None:
+        from stt_to_subtitle.web_app import (
+            job_contract_status_label,
+            job_progress_view,
+        )
+
+        transcription = _StageJob(
+            status="transcription_completed",
+            operation="transcribe",
+        )
+        progress = job_progress_view(transcription)
+
+        self.assertTrue(progress["complete"])
+        self.assertIsNone(progress["endpoint"])
+        self.assertEqual(progress["completion_label"], "전사 완료")
+        self.assertEqual(job_contract_status_label(transcription), "전사 완료")
 
     def test_chunk_counts_drive_the_stage_progress_percentage(self) -> None:
         from stt_to_subtitle.web_app import job_stage_view
@@ -519,22 +534,14 @@ class WebAppTests(unittest.TestCase):
                 )
 
             self.assertEqual(page.status_code, 200)
-            for operation_filter, label in (
-                ("extract", "추출 요청"),
-                ("transcribe", "전사 요청"),
-                ("translate", "번역 요청"),
-                ("full", "전체 파이프라인"),
-            ):
-                self.assertIn(
-                    f'href="/jobs?operation={operation_filter}"',
-                    page.text,
-                )
-                self.assertIn(f"<span>{label}</span>", page.text)
+            self.assertNotIn('data-filter-dimension="operation"', page.text)
+            self.assertNotIn("요청 범위", page.text)
+            self.assertIn('<span class="job-filter-label">단계</span>', page.text)
             for phase_filter, label in (
                 ("extraction", "추출"),
                 ("transcription", "전사"),
                 ("translation", "번역"),
-                ("completion", "작업 완료"),
+                ("completion", "자막 생성"),
             ):
                 self.assertIn(
                     f'href="/jobs?phase={phase_filter}"',
@@ -555,7 +562,7 @@ class WebAppTests(unittest.TestCase):
                     page.text,
                 )
                 self.assertIn(f"<span>{label}</span>", page.text)
-            self.assertEqual(page.text.count("job-filter-row"), 3)
+            self.assertEqual(page.text.count("job-filter-row"), 2)
             self.assertIn(
                 'data-update-url="/job-stage-filters-fragment"',
                 page.text,
@@ -564,7 +571,7 @@ class WebAppTests(unittest.TestCase):
                 ("extraction", "추출", 1),
                 ("transcription", "전사", 2),
                 ("translation", "번역", 2),
-                ("completion", "작업 완료", 4),
+                ("completion", "자막 생성", 2),
             ):
                 self.assertRegex(
                     stage_counts.text,
