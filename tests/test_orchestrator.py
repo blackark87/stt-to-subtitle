@@ -724,6 +724,14 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                     lease_token,
                 )
                 fenced = orchestrator.store.get(job.id)
+                fencing_measurements = [
+                    measurement
+                    for measurement in (
+                        orchestrator.store.operational_measurements()
+                    )
+                    if measurement["metric"]
+                    == "lease.fencing_rejections"
+                ]
             finally:
                 orchestrator.stop()
 
@@ -731,6 +739,14 @@ class SubtitleOrchestratorTests(unittest.TestCase):
             self.assertEqual(fenced.status, "extracting")
             self.assertEqual(fenced.lease_owner, "replacement-worker")
             self.assertEqual(fenced.lease_token, replacement_token[0])
+            self.assertEqual(len(fencing_measurements), 1)
+            self.assertEqual(
+                fencing_measurements[0]["labels"],
+                {
+                    "detection": "worker_result",
+                    "stage": "audio extraction",
+                },
+            )
 
     def test_shutdown_drains_an_active_stage_within_grace_period(self) -> None:
         with TemporaryDirectory() as directory:
@@ -1600,6 +1616,14 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                 stored_generation = (
                     orchestrator.store.latest_translation_generation(job.id)
                 )
+                checkpoint_measurements = [
+                    measurement
+                    for measurement in (
+                        orchestrator.store.operational_measurements()
+                    )
+                    if measurement["metric"]
+                    == "translation.checkpoint.items"
+                ]
             finally:
                 orchestrator.stop()
 
@@ -1607,6 +1631,107 @@ class SubtitleOrchestratorTests(unittest.TestCase):
             self.assertEqual(snapshot["translations"][0]["text"], "DB 번역")
             self.assertEqual(stored_generation["state"], "completed")
             self.assertEqual(stored_generation["attempt"], 1)
+            self.assertEqual(len(checkpoint_measurements), 1)
+            self.assertEqual(
+                checkpoint_measurements[0]["labels"],
+                {"outcome": "reused", "source": "generation_store"},
+            )
+            self.assertEqual(checkpoint_measurements[0]["last_value"], 1.0)
+
+    def test_translation_measures_legacy_checkpoint_reuse_and_invalidation(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            (media_root / "movie.mkv").write_bytes(b"media")
+            orchestrator = self.make_orchestrator(root, media_root)
+            job = orchestrator.create_job(
+                "movie.mkv",
+                force_overwrite=False,
+                options={},
+            )
+            artifact_dir = root / "state" / "jobs" / job.id
+            artifact_dir.mkdir(parents=True)
+            transcript_path = artifact_dir / "transcript.json"
+            translation_path = artifact_dir / "translation.json"
+            transcript_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "job_id": "remote-job",
+                        "segments": [
+                            {
+                                "id": "segment-000001",
+                                "start": 0,
+                                "end": 1,
+                                "speaker": "SPEAKER_00",
+                                "text": "こんにちは",
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            translation_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "status": "partial",
+                        "translations": [
+                            {"id": "segment-000001", "text": "안녕하세요"},
+                            {"id": "stale-segment", "text": "이전 값"},
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            orchestrator.store.update(
+                job.id,
+                status="translation_running",
+                transcript_path=str(transcript_path),
+                translation_path=str(translation_path),
+            )
+            running = orchestrator.store.get(job.id)
+            translation_client = Mock()
+            translation_client.translate = Mock(
+                return_value=[
+                    {"id": "segment-000001", "text": "안녕하세요"}
+                ]
+            )
+            orchestrator._make_translation_client = Mock(
+                return_value=translation_client
+            )
+            try:
+                orchestrator._translate(running)
+                measurements = {
+                    (
+                        measurement["labels"]["source"],
+                        measurement["labels"]["outcome"],
+                    ): measurement["last_value"]
+                    for measurement in (
+                        orchestrator.store.operational_measurements()
+                    )
+                    if measurement["metric"]
+                    == "translation.checkpoint.items"
+                }
+            finally:
+                orchestrator.stop()
+
+            self.assertEqual(
+                translation_client.translate.call_args.kwargs["existing"],
+                {"segment-000001": "안녕하세요"},
+            )
+            self.assertEqual(
+                measurements,
+                {
+                    ("legacy_json", "reused"): 1.0,
+                    ("legacy_json", "invalidated"): 1.0,
+                },
+            )
 
     def test_pauses_all_current_and_future_translation_stages(self) -> None:
         with TemporaryDirectory() as directory:

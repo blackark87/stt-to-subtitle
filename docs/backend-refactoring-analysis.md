@@ -6,7 +6,7 @@
 
 ### 구현 진행 상태
 
-현재 작업 트리에는 계획의 스물여섯 번째 수직 슬라이스까지 반영됐다.
+현재 작업 트리에는 계획의 스물일곱 번째 수직 슬라이스까지 반영됐다.
 
 | 항목 | 반영 상태 | 남은 범위 |
 |---|---|---|
@@ -23,7 +23,7 @@
 | 오디오·전사 revision | source·추출 설정 hash 기반 WAV 재사용, immutable WAV·전사 JSON 경로, DB revision 원장·활성 포인터, 직접 편집·비교 선택의 별도 전사 revision, 번역 generation의 transcript revision 참조, 전체 DB 참조 기반 감사·명시적 orphan 정리, 과거 전사 revision 선택·무결성 검증·새 번역 generation 연동 | revision 간 전사 내용 비교가 필요하면 후속 추가 |
 | STT 실패 계약 | STT DB·API의 `failure_code/retryable/failure_scope`, segment/schema·OOM·인증·입력·처리·재시작 오류 분류, retryable 실패만 원격 재제출 | 실제 backend별 fault test·오류 코드 운영 지표 |
 | STT dispatch gate | 첫 연결 실패 시 영속 gate 차단, 뒤 작업 `audio_ready` 유지, 명시적 연결 확인의 제한된 3회 요청 후 중단 작업 재개 | 자동 recovery mode가 실제로 필요한지 운영 검증·회로 메트릭 |
-| 이벤트·관측성 | 구조화 전이 이벤트, 최근 24시간 단계 대기·처리 시간, 외부 API attempt별 결과·소요 시간, STT 큐와 원격 실행·취소 ID, artifact 감사·정리, startup reconcile 결과를 SQLite에 누적하고 운영 JSON으로 제공하며 민감 label·payload를 거부 | lease fencing·checkpoint cache 세부 counter 및 Prometheus adapter |
+| 이벤트·관측성 | 구조화 전이 이벤트, 단계 대기·처리 시간, 외부 API attempt별 결과·소요 시간, STT 큐와 원격 실행·취소 수, artifact 감사·정리, startup reconcile, lease fencing 거부, 번역 checkpoint 재사용·무효화를 SQLite에 누적하고 JSON·Prometheus text로 제공하며 민감 label·payload와 고카디널리티 원격 ID label을 거부 | dependency 회로 전이·외부 자막 검증 cache 세부 counter |
 | DB 무결성 | 모든 SQLite 연결의 외래키 활성화, 시작 시 레거시 dangling FK/선택 포인터 정리, status-phase-state-reason projection·enum·수치 domain trigger, revision/generation/publication 소유 관계 guard, quick/FK check 운영 지표, 공유 WAV revision의 마지막 참조 기반 삭제 | 순번 기반 migration 모듈 분리·실운영 DB 사본 dry-run |
 
 이하의 문제 분석은 최초 분석 시점 구조를 기준으로 하되, 구현이 끝난 절은 현재
@@ -629,7 +629,7 @@ jobs(
 
 ## 12. 관측성과 운영 기능
 
-현재 `/api/operations/metrics`는 다음 값을 구조화 JSON으로 제공한다.
+현재 `/api/operations/metrics`는 다음 값을 구조화 JSON으로 제공하고 `/api/operations/metrics/prometheus`는 같은 스냅샷을 Prometheus 0.0.4 text로 변환한다.
 
 - 상태·단계·단계별 상태 작업 수와 가장 오래된 대기 작업 나이
 - 작업 retry 합계·최대 attempt와 reason code 분포
@@ -640,16 +640,16 @@ jobs(
 - 명시적 STT readiness에서 받은 큐 상태와 웹 작업이 보유한 원격 실행·취소 대기 job ID
 - 산출물 감사의 참조·누락·orphan·정리 가능 파일/용량과 실제 정리 결과
 - 파이프라인·번역 generation/batch·자막 publication의 시작 복구 결과
+- superseded worker의 lease fencing 거부와 번역 checkpoint source별 재사용·무효화 item 수
 - SQLite 외래키 활성 여부, quick check 결과, FK 위반 수
 
 추가해야 할 세부 운영 지표:
 
 - 마지막 명시적 readiness 요청 결과와 회로 전이 횟수
-- lease 복구·fencing 거부·중복 실행 방지 누적 횟수
-- 번역 체크포인트 재사용·무효화 횟수
+- lease 복구·중복 실행 방지 누적 횟수
 - 외부 자막 revision 수, 로컬 비교 coverage, 상용 LLM 검증 호출·cache hit·실패 수
 
-누적 measurement는 `metric + 정렬된 labels`를 키로 표본 수·합계·최댓값·마지막 값만 저장하므로 요청 URL, 헤더, 본문은 저장하지 않는다. STT 큐 측정도 background probe를 추가하지 않고 사용자가 실행한 readiness 응답을 기록한다. 로그는 사용자용 메시지와 별개로 구조화했다. event payload는 16 KiB로 제한하고 measurement label과 함께 token·password·authorization·credential·secret·API key 이름을 거부한다. 토큰 마스킹은 초기 환경설정 값뿐 아니라 관리 화면에서 변경된 현재 런타임 토큰 전체에 적용해야 한다. 원격 job ID와 attempt/correlation ID는 추적에 사용하지만 인증 헤더·토큰·원문 전체는 기록하지 않는다.
+누적 measurement는 `metric + 정렬된 labels`를 키로 표본 수·합계·최댓값·마지막 값만 저장하므로 요청 URL, 헤더, 본문은 저장하지 않는다. STT 큐 측정도 background probe를 추가하지 않고 사용자가 실행한 readiness 응답을 기록한다. Prometheus 변환은 원격 job ID를 제외하고 개수만 내보낸다. 로그는 사용자용 메시지와 별개로 구조화했다. event payload는 16 KiB로 제한하고 measurement label과 함께 token·password·authorization·credential·secret·API key 이름을 거부한다. 토큰 마스킹은 초기 환경설정 값뿐 아니라 관리 화면에서 변경된 현재 런타임 토큰 전체에 적용해야 한다. 원격 job ID와 attempt/correlation ID는 JSON 추적에 사용하지만 인증 헤더·토큰·원문 전체는 기록하지 않는다.
 
 ## 13. 내부망 무인증 운영과 안전 경계
 
@@ -814,6 +814,7 @@ src/stt_to_subtitle/
 32. 기존 job event 테이블을 구조화 컬럼으로 반복 마이그레이션하고 단계 전이·attempt·correlation·payload를 보존하며 민감 payload 키를 거부하는지 확인. 같은 이벤트로 운영 스냅샷의 단계 대기/처리 표본과 상태 집계가 일치하는지 확인
 33. 모든 SQLite 연결에서 FK가 활성화되고 원시 SQL의 orphan event와 불일치 status projection이 거부되는지 확인. 레거시 dangling revision 포인터는 시작 마이그레이션에서 복구하고 공유 WAV revision은 마지막 참조 job이 삭제될 때까지 유지하는지 확인
 34. 외부 요청 재시도별 결과·시간에 URL·헤더·본문·token이 포함되지 않고, STT readiness 큐·원격 실행/취소 ID·artifact 감사/정리·startup reconcile measurement가 재시작 뒤에도 운영 JSON에 유지되는지 확인
+35. lease fencing 거부와 번역 checkpoint 재사용·무효화가 실제 전이 지점에서 누적되고, Prometheus text에는 원격 job ID 없이 유효한 이름·escape·개수만 노출되는지 확인
 
 ## 18. 피해야 할 변경
 
@@ -847,6 +848,6 @@ src/stt_to_subtitle/
 
 ## 20. 최종 권고
 
-명시적 상태 모델과 공통 projection, 번역 LLM·STT dispatch gate, worker lease·fencing·graceful drain 및 번역 attempt reconcile 기반 단계별 재시작 복구, 비교·선택 가능한 immutable prompt revision, 세그먼트 ID 기반 translation generation 비교, 선택·재사용 가능한 immutable audio/transcript revision, 참조 기반 artifact 보존·수동 orphan 정리, 최초·재게시 cutpoint를 포함한 자막 pair manifest reconcile, backend별 STT 취소·실패 계약, 구조화 전이 이벤트, 외부 요청·원격 STT 큐·artifact/startup reconcile 영속 measurement, 운영 JSON 스냅샷, SQLite 외래키·상태 projection·원장 소유 관계 guard는 반영됐다. 다음 리팩터링 단위는 lease fencing·checkpoint cache 세부 counter, Prometheus adapter와 순번형 migration 모듈 분리다. 자동 회복은 상시 가동 의존성에만 선택적으로 적용한다.
+명시적 상태 모델과 공통 projection, 번역 LLM·STT dispatch gate, worker lease·fencing·graceful drain 및 번역 attempt reconcile 기반 단계별 재시작 복구, 비교·선택 가능한 immutable prompt revision, 세그먼트 ID 기반 translation generation 비교, 선택·재사용 가능한 immutable audio/transcript revision, 참조 기반 artifact 보존·수동 orphan 정리, 최초·재게시 cutpoint를 포함한 자막 pair manifest reconcile, backend별 STT 취소·실패 계약, 구조화 전이 이벤트, 외부 요청·원격 STT 큐·artifact/startup reconcile·lease fencing·checkpoint 영속 measurement, JSON·Prometheus 운영 스냅샷, SQLite 외래키·상태 projection·원장 소유 관계 guard는 반영됐다. 다음 리팩터링 단위는 dependency 회로 전이·외부 자막 검증 cache 세부 counter와 순번형 migration 모듈 분리다. 자동 회복은 상시 가동 의존성에만 선택적으로 적용한다.
 
 동시에 transcript revision, translation generation/batch/item, external/generated subtitle asset, publication, validation을 영속 모델로 추가해야 한다. 그래야 프롬프트 수정 재번역, 부분 번역 재개, 외부 자막 재생·비교, 선택적 상용 LLM 평가, 자막 게시·rollback, WAV·전사본 재사용을 데이터 손실 없이 반복할 수 있다. 내부망 무인증 운영은 그대로 유지하고 인증보다 실행·파일·참조 무결성에 구현 역량을 집중한다.

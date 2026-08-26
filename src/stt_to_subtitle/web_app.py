@@ -43,6 +43,7 @@ from .media_preview import (
     parse_byte_range,
     srt_to_webvtt,
 )
+from .operational_metrics import prometheus_exposition
 from .path_display import shorten_display_path
 from .web_config import (
     group_multipart_media,
@@ -3634,6 +3635,16 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         if not is_authenticated(request):
             raise HTTPException(status_code=401, detail="authentication required")
         return orchestrator(request).store.operational_metrics()
+
+    @app.get("/api/operations/metrics/prometheus")
+    def operations_metrics_prometheus(request: Request) -> Response:
+        if not is_authenticated(request):
+            raise HTTPException(status_code=401, detail="authentication required")
+        snapshot = orchestrator(request).store.operational_metrics()
+        return Response(
+            prometheus_exposition(snapshot),
+            media_type="text/plain; version=0.0.4",
+        )
 
     @app.post("/jobs", response_class=HTMLResponse)
     def create_job(

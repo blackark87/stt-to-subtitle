@@ -490,6 +490,36 @@ class SubtitleOrchestrator:
         with self._stt_gate_lock:
             return self._stt_gate_state
 
+    def _record_measurement(
+        self,
+        metric: str,
+        value: float,
+        *,
+        labels: Mapping[str, str | int | bool] | None = None,
+    ) -> None:
+        try:
+            self.store.record_operational_measurement(
+                metric,
+                value,
+                labels=labels,
+            )
+        except Exception:
+            LOGGER.exception(
+                "operational measurement write failed: %s",
+                metric,
+            )
+
+    def _record_lease_fencing_rejection(
+        self,
+        stage: str,
+        detection: str,
+    ) -> None:
+        self._record_measurement(
+            "lease.fencing_rejections",
+            1,
+            labels={"stage": stage, "detection": detection},
+        )
+
     def record_external_request(self, observation: Mapping[str, Any]) -> None:
         labels: dict[str, str | int | bool] = {
             "service": str(observation.get("service", "external")),
@@ -501,7 +531,7 @@ class SubtitleOrchestrator:
             labels["status_code"] = int(observation["status_code"])
         if observation.get("error_type") is not None:
             labels["error_type"] = str(observation["error_type"])
-        self.store.record_operational_measurement(
+        self._record_measurement(
             "external.request.duration_seconds",
             max(0.0, float(observation.get("elapsed_seconds", 0.0))),
             labels=labels,
@@ -514,7 +544,7 @@ class SubtitleOrchestrator:
         for state in ("queued", "running", "cancel_requested"):
             value = queue.get(state)
             if isinstance(value, int) and value >= 0:
-                self.store.record_operational_measurement(
+                self._record_measurement(
                     "remote_stt.queue.jobs",
                     value,
                     labels={"state": state},
@@ -531,7 +561,7 @@ class SubtitleOrchestrator:
         ):
             value = audit.get(key)
             if isinstance(value, int) and value >= 0:
-                self.store.record_operational_measurement(
+                self._record_measurement(
                     "artifact.audit.files",
                     value,
                     labels={"state": state},
@@ -543,7 +573,7 @@ class SubtitleOrchestrator:
         ):
             value = audit.get(key)
             if isinstance(value, int) and value >= 0:
-                self.store.record_operational_measurement(
+                self._record_measurement(
                     "artifact.audit.bytes",
                     value,
                     labels={"state": state},
@@ -718,17 +748,17 @@ class SubtitleOrchestrator:
                 "산출물 감사 결과가 변경되었습니다. 다시 감사를 실행하세요."
             )
         cleanup = cleanup_orphan_artifacts(audit)
-        self.store.record_operational_measurement(
+        self._record_measurement(
             "artifact.cleanup.files",
             cleanup.removed_files,
             labels={"outcome": "removed"},
         )
-        self.store.record_operational_measurement(
+        self._record_measurement(
             "artifact.cleanup.bytes",
             cleanup.removed_bytes,
             labels={"outcome": "removed"},
         )
-        self.store.record_operational_measurement(
+        self._record_measurement(
             "artifact.cleanup.files",
             len(cleanup.failed_files),
             labels={"outcome": "failed"},
@@ -919,7 +949,7 @@ class SubtitleOrchestrator:
                 repaired_publications,
             )
         recovered = self._reconcile_interrupted_jobs()
-        self.store.record_operational_measurement(
+        self._record_measurement(
             "recovery.pipeline_jobs",
             recovered,
         )
@@ -931,11 +961,11 @@ class SubtitleOrchestrator:
         translation_recovery = (
             self.store.reconcile_interrupted_translation_attempts()
         )
-        self.store.record_operational_measurement(
+        self._record_measurement(
             "recovery.translation_generations",
             translation_recovery["generation_count"],
         )
-        self.store.record_operational_measurement(
+        self._record_measurement(
             "recovery.translation_batches",
             translation_recovery["batch_count"],
         )
@@ -2990,6 +3020,7 @@ class SubtitleOrchestrator:
             job.lease_owner != self._worker_id
             or job.lease_token != expected_lease_token
         ):
+            self._record_lease_fencing_rejection(stage, "dispatch_precheck")
             LOGGER.warning(
                 "discarded superseded %s stage for job %s",
                 stage,
@@ -3012,6 +3043,7 @@ class SubtitleOrchestrator:
             operation(job)
             self._raise_if_job_stop_requested(job_id)
         except WorkerLeaseLost:
+            self._record_lease_fencing_rejection(stage, "worker_result")
             LOGGER.warning(
                 "discarded superseded %s result for job %s",
                 stage,
@@ -3045,6 +3077,10 @@ class SubtitleOrchestrator:
                 reason_code=reason_code,
                 error=message,
             ):
+                self._record_lease_fencing_rejection(
+                    stage,
+                    "terminal_transition",
+                )
                 return
             if error.failure_code == "auth_required":
                 self._set_stt_gate(
@@ -3087,6 +3123,10 @@ class SubtitleOrchestrator:
                 ),
                 error=message,
             ):
+                self._record_lease_fencing_rejection(
+                    stage,
+                    "terminal_transition",
+                )
                 return
             if stage == "transcription":
                 self._set_stt_gate(
@@ -3128,6 +3168,10 @@ class SubtitleOrchestrator:
                     error=None,
                     translation_pause_requested=1,
                 ):
+                    self._record_lease_fencing_rejection(
+                        stage,
+                        "terminal_transition",
+                    )
                     return
                 self.store.add_event(
                     job_id,
@@ -3146,6 +3190,10 @@ class SubtitleOrchestrator:
                 reason_code=JobReason.INTERNAL_ERROR.value,
                 error=message,
             ):
+                self._record_lease_fencing_rejection(
+                    stage,
+                    "terminal_transition",
+                )
                 return
             self.store.add_event(
                 job_id,
@@ -3218,6 +3266,10 @@ class SubtitleOrchestrator:
             translation_pause_requested=0,
             job_stop_requested=0,
         ):
+            self._record_lease_fencing_rejection(
+                stage,
+                "terminal_transition",
+            )
             return
         self.store.add_event(
             job.id,
@@ -3912,6 +3964,7 @@ class SubtitleOrchestrator:
         expected_id_list = [str(segment["id"]) for segment in segments]
         expected_ids = set(expected_id_list)
         stored_items = self.store.translation_items(generation["id"])
+        checkpoint_source = "generation_store" if stored_items else None
         ignored_checkpoint_ids = 0
         if not stored_items and generation["supersedes_generation_id"] is None:
             checkpoint_items, ignored_checkpoint_ids, _payload = (
@@ -3932,7 +3985,25 @@ class SubtitleOrchestrator:
                     ),
                 )
                 stored_items = self.store.translation_items(generation["id"])
+                checkpoint_source = "legacy_json"
+        if stored_items and checkpoint_source is not None:
+            self._record_measurement(
+                "translation.checkpoint.items",
+                len(stored_items),
+                labels={
+                    "source": checkpoint_source,
+                    "outcome": "reused",
+                },
+            )
         if ignored_checkpoint_ids:
+            self._record_measurement(
+                "translation.checkpoint.items",
+                ignored_checkpoint_ids,
+                labels={
+                    "source": "legacy_json",
+                    "outcome": "invalidated",
+                },
+            )
             self.store.add_event(
                 job.id,
                 "warning",
@@ -4289,12 +4360,12 @@ class SubtitleOrchestrator:
                         "subtitle publication reconcile failed for %s",
                         publication["source_rel"],
                     )
-        self.store.record_operational_measurement(
+        self._record_measurement(
             "recovery.subtitle_publications",
             repaired,
             labels={"outcome": "repaired"},
         )
-        self.store.record_operational_measurement(
+        self._record_measurement(
             "recovery.subtitle_publications",
             failed,
             labels={"outcome": "failed"},

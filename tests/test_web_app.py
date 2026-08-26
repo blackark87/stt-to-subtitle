@@ -1966,6 +1966,9 @@ class WebAppTests(unittest.TestCase):
                 )
 
                 response = client.get("/api/operations/metrics")
+                prometheus = client.get(
+                    "/api/operations/metrics/prometheus"
+                )
 
             self.assertEqual(response.status_code, 200)
             payload = response.json()
@@ -1976,6 +1979,16 @@ class WebAppTests(unittest.TestCase):
             self.assertIn("extraction", payload["events"]["stages"])
             self.assertIn("remote_stt", payload)
             self.assertIn("measurements", payload)
+            self.assertEqual(prometheus.status_code, 200)
+            self.assertTrue(
+                prometheus.headers["content-type"].startswith(
+                    "text/plain; version=0.0.4"
+                )
+            )
+            self.assertIn(
+                'stt_to_subtitle_jobs_by_state{state="waiting"} 1',
+                prometheus.text,
+            )
 
     def test_recent_jobs_and_history_use_readable_responsive_layout(self) -> None:
         with TemporaryDirectory() as directory:
