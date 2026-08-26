@@ -121,15 +121,24 @@
       <form
         method="post"
         action="/jobs/{{ job.id }}/restart-translation"
-        data-confirm-message="기존 번역 결과를 초기화하고 번역부터 다시 시작하시겠습니까? 일본어 전사 결과는 유지됩니다."
+        data-confirm-message="선택한 전사와 프롬프트로 새 번역 버전을 시작하시겠습니까? 현재 게시 자막과 기존 이력은 유지됩니다."
       >
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        {% if transcript_revisions|length > 1 %}
+          <select name="transcript_revision_id" aria-label="번역에 사용할 전사 리비전" required>
+            {% for revision in transcript_revisions %}
+              <option value="{{ revision.id }}"{% if revision.is_active %} selected{% endif %}>
+                {{ revision.selector_label }}{% if revision.is_active %} · 현재 사용 중{% endif %}
+              </option>
+            {% endfor %}
+          </select>
+        {% endif %}
         <select name="prompt_category_id" aria-label="번역 프롬프트 카테고리" required>
           {% for category in prompt_categories %}
             <option value="{{ category.id }}"{% if job.options.translation_prompt and job.options.translation_prompt.revision_id == category.revision_id %} selected{% endif %}>{{ category.name }}</option>
           {% endfor %}
         </select>
-        <button type="submit" class="secondary" title="일본어 전사는 다시 실행하지 않습니다">{{ icons.refresh(16) }}번역부터 다시 시작</button>
+        <button type="submit" class="secondary" title="전사는 다시 실행하지 않습니다">{{ icons.refresh(16) }}새 번역 버전 시작</button>
       </form>
     {% endif %}
     {% if job.job_stop_requested %}
@@ -376,6 +385,27 @@
     {% elif not (job.srt_path or job.ass_path) %}
       <p class="muted">비교할 시스템 생성 자막이 없습니다.</p>
     {% endif %}
+  </section>
+{% endif %}
+{% if transcript_revisions %}
+  <section class="card">
+    <div class="section-heading">
+      <div><h2>전사 이력</h2></div>
+      <span class="history-count">{{ transcript_revisions|length }}개 버전</span>
+    </div>
+    <div class="stack">
+      {% for revision in transcript_revisions|reverse %}
+        <article class="notice">
+          <strong>
+            {{ revision.selector_label }}{% if revision.is_active %} · 현재 사용 중{% endif %}
+          </strong>
+          <span>
+            {{ revision.origin_label }}{% if revision.backend %} · {{ revision.backend|stt_backend }}{% endif %}{% if revision.model_revision and revision.model_revision not in ["manual", "imported"] %} · {{ revision.model_revision }}{% endif %}
+          </span>
+          <time class="muted" datetime="{{ revision.created_at|datetime_iso }}">{{ revision.created_at|datetime }}</time>
+        </article>
+      {% endfor %}
+    </div>
   </section>
 {% endif %}
 {% if subtitle_generations %}

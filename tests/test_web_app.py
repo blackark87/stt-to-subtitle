@@ -18,6 +18,7 @@ if WEB_TESTS_AVAILABLE:
     from fastapi.testclient import TestClient
 
 from stt_to_subtitle.web_config import WebSettings
+from stt_to_subtitle.files import sha256_file
 from stt_to_subtitle.gpu_monitoring import GpuDevice, GpuSnapshot
 from stt_to_subtitle.job_state import structured_state_from_legacy
 
@@ -2729,7 +2730,7 @@ class WebAppTests(unittest.TestCase):
             self.assertIn("text/x-ssa", styled_subtitle.headers["content-type"])
             self.assertIn("[V4+ Styles]", styled_subtitle.text)
             self.assertIn("스타일 ASS 다운로드", refreshed_page.text)
-            self.assertIn("번역부터 다시 시작", refreshed_page.text)
+            self.assertIn("새 번역 버전 시작", refreshed_page.text)
             self.assertIn("번역 이력", refreshed_page.text)
             self.assertIn("번역 버전 2 · 완료", refreshed_page.text)
             self.assertIn("직접 편집", refreshed_page.text)
@@ -2756,7 +2757,7 @@ class WebAppTests(unittest.TestCase):
             self.assertEqual(subtitle_generation_download.status_code, 200)
             self.assertIn("수정된 번역", subtitle_generation_download.text)
             self.assertEqual(subtitle_republish.status_code, 303)
-            self.assertIn("번역 다시 시작", completed_jobs.text)
+            self.assertIn("새 번역 버전", completed_jobs.text)
             self.assertIn(
                 f'/jobs/{job.id}/restart-translation',
                 completed_jobs.text,
@@ -2770,6 +2771,110 @@ class WebAppTests(unittest.TestCase):
             self.assertEqual(reset_translation["status"], "partial")
             self.assertEqual(reset_translation["translations"], [])
             self.assertTrue(transcript.is_file())
+
+    def test_selects_historical_transcript_revision_for_new_translation(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            (media_root / "movie.mp4").write_bytes(b"media")
+
+            with TestClient(
+                create_app(self.settings(root, media_root))
+            ) as client:
+                service = client.app.state.orchestrator
+                service.stop()
+                job = service.create_job(
+                    "movie.mp4",
+                    force_overwrite=True,
+                    options={},
+                )
+                revision_root = (
+                    service.settings.jobs_dir
+                    / job.id
+                    / "transcript-revisions"
+                )
+
+                def create_revision(revision_id: str, text: str) -> Path:
+                    path = revision_root / revision_id / "transcript.json"
+                    path.parent.mkdir(parents=True)
+                    path.write_text(
+                        json.dumps(
+                            {
+                                "schema_version": 1,
+                                "job_id": f"remote-{revision_id}",
+                                "segments": [
+                                    {
+                                        "id": "segment-000001",
+                                        "start": 0,
+                                        "end": 1,
+                                        "speaker": "SPEAKER_00",
+                                        "text": text,
+                                    }
+                                ],
+                            },
+                            ensure_ascii=False,
+                        ),
+                        encoding="utf-8",
+                    )
+                    service.store.record_transcript_revision(
+                        revision_id=revision_id,
+                        job_id=job.id,
+                        audio_revision_id=None,
+                        remote_job_id=f"remote-{revision_id}",
+                        backend="whisperx",
+                        model_revision="model-v1",
+                        options_hash="options-hash",
+                        artifact_path=str(path),
+                        content_hash=sha256_file(path),
+                        origin="automatic",
+                        status=None,
+                        chunks_total=1,
+                    )
+                    return path
+
+                first_path = create_revision("revision-1", "첫 전사")
+                create_revision("revision-2", "둘째 전사")
+                service.store.update(job.id, status="completed")
+                page = client.get(f"/jobs/{job.id}")
+                original_first = first_path.read_bytes()
+                first_path.write_bytes(b"tampered")
+                invalid = client.post(
+                    f"/jobs/{job.id}/restart-translation",
+                    data={
+                        "prompt_category_id": "jav",
+                        "transcript_revision_id": "revision-1",
+                    },
+                )
+                first_path.write_bytes(original_first)
+                selected = client.post(
+                    f"/jobs/{job.id}/restart-translation",
+                    data={
+                        "prompt_category_id": "jav",
+                        "transcript_revision_id": "revision-1",
+                    },
+                    follow_redirects=False,
+                )
+                refreshed = service.store.get(job.id)
+                generation = service.store.latest_translation_generation(
+                    job.id
+                )
+                selected_page = client.get(f"/jobs/{job.id}")
+
+            self.assertIn("전사 이력", page.text)
+            self.assertIn("전사 리비전 1", page.text)
+            self.assertIn("전사 리비전 2 · 현재 사용 중", page.text)
+            self.assertIn('name="transcript_revision_id"', page.text)
+            self.assertEqual(invalid.status_code, 400)
+            self.assertEqual(selected.status_code, 303)
+            self.assertEqual(refreshed.transcript_revision_id, "revision-1")
+            self.assertEqual(generation["transcript_revision_id"], "revision-1")
+            self.assertIn(
+                "전사 리비전 1 · 현재 사용 중",
+                selected_page.text,
+            )
 
     def test_media_cards_show_job_state_and_link_to_latest_detail(self) -> None:
         with TemporaryDirectory() as directory:

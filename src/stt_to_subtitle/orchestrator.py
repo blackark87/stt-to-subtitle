@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor, wait
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import hashlib
 import json
 import logging
@@ -2170,6 +2170,7 @@ class SubtitleOrchestrator:
         self,
         job_id: str,
         prompt_category_id: str | None = None,
+        transcript_revision_id: str | None = None,
     ) -> PipelineJob:
         """Reset translation only while preserving a completed transcript."""
         job = self.store.get(job_id)
@@ -2183,30 +2184,65 @@ class SubtitleOrchestrator:
             raise ValueError("transcript artifact is unavailable")
 
         transcript_path = Path(job.transcript_path)
-        if not transcript_path.is_file():
-            raise ValueError("transcript artifact is unavailable")
-        try:
-            transcript_payload = json.loads(
-                transcript_path.read_text(encoding="utf-8")
+        current_transcript_payload, current_segments, current_job_id = (
+            self._load_translation_transcript(transcript_path)
+        )
+        transcript_payload = current_transcript_payload
+        segments = current_segments
+        transcript_job_id = current_job_id
+
+        selected_job = replace(
+            job,
+            stt_job_id=job.stt_job_id or current_job_id,
+        )
+        selected_revision_id = job.transcript_revision_id
+        selected_chunks_total = job.transcription_chunks_total
+        if transcript_revision_id:
+            revision = self.store.get_transcript_revision(
+                job.id,
+                transcript_revision_id,
             )
-        except (OSError, UnicodeError, json.JSONDecodeError) as error:
-            raise ValueError("transcript artifact could not be read") from error
-        if not isinstance(transcript_payload, Mapping):
-            raise ValueError("transcript JSON document must be an object")
-        segments = validate_transcript(transcript_payload)
-        transcript_job_id = str(
-            transcript_payload.get("job_id", "")
-        ).strip()
-        if not transcript_job_id:
-            raise ValueError("transcript job_id is unavailable")
+            if revision is None:
+                raise ValueError("선택한 전사 리비전을 찾을 수 없습니다.")
+            selected_path = Path(str(revision["artifact_path"])).resolve()
+            job_root = (self.settings.jobs_dir / job.id).resolve()
+            try:
+                selected_path.relative_to(job_root)
+            except ValueError as error:
+                raise ValueError(
+                    "선택한 전사 리비전의 경로가 올바르지 않습니다."
+                ) from error
+            if (
+                not selected_path.is_file()
+                or sha256_file(selected_path) != revision["content_hash"]
+            ):
+                raise ValueError(
+                    "선택한 전사 리비전의 파일 무결성을 확인할 수 없습니다."
+                )
+            transcript_path = selected_path
+            transcript_payload, segments, transcript_job_id = (
+                self._load_translation_transcript(transcript_path)
+            )
+            selected_revision_id = str(revision["id"])
+            selected_chunks_total = int(revision["chunks_total"])
+            selected_job = replace(
+                job,
+                transcript_path=str(transcript_path),
+                transcript_revision_id=selected_revision_id,
+                stt_job_id=(
+                    str(revision["remote_job_id"])
+                    if revision.get("remote_job_id")
+                    else transcript_job_id
+                ),
+            )
 
         current_prompt_snapshot = job.options.get(TRANSLATION_PROMPT_OPTION)
         if not isinstance(current_prompt_snapshot, Mapping):
             current_prompt_snapshot = self._legacy_prompt_snapshot()
         legacy_translation = self._capture_legacy_translation_generation(
             job,
-            transcript_payload,
-            segments,
+            current_transcript_payload,
+            current_segments,
             current_prompt_snapshot,
             self.remote_servers,
         )
@@ -2245,7 +2281,7 @@ class SubtitleOrchestrator:
         if not isinstance(updated_prompt_snapshot, Mapping):
             updated_prompt_snapshot = self._legacy_prompt_snapshot()
         generation = self._create_translation_generation(
-            job,
+            selected_job,
             transcript_payload,
             updated_prompt_snapshot,
             self.remote_servers,
@@ -2262,11 +2298,17 @@ class SubtitleOrchestrator:
         self.store.update(
             job.id,
             status="transcribed",
+            transcript_path=str(transcript_path),
+            transcript_revision_id=selected_revision_id,
+            stt_job_id=selected_job.stt_job_id,
             translation_path=str(translation_path),
             blocked_stage=None,
             error=None,
             translation_chunks_total=0,
             translation_chunks_completed=0,
+            chunks_created=selected_chunks_total,
+            chunks_completed=selected_chunks_total,
+            chunks_total_estimate=selected_chunks_total,
             translation_pause_requested=0,
             options_json=json.dumps(updated_options, sort_keys=True),
         )
@@ -2274,12 +2316,35 @@ class SubtitleOrchestrator:
             job.id,
             "info",
             "translation restart requested; transcript preserved and "
-            f"generation {generation['generation_number']} created",
+            f"generation {generation['generation_number']} created"
+            + (
+                f" from transcript revision {selected_revision_id}"
+                if selected_revision_id
+                else ""
+            ),
         )
         restarted = self.store.get(job.id)
         if restarted is None:
             raise RuntimeError("restarted job could not be read")
         return restarted
+
+    @staticmethod
+    def _load_translation_transcript(
+        transcript_path: Path,
+    ) -> tuple[Mapping[str, Any], list[dict[str, Any]], str]:
+        if not transcript_path.is_file():
+            raise ValueError("transcript artifact is unavailable")
+        try:
+            payload = json.loads(transcript_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise ValueError("transcript artifact could not be read") from error
+        if not isinstance(payload, Mapping):
+            raise ValueError("transcript JSON document must be an object")
+        segments = validate_transcript(payload)
+        transcript_job_id = str(payload.get("job_id", "")).strip()
+        if not transcript_job_id:
+            raise ValueError("transcript job_id is unavailable")
+        return payload, segments, transcript_job_id
 
     def reprocess(
         self,

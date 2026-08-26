@@ -450,6 +450,13 @@ class JobStoreTests(unittest.TestCase):
                 ],
                 str(historical_transcript),
             )
+            self.assertEqual(
+                store.get_transcript_revision(job.id, "transcript-v1")["id"],
+                "transcript-v1",
+            )
+            self.assertIsNone(
+                store.get_transcript_revision("other-job", "transcript-v1")
+            )
 
     def test_lists_and_counts_jobs_by_status(self) -> None:
         with TemporaryDirectory() as directory:
@@ -1755,3 +1762,40 @@ class JobStoreTests(unittest.TestCase):
             self.assertEqual(stopped.phase, "translation")
             self.assertEqual(stopped.state, "stopped")
             self.assertEqual(stopped.reason_code, "user_stop")
+
+    def test_adds_chunk_count_to_existing_transcript_revisions(self) -> None:
+        with TemporaryDirectory() as directory:
+            database_path = Path(directory) / "jobs.sqlite3"
+            with sqlite3.connect(database_path) as connection:
+                connection.execute(
+                    """
+                    CREATE TABLE transcript_revisions (
+                        id TEXT PRIMARY KEY,
+                        created_by_job_id TEXT NOT NULL,
+                        audio_revision_id TEXT,
+                        remote_job_id TEXT,
+                        backend TEXT NOT NULL,
+                        model_revision TEXT NOT NULL,
+                        options_hash TEXT NOT NULL,
+                        artifact_path TEXT NOT NULL,
+                        content_hash TEXT NOT NULL,
+                        origin TEXT NOT NULL,
+                        created_at REAL NOT NULL
+                    )
+                    """
+                )
+                connection.execute(
+                    """
+                    INSERT INTO transcript_revisions VALUES (
+                        'revision-1', 'job-1', NULL, 'remote-1',
+                        'whisperx', 'model-v1', 'options-hash',
+                        '/work/transcript.json', 'content-hash',
+                        'automatic', 1.0
+                    )
+                    """
+                )
+
+            store = JobStore(database_path)
+            revisions = store.transcript_revisions("job-1")
+
+            self.assertEqual(revisions[0]["chunks_total"], 0)

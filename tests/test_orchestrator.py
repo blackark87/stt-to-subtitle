@@ -2990,6 +2990,115 @@ class SubtitleOrchestratorTests(unittest.TestCase):
             self.assertIn("새 번역", repaired_ass)
             self.assertTrue(manifest_path.is_file())
 
+    def test_restart_translation_can_select_a_historical_transcript_revision(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            (media_root / "movie.mkv").write_bytes(b"media")
+            orchestrator = self.make_orchestrator(root, media_root)
+            try:
+                orchestrator.stop()
+                job = orchestrator.create_job(
+                    "movie.mkv",
+                    force_overwrite=True,
+                    options={},
+                )
+                revision_root = (
+                    orchestrator.settings.jobs_dir
+                    / job.id
+                    / "transcript-revisions"
+                )
+                revision_root.mkdir(parents=True)
+
+                def write_revision(revision_id: str, text: str) -> Path:
+                    path = revision_root / revision_id / "transcript.json"
+                    path.parent.mkdir()
+                    path.write_text(
+                        json.dumps(
+                            {
+                                "schema_version": 1,
+                                "job_id": f"remote-{revision_id}",
+                                "segments": [
+                                    {
+                                        "id": "segment-000001",
+                                        "start": 0,
+                                        "end": 1,
+                                        "speaker": "SPEAKER_00",
+                                        "text": text,
+                                    }
+                                ],
+                            },
+                            ensure_ascii=False,
+                        ),
+                        encoding="utf-8",
+                    )
+                    return path
+
+                first_path = write_revision("revision-1", "첫 전사")
+                second_path = write_revision("revision-2", "둘째 전사")
+                for revision_id, path in (
+                    ("revision-1", first_path),
+                    ("revision-2", second_path),
+                ):
+                    orchestrator.store.record_transcript_revision(
+                        revision_id=revision_id,
+                        job_id=job.id,
+                        audio_revision_id=None,
+                        remote_job_id=f"remote-{revision_id}",
+                        backend="whisperx",
+                        model_revision="model-v1",
+                        options_hash="options-hash",
+                        artifact_path=str(path),
+                        content_hash=sha256_file(path),
+                        origin="automatic",
+                        status=None,
+                        chunks_total=1,
+                    )
+                orchestrator.store.update(job.id, status="completed")
+                original_first = first_path.read_bytes()
+                first_path.write_bytes(b"tampered")
+
+                with self.assertRaisesRegex(ValueError, "무결성"):
+                    orchestrator.restart_translation(
+                        job.id,
+                        "jav",
+                        transcript_revision_id="revision-1",
+                    )
+                self.assertEqual(
+                    orchestrator.store.list_translation_generations(job.id),
+                    [],
+                )
+
+                first_path.write_bytes(original_first)
+                restarted = orchestrator.restart_translation(
+                    job.id,
+                    "jav",
+                    transcript_revision_id="revision-1",
+                )
+                generation = orchestrator.store.latest_translation_generation(
+                    job.id
+                )
+            finally:
+                orchestrator.stop()
+
+            self.assertEqual(restarted.status, "transcribed")
+            self.assertEqual(restarted.transcript_revision_id, "revision-1")
+            self.assertEqual(restarted.transcript_path, str(first_path))
+            self.assertEqual(restarted.stt_job_id, "remote-revision-1")
+            self.assertEqual(restarted.chunks_created, 1)
+            self.assertEqual(generation["transcript_revision_id"], "revision-1")
+            self.assertEqual(
+                generation["transcript_hash"],
+                sha256_file(first_path),
+            )
+            self.assertIn(
+                "첫 전사",
+                Path(restarted.transcript_path).read_text(encoding="utf-8"),
+            )
+
     def test_recovers_subtitle_publication_at_each_file_cutpoint(self) -> None:
         for cutpoint in (
             "generation_recorded",

@@ -152,7 +152,7 @@
         </form>
       {% endif %}
       {% if job.status == "completed" and job.transcript_path %}
-        <form method="post" action="/jobs/{{ job.id }}/restart-translation" data-confirm-message="기존 번역 결과를 초기화하고 번역부터 다시 시작하시겠습니까? 일본어 전사 결과는 유지됩니다.">
+        <form method="post" action="/jobs/{{ job.id }}/restart-translation" data-confirm-message="현재 전사와 선택한 프롬프트로 새 번역 버전을 시작하시겠습니까? 현재 게시 자막과 기존 이력은 유지됩니다.">
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
           <input type="hidden" name="return_folder" value="{{ current_folder }}">
           <select name="prompt_category_id" aria-label="번역 프롬프트 카테고리" required>
@@ -160,7 +160,7 @@
               <option value="{{ category.id }}"{% if job.options.translation_prompt and job.options.translation_prompt.revision_id == category.revision_id %} selected{% endif %}>{{ category.name }}</option>
             {% endfor %}
           </select>
-          <button type="submit" class="secondary compact">{{ icons.refresh(14) }}번역 다시 시작</button>
+          <button type="submit" class="secondary compact">{{ icons.refresh(14) }}새 번역 버전</button>
         </form>
       {% endif %}
       {% if job.can_delete_record %}

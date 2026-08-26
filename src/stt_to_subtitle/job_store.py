@@ -641,6 +641,7 @@ class JobStore:
                     artifact_path TEXT NOT NULL,
                     content_hash TEXT NOT NULL,
                     origin TEXT NOT NULL,
+                    chunks_total INTEGER NOT NULL DEFAULT 0,
                     created_at REAL NOT NULL,
                     FOREIGN KEY (audio_revision_id)
                         REFERENCES audio_revisions(id)
@@ -861,6 +862,17 @@ class JobStore:
                 connection.execute(
                     "ALTER TABLE translation_generations "
                     "ADD COLUMN prompt_revision_id TEXT"
+                )
+            transcript_revision_columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(transcript_revisions)"
+                ).fetchall()
+            }
+            if "chunks_total" not in transcript_revision_columns:
+                connection.execute(
+                    "ALTER TABLE transcript_revisions ADD COLUMN "
+                    "chunks_total INTEGER NOT NULL DEFAULT 0"
                 )
             prompt_columns = {
                 str(row["name"])
@@ -2424,8 +2436,8 @@ class JobStore:
                 INSERT INTO transcript_revisions (
                     id, created_by_job_id, audio_revision_id, remote_job_id,
                     backend, model_revision, options_hash, artifact_path,
-                    content_hash, origin, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    content_hash, origin, chunks_total, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     revision_id,
@@ -2438,6 +2450,7 @@ class JobStore:
                     artifact_path,
                     content_hash,
                     origin,
+                    max(0, int(chunks_total)),
                     now,
                 ),
             )
@@ -2511,6 +2524,25 @@ class JobStore:
                 (job_id,),
             ).fetchall()
         return [self._transcript_revision_from_row(row) for row in rows]
+
+    def get_transcript_revision(
+        self,
+        job_id: str,
+        revision_id: str,
+    ) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM transcript_revisions
+                WHERE id = ? AND created_by_job_id = ?
+                """,
+                (revision_id, job_id),
+            ).fetchone()
+        return (
+            self._transcript_revision_from_row(row)
+            if row is not None
+            else None
+        )
 
     def update(self, job_id: str, **fields: Any) -> None:
         if not fields:
@@ -3711,6 +3743,7 @@ class JobStore:
             "artifact_path": str(row["artifact_path"]),
             "content_hash": str(row["content_hash"]),
             "origin": str(row["origin"]),
+            "chunks_total": int(row["chunks_total"]),
             "created_at": float(row["created_at"]),
         }
 

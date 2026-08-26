@@ -146,6 +146,12 @@ TRANSLATION_GENERATION_ORIGIN_LABELS = {
     "restart": "재번역",
     "manual": "직접 편집",
 }
+TRANSCRIPT_REVISION_ORIGIN_LABELS = {
+    "automatic": "자동 전사",
+    "manual": "직접 편집",
+    "imported": "비교 결과 선택",
+    "legacy": "이전 형식",
+}
 SUBTITLE_GENERATION_ORIGIN_LABELS = {
     "rendered": "시스템 생성",
     "legacy": "기존 자막 가져옴",
@@ -562,6 +568,43 @@ def translation_generation_history(
     return translation_generation_view(
         service.store.list_translation_generations(job_id)
     )
+
+
+def transcript_revision_history(
+    service: SubtitleOrchestrator,
+    job: Any,
+) -> list[dict[str, Any]]:
+    revisions = service.store.transcript_revisions(job.id)
+    history = [
+        {
+            **revision,
+            "revision_number": index,
+            "origin_label": TRANSCRIPT_REVISION_ORIGIN_LABELS.get(
+                str(revision.get("origin", "")),
+                str(revision.get("origin", "")),
+            ),
+            "is_active": revision["id"] == job.transcript_revision_id,
+            "selector_label": f"전사 리비전 {index}",
+        }
+        for index, revision in enumerate(revisions, start=1)
+    ]
+    if job.transcript_path and not any(
+        revision["is_active"] for revision in history
+    ):
+        history.append(
+            {
+                "id": "__current__",
+                "revision_number": None,
+                "origin": "legacy",
+                "origin_label": TRANSCRIPT_REVISION_ORIGIN_LABELS["legacy"],
+                "backend": str(job.options.get("backend", "")),
+                "model_revision": "",
+                "created_at": job.updated_at,
+                "is_active": True,
+                "selector_label": "현재 전사",
+            }
+        )
+    return history
 
 
 def translation_source_texts(
@@ -4271,6 +4314,10 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                     external_subtitles,
                 ),
                 "subtitle_validator": service.subtitle_validator_view(),
+                "transcript_revisions": transcript_revision_history(
+                    service,
+                    job,
+                ),
                 "translation_generations": translation_generation_history(
                     service,
                     job.id,
@@ -4350,6 +4397,10 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                     external_subtitles,
                 ),
                 "subtitle_validator": service.subtitle_validator_view(),
+                "transcript_revisions": transcript_revision_history(
+                    service,
+                    job,
+                ),
                 "translation_generations": translation_generation_history(
                     service,
                     job.id,
@@ -4492,6 +4543,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         csrf_token: str = Form(""),
         return_folder: str | None = Form(None),
         prompt_category_id: str = Form(""),
+        transcript_revision_id: str = Form(""),
     ) -> Any:
         if not is_authenticated(request):
             return login_redirect()
@@ -4502,6 +4554,11 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             orchestrator(request).restart_translation(
                 job_id,
                 prompt_category_id,
+                transcript_revision_id=(
+                    None
+                    if transcript_revision_id.strip() in {"", "__current__"}
+                    else transcript_revision_id.strip()
+                ),
             )
         except (OSError, UnicodeError, ValueError) as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
