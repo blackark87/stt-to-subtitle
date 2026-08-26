@@ -1274,6 +1274,177 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                 "remote-running"
             )
 
+    def test_startup_reconciles_each_running_stage_from_its_checkpoint(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            orchestrator = self.make_orchestrator(root, media_root)
+            try:
+                audio_path = root / "audio.wav"
+                audio_path.write_bytes(b"audio")
+                transcript_path = root / "transcript.json"
+                transcript_payload = {
+                    "schema_version": 1,
+                    "job_id": "remote-job",
+                    "segments": [
+                        {
+                            "id": "segment-000001",
+                            "start": 0.0,
+                            "end": 1.0,
+                            "speaker": "SPEAKER_00",
+                            "text": "こんにちは",
+                        }
+                    ],
+                }
+                transcript_path.write_text(
+                    json.dumps(transcript_payload, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                translation_path = root / "translation.json"
+                translation_path.write_text(
+                    json.dumps(
+                        {
+                            "schema_version": 1,
+                            "job_id": "translation-job",
+                            "translations": [
+                                {
+                                    "id": "segment-000001",
+                                    "text": "안녕하세요",
+                                }
+                            ],
+                        },
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+
+                extracting = orchestrator.store.create(
+                    job_id="restart-extracting",
+                    source_rel="extracting.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                orchestrator.store.update(extracting.id, status="extracting")
+                remote = orchestrator.store.create(
+                    job_id="restart-remote",
+                    source_rel="remote.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                orchestrator.store.update(
+                    remote.id,
+                    status="transcription_running",
+                    audio_path=str(audio_path),
+                    stt_job_id="remote-stt-job",
+                )
+                local_transcription = orchestrator.store.create(
+                    job_id="restart-local-transcription",
+                    source_rel="local.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                orchestrator.store.update(
+                    local_transcription.id,
+                    status="transcription_running",
+                    audio_path=str(audio_path),
+                )
+                translating = orchestrator.store.create(
+                    job_id="restart-translating",
+                    source_rel="translating.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                orchestrator.store.update(
+                    translating.id,
+                    status="translation_running",
+                    transcript_path=str(transcript_path),
+                )
+                rendering = orchestrator.store.create(
+                    job_id="restart-rendering",
+                    source_rel="rendering.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                orchestrator.store.update(
+                    rendering.id,
+                    status="rendering",
+                    transcript_path=str(transcript_path),
+                    translation_path=str(translation_path),
+                )
+                stopping = orchestrator.store.create(
+                    job_id="restart-stopping",
+                    source_rel="stopping.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                orchestrator.store.update(
+                    stopping.id,
+                    status="rendering",
+                    job_stop_requested=1,
+                )
+                remote_stopping = orchestrator.store.create(
+                    job_id="restart-remote-stopping",
+                    source_rel="remote-stopping.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                orchestrator.store.update(
+                    remote_stopping.id,
+                    status="transcription_running",
+                    stt_job_id="remote-stopping-job",
+                    job_stop_requested=1,
+                )
+                orchestrator._stt_executor.submit = Mock()
+
+                recovered = orchestrator._reconcile_interrupted_jobs()
+
+                self.assertEqual(recovered, 7)
+                self.assertEqual(
+                    orchestrator.store.get(extracting.id).status,
+                    "queued",
+                )
+                self.assertEqual(
+                    orchestrator.store.get(remote.id).status,
+                    "transcription_running",
+                )
+                self.assertEqual(
+                    orchestrator.store.get(local_transcription.id).status,
+                    "audio_ready",
+                )
+                self.assertEqual(
+                    orchestrator.store.get(translating.id).status,
+                    "transcribed",
+                )
+                self.assertEqual(
+                    orchestrator.store.get(rendering.id).status,
+                    "translated",
+                )
+                stopped = orchestrator.store.get(stopping.id)
+                self.assertEqual(stopped.state, "stopped")
+                self.assertEqual(stopped.phase, "render")
+                self.assertEqual(
+                    orchestrator.store.get(remote_stopping.id).status,
+                    "transcription_running",
+                )
+                self.assertEqual(orchestrator._stt_executor.submit.call_count, 2)
+                orchestrator._stt_executor.submit.assert_any_call(
+                    orchestrator._run_stage,
+                    remote.id,
+                    "transcription",
+                    orchestrator._transcribe,
+                )
+                orchestrator._stt_executor.submit.assert_any_call(
+                    orchestrator._run_stage,
+                    remote_stopping.id,
+                    "transcription",
+                    orchestrator._cancel_interrupted_transcription,
+                )
+            finally:
+                orchestrator.stop()
+
     def test_stops_only_selected_jobs(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)

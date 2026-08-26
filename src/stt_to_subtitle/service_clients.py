@@ -24,6 +24,10 @@ class ExternalServiceError(RuntimeError):
     """An external stage cannot currently make progress."""
 
 
+class RemoteTranscriptionNotFound(ExternalServiceError):
+    """The persisted remote transcription ID no longer exists."""
+
+
 class TranslationResponseIDError(ExternalServiceError):
     """The translation server returned a different segment ID set."""
 
@@ -194,11 +198,17 @@ class STTAPIClient(RetryingJSONClient):
                     on_progress=on_progress,
                     should_stop=should_stop,
                 )
+            except RemoteTranscriptionNotFound:
+                if not may_requeue_existing:
+                    raise
+                may_requeue_existing = False
+                job_id = None
+                continue
             except OperationStopped:
                 if job_id is None:
                     raise
                 stop_initiated = True
-                status_payload = self._cancel_and_wait(job_id)
+                status_payload = self.cancel_job_and_wait(job_id)
             remote_status = str(status_payload["status"])
             if remote_status == "completed":
                 break
@@ -262,7 +272,7 @@ class STTAPIClient(RetryingJSONClient):
             )
         return payload
 
-    def _cancel_and_wait(self, job_id: str) -> Mapping[str, Any]:
+    def cancel_job_and_wait(self, job_id: str) -> Mapping[str, Any]:
         payload = self.cancel_job(job_id)
         remote_status = str(payload["status"])
         if remote_status in {"cancelled", "completed", "failed"}:
@@ -370,6 +380,10 @@ class STTAPIClient(RetryingJSONClient):
                     detail = _safe_error(response)
                 finally:
                     response.close()
+                if response.status_code == 404:
+                    raise RemoteTranscriptionNotFound(
+                        "remote transcription job was not found"
+                    )
                 raise ExternalServiceError(
                     "transcription status request failed: "
                     f"HTTP {response.status_code}: {detail}"

@@ -83,6 +83,12 @@ RUNNING_STATUSES = {
     "translation_running",
     "rendering",
 }
+RUNNING_STAGE_BY_STATUS = {
+    "extracting": "extraction",
+    "transcription_running": "transcription",
+    "translation_running": "translation",
+    "rendering": "render",
+}
 
 
 def _canonical_payload_hash(value: Any) -> str:
@@ -577,13 +583,154 @@ class SubtitleOrchestrator:
         return normalized
 
     def start(self) -> None:
-        interrupted = self.store.recover_interrupted()
-        if interrupted:
+        recovered = self._reconcile_interrupted_jobs()
+        if recovered:
             LOGGER.warning(
-                "%d interrupted job(s) now require manual retry",
-                interrupted,
+                "reconciled %d interrupted job(s) from persisted checkpoints",
+                recovered,
             )
         self._scheduler.start()
+
+    def _reconcile_interrupted_jobs(self) -> int:
+        interrupted = self.store.list_jobs(
+            limit=None,
+            statuses=RUNNING_STATUSES,
+        )
+        for job in interrupted:
+            stage = RUNNING_STAGE_BY_STATUS[job.status]
+            if job.job_stop_requested:
+                if (
+                    job.status == "transcription_running"
+                    and job.stt_job_id
+                ):
+                    self.store.add_event(
+                        job.id,
+                        "warning",
+                        "service restart detected; confirming requested "
+                        "remote transcription cancellation",
+                    )
+                    self._stt_executor.submit(
+                        self._run_stage,
+                        job.id,
+                        "transcription",
+                        self._cancel_interrupted_transcription,
+                    )
+                else:
+                    self._mark_job_stopped(job.id, stage)
+                continue
+
+            if (
+                job.status == "transcription_running"
+                and job.stt_job_id
+                and job.audio_path
+                and Path(job.audio_path).is_file()
+            ):
+                self.store.add_event(
+                    job.id,
+                    "warning",
+                    "service restart detected; reconnecting remote "
+                    f"transcription {job.stt_job_id}",
+                )
+                self._stt_executor.submit(
+                    self._run_stage,
+                    job.id,
+                    "transcription",
+                    self._transcribe,
+                )
+                continue
+
+            if job.status == "extracting":
+                target_status = "queued"
+            elif job.status == "translation_running":
+                target_status = self._restart_checkpoint_status(
+                    job,
+                    include_translation=False,
+                )
+            elif job.status == "rendering":
+                target_status = self._restart_checkpoint_status(
+                    job,
+                    include_translation=True,
+                )
+            else:
+                target_status = self._restart_checkpoint_status(
+                    job,
+                    include_translation=False,
+                )
+
+            fields: dict[str, Any] = {
+                "status": target_status,
+                "attempt": job.attempt + 1,
+                "blocked_stage": None,
+                "error": None,
+                "job_stop_requested": 0,
+            }
+            if target_status != "translation_paused":
+                fields["translation_pause_requested"] = 0
+            if self.store.update_if_status(
+                job.id,
+                {job.status},
+                **fields,
+            ):
+                self.store.add_event(
+                    job.id,
+                    "warning",
+                    "service restart detected; resumed from persisted "
+                    f"checkpoint {target_status}",
+                )
+        return len(interrupted)
+
+    def _cancel_interrupted_transcription(self, job: PipelineJob) -> None:
+        if self.stt_client is None or not job.stt_job_id:
+            raise ExternalServiceError(
+                "transcription server is not configured for cancellation"
+            )
+        self.stt_client.cancel_job_and_wait(job.stt_job_id)
+        raise OperationStopped("remote transcription cancellation confirmed")
+
+    def _restart_checkpoint_status(
+        self,
+        job: PipelineJob,
+        *,
+        include_translation: bool,
+    ) -> str:
+        segments: list[dict[str, Any]] | None = None
+        if job.transcript_path and Path(job.transcript_path).is_file():
+            try:
+                transcript_payload = json.loads(
+                    Path(job.transcript_path).read_text(encoding="utf-8")
+                )
+                segments = validate_transcript(transcript_payload)
+            except (OSError, ValueError, json.JSONDecodeError):
+                segments = None
+        if segments is None:
+            if job.audio_path and Path(job.audio_path).is_file():
+                return "audio_ready"
+            return "queued"
+        if job.operation == "transcribe":
+            return "transcription_completed"
+        if (
+            include_translation
+            and job.translation_path
+            and Path(job.translation_path).is_file()
+        ):
+            try:
+                translation_payload = json.loads(
+                    Path(job.translation_path).read_text(encoding="utf-8")
+                )
+                if not isinstance(translation_payload, Mapping):
+                    raise ValueError(
+                        "translation JSON document must be an object"
+                    )
+                validate_translation_items(
+                    translation_payload.get("translations"),
+                    [str(segment["id"]) for segment in segments],
+                )
+                return "translated"
+            except (OSError, ValueError, json.JSONDecodeError):
+                pass
+        if job.translation_pause_requested:
+            return "translation_paused"
+        return "transcribed"
 
     def stop(self) -> None:
         self._stop_event.set()

@@ -972,25 +972,6 @@ class JobStoreTests(unittest.TestCase):
                 third["id"],
             )
 
-    def test_recovers_running_stage_as_manually_retryable(self) -> None:
-        with TemporaryDirectory() as directory:
-            store = JobStore(Path(directory) / "jobs.sqlite3")
-            store.create(
-                job_id="job-1",
-                source_rel="movie.mkv",
-                force_overwrite=False,
-                options={},
-            )
-            store.update("job-1", status="translation_running")
-
-            self.assertEqual(store.recover_interrupted(), 1)
-            job = store.get("job-1")
-            self.assertEqual(job.status, "blocked")
-            self.assertEqual(job.blocked_stage, "translation")
-            self.assertEqual(job.phase, "translation")
-            self.assertEqual(job.state, "blocked")
-            self.assertEqual(job.reason_code, "service_restarted")
-
     def test_persists_chunk_progress_for_the_job_panel(self) -> None:
         with TemporaryDirectory() as directory:
             store = JobStore(Path(directory) / "jobs.sqlite3")

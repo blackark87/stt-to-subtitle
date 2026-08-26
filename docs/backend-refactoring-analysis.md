@@ -6,7 +6,7 @@
 
 ### 구현 진행 상태
 
-현재 작업 트리에는 계획의 다섯 번째 수직 슬라이스까지 반영됐다.
+현재 작업 트리에는 계획의 여섯 번째 수직 슬라이스까지 반영됐다.
 
 | 항목 | 반영 상태 | 남은 범위 |
 |---|---|---|
@@ -18,6 +18,7 @@
 | 번역 generation | generation·batch·segment SQLite 원장, 입력 지문, 배치 시도·실패, DB 기반 JSON 복구, 재번역·직접 편집 이력 | immutable prompt revision·startup reconcile |
 | 자막 publication | source별 단일 게시 포인터, generation별 SRT/ASS와 해시, 다운로드·과거 버전 재게시 | pair manifest·파일/DB startup reconcile·retention |
 | 원격 STT 취소 | 멱등 cancel API, `cancel_requested/cancelled` 영속 상태, 웹의 취소 호출·최종 확인, WhisperX/JAV process group 종료, Kotoba 청크 경계 취소 | Kotoba diarization/postprocess 즉시 중단·실제 GPU 자원 fault test |
+| 시작 복구 | 추출 재대기, 원격 STT 재연결·유실 ID 멱등 재제출, 번역 체크포인트 대기 복원, 검증된 전사·번역 산출물 기반 렌더 재개, 중지 요청 보존 | worker lease·렌더 publication pair manifest reconcile·강제 종료 fault test |
 
 이하의 문제 분석은 최초 분석 시점 구조를 기준으로 하되, 구현이 끝난 절은 현재
 동작과 남은 범위로 갱신했다.
@@ -30,7 +31,7 @@
 
 1. 사용자 표시와 필터는 `phase/state/reason_code/attempt`로 분리됐지만 스케줄러 실행 전이는 아직 레거시 `status`를 호환 필드로 함께 사용한다.
 2. 언어 모델 수동 gate로 대기열 연쇄 실패는 차단했지만 gate가 프로세스 메모리에만 있어 재시작 복원과 구조화된 장애 사유가 없다.
-3. 웹 프로세스 재시작 시 실행 중이던 모든 작업을 일괄 `blocked`로 바꾸며, 단계별 자동 복구나 원격 STT 작업 재연결이 없다.
+3. 웹 프로세스 재시작 시 실행 중 작업을 단계별로 reconcile한다. 원격 STT는 기존 ID에 재연결하고 ID가 유실됐으면 동일 멱등 키로 재제출한다. 번역 LLM은 자동 호출하지 않고 체크포인트를 대기로 복원한다.
 4. 사용자 정지는 신규 작업에서 명시적 `stopped/user_stop`으로 저장한다. 기존 한국어 오류 문구 판별은 과거 DB를 한 번 마이그레이션할 때만 사용한다.
 5. 2D 대시보드, 3D 대시보드, 작업 목록은 영속 `state`를 공통 원천으로 사용하고 작업 목록은 `phase + state` 결합 필터를 지원한다.
 6. 전사 중지는 원격 STT cancel API를 호출하고 `cancelled` 확인 뒤 웹 작업을 `stopped/user_stop`으로 확정한다. WhisperX/JAV는 process group을 종료하고 Kotoba는 청크 경계에서 협력적으로 중지한다.
@@ -224,17 +225,17 @@ stateDiagram-v2
 
 ## 6. 재시작·장애 복구 전략
 
-현재 웹 오케스트레이터는 시작할 때 실행 중 상태를 모두 `blocked`로 바꾸고 수동 재시도를 요구한다. STT 서비스는 실행 중 작업을 `failed`로 바꾼다. 같은 파이프라인 안에서 복구 의미가 일치하지 않는다.
+웹 오케스트레이터의 단계별 startup reconcile은 구현됐다. STT 서비스 자체가 재시작되면 실행 중 전사는 아직 `failed`로 확정되지만, 웹은 해당 원격 실패 또는 유실 ID를 확인한 뒤 저장된 WAV와 동일 멱등 키로 재제출한다.
 
 권장 복구 행렬은 다음과 같다.
 
 | 단계 | 체크포인트 | 재시작 시 처리 | 사용자 표시 |
 |---|---|---|---|
 | 대기 | DB 행 | 그대로 유지 | 대기 |
-| 오디오 추출 | 없음 | 임시 WAV 제거 후 단계 처음부터 자동 재실행 | 대기 → 진행 |
+| 오디오 추출 | 없음 | `queued`로 되돌려 단계 처음부터 자동 재실행 | 대기 → 진행 |
 | 전사 | 원격 `stt_job_id`, 원본 WAV | 원격 상태 조회 후 완료 결과 회수 또는 실행 재연결. 원격 작업 유실 시 동일 멱등 키로 재제출 | 진행 또는 외부 서비스 중단 |
-| 번역 | 번역 ID별 부분 결과 | 설정 지문 검증 후 미완료 논리 배치부터 재개 | 진행 또는 일시정지 |
-| 렌더 | transcript/translation과 generation manifest | 파일 세트 검증 후 DB만 확정하거나 전체 재렌더 | 진행 → 완료 |
+| 번역 | 번역 ID별 부분 결과 | transcript를 검증하고 `transcribed`로 복원. 수동 LLM gate가 열릴 때 미완료 논리 배치부터 재개 | 대기 또는 일시정지 |
+| 렌더 | transcript/translation과 generation 원장 | 두 JSON 계약을 검증해 `translated`로 복원하고 전체 재렌더 | 대기 → 진행 → 완료 |
 | 사용자 중지 | 명시적 `stopped` | 자동 재개하지 않음 | 중지 |
 | 비재시도 실패 | `failed + reason_code` | 자동 재개하지 않음 | 실패 |
 
@@ -248,7 +249,7 @@ stateDiagram-v2
 2. `completed`이면 결과를 회수하고 다음 단계로 이동한다.
 3. `queued/running`이면 SSE 또는 polling을 재연결한다.
 4. `failed/cancelled/not_found`이면 원인에 따라 재제출 또는 명시적 실패 처리한다.
-5. STT 서비스 자체가 불가하면 STT 회로를 열고 다른 전사 대기 작업은 실행하지 않는다.
+5. STT 서비스 자체가 불가하면 해당 작업을 `blocked/stt_unavailable`로 내린다. 전체 STT dispatch gate는 아직 남은 범위다.
 
 ## 7. 일시정지·중지·중단·실패의 계약
 

@@ -25,13 +25,6 @@ from .translation_prompt import (
     KOREAN_VARIETY_SYSTEM_PROMPT,
 )
 
-RUNNING_STATUSES = {
-    "extracting",
-    "transcription_running",
-    "translation_running",
-    "rendering",
-}
-
 SUCCESS_STATUSES = {
     "audio_completed",
     "transcription_completed",
@@ -2627,43 +2620,3 @@ class JobStore:
             }
             for row in reversed(rows)
         ]
-
-    def recover_interrupted(self) -> int:
-        placeholders = ", ".join("?" for _ in RUNNING_STATUSES)
-        with self._connect() as connection:
-            rows = connection.execute(
-                f"SELECT id, status FROM jobs WHERE status IN ({placeholders})",
-                tuple(RUNNING_STATUSES),
-            ).fetchall()
-            now = time.time()
-            for row in rows:
-                stage = str(row["status"]).replace("_running", "")
-                connection.execute(
-                    """
-                    UPDATE jobs
-                    SET status = 'blocked', blocked_stage = ?,
-                        phase = ?, state = 'blocked',
-                        reason_code = 'service_restarted',
-                        error = 'service restarted during this stage',
-                        job_stop_requested = 0,
-                        status_updated_at = ?, updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (
-                        stage,
-                        structured_state_from_legacy(
-                            status=str(row["status"]),
-                            operation="full",
-                        ).phase.value,
-                        now,
-                        now,
-                        str(row["id"]),
-                    ),
-                )
-        for row in rows:
-            self.add_event(
-                str(row["id"]),
-                "warning",
-                "service restart detected; manual retry is required",
-            )
-        return len(rows)

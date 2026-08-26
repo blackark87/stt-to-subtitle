@@ -255,6 +255,34 @@ class STTAPIClientProgressTests(unittest.TestCase):
         self.assertEqual(client.request.call_args_list[1].args[0], "POST")
         self.assertEqual(client.request.call_args_list[2].args[0], "GET")
 
+    def test_resubmits_when_persisted_remote_job_is_missing(self) -> None:
+        missing = Mock(status_code=404)
+        missing.json.return_value = {"detail": "job not found"}
+        completed = self.event_stream({"status": "completed"})
+        result = Mock(status_code=200)
+        result.json.return_value = {
+            "schema_version": 1,
+            "job_id": "replacement-job",
+            "segments": [],
+        }
+        client = STTAPIClient("http://stt.test", "")
+        client.request = Mock(side_effect=[missing, completed, result])
+        client._submit = Mock(return_value="replacement-job")
+
+        payload = client.transcribe(
+            Path("/not-read.wav"),
+            options={},
+            idempotency_key="key",
+            existing_job_id="missing-job",
+        )
+
+        self.assertEqual(payload["job_id"], "replacement-job")
+        client._submit.assert_called_once_with(
+            Path("/not-read.wav"),
+            options={},
+            idempotency_key="key",
+        )
+
     def test_forwards_changed_chunk_progress_from_event_stream(self) -> None:
         events = self.event_stream(
             {
