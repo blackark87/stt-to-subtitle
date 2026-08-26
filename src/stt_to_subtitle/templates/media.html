@@ -59,15 +59,25 @@
         placeholder="제목 검색"
         aria-label="미디어 제목 검색"
       >
-      <button type="submit" class="secondary">검색</button>
-      {% if search_query %}
-        <a class="button secondary" href="/media{% if current_folder %}?folder={{ current_folder|urlencode }}{% endif %}">검색 해제</a>
+      <input
+        id="media-actor-filter"
+        name="actor"
+        type="search"
+        value="{{ actor_filter }}"
+        maxlength="200"
+        placeholder="배우 필터"
+        aria-label="배우별 필터"
+      >
+      <button type="submit" class="secondary">적용</button>
+      {% if search_query or actor_filter %}
+        <a class="button secondary" href="/media{% if current_folder %}?folder={{ current_folder|urlencode }}{% endif %}">필터 해제</a>
       {% endif %}
     </form>
     <form method="post" action="/jobs" class="grid-form">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <input type="hidden" name="return_folder" value="{{ current_folder }}">
       <input type="hidden" name="return_query" value="{{ search_query }}">
+      <input type="hidden" name="return_actor" value="{{ actor_filter }}">
       <fieldset class="media-picker wide" aria-label="미디어 탐색">
         <nav class="breadcrumbs" aria-label="미디어 폴더 경로">
           {% for breadcrumb in breadcrumbs %}
@@ -79,9 +89,12 @@
             {% endif %}
           {% endfor %}
         </nav>
-        {% if search_query %}
+        {% if search_query or actor_filter %}
           <p class="media-search-summary">
-            <strong>“{{ search_query }}”</strong> 제목 검색 결과 {{ files|length }}개
+            {% if search_query %}<strong>제목 “{{ search_query }}”</strong>{% endif %}
+            {% if search_query and actor_filter %} · {% endif %}
+            {% if actor_filter %}<strong>배우 “{{ actor_filter }}”</strong>{% endif %}
+            필터 결과 {{ files|length }}개
           </p>
         {% endif %}
         {% set selectable_files = files|selectattr("selectable")|list %}
@@ -113,9 +126,19 @@
                 <span>폴더 전체 선택</span>
               </label>
               <a data-folder-link href="/media?folder={{ folder.path|urlencode }}">
-                <span class="folder-visual folder-icon" aria-hidden="true">
-                  {{ icons.folder(40) }}
-                </span>
+                {% if folder.actor_image_path %}
+                  <span class="folder-visual actor-folder-preview">
+                    <img
+                      src="{{ url_for('media_actor_image', actor_path=folder.actor_image_path) }}"
+                      alt="{{ folder.name }} 프로필"
+                      loading="lazy"
+                    >
+                  </span>
+                {% else %}
+                  <span class="folder-visual folder-icon" aria-hidden="true">
+                    {{ icons.folder(40) }}
+                  </span>
+                {% endif %}
                 <span class="folder-card-content">
                   <strong class="folder-name">{{ folder.name }}</strong>
                   <span class="folder-summary">폴더 열기</span>
@@ -157,9 +180,9 @@
                     <span class="metadata-label multipart-badge">MULTIPART · {{ file.part_count }}</span>
                     <strong class="media-title" title="{{ file.title }}">{{ file.title }}</strong>
                     {% if file.name != file.title %}
-                      <span class="media-filename" title="{{ file.paths|join(', ') }}">{{ file.name }}</span>
+                      <span class="media-filename" title="{{ file.paths|display_paths|join(', ') }}">{{ file.name }}</span>
                     {% endif %}
-                    {% if search_query %}<span class="media-path" title="{{ file.actors|join(', ') if file.actors else file.path }}">{{ file.actors|actor_label }}</span>{% endif %}
+                    {% if search_query or actor_filter %}<span class="media-path" title="{{ file.actors|join(', ') if file.actors else file.path|display_path }}">{{ file.actors|join(', ') if file.actors else 'Unknown' }}</span>{% endif %}
                     <span class="media-size">{{ file.size|filesize }}</span>
                     <span class="media-duration">총 재생시간 {{ file.duration_seconds|duration }}</span>
                     {% if file.selectable and file.job_id %}
@@ -191,7 +214,7 @@
                     <span class="metadata-label">NFO</span>
                     <strong class="media-title" title="{{ file.title }}">{{ file.title }}</strong>
                     <span class="media-filename" title="{{ file.name }}">{{ file.name }}</span>
-                    {% if search_query %}<span class="media-path" title="{{ file.actors|join(', ') if file.actors else file.path }}">{{ file.actors|actor_label }}</span>{% endif %}
+                    {% if search_query or actor_filter %}<span class="media-path" title="{{ file.actors|join(', ') if file.actors else file.path|display_path }}">{{ file.actors|join(', ') if file.actors else 'Unknown' }}</span>{% endif %}
                     <span class="media-size">{{ file.size|filesize }}</span>
                     <span class="media-duration">재생시간 {{ file.duration_seconds|duration }}</span>
                     {% if file.selectable and file.job_id %}
@@ -214,7 +237,7 @@
                   <span class="media-card-content">
                     <span class="metadata-label is-empty" aria-hidden="true">&nbsp;</span>
                     <strong class="media-title" title="{{ file.name }}">{{ file.name }}</strong>
-                    {% if search_query %}<span class="media-path" title="{{ file.actors|join(', ') if file.actors else file.path }}">{{ file.actors|actor_label }}</span>{% endif %}
+                    {% if search_query or actor_filter %}<span class="media-path" title="{{ file.actors|join(', ') if file.actors else file.path|display_path }}">{{ file.actors|join(', ') if file.actors else 'Unknown' }}</span>{% endif %}
                     <span class="media-size">{{ file.size|filesize }}</span>
                     <span class="media-duration">재생시간 {{ file.duration_seconds|duration }}</span>
                     {% if file.selectable and file.job_id %}

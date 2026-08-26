@@ -1093,6 +1093,7 @@ FodyWeavers.xsd
 !IMPLEMENTATION_SUMMARY.md
 !future_task.md
 !LICENSE
+!docs/backend-refactoring-analysis.md
 
 # !Makefile
 

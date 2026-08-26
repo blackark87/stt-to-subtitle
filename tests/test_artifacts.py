@@ -16,16 +16,16 @@ class ArtifactNamingTests(unittest.TestCase):
         )
 
     def test_isolates_equal_basenames_by_job_directory(self) -> None:
-        state_dir = Path("/state")
+        jobs_dir = Path("/work/jobs")
 
         first = artifact_path(
-            state_dir,
+            jobs_dir,
             "job-one",
             "show-a/episode.mkv",
             "translation",
         )
         second = artifact_path(
-            state_dir,
+            jobs_dir,
             "job-two",
             "show-b/episode.mkv",
             "translation",
@@ -33,3 +33,4 @@ class ArtifactNamingTests(unittest.TestCase):
 
         self.assertEqual(first.name, second.name)
         self.assertNotEqual(first.parent, second.parent)
+        self.assertEqual(first.parent, jobs_dir / "job-one")

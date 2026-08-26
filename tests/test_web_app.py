@@ -20,7 +20,12 @@ from stt_to_subtitle.web_config import WebSettings
 from stt_to_subtitle.gpu_monitoring import GpuDevice, GpuSnapshot
 
 if WEB_TESTS_AVAILABLE:
-    from stt_to_subtitle.web_app import JobChangeHook, create_app, main
+    from stt_to_subtitle.web_app import (
+        JobChangeHook,
+        create_app,
+        main,
+        webgpu_scene_context,
+    )
 
 
 @unittest.skipUnless(
@@ -100,7 +105,7 @@ class JobStageViewTests(unittest.TestCase):
                 ("추출", "done"),
                 ("전사", "running"),
                 ("번역", "pending"),
-                ("완료", "pending"),
+                ("작업 완료", "pending"),
             ],
         )
 
@@ -111,28 +116,71 @@ class JobStageViewTests(unittest.TestCase):
                 ("추출", "done"),
                 ("전사", "done"),
                 ("번역", "blocked"),
-                ("완료", "pending"),
+                ("작업 완료", "pending"),
             ],
         )
 
-    def test_completed_transcription_keeps_follow_up_stages_visible(self) -> None:
+    def test_operation_exposes_selected_phase_and_job_endpoint(self) -> None:
+        from stt_to_subtitle.web_app import job_pipeline_phase_view
+
         self.assertEqual(
             self.states(status="transcription_completed", operation="transcribe"),
             [
-                ("추출", "done"),
                 ("전사", "done"),
-                ("번역", "waiting"),
-                ("완료", "pending"),
+                ("작업 완료", "done"),
+            ],
+        )
+        self.assertEqual(
+            self.states(status="extracting", operation="transcribe"),
+            [("전사", "waiting"), ("작업 완료", "pending")],
+        )
+        self.assertEqual(
+            [
+                (phase["label"], phase["state"])
+                for phase in job_pipeline_phase_view(
+                    _StageJob(status="extracting", operation="transcribe")
+                )
+            ],
+            [
+                ("추출", "running"),
+                ("전사", "pending"),
+                ("번역", "pending"),
             ],
         )
         self.assertEqual(
             self.states(status="queued", operation="translate"),
             [
-                ("추출", "done"),
-                ("전사", "done"),
                 ("번역", "waiting"),
-                ("완료", "pending"),
+                ("작업 완료", "pending"),
             ],
+        )
+        self.assertEqual(
+            self.states(status="queued", operation="extract"),
+            [("추출", "waiting"), ("작업 완료", "pending")],
+        )
+
+    def test_job_endpoint_tracks_internal_completion_states(self) -> None:
+        from stt_to_subtitle.web_app import job_progress_view
+
+        self.assertEqual(
+            self.states(status="translated", operation="translate"),
+            [("번역", "done"), ("작업 완료", "waiting")],
+        )
+        self.assertEqual(
+            self.states(status="rendering", operation="translate"),
+            [("번역", "done"), ("작업 완료", "running")],
+        )
+        progress = job_progress_view(
+            _StageJob(status="rendering", operation="translate")
+        )
+        self.assertEqual(
+            [(phase["label"], phase["kind"]) for phase in progress["phases"]],
+            [("번역", "phase")],
+        )
+        self.assertEqual(progress["endpoint"]["kind"], "endpoint")
+        self.assertEqual(
+            progress["endpoint"]["display_label"],
+            "작업 마무리 중",
         )
 
     def test_chunk_counts_drive_the_stage_progress_percentage(self) -> None:
@@ -224,7 +272,7 @@ class JobStageViewTests(unittest.TestCase):
                 ("추출", "done"),
                 ("전사", "done"),
                 ("번역", "paused"),
-                ("완료", "pending"),
+                ("작업 완료", "pending"),
             ],
         )
 
@@ -655,6 +703,389 @@ class WebAppTests(unittest.TestCase):
             self.assertNotIn("grafana", dashboard.text.lower())
             self.assertIn("window.setTimeout", script.text)
 
+    def test_webgpu_dashboard_uses_live_jobs_and_vendored_renderer(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            (media_root / "Shows").mkdir(parents=True)
+            snapshot = GpuSnapshot(
+                configured=True,
+                available=True,
+                devices=(
+                    GpuDevice(
+                        id="GPU-test",
+                        index="0",
+                        model_name="NVIDIA Test GPU",
+                        hostname="test-host",
+                        utilization_percent=73,
+                        memory_used_mib=8192,
+                        memory_total_mib=16384,
+                        temperature_celsius=67,
+                        power_watts=214.5,
+                    ),
+                ),
+            )
+
+            with TestClient(create_app(self.settings(root, media_root))) as client:
+                service = client.app.state.orchestrator
+                service.stop()
+                active = service.store.create(
+                    job_id="active-job",
+                    source_rel="active.mkv",
+                    force_overwrite=False,
+                    options={"backend": "whisperx"},
+                )
+                service.store.update(
+                    active.id,
+                    status="transcription_running",
+                    chunks_created=10,
+                    chunks_completed=4,
+                )
+                queued = service.store.create(
+                    job_id="queued-job",
+                    source_rel="queued.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                failed = service.store.create(
+                    job_id="failed-job",
+                    source_rel="failed.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                service.store.update(
+                    failed.id,
+                    status="failed",
+                    blocked_stage="transcription",
+                    error="worker unavailable",
+                )
+                blocked = service.store.create(
+                    job_id="blocked-job",
+                    source_rel="blocked.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                service.store.update(
+                    blocked.id,
+                    status="blocked",
+                    blocked_stage="translation",
+                    error="temporary upstream interruption",
+                )
+                stopped = service.store.create(
+                    job_id="stopped-job",
+                    source_rel="stopped.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                service.store.update(
+                    stopped.id,
+                    status="blocked",
+                    blocked_stage="transcription",
+                    error="사용자 요청으로 작업이 중단되었습니다.",
+                )
+                paused = service.store.create(
+                    job_id="paused-job",
+                    source_rel="paused.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                service.store.update(
+                    paused.id,
+                    status="translation_paused",
+                )
+                completed = service.store.create(
+                    job_id="completed-job",
+                    source_rel="completed.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                service.store.update(completed.id, status="completed")
+                rendering = service.store.create(
+                    job_id="rendering-job",
+                    source_rel="rendering.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                service.store.update(rendering.id, status="rendering")
+                scene = webgpu_scene_context(
+                    service,
+                    snapshot,
+                    audio_workers=1,
+                )
+                settled_at = max(
+                    job.status_updated_at
+                    for job in service.store.list_jobs(limit=None)
+                ) + 31
+                with patch(
+                    "stt_to_subtitle.web_app.time.time",
+                    return_value=settled_at,
+                ):
+                    settled_scene = webgpu_scene_context(
+                        service,
+                        snapshot,
+                        audio_workers=1,
+                    )
+                empty_gpu_page = client.get("/?view=3d")
+                client.app.state.gpu_monitor = Mock(
+                    snapshot=Mock(return_value=snapshot)
+                )
+
+                page = client.get("/")
+                dashboard = client.get("/?view=2d")
+                persisted_dashboard = client.get("/")
+                pipeline_fragment = client.get(
+                    "/jobs-fragment?dashboard_section=pipeline"
+                )
+                work_fragment = client.get(
+                    "/jobs-fragment?dashboard_section=work"
+                )
+                side_fragment = client.get(
+                    "/jobs-fragment?dashboard_section=side"
+                )
+                invalid_dashboard_fragment = client.get(
+                    "/jobs-fragment?dashboard_section=unknown"
+                )
+                renderer = client.get(
+                    "/static/vendor/three.webgpu.min.js"
+                )
+                renderer_core = client.get(
+                    "/static/vendor/three.core.min.js"
+                )
+                stylesheet = client.get("/static/webgpu.css")
+
+            self.assertEqual(page.status_code, 200)
+            self.assertEqual(empty_gpu_page.status_code, 200)
+            self.assertIn("GPU 메트릭 없음", empty_gpu_page.text)
+            self.assertIn('<script type="importmap">', page.text)
+            self.assertIn("NVIDIA Test GPU", page.text)
+            self.assertIn("active.mkv", page.text)
+            self.assertIn("queued.mkv", page.text)
+            self.assertIn("failed.mkv", page.text)
+            self.assertIn("blocked.mkv", page.text)
+            self.assertIn("stopped.mkv", page.text)
+            self.assertIn("paused.mkv", page.text)
+            self.assertIn("completed.mkv", page.text)
+            self.assertIn("rendering.mkv", page.text)
+            self.assertIn("Shows", page.text)
+            self.assertEqual(
+                {
+                    job["source_rel"]: [
+                        (phase["label"], phase["state"])
+                        for phase in job["phases"]
+                    ]
+                    for job in scene["phase_jobs"]
+                },
+                {
+                    "active.mkv": [
+                        ("추출", "done"),
+                        ("전사", "running"),
+                        ("번역", "pending"),
+                    ],
+                    "rendering.mkv": [
+                        ("추출", "done"),
+                        ("전사", "done"),
+                        ("번역", "done"),
+                    ],
+                },
+            )
+            self.assertEqual(
+                {
+                    job["source_rel"]: (
+                        job["endpoint"]["display_label"],
+                        job["endpoint"]["state"],
+                    )
+                    for job in scene["phase_jobs"]
+                },
+                {
+                    "active.mkv": ("작업 완료 대기", "pending"),
+                    "rendering.mkv": ("작업 마무리 중", "running"),
+                },
+            )
+            self.assertEqual(scene["blocked"][0]["source_rel"], "blocked.mkv")
+            self.assertEqual(scene["stopped"][0]["source_rel"], "stopped.mkv")
+            self.assertEqual(scene["paused"][0]["source_rel"], "paused.mkv")
+            self.assertEqual(scene["failed"][0]["source_rel"], "failed.mkv")
+            self.assertNotIn("error", scene["blocked"][0])
+            self.assertNotIn("error", scene["stopped"][0])
+            self.assertNotIn("error", scene["paused"][0])
+            self.assertEqual(
+                scene["failed"][0]["error"],
+                "worker unavailable",
+            )
+            transport_active = sum(
+                bool(job["transport_active"])
+                for state in ("paused", "blocked", "stopped", "failed")
+                for job in scene[state]
+            )
+            self.assertEqual(
+                scene["workers"]["transporting"],
+                transport_active,
+            )
+            self.assertEqual(
+                scene["workers"]["total"],
+                scene["workers"]["active"]
+                + scene["workers"]["transporting"]
+                + scene["workers"]["idle"],
+            )
+            self.assertTrue(
+                all(
+                    not job["transport_active"]
+                    for state in ("paused", "blocked", "stopped", "failed")
+                    for job in settled_scene[state]
+                )
+            )
+            self.assertEqual(settled_scene["workers"]["transporting"], 0)
+            self.assertEqual(
+                scene["state_counts"],
+                {
+                    "running": 2,
+                    "waiting": 1,
+                    "paused": 1,
+                    "blocked": 1,
+                    "stopped": 1,
+                    "failed": 1,
+                    "completed": 1,
+                },
+            )
+            self.assertEqual(
+                [item["title"] for item in scene["queue"]],
+                ["queued.mkv"],
+            )
+            self.assertIn('id="phase-states"', page.text)
+            self.assertNotIn("/media/Shows", page.text)
+            self.assertIn('data-layer="blocked"', page.text)
+            self.assertIn('data-layer="paused"', page.text)
+            self.assertIn('data-layer="stopped"', page.text)
+            self.assertIn('data-layer="failed"', page.text)
+            self.assertIn("커피 한 잔?", page.text)
+            self.assertIn("DRINK", page.text)
+            self.assertIn("BREAK", page.text)
+            self.assertIn("const LOUNGE_ROUTES = [", page.text)
+            self.assertIn("function updateLoungeWorkers(t)", page.text)
+            self.assertIn("updateLoungeWorkers(t);", page.text)
+            self.assertIn("chatter.el.hidden = true", page.text)
+            self.assertIn("function phaseStation(", page.text)
+            self.assertIn("function vendingMachine(", page.text)
+            self.assertIn("function arcadeMachine(", page.text)
+            self.assertIn("function transportCart(", page.text)
+            self.assertIn("function statusBay(", page.text)
+            self.assertIn("updateStatusTransports(t);", page.text)
+            self.assertIn("const handler = person(", page.text)
+            self.assertIn("job.transport_active", page.text)
+            self.assertIn("function conveyorLine(", page.text)
+            self.assertIn("function packingStation(", page.text)
+            self.assertIn("완제품 보관동", page.text)
+            self.assertIn("ARCHIVE_FLOOR_CAPACITY", page.text)
+            self.assertIn("function serverCabinet(", page.text)
+            self.assertIn('touch-action: none', page.text)
+            self.assertIn('mode: e.button === 2 || e.shiftKey ? "orbit" : "pan"', page.text)
+            self.assertIn("renderer.setAnimationLoop(loop);", page.text)
+            self.assertNotIn('id="fps"', page.text)
+            self.assertNotIn("requestAnimationFrame(loop)", page.text)
+            self.assertNotIn("최근 3건 표시", page.text)
+            self.assertNotIn("temporary upstream interruption", page.text)
+            self.assertNotIn(
+                "사용자 요청으로 작업이 중단되었습니다.",
+                page.text,
+            )
+            self.assertIn("worker unavailable", page.text)
+            self.assertIn('href="/?view=2d"', page.text)
+            self.assertIn('href="/media">미디어 선택</a>', page.text)
+            self.assertIn("location.assign(o.userData.href)", page.text)
+            self.assertNotIn("/option-B", page.text)
+            self.assertNotIn("상주 모델 정보", page.text)
+            self.assertNotIn("Prometheus 연결을 설정하면", page.text)
+            self.assertIn('href="/?view=3d"', dashboard.text)
+            self.assertIn("<h1>대시보드</h1>", persisted_dashboard.text)
+            self.assertIn(
+                'class="dashboard-option-b"',
+                persisted_dashboard.text,
+            )
+            self.assertIn("일시 정지 1", persisted_dashboard.text)
+            self.assertIn("중단 1", persisted_dashboard.text)
+            self.assertIn("정지 1", persisted_dashboard.text)
+            self.assertIn("실패 1", persisted_dashboard.text)
+            self.assertIn("최근 완료", persisted_dashboard.text)
+            self.assertNotIn("남은 시간", persisted_dashboard.text)
+            self.assertEqual(pipeline_fragment.status_code, 200)
+            self.assertIn("파이프라인", pipeline_fragment.text)
+            self.assertEqual(work_fragment.status_code, 200)
+            self.assertIn("실행 중", work_fragment.text)
+            self.assertIn("멈춤", work_fragment.text)
+            self.assertEqual(side_fragment.status_code, 200)
+            self.assertIn("대기 큐", side_fragment.text)
+            self.assertEqual(invalid_dashboard_fragment.status_code, 400)
+            self.assertNotIn(
+                "/webgpu",
+                {route.path for route in client.app.routes},
+            )
+            self.assertEqual(renderer.status_code, 200)
+            self.assertIn(b"Three.js Authors", renderer.content[:200])
+            self.assertEqual(renderer_core.status_code, 200)
+            self.assertEqual(stylesheet.status_code, 200)
+            self.assertIn("--accent", stylesheet.text)
+
+    def test_webgpu_workers_rest_when_no_jobs_exist(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            snapshot = GpuSnapshot(configured=False, available=False)
+
+            with TestClient(create_app(self.settings(root, media_root))) as client:
+                service = client.app.state.orchestrator
+                service.stop()
+                scene = webgpu_scene_context(
+                    service,
+                    snapshot,
+                    audio_workers=1,
+                )
+                page = client.get("/?view=3d")
+                extract_job = service.store.create(
+                    job_id="extract-only",
+                    source_rel="extract-only.mkv",
+                    force_overwrite=False,
+                    options={},
+                    operation="extract",
+                )
+                extract_scene = webgpu_scene_context(
+                    service,
+                    snapshot,
+                    audio_workers=1,
+                )
+                service.store.update(
+                    extract_job.id,
+                    status="audio_completed",
+                )
+                completed_extract_scene = webgpu_scene_context(
+                    service,
+                    snapshot,
+                    audio_workers=1,
+                )
+
+            self.assertEqual(
+                scene["workers"],
+                {
+                    "total": 3,
+                    "active": 0,
+                    "transporting": 0,
+                    "idle": 3,
+                },
+            )
+            self.assertEqual(scene["phase_jobs"], [])
+            self.assertEqual(
+                [item["title"] for item in extract_scene["queue"]],
+                ["extract-only.mkv"],
+            )
+            self.assertEqual(extract_scene["phase_jobs"], [])
+            self.assertEqual(completed_extract_scene["phase_jobs"], [])
+            self.assertEqual(completed_extract_scene["completed_total"], 1)
+            self.assertEqual(page.status_code, 200)
+            self.assertIn("휴게소", page.text)
+            self.assertNotIn('id="phase-states"', page.text)
+            self.assertNotIn("ROUTE_START", page.text)
+            self.assertNotIn("dropQueue", page.text)
+
     def test_media_page_renders_media_cards_and_local_poster(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -742,6 +1173,92 @@ class WebAppTests(unittest.TestCase):
             self.assertEqual(poster.status_code, 200)
             self.assertEqual(poster.content, b"poster-bytes")
 
+    def test_actor_folder_preview_and_option_b_progress_use_actor_image(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            actor = media_root / "AV" / "japan" / "Actor"
+            title = actor / "TITLE-001"
+            variety = media_root / "Variety" / "Show"
+            (actor / ".actors").mkdir(parents=True)
+            title.mkdir()
+            variety.mkdir(parents=True)
+            profile = actor / ".actors" / "Actor.jpg"
+            profile.write_bytes(b"actor-profile")
+            for name in (
+                "done.mp4",
+                "running.mp4",
+                "blocked.mp4",
+                "queued.mp4",
+                "unprocessed.mp4",
+            ):
+                (title / name).write_bytes(b"media")
+            (title / "done.ko.srt").write_text("subtitle", encoding="utf-8")
+            (variety / "done.mp4").write_bytes(b"media")
+            (variety / "done.ko.srt").write_text("subtitle", encoding="utf-8")
+            (variety / "unprocessed.mp4").write_bytes(b"media")
+
+            with TestClient(
+                create_app(self.settings(root, media_root))
+            ) as client:
+                service = client.app.state.orchestrator
+                service.stop()
+                running = service.store.create(
+                    job_id="actor-running",
+                    source_rel="AV/japan/Actor/TITLE-001/running.mp4",
+                    force_overwrite=False,
+                    options={},
+                )
+                service.store.update(
+                    running.id,
+                    status="transcription_running",
+                )
+                blocked = service.store.create(
+                    job_id="actor-blocked",
+                    source_rel="AV/japan/Actor/TITLE-001/blocked.mp4",
+                    force_overwrite=False,
+                    options={},
+                )
+                service.store.update(blocked.id, status="blocked")
+                service.store.create(
+                    job_id="actor-queued",
+                    source_rel="AV/japan/Actor/TITLE-001/queued.mp4",
+                    force_overwrite=False,
+                    options={},
+                )
+
+                media_page = client.get("/media?folder=AV/japan")
+                dashboard = client.get("/")
+                actor_image = client.get(
+                    "/media/actors/AV/japan/Actor/.actors/Actor.jpg"
+                )
+                invalid_image = client.get(
+                    "/media/actors/AV/japan/Actor/TITLE-001/done.mp4"
+                )
+
+            self.assertEqual(media_page.status_code, 200)
+            self.assertIn('class="folder-visual actor-folder-preview"', media_page.text)
+            self.assertIn(
+                "/media/actors/AV/japan/Actor/.actors/Actor.jpg",
+                media_page.text,
+            )
+            self.assertEqual(dashboard.status_code, 200)
+            self.assertIn("라이브러리 진척", dashboard.text)
+            self.assertIn("현재 작업 우선 · 배우 최대 5명", dashboard.text)
+            self.assertIn("버라이어티", dashboard.text)
+            self.assertIn("1 / 5", dashboard.text)
+            self.assertIn('class="is-done" style="width: 20.0%"', dashboard.text)
+            self.assertIn('class="is-running" style="width: 20.0%"', dashboard.text)
+            self.assertIn('class="is-queued" style="width: 20.0%"', dashboard.text)
+            self.assertIn('class="is-attention" style="width: 20.0%"', dashboard.text)
+            self.assertIn('class="is-unprocessed" style="width: 20.0%"', dashboard.text)
+            self.assertIn("미처리", dashboard.text)
+            self.assertEqual(actor_image.status_code, 200)
+            self.assertEqual(actor_image.content, b"actor-profile")
+            self.assertEqual(invalid_image.status_code, 404)
+
     def test_media_page_searches_nested_display_titles_and_preserves_query(
         self,
     ) -> None:
@@ -753,10 +1270,16 @@ class WebAppTests(unittest.TestCase):
             episode = show / "episode-01.mkv"
             episode.write_bytes(b"media")
             episode.with_suffix(".nfo").write_text(
-                "<episodedetails><title>첫 번째 에피소드</title></episodedetails>",
+                "<episodedetails><title>첫 번째 에피소드</title>"
+                "<actor><name>미야시타 레나</name></actor>"
+                "</episodedetails>",
                 encoding="utf-8",
             )
             (show / "second.mkv").write_bytes(b"media")
+            (show / "second.nfo").write_text(
+                "<movie><actor><name>사토 아이</name></actor></movie>",
+                encoding="utf-8",
+            )
 
             with patch(
                 "stt_to_subtitle.orchestrator.probe_media_duration",
@@ -766,11 +1289,15 @@ class WebAppTests(unittest.TestCase):
             ) as client:
                 client.app.state.orchestrator.stop()
                 response = client.get("/media?q=첫 번째")
+                actor_response = client.get(
+                    "/media?actor=미야시타 레나"
+                )
                 queued = client.post(
                     "/jobs",
                     data={
                         "source_rels": "show/episode-01.mkv",
                         "return_query": "첫 번째",
+                        "return_actor": "미야시타 레나",
                         "operation": "transcribe",
                     },
                     follow_redirects=False,
@@ -780,19 +1307,77 @@ class WebAppTests(unittest.TestCase):
             self.assertEqual(response.status_code, 200)
             self.assertIn('name="q"', response.text)
             self.assertIn('value="첫 번째"', response.text)
+            self.assertIn('name="actor"', actor_response.text)
+            self.assertIn('value="미야시타 레나"', actor_response.text)
             self.assertIn("첫 번째 에피소드", response.text)
+            self.assertIn("첫 번째 에피소드", actor_response.text)
+            self.assertNotIn("second.mkv", actor_response.text)
             self.assertIn("show/episode-01.mkv", response.text)
             self.assertNotIn("second.mkv", response.text)
             self.assertIn(
                 'name="return_query" value="첫 번째"',
                 response.text,
             )
-            self.assertIn("제목 검색 결과 1개", response.text)
+            self.assertIn(
+                'name="return_actor" value="미야시타 레나"',
+                actor_response.text,
+            )
+            self.assertIn("필터 결과 1개", response.text)
+            self.assertIn("배우 “미야시타 레나”", actor_response.text)
             self.assertEqual(app_version, __version__)
             self.assertEqual(queued.status_code, 303)
             self.assertEqual(
                 queued.headers["location"],
-                "/media?queued=1&q=%EC%B2%AB+%EB%B2%88%EC%A7%B8",
+                "/media?queued=1&q=%EC%B2%AB+%EB%B2%88%EC%A7%B8"
+                "&actor=%EB%AF%B8%EC%95%BC%EC%8B%9C%ED%83%80+%EB%A0%88%EB%82%98",
+            )
+
+    def test_media_page_lifts_files_out_of_shortened_content_folder(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            actress = media_root / "AV" / "japan" / "배우"
+            content = actress / "ABC-001"
+            content.mkdir(parents=True)
+            (content / "ABC-001.mp4").write_bytes(b"media")
+
+            with TestClient(
+                create_app(self.settings(root, media_root))
+            ) as client:
+                client.app.state.orchestrator.stop()
+                page = client.get(
+                    "/media?folder=AV%2Fjapan%2F%EB%B0%B0%EC%9A%B0"
+                )
+                queued = client.post(
+                    "/jobs",
+                    data={
+                        "source_rels": (
+                            "AV/japan/배우/ABC-001/ABC-001.mp4"
+                        ),
+                        "operation": "extract",
+                    },
+                    follow_redirects=False,
+                )
+                job = client.app.state.orchestrator.store.list_jobs(
+                    limit=None
+                )[0]
+
+            self.assertEqual(page.status_code, 200)
+            self.assertIn("ABC-001.mp4", page.text)
+            self.assertNotIn(
+                '<strong class="folder-name">ABC-001</strong>',
+                page.text,
+            )
+            self.assertIn(
+                'value="AV/japan/배우/ABC-001/ABC-001.mp4"',
+                page.text,
+            )
+            self.assertEqual(queued.status_code, 303)
+            self.assertEqual(
+                job.source_rel,
+                "AV/japan/배우/ABC-001/ABC-001.mp4",
             )
 
     def test_updates_remote_servers_from_settings_page(self) -> None:
@@ -854,6 +1439,73 @@ class WebAppTests(unittest.TestCase):
             )
             self.assertEqual(reloaded.lm_client.model, "new-model")
             self.assertIn("http://new-stt.test:8100", reloaded_page.text)
+
+    def test_manages_path_display_rules_and_shortens_job_paths(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+
+            with TestClient(
+                create_app(self.settings(root, media_root))
+            ) as client:
+                service = client.app.state.orchestrator
+                service.stop()
+                service.store.create(
+                    job_id="nested-job",
+                    source_rel="av/japan/배우/ABC-001/ABC-001.mp4",
+                    force_overwrite=False,
+                    options={},
+                )
+                default_rule = service.path_display_rules[0]
+                settings_page = client.get("/settings")
+                shortened = client.get("/")
+                updated = client.post(
+                    f"/settings/path-display-rules/{default_rule.id}",
+                    data={
+                        "source_pattern": (
+                            "av/{country}/{actress}/{content_id}/{filename}"
+                        ),
+                        "display_pattern": "{country}/{actress}/{filename}",
+                    },
+                    follow_redirects=False,
+                )
+                updated_dashboard = client.get("/")
+                deleted = client.post(
+                    f"/settings/path-display-rules/{default_rule.id}/delete",
+                    follow_redirects=False,
+                )
+                unshortened = client.get("/")
+                created = client.post(
+                    "/settings/path-display-rules",
+                    data={
+                        "source_pattern": "{actress}/{content_id}/{filename}",
+                        "display_pattern": "{actress}/{filename}",
+                    },
+                    follow_redirects=False,
+                )
+
+            self.assertIn("경로 표시 규칙", settings_page.text)
+            self.assertIn(default_rule.source_pattern, settings_page.text)
+            self.assertIn(
+                'title="av/japan/배우/ABC-001.mp4"',
+                shortened.text,
+            )
+            self.assertIn(
+                '>av/japan/배우</span>',
+                shortened.text,
+            )
+            self.assertEqual(updated.status_code, 303)
+            self.assertIn(
+                'title="japan/배우/ABC-001.mp4"',
+                updated_dashboard.text,
+            )
+            self.assertEqual(deleted.status_code, 303)
+            self.assertIn(
+                'title="av/japan/배우/ABC-001/ABC-001.mp4"',
+                unshortened.text,
+            )
+            self.assertEqual(created.status_code, 303)
 
     def test_manages_prompt_categories(self) -> None:
         with TemporaryDirectory() as directory:
@@ -1012,17 +1664,17 @@ class WebAppTests(unittest.TestCase):
                 detail = client.get(f"/jobs/{blocked.id}")
 
             self.assertEqual(dashboard.status_code, 200)
-            self.assertIn('class="recent-job-list"', dashboard.text)
+            self.assertIn('class="ob-work-column"', dashboard.text)
             self.assertNotIn("<table", dashboard.text)
-            self.assertIn("최근 작업", dashboard.text)
-            self.assertIn("전사 중", dashboard.text)
+            self.assertIn("실행 중", dashboard.text)
+            self.assertIn("전사", dashboard.text)
             self.assertIn("중단", dashboard.text)
             self.assertNotIn("확인 필요", dashboard.text)
-            self.assertIn('class="job-stage-strip"', dashboard.text)
-            self.assertIn('class="job-progress-overview"', dashboard.text)
-            self.assertIn("전체 진행률", dashboard.text)
+            self.assertIn('class="ob-stages"', dashboard.text)
+            self.assertIn("경과", dashboard.text)
+            self.assertNotIn("남은 시간", dashboard.text)
             self.assertNotIn("추출된 WAV 재생 시간", dashboard.text)
-            self.assertIn(">7/≈15<", dashboard.text)
+            self.assertIn("7/≈15", dashboard.text)
             self.assertIn("movie.mkv", dashboard.text)
             self.assertIn("show", dashboard.text)
 
@@ -1616,11 +2268,13 @@ class WebAppTests(unittest.TestCase):
             self.assertIn("21 전체", page.text)
             self.assertIn("1 남음", page.text)
             self.assertIn('class="job-stage-strip job-detail-stage-strip"', page.text)
-            for stage_label in ("추출", "전사", "번역", "완료"):
+            for stage_label in ("추출", "전사", "번역"):
                 self.assertIn(
                     f'<span class="job-stage-label">{stage_label}</span>',
                     page.text,
                 )
+            self.assertIn('class="job-endpoint is-done"', page.text)
+            self.assertIn("작업 완료", page.text)
             self.assertIn("한국어 결과 JSON 편집", page.text)
             self.assertEqual(editor.status_code, 200)
             self.assertIn("movie_result_ko.json", editor.text)

@@ -23,6 +23,7 @@ from .contracts import (
 from .files import sha256_file, write_json_atomic
 from .hybrid_stt import HybridRescueOptions
 from .kotoba import DEFAULT_CHUNK_LENGTH_SECONDS, TranscriptionOptions
+from .path_display import PathDisplayRule
 from .web_config import (
     MediaLibrary,
     WebSettings,
@@ -201,12 +202,25 @@ class SubtitleOrchestrator:
         settings.validate()
         self.settings = settings
         self.settings.state_dir.mkdir(parents=True, exist_ok=True)
+        self.settings.jobs_dir.mkdir(parents=True, exist_ok=True)
         self.library = MediaLibrary(
             settings.media_root,
             settings.maximum_listed_files,
             duration_probe=probe_media_duration,
         )
         self.store = JobStore(settings.state_dir / "jobs.sqlite3")
+        self._path_display_rules = tuple(
+            self.store.list_path_display_rules()
+        )
+        rebased_paths = self.store.rebase_artifact_paths(
+            previous_root=settings.state_dir / "jobs",
+            current_root=settings.jobs_dir,
+        )
+        if rebased_paths:
+            LOGGER.info(
+                "rebased artifact paths for %d web job(s)",
+                rebased_paths,
+            )
         saved_servers = self.store.get_remote_server_settings()
         initial_servers = (
             RemoteServerSettings(**saved_servers)
@@ -288,6 +302,48 @@ class SubtitleOrchestrator:
 
     def all_prompt_categories(self) -> list[PromptCategory]:
         return self.store.list_prompt_categories(include_archived=True)
+
+    @property
+    def path_display_rules(self) -> tuple[PathDisplayRule, ...]:
+        return self._path_display_rules
+
+    def create_path_display_rule(
+        self,
+        *,
+        source_pattern: str,
+        display_pattern: str,
+    ) -> PathDisplayRule:
+        created = self.store.create_path_display_rule(
+            source_pattern=source_pattern,
+            display_pattern=display_pattern,
+        )
+        self._path_display_rules = tuple(
+            self.store.list_path_display_rules()
+        )
+        return created
+
+    def update_path_display_rule(
+        self,
+        rule_id: str,
+        *,
+        source_pattern: str,
+        display_pattern: str,
+    ) -> PathDisplayRule:
+        updated = self.store.update_path_display_rule(
+            rule_id,
+            source_pattern=source_pattern,
+            display_pattern=display_pattern,
+        )
+        self._path_display_rules = tuple(
+            self.store.list_path_display_rules()
+        )
+        return updated
+
+    def delete_path_display_rule(self, rule_id: str) -> None:
+        self.store.delete_path_display_rule(rule_id)
+        self._path_display_rules = tuple(
+            self.store.list_path_display_rules()
+        )
 
     def _prompt_snapshot(self, category_id: str) -> dict[str, Any]:
         category = self.store.get_prompt_category(category_id.strip())
@@ -625,7 +681,7 @@ class SubtitleOrchestrator:
                     operation="translate",
                 )
                 transcript_path = artifact_path(
-                    self.settings.state_dir,
+                    self.settings.jobs_dir,
                     created.id,
                     source_rel,
                     "transcript",
@@ -1013,7 +1069,7 @@ class SubtitleOrchestrator:
                 operation="translate",
             )
             transcript_path = artifact_path(
-                self.settings.state_dir,
+                self.settings.jobs_dir,
                 created.id,
                 created.source_rel,
                 "transcript",
@@ -1497,7 +1553,7 @@ class SubtitleOrchestrator:
             Path(job.translation_path)
             if job.translation_path
             else artifact_path(
-                self.settings.state_dir,
+                self.settings.jobs_dir,
                 job.id,
                 job.source_rel,
                 "translation",
@@ -1921,7 +1977,7 @@ class SubtitleOrchestrator:
 
     def _extract(self, job: PipelineJob) -> None:
         source = self.library.resolve_file(job.source_rel)
-        artifact_dir = self.settings.state_dir / "jobs" / job.id
+        artifact_dir = self.settings.jobs_dir / job.id
         audio_path = artifact_dir / "audio.16k.wav"
         options = AudioExtraction(
             audio_stream=int(job.options["audio_stream"]),
@@ -2105,7 +2161,7 @@ class SubtitleOrchestrator:
             )
         validate_transcript(payload)
         transcript_path = artifact_path(
-            self.settings.state_dir,
+            self.settings.jobs_dir,
             job.id,
             job.source_rel,
             "transcript",
@@ -2195,7 +2251,7 @@ class SubtitleOrchestrator:
             Path(job.translation_path)
             if job.translation_path
             else artifact_path(
-                self.settings.state_dir,
+                self.settings.jobs_dir,
                 job.id,
                 job.source_rel,
                 "translation",

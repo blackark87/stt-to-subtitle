@@ -19,6 +19,11 @@ stt-web = "stt_to_subtitle.web_app:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-stt_to_subtitle = ["templates/*.html", "static/*.css", "static/*.js"]
+stt_to_subtitle = [
+    "templates/*.html",
+    "static/*.css",
+    "static/*.js",
+    "static/vendor/*.js",
+]
 "stt_to_subtitle.vendor.whisperjav" = ["LICENSE", "NOTICES", "VENDOR.md"]
 "stt_to_subtitle.vendor.whisperjav.data.hallucination_filters" = ["*.json"]

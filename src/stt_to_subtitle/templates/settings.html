@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% import "_icons.html" as icons %}
-{% block title %}서버 설정 · STT to Subtitle{% endblock %}
+{% block title %}설정 · STT to Subtitle{% endblock %}
 {% block head %}
   <script defer src="{{ url_for('static', path='/server-settings.js') }}"></script>
 {% endblock %}
@@ -8,7 +8,7 @@
   <div class="page-heading workspace-heading">
     <div>
       <p class="page-kicker">SETTINGS</p>
-      <h1>서버 설정</h1>
+      <h1>설정</h1>
       <p class="muted">
         저장한 값은 다음 전사·번역 요청부터 즉시 적용됩니다.
         Docker를 재시작할 필요가 없습니다.
@@ -139,6 +139,54 @@
       </span>
     </div>
   </form>
+
+  <section class="stack path-display-settings" id="path-display-rules">
+    <div class="section-heading">
+      <div>
+        <h2>경로 표시 규칙</h2>
+        <p class="muted settings-description"><code>{이름}</code>은 경로 한 단계를 나타냅니다.</p>
+      </div>
+    </div>
+
+    {% for rule in path_display_rules %}
+      <article class="card settings-card">
+        <form method="post" action="/settings/path-display-rules/{{ rule.id }}" class="stack">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <div class="path-rule-grid">
+            <label>원본 패턴
+              <input name="source_pattern" value="{{ rule.source_pattern }}" required>
+            </label>
+            <label>표시 패턴
+              <input name="display_pattern" value="{{ rule.display_pattern }}" required>
+            </label>
+          </div>
+          <div class="submit-row">
+            <button type="submit">규칙 저장</button>
+          </div>
+        </form>
+        <form method="post" action="/settings/path-display-rules/{{ rule.id }}/delete" data-confirm-message="이 경로 표시 규칙을 삭제하시겠습니까?">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button type="submit" class="danger secondary">규칙 삭제</button>
+        </form>
+      </article>
+    {% endfor %}
+
+    <details class="card settings-card">
+      <summary><strong>새 규칙 추가</strong></summary>
+      <form method="post" action="/settings/path-display-rules" class="stack">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <div class="path-rule-grid">
+          <label>원본 패턴
+            <input name="source_pattern" placeholder="av/japan/{actress}/{content_id}/{filename}" required>
+          </label>
+          <label>표시 패턴
+            <input name="display_pattern" placeholder="av/japan/{actress}/{filename}" required>
+          </label>
+        </div>
+        <div class="submit-row"><button type="submit">규칙 추가</button></div>
+      </form>
+    </details>
+  </section>
 
   <section class="stack prompt-settings" id="prompt-categories">
     <div class="section-heading">

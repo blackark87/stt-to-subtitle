@@ -9,6 +9,8 @@ services:
     build:
       context: ${WORKSPACE:-.}
       dockerfile: Dockerfile.stt-runtime
+      cache_from:
+        - type=local,src=${STT_RUNTIME_CACHE_PATH:-/data/cache/buildkit/stt-runtime-py311-cuda-v4-20260825}
 
   web:
     container_name: stt-web
@@ -40,6 +42,7 @@ services:
     environment:
       MEDIA_ROOT: /media
       WEB_STATE_DIR: /var/lib/stt
+      WEB_WORK_DIR: /var/lib/stt-work
       WEB_ADMIN_PASSWORD: ${WEB_ADMIN_PASSWORD:-}
       WEB_SESSION_SECRET: ${WEB_SESSION_SECRET:-}
       WEB_SECURE_COOKIE: ${WEB_SECURE_COOKIE:-true}
@@ -56,10 +59,21 @@ services:
       TRANSLATION_BATCH_CHARACTERS: ${TRANSLATION_BATCH_CHARACTERS:-6000}
       WEB_AUDIO_WORKERS: ${WEB_AUDIO_WORKERS:-1}
     volumes:
-      - ${MEDIA_PATH:-./media}:/media:rw
       - type: bind
-        source: ${WEB_STATE_PATH:-/data/stt-to-subtitle/web-state}
+        source: ${MEDIA_PATH:-./media}
+        target: /media
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${WEB_STATE_PATH:-/var/lib/homelab/stt-to-subtitle/web-state}
         target: /var/lib/stt
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${WEB_WORK_PATH:-/data/work/stt-to-subtitle/web-jobs}
+        target: /var/lib/stt-work
+        bind:
+          create_host_path: false
     tmpfs:
       - /tmp:size=256m,mode=1777
     networks:
@@ -85,6 +99,7 @@ services:
       STT_HOST: 0.0.0.0
       STT_PORT: 8100
       STT_STATE_DIR: /var/lib/stt
+      STT_WORK_DIR: /var/lib/stt-work
       STT_DEVICE: ${STT_DEVICE:-cuda}
       STT_DIARIZATION_DEVICE: ${STT_DIARIZATION_DEVICE:-cuda}
       STT_BATCH_SIZE: ${STT_BATCH_SIZE:-8}
@@ -107,11 +122,20 @@ services:
       NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
     volumes:
       - type: bind
-        source: ${STT_STATE_PATH:-/data/stt-to-subtitle/stt-state}
+        source: ${STT_STATE_PATH:-/var/lib/homelab/stt-to-subtitle/stt-state}
         target: /var/lib/stt
+        bind:
+          create_host_path: false
       - type: bind
-        source: ${MODEL_CACHE_PATH:-/data/stt-to-subtitle/model}
+        source: ${STT_WORK_PATH:-/data/work/stt-to-subtitle/stt-incoming}
+        target: /var/lib/stt-work
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${MODEL_CACHE_PATH:-/data/models/stt-to-subtitle}
         target: /var/cache/stt
+        bind:
+          create_host_path: false
     tmpfs:
       - /tmp:size=1g,mode=1777
     deploy:

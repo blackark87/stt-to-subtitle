@@ -9,10 +9,54 @@ from stt_to_subtitle.orchestrator import (
     SubtitleOrchestrator,
     estimate_transcription_chunks,
 )
+from stt_to_subtitle.job_store import JobStore
 from stt_to_subtitle.service_clients import TranslationPaused
 
 
 class SubtitleOrchestratorTests(unittest.TestCase):
+    def test_uses_separate_work_storage_and_rebases_saved_paths(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_dir = root / "state"
+            work_dir = root / "work"
+            media_root = root / "media"
+            media_root.mkdir()
+            store = JobStore(state_dir / "jobs.sqlite3")
+            job = store.create(
+                job_id="legacy-job",
+                source_rel="movie.mkv",
+                force_overwrite=False,
+                options={},
+            )
+            store.update(
+                job.id,
+                audio_path=str(state_dir / "jobs" / job.id / "audio.wav"),
+            )
+
+            orchestrator = SubtitleOrchestrator(
+                WebSettings(
+                    state_dir=state_dir,
+                    work_dir=work_dir,
+                    media_root=media_root,
+                    admin_password="",
+                    session_secret="",
+                    stt_base_url="",
+                    stt_token="",
+                    lm_base_url="",
+                    lm_token="",
+                    lm_model="",
+                )
+            )
+            try:
+                rebased = orchestrator.store.get(job.id)
+                self.assertTrue(work_dir.is_dir())
+                self.assertEqual(
+                    rebased.audio_path,
+                    str(work_dir / job.id / "audio.wav"),
+                )
+            finally:
+                orchestrator.stop()
+
     def test_estimates_transcription_chunks_from_audio_duration(self) -> None:
         self.assertEqual(
             estimate_transcription_chunks(

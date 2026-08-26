@@ -11,6 +11,11 @@ import time
 from typing import Any, Callable, Collection, Iterator, Mapping
 from uuid import uuid4
 
+from .path_display import (
+    PathDisplayRule,
+    normalize_path_display_patterns,
+)
+from .storage_paths import rebase_stored_path
 from .translation_prompt import (
     KOREAN_JAV_SYSTEM_PROMPT,
     KOREAN_JAV_REVIEW_PROMPT,
@@ -51,6 +56,13 @@ TRANSLATION_PAUSABLE_STATUSES = {
 }
 PROMPT_NAME_MAX_LENGTH = 80
 PROMPT_TEXT_MAX_LENGTH = 50_000
+DEFAULT_PATH_DISPLAY_RULE_ID = "default-actress-content"
+DEFAULT_PATH_DISPLAY_SOURCE = "av/japan/{actress}/{content_id}/{filename}"
+DEFAULT_PATH_DISPLAY_TARGET = "av/japan/{actress}/{filename}"
+LEGACY_PATH_DISPLAY_SOURCE = (
+    "{root}/{collection}/{actress}/{content_id}/{filename}"
+)
+LEGACY_PATH_DISPLAY_TARGET = "{actress}/{filename}"
 _COMPARISON_TRANSCRIPTION_SQL = (
     "operation = 'transcribe' AND "
     "json_extract(options_json, '$.comparison_id') IS NOT NULL"
@@ -210,6 +222,48 @@ class JobStore:
     ) -> None:
         self._change_hook = hook
 
+    def rebase_artifact_paths(
+        self,
+        *,
+        previous_root: Path,
+        current_root: Path,
+    ) -> int:
+        """Repoint persisted work artifacts after their storage root moves."""
+        if previous_root == current_root:
+            return 0
+        changed = 0
+        fields = ("audio_path", "transcript_path", "translation_path")
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, audio_path, transcript_path, translation_path
+                FROM jobs
+                """
+            ).fetchall()
+            for row in rows:
+                original = tuple(row[field] for field in fields)
+                rebased = tuple(
+                    rebase_stored_path(
+                        str(value) if value is not None else None,
+                        previous_root=previous_root,
+                        current_root=current_root,
+                    )
+                    for value in original
+                )
+                if rebased == original:
+                    continue
+                connection.execute(
+                    """
+                    UPDATE jobs
+                    SET audio_path = ?, transcript_path = ?,
+                        translation_path = ?
+                    WHERE id = ?
+                    """,
+                    (*rebased, str(row["id"])),
+                )
+                changed += 1
+        return changed
+
     def _notify_change(self, job_id: str) -> None:
         if self._change_hook is not None:
             self._change_hook(job_id)
@@ -286,6 +340,19 @@ class JobStore:
                     archived INTEGER NOT NULL DEFAULT 0,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS path_display_rules (
+                    id TEXT PRIMARY KEY,
+                    source_pattern TEXT NOT NULL UNIQUE,
+                    display_pattern TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS schema_migrations (
+                    name TEXT PRIMARY KEY,
+                    applied_at REAL NOT NULL
                 );
 
                 CREATE INDEX IF NOT EXISTS jobs_status_idx
@@ -404,6 +471,82 @@ class JobStore:
                     ),
                 ),
             )
+            default_rule_migration = "default_path_display_rule_v1"
+            default_rule_seeded = connection.execute(
+                "SELECT 1 FROM schema_migrations WHERE name = ?",
+                (default_rule_migration,),
+            ).fetchone()
+            if default_rule_seeded is None:
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO path_display_rules (
+                        id, source_pattern, display_pattern,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        DEFAULT_PATH_DISPLAY_RULE_ID,
+                        DEFAULT_PATH_DISPLAY_SOURCE,
+                        DEFAULT_PATH_DISPLAY_TARGET,
+                        now,
+                        now,
+                    ),
+                )
+                connection.execute(
+                    "INSERT INTO schema_migrations (name, applied_at) "
+                    "VALUES (?, ?)",
+                    (default_rule_migration, now),
+                )
+            corrected_rule_migration = "correct_default_path_display_rule_v2"
+            corrected_rule_applied = connection.execute(
+                "SELECT 1 FROM schema_migrations WHERE name = ?",
+                (corrected_rule_migration,),
+            ).fetchone()
+            if corrected_rule_applied is None:
+                conflicting_rule = connection.execute(
+                    "SELECT id FROM path_display_rules "
+                    "WHERE source_pattern = ? AND id != ?",
+                    (
+                        DEFAULT_PATH_DISPLAY_SOURCE,
+                        DEFAULT_PATH_DISPLAY_RULE_ID,
+                    ),
+                ).fetchone()
+                if conflicting_rule is None:
+                    connection.execute(
+                        """
+                        UPDATE path_display_rules
+                        SET source_pattern = ?, display_pattern = ?,
+                            updated_at = ?
+                        WHERE id = ? AND source_pattern = ?
+                          AND display_pattern = ?
+                        """,
+                        (
+                            DEFAULT_PATH_DISPLAY_SOURCE,
+                            DEFAULT_PATH_DISPLAY_TARGET,
+                            now,
+                            DEFAULT_PATH_DISPLAY_RULE_ID,
+                            LEGACY_PATH_DISPLAY_SOURCE,
+                            LEGACY_PATH_DISPLAY_TARGET,
+                        ),
+                    )
+                else:
+                    connection.execute(
+                        """
+                        DELETE FROM path_display_rules
+                        WHERE id = ? AND source_pattern = ?
+                          AND display_pattern = ?
+                        """,
+                        (
+                            DEFAULT_PATH_DISPLAY_RULE_ID,
+                            LEGACY_PATH_DISPLAY_SOURCE,
+                            LEGACY_PATH_DISPLAY_TARGET,
+                        ),
+                    )
+                connection.execute(
+                    "INSERT INTO schema_migrations (name, applied_at) "
+                    "VALUES (?, ?)",
+                    (corrected_rule_migration, now),
+                )
 
     @staticmethod
     def _prompt_category_from_row(
@@ -556,6 +699,119 @@ class JobStore:
         if updated is None:
             raise RuntimeError("updated prompt category could not be read")
         return updated
+
+    @staticmethod
+    def _path_display_rule_from_row(
+        row: sqlite3.Row | None,
+    ) -> PathDisplayRule | None:
+        if row is None:
+            return None
+        return PathDisplayRule(
+            id=str(row["id"]),
+            source_pattern=str(row["source_pattern"]),
+            display_pattern=str(row["display_pattern"]),
+            created_at=float(row["created_at"]),
+            updated_at=float(row["updated_at"]),
+        )
+
+    def list_path_display_rules(self) -> list[PathDisplayRule]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, source_pattern, display_pattern,
+                       created_at, updated_at
+                FROM path_display_rules
+                ORDER BY created_at, id
+                """
+            ).fetchall()
+        return [
+            rule
+            for row in rows
+            if (rule := self._path_display_rule_from_row(row)) is not None
+        ]
+
+    def create_path_display_rule(
+        self,
+        *,
+        source_pattern: str,
+        display_pattern: str,
+    ) -> PathDisplayRule:
+        source, display = normalize_path_display_patterns(
+            source_pattern,
+            display_pattern,
+        )
+        rule_id = str(uuid4())
+        now = time.time()
+        try:
+            with self._connect() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO path_display_rules (
+                        id, source_pattern, display_pattern,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (rule_id, source, display, now, now),
+                )
+        except sqlite3.IntegrityError as error:
+            raise ValueError("같은 원본 패턴의 규칙이 이미 있습니다.") from error
+        created = next(
+            (
+                rule
+                for rule in self.list_path_display_rules()
+                if rule.id == rule_id
+            ),
+            None,
+        )
+        if created is None:
+            raise RuntimeError("created path display rule could not be read")
+        return created
+
+    def update_path_display_rule(
+        self,
+        rule_id: str,
+        *,
+        source_pattern: str,
+        display_pattern: str,
+    ) -> PathDisplayRule:
+        source, display = normalize_path_display_patterns(
+            source_pattern,
+            display_pattern,
+        )
+        try:
+            with self._connect() as connection:
+                result = connection.execute(
+                    """
+                    UPDATE path_display_rules
+                    SET source_pattern = ?, display_pattern = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (source, display, time.time(), rule_id),
+                )
+        except sqlite3.IntegrityError as error:
+            raise ValueError("같은 원본 패턴의 규칙이 이미 있습니다.") from error
+        if result.rowcount != 1:
+            raise ValueError("경로 표시 규칙을 찾을 수 없습니다.")
+        updated = next(
+            (
+                rule
+                for rule in self.list_path_display_rules()
+                if rule.id == rule_id
+            ),
+            None,
+        )
+        if updated is None:
+            raise RuntimeError("updated path display rule could not be read")
+        return updated
+
+    def delete_path_display_rule(self, rule_id: str) -> None:
+        with self._connect() as connection:
+            result = connection.execute(
+                "DELETE FROM path_display_rules WHERE id = ?",
+                (rule_id,),
+            )
+        if result.rowcount != 1:
+            raise ValueError("경로 표시 규칙을 찾을 수 없습니다.")
 
     def get_remote_server_settings(self) -> dict[str, Any] | None:
         with self._connect() as connection:

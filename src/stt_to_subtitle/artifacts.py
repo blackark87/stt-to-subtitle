@@ -19,10 +19,10 @@ def artifact_filename(source_rel: str, kind: str) -> str:
 
 
 def artifact_path(
-    state_dir: Path,
+    jobs_dir: Path,
     job_id: str,
     source_rel: str,
     kind: str,
 ) -> Path:
     """Keep equal media basenames isolated inside their job directories."""
-    return state_dir / "jobs" / job_id / artifact_filename(source_rel, kind)
+    return jobs_dir / job_id / artifact_filename(source_rel, kind)

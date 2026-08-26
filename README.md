@@ -76,15 +76,22 @@ chmod 600 .env.compose
 - `OPENAI_COMPATIBLE_BASE_URL`: 번역 API 루트
 - `OPENAI_COMPATIBLE_MODEL`: 번역 모델 ID
 
-상태와 모델 캐시 디렉터리를 만들고 쓰기 권한을 확인합니다.
+Compose는 경로 오타로 빈 호스트 디렉터리를 만들지 않습니다. 미디어, 상태,
+작업 공간과 모델 캐시 디렉터리를 먼저 만들고 쓰기 권한을 확인합니다.
 
 ```bash
-mkdir -p /data/stt-to-subtitle/web-state \
-  /data/stt-to-subtitle/stt-state \
-  /data/stt-to-subtitle/model
-test -w /data/stt-to-subtitle/web-state
-test -w /data/stt-to-subtitle/stt-state
-test -w /data/stt-to-subtitle/model
+mkdir -p ./media \
+  /var/lib/homelab/stt-to-subtitle/web-state \
+  /var/lib/homelab/stt-to-subtitle/stt-state \
+  /data/work/stt-to-subtitle/web-jobs \
+  /data/work/stt-to-subtitle/stt-incoming \
+  /data/models/stt-to-subtitle
+test -w ./media
+test -w /var/lib/homelab/stt-to-subtitle/web-state
+test -w /var/lib/homelab/stt-to-subtitle/stt-state
+test -w /data/work/stt-to-subtitle/web-jobs
+test -w /data/work/stt-to-subtitle/stt-incoming
+test -w /data/models/stt-to-subtitle
 ```
 
 고정 STT 실행 환경 이미지는 Python, CUDA 라이브러리와 서로 격리된 Kotoba,
@@ -115,6 +122,8 @@ root 실행은 거부합니다. 따라서 `.env.compose`에 UID/GID를 설정할
 변경할 때만 `STT_RUNTIME_IMAGE` 태그를 올리고 `stt-runtime`을 다시
 빌드합니다. 모델 가중치는 이미지에 포함하지 않으며 최초 전사 요청 때
 `${MODEL_CACHE_PATH}`로 내려받습니다.
+`STT_RUNTIME_CACHE_PATH`는 외부에서 준비한 BuildKit 로컬 캐시를 읽는 경로이며,
+Compose 빌드 자체는 이 캐시를 갱신하지 않습니다.
 
 상태를 확인합니다.
 
@@ -132,7 +141,10 @@ curl https://stt.example.com/healthz
 
 웹 화면은 역할별로 분리됩니다. `/`는 상태 요약과 최근 작업만 보여 주는
 대시보드이고, `/media`는 파일 탐색과 신규 작업 등록, `/jobs`는 상태별 작업
-목록입니다. 모든 화면에서 사이드 메뉴로 각 영역을 직접 이동할 수 있습니다.
+목록입니다. 대시보드의 2D/3D 전환 상태는 브라우저 쿠키에 저장됩니다. 3D 모드는
+같은 작업·GPU 데이터를 아이소메트릭 파이프라인으로 표시하며, WebGPU가 지원되지
+않으면 WebGL2로 폴백합니다. 모든 화면에서 사이드 메뉴로 각 영역을 직접 이동할
+수 있습니다.
 
 전사 상태는 고정 간격으로 조회하지 않습니다. STT 저장소 변경 Hook이 작업별
 SSE 스트림으로 상태를 보내고, 웹 오케스트레이터의 변경 Hook이 다시 브라우저
@@ -147,7 +159,8 @@ SSE에 전달합니다. 번역도 배치 저장 시 같은 경로로 즉시 반�
 | 변수 | 기본값 | 용도 |
 | --- | --- | --- |
 | `MEDIA_PATH` | `./media` | 입력 영상과 생성 자막 |
-| `WEB_STATE_PATH` | `/data/stt-to-subtitle/web-state` | 작업 DB, WAV, JSON 체크포인트 |
+| `WEB_STATE_PATH` | `/var/lib/homelab/stt-to-subtitle/web-state` | 작업 DB와 영속 상태 |
+| `WEB_WORK_PATH` | `/data/work/stt-to-subtitle/web-jobs` | 작업 WAV와 재생성 가능한 JSON 체크포인트 |
 | `WEB_PUID` | `1026` | 웹 컨테이너 프로세스 UID |
 | `WEB_PGID` | `100` | 웹 컨테이너 프로세스 GID |
 | `TRAEFIK_HOST` | 필수 | 웹 HTTPS 라우터의 DNS 호스트명 |
@@ -176,8 +189,10 @@ python3 -c 'import secrets; print(secrets.token_urlsafe(48))'
 
 | 변수 | 기본값 | 용도 |
 | --- | --- | --- |
-| `STT_STATE_PATH` | `/data/stt-to-subtitle/stt-state` | 전사 작업 DB와 결과 |
-| `MODEL_CACHE_PATH` | `/data/stt-to-subtitle/model` | Hugging Face·PyTorch·WhisperX·WhisperJAV 캐시 |
+| `STT_STATE_PATH` | `/var/lib/homelab/stt-to-subtitle/stt-state` | 전사 작업 DB와 결과 |
+| `STT_WORK_PATH` | `/data/work/stt-to-subtitle/stt-incoming` | 전사용 입력 WAV 작업 공간 |
+| `MODEL_CACHE_PATH` | `/data/models/stt-to-subtitle` | Hugging Face·PyTorch·WhisperX·WhisperJAV 캐시 |
+| `STT_RUNTIME_CACHE_PATH` | `/data/cache/buildkit/stt-runtime-py311-cuda-v4-20260825` | 외부에서 준비한 고비용 런타임 빌드 캐시 |
 | `STT_DEVICE` | `cuda` | `cuda` 또는 `cuda:<index>` |
 | `STT_DIARIZATION_DEVICE` | `cuda` | 화자 분리 장치, VRAM 절약 시 `cpu` |
 | `STT_BATCH_SIZE` | `8` | Kotoba 파이프라인 배치 크기, 로드 시점에 고정 |
@@ -304,14 +319,18 @@ JSON·번역 체크포인트부터 이어집니다.
 마운트 용도는 다음과 같습니다.
 
 - `${MEDIA_PATH}:/media:rw`: 영상 조회 및 원본 옆 자막 저장
-- `${WEB_STATE_PATH}:/var/lib/stt:rw`: 작업 DB, WAV, 전사·번역 JSON
+- `${WEB_STATE_PATH}:/var/lib/stt:rw`: 작업 DB와 영속 상태
+- `${WEB_WORK_PATH}:/var/lib/stt-work:rw`: 작업 WAV와 재생성 가능한 체크포인트
 - `${STT_STATE_PATH}:/var/lib/stt:rw`: STT 작업 DB와 결과
+- `${STT_WORK_PATH}:/var/lib/stt-work:rw`: 전사용 입력 WAV 작업 공간
 - `${MODEL_CACHE_PATH}:/var/cache/stt:rw`: 모델 캐시
 
-기존 배포의 `jobs.sqlite3`와 `jobs/` 디렉터리를 새
-`WEB_STATE_PATH`로 옮기거나 그 기존 경로를 직접 지정하면 작업 기록과
-산출물을 계속 사용할 수 있습니다. 데이터베이스 스키마와 파일명은 변경하지
-않습니다.
+기존 배포를 이전할 때는 서비스를 먼저 중지합니다. 웹 `jobs.sqlite3`는
+`WEB_STATE_PATH`로, 기존 웹 `jobs/`의 내용은 `WEB_WORK_PATH`로 옮깁니다.
+STT의 `jobs.sqlite3`와 `results/`는 `STT_STATE_PATH`에 유지하고,
+`incoming/`의 내용은 `STT_WORK_PATH`로 옮깁니다. 첫 시작 시 DB에 저장된
+기존 `/var/lib/stt/jobs` 및 `/var/lib/stt/incoming` 경로는 새 비중첩 작업
+경로로 자동 변환됩니다. 데이터베이스 스키마와 파일명은 변경하지 않습니다.
 
 ## 호스트 STT API (Apple Silicon MPS 예시)
 

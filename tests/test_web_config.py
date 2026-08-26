@@ -134,6 +134,43 @@ class MediaLibraryTests(unittest.TestCase):
             self.assertEqual(files["plain.mkv"]["actors"], ["모리 히나코"])
             self.assertEqual(files["none.mkv"]["actors"], [])
 
+    def test_filters_media_recursively_by_nfo_actor_and_title(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            season = root / "Series" / "Season 1"
+            season.mkdir(parents=True)
+            for filename, title, actor in (
+                ("first.mkv", "첫 번째", "미야시타 레나"),
+                ("second.mkv", "두 번째", "사토 아이"),
+                ("third.mkv", "세 번째", "미야시타 레나"),
+            ):
+                media = season / filename
+                media.write_bytes(b"media")
+                media.with_suffix(".nfo").write_text(
+                    f"<movie><title>{title}</title>"
+                    f"<actor><name>{actor}</name></actor></movie>",
+                    encoding="utf-8",
+                )
+
+            actor_results = MediaLibrary(root).search_media(
+                actor_query="미야시타",
+                relative_directory="Series",
+            )
+            combined_results = MediaLibrary(root).search_media(
+                title_query="세 번째",
+                actor_query="미야시타 레나",
+                relative_directory="Series",
+            )
+
+            self.assertEqual(
+                [item["name"] for item in actor_results["files"]],
+                ["first.mkv", "third.mkv"],
+            )
+            self.assertEqual(
+                [item["name"] for item in combined_results["files"]],
+                ["third.mkv"],
+            )
+
     def test_multipart_group_merges_actor_names_without_duplicates(
         self,
     ) -> None:
@@ -535,6 +572,112 @@ class MediaLibraryTests(unittest.TestCase):
                 poster.resolve(),
             )
 
+    def test_finds_actor_profile_in_actor_or_title_metadata_folder(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            direct_actor = root / "AV" / "japan" / "Direct Actor"
+            nested_actor = root / "AV" / "japan" / "Nested Actor"
+            (direct_actor / ".actors").mkdir(parents=True)
+            (nested_actor / "TITLE-001" / ".actors").mkdir(parents=True)
+            direct_image = direct_actor / ".actors" / "Direct Actor.jpg"
+            nested_image = (
+                nested_actor
+                / "TITLE-001"
+                / ".actors"
+                / "Nested Actor.png"
+            )
+            direct_image.write_bytes(b"direct")
+            nested_image.write_bytes(b"nested")
+
+            library = MediaLibrary(root)
+
+            self.assertEqual(
+                library.actor_profile_for_directory(
+                    "AV/japan/Direct Actor"
+                ),
+                "AV/japan/Direct Actor/.actors/Direct Actor.jpg",
+            )
+            self.assertEqual(
+                library.actor_profile_for_directory(
+                    "AV/japan/Nested Actor"
+                ),
+                "AV/japan/Nested Actor/TITLE-001/.actors/Nested Actor.png",
+            )
+            self.assertEqual(
+                library.resolve_actor_image(
+                    "AV/japan/Direct Actor/.actors/Direct Actor.jpg"
+                ),
+                direct_image.resolve(),
+            )
+
+    def test_actor_library_entries_report_media_and_subtitles(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            actor = root / "AV" / "japan" / "Actor"
+            title = actor / "TITLE-001"
+            (actor / ".actors").mkdir(parents=True)
+            title.mkdir()
+            (actor / ".actors" / "Actor.jpg").write_bytes(b"profile")
+            (title / "done.mp4").write_bytes(b"media")
+            (title / "done.ko.srt").write_text("subtitle", encoding="utf-8")
+            (title / "pending.mkv").write_bytes(b"media")
+            (actor / ".actors" / "ignored.mp4").write_bytes(b"metadata")
+
+            entries = MediaLibrary(root).actor_library_entries()
+
+            self.assertEqual(len(entries), 1)
+            self.assertEqual(entries[0]["name"], "Actor")
+            self.assertEqual(entries[0]["path"], "AV/japan/Actor")
+            self.assertEqual(
+                entries[0]["image_path"],
+                "AV/japan/Actor/.actors/Actor.jpg",
+            )
+            self.assertEqual(
+                entries[0]["media"],
+                [
+                    {
+                        "path": "AV/japan/Actor/TITLE-001/done.mp4",
+                        "has_subtitle": True,
+                    },
+                    {
+                        "path": "AV/japan/Actor/TITLE-001/pending.mkv",
+                        "has_subtitle": False,
+                    },
+                ],
+            )
+
+    def test_collection_library_entry_reports_non_actor_media(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            show = root / "Variety" / "Show"
+            show.mkdir(parents=True)
+            (show / "done.mp4").write_bytes(b"media")
+            (show / "done.ko.ass").write_text("subtitle", encoding="utf-8")
+            (show / "pending.mkv").write_bytes(b"media")
+
+            entry = MediaLibrary(root).collection_library_entry(
+                "variety",
+                name="버라이어티",
+            )
+
+            self.assertIsNotNone(entry)
+            assert entry is not None
+            self.assertEqual(entry["name"], "버라이어티")
+            self.assertEqual(entry["path"], "Variety")
+            self.assertEqual(
+                entry["media"],
+                [
+                    {
+                        "path": "Variety/Show/done.mp4",
+                        "has_subtitle": True,
+                    },
+                    {
+                        "path": "Variety/Show/pending.mkv",
+                        "has_subtitle": False,
+                    },
+                ],
+            )
+
     def test_malformed_nfo_does_not_hide_media(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -587,6 +730,9 @@ class MediaLibraryTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "escapes"):
                 MediaLibrary(root).resolve_poster("../outside.jpg")
 
+            with self.assertRaisesRegex(ValueError, "escapes"):
+                MediaLibrary(root).resolve_actor_image("../outside.jpg")
+
     @unittest.skipUnless(hasattr(os, "symlink"), "symlink is unavailable")
     def test_rejects_symlink_to_file_outside_root(self) -> None:
         with TemporaryDirectory() as directory:
@@ -626,6 +772,18 @@ class WebSettingsTests(unittest.TestCase):
             settings.state_dir,
             Path("/var/lib/stt"),
         )
+        self.assertEqual(settings.jobs_dir, Path("/var/lib/stt/jobs"))
+
+    def test_reads_a_separate_web_work_directory(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"WEB_STATE_DIR": "/state", "WEB_WORK_DIR": "/work"},
+            clear=True,
+        ):
+            settings = WebSettings.from_env()
+
+        self.assertEqual(settings.state_dir, Path("/state"))
+        self.assertEqual(settings.jobs_dir, Path("/work"))
 
     def test_keeps_legacy_lm_studio_environment_fallback(self) -> None:
         with patch.dict(

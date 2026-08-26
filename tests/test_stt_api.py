@@ -22,7 +22,10 @@ from stt_to_subtitle.stt_api import (
     _validate_wav,
     create_app,
 )
-from stt_to_subtitle.transcription_store import TranscriptionJob
+from stt_to_subtitle.transcription_store import (
+    TranscriptionJob,
+    TranscriptionStore,
+)
 
 
 class TranscriptionChangeHookTests(unittest.IsolatedAsyncioTestCase):
@@ -38,6 +41,55 @@ class TranscriptionChangeHookTests(unittest.IsolatedAsyncioTestCase):
 
 
 class STTAPIHelpersTests(unittest.TestCase):
+    def test_service_uses_separate_work_storage_and_rebases_uploads(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_dir = root / "state"
+            work_dir = root / "work"
+            store = TranscriptionStore(state_dir / "jobs.sqlite3")
+            store.create(
+                job_id="legacy-job",
+                idempotency_key="legacy-key",
+                audio_path=state_dir / "incoming" / "legacy-job.wav",
+                audio_sha256="abc",
+                options={},
+            )
+
+            service = TranscriptionService(
+                STTAPISettings(
+                    state_dir=state_dir,
+                    work_dir=work_dir,
+                    api_token="",
+                    hf_token="hf-token",
+                    device="cpu",
+                    diarization_device="cpu",
+                )
+            )
+
+            self.assertEqual(service.incoming_dir, work_dir)
+            self.assertTrue(work_dir.is_dir())
+            self.assertEqual(
+                service.store.get("legacy-job").audio_path,
+                str(work_dir / "legacy-job.wav"),
+            )
+
+    def test_reads_a_separate_stt_work_directory(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "HF_TOKEN": "hf-token",
+                "STT_STATE_DIR": "/state",
+                "STT_WORK_DIR": "/work",
+            },
+            clear=True,
+        ):
+            settings = STTAPISettings.from_env()
+
+        self.assertEqual(settings.state_dir, Path("/state"))
+        self.assertEqual(settings.incoming_dir, Path("/work"))
+
     def test_exposes_the_package_version(self) -> None:
         app = create_app(
             STTAPISettings(

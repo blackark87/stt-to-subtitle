@@ -9,6 +9,40 @@ from stt_to_subtitle.transcription_store import TranscriptionStore
 
 
 class TranscriptionStoreTests(unittest.TestCase):
+    def test_rebases_only_uploads_under_the_previous_work_root(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = TranscriptionStore(root / "jobs.sqlite3")
+            store.create(
+                job_id="moved",
+                idempotency_key="moved-key",
+                audio_path=Path("/var/lib/stt/incoming/moved.wav"),
+                audio_sha256="abc",
+                options={},
+            )
+            store.create(
+                job_id="external",
+                idempotency_key="external-key",
+                audio_path=Path("/media/external.wav"),
+                audio_sha256="def",
+                options={},
+            )
+
+            changed = store.rebase_audio_paths(
+                previous_root=Path("/var/lib/stt/incoming"),
+                current_root=Path("/var/lib/stt-work"),
+            )
+
+            self.assertEqual(changed, 1)
+            self.assertEqual(
+                store.get("moved").audio_path,
+                "/var/lib/stt-work/moved.wav",
+            )
+            self.assertEqual(
+                store.get("external").audio_path,
+                "/media/external.wav",
+            )
+
     def test_calls_change_hook_after_transcription_mutations(self) -> None:
         with TemporaryDirectory() as directory:
             store = TranscriptionStore(Path(directory) / "jobs.sqlite3")
@@ -127,6 +161,42 @@ class TranscriptionStoreTests(unittest.TestCase):
 
 
 class JobStoreTests(unittest.TestCase):
+    def test_rebases_only_artifacts_under_the_previous_work_root(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = JobStore(Path(directory) / "jobs.sqlite3")
+            job = store.create(
+                job_id="job-1",
+                source_rel="movie.mkv",
+                force_overwrite=False,
+                options={},
+            )
+            store.update(
+                job.id,
+                audio_path="/var/lib/stt/jobs/job-1/audio.16k.wav",
+                transcript_path="/var/lib/stt/jobs/job-1/transcript.json",
+                translation_path="/media/external-result.json",
+            )
+
+            changed = store.rebase_artifact_paths(
+                previous_root=Path("/var/lib/stt/jobs"),
+                current_root=Path("/var/lib/stt-work"),
+            )
+
+            rebased = store.get(job.id)
+            self.assertEqual(changed, 1)
+            self.assertEqual(
+                rebased.audio_path,
+                "/var/lib/stt-work/job-1/audio.16k.wav",
+            )
+            self.assertEqual(
+                rebased.transcript_path,
+                "/var/lib/stt-work/job-1/transcript.json",
+            )
+            self.assertEqual(
+                rebased.translation_path,
+                "/media/external-result.json",
+            )
+
     def test_lists_and_counts_jobs_by_status(self) -> None:
         with TemporaryDirectory() as directory:
             store = JobStore(Path(directory) / "jobs.sqlite3")
@@ -276,6 +346,71 @@ class JobStoreTests(unittest.TestCase):
                         database_path
                     ).list_prompt_categories(include_archived=True)
                 },
+            )
+
+    def test_manages_path_display_rules_without_reseeding_deleted_default(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            database_path = Path(directory) / "jobs.sqlite3"
+            store = JobStore(database_path)
+            default_rule = store.list_path_display_rules()[0]
+            self.assertEqual(
+                default_rule.source_pattern,
+                "av/japan/{actress}/{content_id}/{filename}",
+            )
+            self.assertEqual(
+                default_rule.display_pattern,
+                "av/japan/{actress}/{filename}",
+            )
+
+            created = store.create_path_display_rule(
+                source_pattern="{actress}/{content_id}/{filename}",
+                display_pattern="{actress}/{filename}",
+            )
+            updated = store.update_path_display_rule(
+                created.id,
+                source_pattern="shows/{season}/{filename}",
+                display_pattern="shows/{filename}",
+            )
+            store.delete_path_display_rule(default_rule.id)
+
+            self.assertEqual(updated.display_pattern, "shows/{filename}")
+            self.assertEqual(
+                [rule.id for rule in JobStore(database_path).list_path_display_rules()],
+                [created.id],
+            )
+
+    def test_corrects_the_legacy_default_path_display_rule(self) -> None:
+        with TemporaryDirectory() as directory:
+            database_path = Path(directory) / "jobs.sqlite3"
+            JobStore(database_path)
+            with sqlite3.connect(database_path) as connection:
+                connection.execute(
+                    """
+                    UPDATE path_display_rules
+                    SET source_pattern = ?, display_pattern = ?
+                    WHERE id = 'default-actress-content'
+                    """,
+                    (
+                        "{root}/{collection}/{actress}/{content_id}/{filename}",
+                        "{actress}/{filename}",
+                    ),
+                )
+                connection.execute(
+                    "DELETE FROM schema_migrations "
+                    "WHERE name = 'correct_default_path_display_rule_v2'"
+                )
+
+            rule = JobStore(database_path).list_path_display_rules()[0]
+
+            self.assertEqual(
+                rule.source_pattern,
+                "av/japan/{actress}/{content_id}/{filename}",
+            )
+            self.assertEqual(
+                rule.display_pattern,
+                "av/japan/{actress}/{filename}",
             )
 
     def test_lists_jobs_by_latest_status_change_without_progress_reordering(

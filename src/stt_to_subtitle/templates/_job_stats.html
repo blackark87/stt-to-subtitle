@@ -1,28 +1,9 @@
-{% import "_icons.html" as icons %}
-<div class="stat-strip">
-  <a class="stat-tile stat-running" href="/jobs?status_group=running">
-    <span class="stat-icon">{{ icons.activity(18) }}</span>
-    <span class="stat-value">{{ job_stats.running }}</span>
-    <span class="stat-label">진행 중</span>
-  </a>
-  <a class="stat-tile stat-blocked" href="/jobs?status_group=blocked">
-    <span class="stat-icon">{{ icons.pause(18) }}</span>
-    <span class="stat-value">{{ job_stats.blocked }}</span>
-    <span class="stat-label">중단</span>
-  </a>
-  <a class="stat-tile stat-failed" href="/jobs?status_group=failed">
-    <span class="stat-icon">{{ icons.alert_triangle(18) }}</span>
-    <span class="stat-value">{{ job_stats.failed }}</span>
-    <span class="stat-label">실패</span>
-  </a>
-  <a class="stat-tile stat-waiting" href="/jobs?status_group=waiting">
-    <span class="stat-icon">{{ icons.clock(18) }}</span>
-    <span class="stat-value">{{ job_stats.waiting }}</span>
-    <span class="stat-label">대기</span>
-  </a>
-  <a class="stat-tile stat-completed" href="/jobs?status_group=completed">
-    <span class="stat-icon">{{ icons.check(18) }}</span>
-    <span class="stat-value">{{ job_stats.completed }}</span>
-    <span class="stat-label">완료</span>
-  </a>
-</div>
+<nav class="ob-state-badges" aria-label="작업 상태 요약">
+  <a class="ob-badge is-running" href="/jobs?status_group=running">실행 {{ dashboard_counts.running }}</a>
+  <a class="ob-badge is-waiting" href="/jobs?status_group=waiting">대기 {{ dashboard_counts.waiting }}</a>
+  <a class="ob-badge is-paused" href="/jobs?status_group=waiting">일시 정지 {{ dashboard_counts.paused }}</a>
+  <a class="ob-badge is-blocked" href="/jobs?status_group=blocked">중단 {{ dashboard_counts.blocked }}</a>
+  <a class="ob-badge is-stopped" href="/jobs?status_group=blocked">정지 {{ dashboard_counts.stopped }}</a>
+  <a class="ob-badge is-failed" href="/jobs?status_group=failed">실패 {{ dashboard_counts.failed }}</a>
+  <a class="ob-badge is-completed" href="/jobs?status_group=completed">완료 {{ dashboard_counts.completed }}</a>
+</nav>

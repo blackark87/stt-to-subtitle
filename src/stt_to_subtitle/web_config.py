@@ -317,6 +317,7 @@ class WebSettings:
     translation_batch_segments: int = 30
     translation_batch_characters: int = 6000
     audio_workers: int = 1
+    work_dir: Path | None = None
 
     @classmethod
     def from_env(cls) -> WebSettings:
@@ -343,6 +344,11 @@ class WebSettings:
                 "OPENAI_COMPATIBLE_MODEL",
                 "LM_STUDIO_MODEL",
             ).strip(),
+            work_dir=(
+                Path(os.environ["WEB_WORK_DIR"]).expanduser()
+                if os.environ.get("WEB_WORK_DIR", "").strip()
+                else None
+            ),
             gpu_prometheus_url=os.environ.get(
                 "GPU_PROMETHEUS_URL",
                 "",
@@ -369,6 +375,10 @@ class WebSettings:
             ),
             audio_workers=int(os.environ.get("WEB_AUDIO_WORKERS", "1")),
         )
+
+    @property
+    def jobs_dir(self) -> Path:
+        return self.work_dir or self.state_dir / "jobs"
 
     def validate(self) -> None:
         if self.admin_password.strip() and not self.session_secret.strip():
@@ -460,6 +470,140 @@ class MediaLibrary:
         ):
             raise ValueError("unsupported poster file")
         return resolved
+
+    def resolve_actor_image(self, relative_path: str) -> Path:
+        if not relative_path or Path(relative_path).is_absolute():
+            raise ValueError("actor image path must be relative")
+        candidate = self.root / relative_path
+        try:
+            resolved = candidate.resolve(strict=True)
+        except OSError as error:
+            raise ValueError("actor image does not exist") from error
+        if not resolved.is_relative_to(self.root):
+            raise ValueError("actor image path escapes MEDIA_ROOT")
+        relative = resolved.relative_to(self.root)
+        if not any(part.casefold() == ".actors" for part in relative.parts[:-1]):
+            raise ValueError("actor image is not inside an .actors folder")
+        if (
+            candidate.is_symlink()
+            or not resolved.is_file()
+            or resolved.suffix.lower() not in POSTER_EXTENSIONS
+        ):
+            raise ValueError("unsupported actor image")
+        return resolved
+
+    def actor_profile_for_directory(
+        self,
+        relative_directory: str,
+    ) -> str | None:
+        directory = self.resolve_directory(relative_directory)
+        profile = self._find_actor_profile(directory, directory.name)
+        if profile is None:
+            return None
+        return profile.relative_to(self.root).as_posix()
+
+    def actor_library_entries(
+        self,
+        relative_directory: str = "av/japan",
+    ) -> list[dict[str, object]]:
+        """Return actor folders and their media/subtitle state."""
+        collection = self._casefold_directory(relative_directory)
+        if collection is None:
+            return []
+        try:
+            actor_directories = sorted(
+                (
+                    entry
+                    for entry in os.scandir(collection)
+                    if entry.is_dir(follow_symlinks=False)
+                    and not _is_ignored_directory(entry.name)
+                ),
+                key=lambda entry: entry.name.casefold(),
+            )
+        except OSError:
+            return []
+
+        entries: list[dict[str, object]] = []
+        for actor_entry in actor_directories:
+            actor_directory = Path(actor_entry.path)
+            media = self._progress_media_entries(actor_directory)
+            if not media:
+                continue
+            profile = self._find_actor_profile(
+                actor_directory,
+                actor_entry.name,
+            )
+            entries.append(
+                {
+                    "name": actor_entry.name,
+                    "path": actor_directory.relative_to(self.root).as_posix(),
+                    "image_path": (
+                        profile.relative_to(self.root).as_posix()
+                        if profile is not None
+                        else None
+                    ),
+                    "media": media,
+                }
+            )
+        return entries
+
+    def collection_library_entry(
+        self,
+        relative_directory: str,
+        *,
+        name: str,
+    ) -> dict[str, object] | None:
+        """Return progress media for a non-actor library collection."""
+        collection = self._casefold_directory(relative_directory)
+        if collection is None:
+            return None
+        media = self._progress_media_entries(collection)
+        if not media:
+            return None
+        return {
+            "name": name,
+            "path": collection.relative_to(self.root).as_posix(),
+            "image_path": None,
+            "media": media,
+        }
+
+    def _progress_media_entries(
+        self,
+        root: Path,
+    ) -> list[dict[str, object]]:
+        media: list[dict[str, object]] = []
+        pending = [root]
+        while pending:
+            directory = pending.pop()
+            try:
+                children = list(os.scandir(directory))
+            except OSError:
+                continue
+            names = {child.name.casefold() for child in children}
+            for child in children:
+                if child.is_dir(follow_symlinks=False):
+                    if not _is_ignored_directory(child.name):
+                        pending.append(Path(child.path))
+                    continue
+                if (
+                    not child.is_file(follow_symlinks=False)
+                    or Path(child.name).suffix.lower() not in MEDIA_EXTENSIONS
+                    or _is_ignored_file(child.name)
+                    or _is_hidden_media_file(child.name)
+                ):
+                    continue
+                source = Path(child.path)
+                media.append(
+                    {
+                        "path": source.relative_to(self.root).as_posix(),
+                        "has_subtitle": (
+                            f"{source.stem}.ko.srt".casefold() in names
+                            or f"{source.stem}.ko.ass".casefold() in names
+                        ),
+                    }
+                )
+        media.sort(key=lambda item: str(item["path"]).casefold())
+        return media
 
     def resolve_directory(self, relative_path: str = "") -> Path:
         if Path(relative_path).is_absolute():
@@ -566,11 +710,27 @@ class MediaLibrary:
         relative_directory: str = "",
     ) -> dict[str, object]:
         """Find media by display title below the selected directory."""
-        normalized_query = query.strip()
-        if not normalized_query:
+        return self.search_media(
+            title_query=query,
+            relative_directory=relative_directory,
+        )
+
+    def search_media(
+        self,
+        *,
+        title_query: str = "",
+        actor_query: str = "",
+        relative_directory: str = "",
+    ) -> dict[str, object]:
+        """Find media by title and NFO actor below the selected directory."""
+        normalized_title = title_query.strip()
+        normalized_actor = actor_query.strip()
+        if not normalized_title and not normalized_actor:
             return self.browse(relative_directory)
-        if len(normalized_query) > 200:
+        if len(normalized_title) > 200:
             raise ValueError("검색어는 200자 이하로 입력하세요.")
+        if len(normalized_actor) > 200:
+            raise ValueError("배우 필터는 200자 이하로 입력하세요.")
         if not self.root.is_dir():
             if relative_directory:
                 raise ValueError("media folder does not exist")
@@ -584,10 +744,11 @@ class MediaLibrary:
 
         directory = self.resolve_directory(relative_directory)
         location = self._directory_location(directory)
-        matching_paths: list[Path] = []
+        matching_files: list[dict[str, object]] = []
         pending = [directory]
-        folded_query = normalized_query.casefold()
-        while pending and len(matching_paths) < self.maximum_files:
+        folded_title = normalized_title.casefold()
+        folded_actor = normalized_actor.casefold()
+        while pending and len(matching_files) < self.maximum_files:
             current = pending.pop()
             try:
                 children = sorted(
@@ -611,19 +772,28 @@ class MediaLibrary:
                     or _is_hidden_media_file(child.name)
                 ):
                     continue
-                if folded_query not in self._media_title(child).casefold():
+                if (
+                    folded_title
+                    and folded_title not in self._media_title(child).casefold()
+                ):
                     continue
-                matching_paths.append(child)
-                if len(matching_paths) >= self.maximum_files:
+                media = self._describe_media(child)
+                if folded_actor and not any(
+                    folded_actor in str(actor).casefold()
+                    for actor in media.get("actors", ())
+                ):
+                    continue
+                matching_files.append(media)
+                if len(matching_files) >= self.maximum_files:
                     break
 
-        matching_paths.sort(
-            key=lambda path: path.relative_to(self.root).as_posix().casefold()
+        matching_files.sort(
+            key=lambda media: str(media["path"]).casefold()
         )
         return {
             **location,
             "folders": [],
-            "files": [self._describe_media(path) for path in matching_paths],
+            "files": matching_files,
         }
 
     def list_media_recursive(
@@ -826,6 +996,66 @@ class MediaLibrary:
                 candidate = source_path.parent / f"{stem}{extension}"
                 if candidate.is_file() and not candidate.is_symlink():
                     return candidate.resolve()
+        return None
+
+    def _casefold_directory(self, relative_directory: str) -> Path | None:
+        current = self.root
+        for part in Path(relative_directory).parts:
+            if part in {"", "."}:
+                continue
+            try:
+                matches = sorted(
+                    (
+                        entry
+                        for entry in os.scandir(current)
+                        if entry.name.casefold() == part.casefold()
+                        and entry.is_dir(follow_symlinks=False)
+                    ),
+                    key=lambda entry: entry.name,
+                )
+            except OSError:
+                return None
+            if not matches:
+                return None
+            current = Path(matches[0].path)
+        return current
+
+    def _find_actor_profile(
+        self,
+        actor_directory: Path,
+        actor_name: str,
+    ) -> Path | None:
+        metadata_directories = [actor_directory / ".actors"]
+        try:
+            children = list(os.scandir(actor_directory))
+        except OSError:
+            children = []
+        metadata_directories.extend(
+            Path(child.path) / ".actors"
+            for child in children
+            if child.is_dir(follow_symlinks=False)
+            and not _is_ignored_directory(child.name)
+        )
+        folded_name = actor_name.casefold()
+        for metadata_directory in metadata_directories:
+            if metadata_directory.is_symlink():
+                continue
+            try:
+                images = sorted(
+                    (
+                        entry
+                        for entry in os.scandir(metadata_directory)
+                        if entry.is_file(follow_symlinks=False)
+                        and Path(entry.name).suffix.lower()
+                        in POSTER_EXTENSIONS
+                    ),
+                    key=lambda entry: entry.name.casefold(),
+                )
+            except OSError:
+                continue
+            for image in images:
+                if Path(image.name).stem.casefold() == folded_name:
+                    return Path(image.path).resolve()
         return None
 
     def _resolve_local_poster(

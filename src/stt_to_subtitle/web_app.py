@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 import hmac
@@ -12,6 +12,7 @@ import logging
 import os
 from pathlib import Path
 import secrets
+import time
 from typing import Any, AsyncIterator
 from urllib.parse import quote, urlencode, urlsplit
 
@@ -25,12 +26,13 @@ from fastapi.responses import (
 )
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from jinja2 import pass_context
 from starlette.middleware.sessions import SessionMiddleware
 
 from . import __version__
 from .artifacts import artifact_filename
 from .contracts import validate_transcript, validate_translation_items
-from .gpu_monitoring import PrometheusGpuMonitor
+from .gpu_monitoring import GpuSnapshot, PrometheusGpuMonitor
 from .job_store import RETRYABLE_STATUSES, RUNNING_STATUSES, SUCCESS_STATUSES
 from .media_preview import (
     guess_media_type,
@@ -38,8 +40,10 @@ from .media_preview import (
     parse_byte_range,
     srt_to_webvtt,
 )
+from .path_display import shorten_display_path
 from .web_config import (
     group_multipart_media,
+    MediaLibrary,
     WebSettings,
     RemoteServerSettings,
     normalize_server_url,
@@ -49,6 +53,8 @@ from .orchestrator import (
     COMPARISON_PARENT_ID_OPTION,
     SubtitleOrchestrator,
     TRANSCRIPTION_COMPARISON_BACKENDS,
+    USER_SELECTED_STOP_MESSAGE,
+    USER_STOP_MESSAGE,
 )
 from .service_clients import (
     ExternalServiceError,
@@ -73,6 +79,21 @@ PACKAGE_DIR = Path(__file__).parent
 RECENT_JOB_LIMIT = 20
 COMPARISON_HISTORY_LIMIT = 20
 DASHBOARD_JOB_LIMIT = 5
+ACTOR_PROGRESS_LIMIT = 5
+DASHBOARD_ATTENTION_LIMIT = 3
+DASHBOARD_COMPLETED_LIMIT = 4
+DASHBOARD_QUEUE_LIMIT = 6
+DASHBOARD_MODE_COOKIE = "stt_dashboard_mode"
+WEBGPU_QUEUE_LIMIT = 6
+WEBGPU_PHASE_JOB_LIMIT = 6
+WEBGPU_STOPPED_LIMIT = 3
+WEBGPU_COMPLETED_LIMIT = 4
+WEBGPU_MEDIA_ZONE_LIMIT = 8
+WEBGPU_TRANSPORT_WINDOW_SECONDS = 30.0
+WEBGPU_USER_STOP_MESSAGES = {
+    USER_SELECTED_STOP_MESSAGE,
+    USER_STOP_MESSAGE,
+}
 WAITING_STATUSES = {
     "queued",
     "audio_ready",
@@ -158,7 +179,7 @@ JOB_STATUS_LABELS = {
     "transcribed": "번역 대기",
     "transcription_completed": "전사 완료",
     "translation_running": "번역 중",
-    "translation_paused": "번역 중단됨",
+    "translation_paused": "번역 일시 정지",
     "translated": "자막 생성 대기",
     "rendering": "자막 생성 중",
     "completed": "완료",
@@ -174,7 +195,7 @@ MEDIA_PROCESSING_LABELS = {
     "transcribed": "전사 완료 · 번역 대기",
     "transcription_completed": "전사 완료",
     "translation_running": "번역 중",
-    "translation_paused": "번역 중단됨",
+    "translation_paused": "번역 일시 정지",
     "translated": "번역 완료 · 자막 생성 대기",
     "rendering": "자막 생성 중",
     "completed": "자막 생성 완료",
@@ -186,7 +207,7 @@ STT_BACKEND_LABELS = {
     "kotoba": "Kotoba",
 }
 JOB_OPERATION_LABELS = {
-    "extract": "오디오 추출 (기존 작업)",
+    "extract": "추출",
     "transcribe": "전사",
     "translate": "번역",
     "full": "전체",
@@ -195,19 +216,26 @@ JOB_STAGE_LABELS = {
     "audio extraction": "추출",
     "transcription": "전사",
     "translation": "번역",
-    "render": "완료",
+    "render": "작업 완료",
 }
-STAGE_SEQUENCE = (
+PHASE_SEQUENCE = (
     "audio extraction",
     "transcription",
     "translation",
-    "render",
 )
-OPERATION_STAGES = {
-    "extract": ("audio extraction", "render"),
-    "transcribe": STAGE_SEQUENCE,
-    "translate": STAGE_SEQUENCE,
-    "full": STAGE_SEQUENCE,
+JOB_ENDPOINT_KEY = "render"
+STAGE_SEQUENCE = (*PHASE_SEQUENCE, JOB_ENDPOINT_KEY)
+OPERATION_PHASES = {
+    "extract": ("audio extraction",),
+    "transcribe": ("transcription",),
+    "translate": ("translation",),
+    "full": PHASE_SEQUENCE,
+}
+OPERATION_SUCCESS_STATUS = {
+    "extract": "audio_completed",
+    "transcribe": "transcription_completed",
+    "translate": "completed",
+    "full": "completed",
 }
 STATUS_ACTIVE_STAGE = {
     "extracting": ("audio extraction", "running"),
@@ -220,24 +248,24 @@ STATUS_ACTIVE_STAGE = {
     "translated": ("render", "waiting"),
     "rendering": ("render", "running"),
 }
-STAGE_FINISHED_STATUSES = {
-    "audio_completed",
-    "completed",
-}
 STAGE_STATE_LABELS = {
     "done": "완료",
     "running": "진행 중",
     "waiting": "대기",
-    "paused": "중단됨",
+    "paused": "일시 정지",
     "blocked": "중단",
     "failed": "실패",
     "pending": "대기",
 }
 
 
-def job_stage_view(job: Any) -> list[dict[str, Any]]:
-    """작업이 거치는 모든 파이프라인 단계와 각 단계의 상태를 돌려준다."""
-    stages = OPERATION_STAGES.get(str(job.operation), STAGE_SEQUENCE)
+def _job_progress_step(
+    job: Any,
+    key: str,
+    state: str,
+    *,
+    kind: str,
+) -> dict[str, Any]:
     chunks_created = int(job.chunks_created)
     chunks_total_estimate = int(getattr(job, "chunks_total_estimate", 0))
     transcription_total = max(chunks_created, chunks_total_estimate)
@@ -248,63 +276,153 @@ def job_stage_view(job: Any) -> list[dict[str, Any]]:
             job.translation_chunks_total,
         ),
     }
+    completed, total = chunk_counts.get(key, (0, 0))
+    percent = (
+        round(completed * 100 / total)
+        if total
+        else (100 if state == "done" else 0)
+    )
+    if state != "done":
+        percent = min(99, percent)
+    count_label = ""
+    total_is_estimate = (
+        key == "transcription" and chunks_total_estimate > chunks_created
+    )
+    if total:
+        count_label = (
+            f"{completed}/{('≈' if total_is_estimate else '')}{total}"
+        )
+    return {
+        "key": key,
+        "label": JOB_STAGE_LABELS.get(key, key),
+        "kind": kind,
+        "state": state,
+        "state_label": STAGE_STATE_LABELS[state],
+        "completed": completed,
+        "total": total,
+        "total_is_estimate": total_is_estimate,
+        "percent": percent,
+        "progress_label": " · ".join(
+            part
+            for part in (STAGE_STATE_LABELS[state], count_label)
+            if part
+        ),
+        "display_label": (
+            {
+                "done": "작업 완료",
+                "running": "작업 마무리 중",
+                "waiting": "작업 완료 대기",
+                "pending": "작업 완료 대기",
+                "paused": "작업 일시 정지",
+                "blocked": "작업 중단",
+                "failed": "작업 실패",
+            }[state]
+            if kind == "endpoint"
+            else JOB_STAGE_LABELS.get(key, key)
+        ),
+    }
+
+
+def job_pipeline_phase_view(job: Any) -> list[dict[str, Any]]:
+    """실제 파이프라인의 세 phase 상태를 작업 범위와 무관하게 계산한다."""
     status = str(job.status)
-    if status in STAGE_FINISHED_STATUSES:
-        active: str | None = None
-        active_state = "done"
+    operation = str(job.operation)
+    finished_through = -1
+    active: str | None = None
+    active_state = "waiting"
+    if status == "audio_completed":
+        finished_through = 0
+    elif status == "transcription_completed":
+        finished_through = 1
+    elif status in {"translated", "rendering", "completed"}:
+        finished_through = len(PHASE_SEQUENCE) - 1
     elif status in {"blocked", "failed"}:
         blocked = str(job.blocked_stage or "")
-        active = blocked if blocked in stages else stages[0]
-        active_state = "blocked" if status == "blocked" else "failed"
+        if blocked in PHASE_SEQUENCE:
+            active = blocked
+            active_state = "blocked" if status == "blocked" else "failed"
+        elif blocked == JOB_ENDPOINT_KEY:
+            finished_through = len(PHASE_SEQUENCE) - 1
     elif status == "queued":
         active = (
-            "translation" if str(job.operation) == "translate" else stages[0]
+            "translation" if operation == "translate" else "audio extraction"
         )
         active_state = "waiting"
     else:
         active, active_state = STATUS_ACTIVE_STAGE.get(
             status,
-            (stages[0], "waiting"),
+            (
+                "translation"
+                if operation == "translate"
+                else "audio extraction",
+                "waiting",
+            ),
         )
-        if active not in stages:
-            active = stages[0]
+        if active == JOB_ENDPOINT_KEY:
+            active = None
+            finished_through = len(PHASE_SEQUENCE) - 1
 
     view: list[dict[str, Any]] = []
-    reached_active = False
-    for stage in stages:
-        if active is None:
+    active_index = (
+        PHASE_SEQUENCE.index(active) if active in PHASE_SEQUENCE else None
+    )
+    for index, phase in enumerate(PHASE_SEQUENCE):
+        if index <= finished_through or (
+            active_index is not None and index < active_index
+        ):
             state = "done"
-        elif stage == active:
+        elif phase == active:
             state = active_state
-            reached_active = True
-        elif reached_active:
-            state = "pending"
         else:
-            state = "done"
-        completed, total = chunk_counts.get(stage, (0, 0))
-        percent = (
-            round(completed * 100 / total)
-            if total
-            else (100 if state == "done" else 0)
-        )
-        if state != "done":
-            percent = min(99, percent)
+            state = "pending"
         view.append(
-            {
-                "key": stage,
-                "label": JOB_STAGE_LABELS.get(stage, stage),
-                "state": state,
-                "state_label": STAGE_STATE_LABELS[state],
-                "completed": completed,
-                "total": total,
-                "total_is_estimate": (
-                    stage == "transcription"
-                    and chunks_total_estimate > chunks_created
-                ),
-                "percent": percent,
-            }
+            _job_progress_step(job, phase, state, kind="phase")
         )
     return view
+
+
+def job_stage_view(job: Any) -> list[dict[str, Any]]:
+    """선택한 phase와 작업 완료 endpoint를 사용자 표시용으로 돌려준다."""
+    operation = str(job.operation)
+    phases_by_key = {
+        str(phase["key"]): phase for phase in job_pipeline_phase_view(job)
+    }
+    phases = [
+        dict(phases_by_key[key])
+        for key in OPERATION_PHASES.get(operation, PHASE_SEQUENCE)
+    ]
+    if (
+        operation == "transcribe"
+        and phases
+        and phases[0]["state"] == "pending"
+    ):
+        phases[0] = _job_progress_step(
+            job,
+            "transcription",
+            "waiting",
+            kind="phase",
+        )
+
+    status = str(job.status)
+    if status == OPERATION_SUCCESS_STATUS.get(operation, "completed"):
+        endpoint_state = "done"
+    elif status == "rendering":
+        endpoint_state = "running"
+    elif status == "translated":
+        endpoint_state = "waiting"
+    elif status in {"blocked", "failed"} and str(
+        job.blocked_stage or ""
+    ) == JOB_ENDPOINT_KEY:
+        endpoint_state = "blocked" if status == "blocked" else "failed"
+    else:
+        endpoint_state = "pending"
+    endpoint = _job_progress_step(
+        job,
+        JOB_ENDPOINT_KEY,
+        endpoint_state,
+        kind="endpoint",
+    )
+    return [*phases, endpoint]
 
 
 def job_progress_view(job: Any) -> dict[str, Any]:
@@ -324,8 +442,15 @@ def job_progress_view(job: Any) -> dict[str, Any]:
         ),
         stages[-1] if stages else None,
     )
+    phases = [stage for stage in stages if stage["kind"] == "phase"]
+    endpoint = next(
+        (stage for stage in stages if stage["kind"] == "endpoint"),
+        None,
+    )
     return {
         "stages": stages,
+        "phases": phases,
+        "endpoint": endpoint,
         "percent": percent,
         "current": current,
         "complete": bool(stages) and all(
@@ -334,12 +459,272 @@ def job_progress_view(job: Any) -> dict[str, Any]:
     }
 
 
+def _webgpu_stage_progress(
+    job: Any,
+    stage_key: str,
+) -> tuple[int | None, str]:
+    stage = next(
+        (
+            item
+            for item in job_pipeline_phase_view(job)
+            if item["key"] == stage_key
+        ),
+        None,
+    )
+    if stage is None:
+        return None, JOB_STATUS_LABELS.get(str(job.status), str(job.status))
+    completed = int(stage["completed"])
+    total = int(stage["total"])
+    if total <= 0:
+        return None, str(stage["state_label"])
+    total_prefix = "≈" if stage["total_is_estimate"] else ""
+    return (
+        int(stage["percent"]),
+        f"{completed} / {total_prefix}{total}",
+    )
+
+
+def _webgpu_backend_label(job: Any) -> str:
+    backend = str(job.options.get("backend", "")).strip()
+    return STT_BACKEND_LABELS.get(backend, backend)
+
+
+def _webgpu_gpu_view(snapshot: GpuSnapshot) -> dict[str, Any]:
+    if snapshot.available and snapshot.devices:
+        device = snapshot.devices[0]
+        return {
+            "available": True,
+            "index": device.index,
+            "display_name": device.display_name,
+            "utilization_percent": device.utilization_percent,
+            "memory_percent": device.memory_percent,
+            "memory_used_gib": device.memory_used_gib,
+            "memory_total_gib": device.memory_total_gib,
+            "temperature_celsius": device.temperature_celsius,
+            "power_watts": device.power_watts,
+        }
+    return {
+        "available": False,
+        "index": "",
+        "display_name": "GPU 메트릭 없음",
+        "utilization_percent": None,
+        "memory_percent": None,
+        "memory_used_gib": None,
+        "memory_total_gib": None,
+        "temperature_celsius": None,
+        "power_watts": None,
+    }
+
+
+def webgpu_scene_context(
+    service: SubtitleOrchestrator,
+    snapshot: GpuSnapshot,
+    *,
+    audio_workers: int,
+) -> dict[str, Any]:
+    """Build the 3D dashboard from values the application actually records."""
+    jobs = service.store.list_jobs(
+        limit=None,
+        include_comparison_transcriptions=False,
+    )
+    slots = dashboard_pipeline_slots(jobs, audio_workers=audio_workers)
+
+    phase_jobs = [job for job in jobs if job.status in RUNNING_STATUSES]
+    phase_job_views = []
+    for job in phase_jobs[:WEBGPU_PHASE_JOB_LIMIT]:
+        progress = job_progress_view(job)
+        phase_job_views.append(
+            {
+                "source_rel": job.source_rel,
+                "operation": JOB_OPERATION_LABELS.get(
+                    str(job.operation),
+                    str(job.operation),
+                ),
+                "percent": progress["percent"],
+                "phases": progress["phases"],
+                "endpoint": progress["endpoint"],
+            }
+        )
+
+    worker_total = sum(int(slot["capacity"]) for slot in slots)
+    worker_active = sum(
+        min(int(slot["active"]), int(slot["capacity"])) for slot in slots
+    )
+    worker_available = max(0, worker_total - worker_active)
+
+    waiting = [
+        job
+        for job in jobs
+        if job.status in WAITING_STATUSES
+        and job.status != "translation_paused"
+    ]
+    queue = []
+    for job in waiting[:WEBGPU_QUEUE_LIMIT]:
+        progress = job_progress_view(job)
+        current = progress["current"] or {}
+        queue.append(
+            {
+                "title": Path(job.source_rel).name,
+                "stage": str(current.get("label", "파이프라인")),
+                "status": JOB_STATUS_LABELS.get(job.status, job.status),
+            }
+        )
+
+    transport_cutoff = time.time() - WEBGPU_TRANSPORT_WINDOW_SECONDS
+
+    def stopped_view(
+        job: Any,
+        *,
+        include_error: bool = False,
+    ) -> dict[str, Any]:
+        view: dict[str, Any] = {
+            "source_rel": job.source_rel,
+            "status": job.status,
+            "status_label": JOB_STATUS_LABELS.get(job.status, job.status),
+            "transport_pending": (
+                float(job.status_updated_at) >= transport_cutoff
+            ),
+        }
+        if include_error and job.error:
+            view["error"] = str(job.error)
+        return view
+
+    def newest_status_first(values: Iterable[Any]) -> list[Any]:
+        return sorted(
+            values,
+            key=lambda job: (float(job.status_updated_at), job.id),
+            reverse=True,
+        )
+
+    paused_jobs = newest_status_first(
+        job for job in jobs if job.status == "translation_paused"
+    )
+    stopped_jobs = newest_status_first(
+        job
+        for job in jobs
+        if job.status == "blocked"
+        and str(job.error or "") in WEBGPU_USER_STOP_MESSAGES
+    )
+    blocked_jobs = newest_status_first(
+        job
+        for job in jobs
+        if job.status == "blocked"
+        and str(job.error or "") not in WEBGPU_USER_STOP_MESSAGES
+    )
+    failed_jobs = newest_status_first(
+        job for job in jobs if job.status == "failed"
+    )
+
+    stopped_views = [
+        stopped_view(job) for job in stopped_jobs[:WEBGPU_STOPPED_LIMIT]
+    ]
+    blocked_views = [
+        stopped_view(job) for job in blocked_jobs[:WEBGPU_STOPPED_LIMIT]
+    ]
+    paused_views = [
+        stopped_view(job) for job in paused_jobs[:WEBGPU_STOPPED_LIMIT]
+    ]
+    failed_views = [
+        stopped_view(job, include_error=True)
+        for job in failed_jobs[:WEBGPU_STOPPED_LIMIT]
+    ]
+    transport_budget = worker_available
+    transport_count = 0
+    for views in (paused_views, blocked_views, stopped_views, failed_views):
+        for view in views:
+            active = bool(view.pop("transport_pending")) and transport_budget > 0
+            view["transport_active"] = active
+            if active:
+                transport_budget -= 1
+                transport_count += 1
+
+    completed_jobs = [job for job in jobs if job.status in SUCCESS_STATUSES]
+    completed = []
+    for job in completed_jobs[:WEBGPU_COMPLETED_LIMIT]:
+        detail = [JOB_STATUS_LABELS.get(job.status, job.status)]
+        backend_label = _webgpu_backend_label(job)
+        if backend_label:
+            detail.append(backend_label)
+        completed.append(
+            {
+                "source_rel": job.source_rel,
+                "detail": " · ".join(detail),
+            }
+        )
+
+    rendering_jobs = [job for job in jobs if job.status == "rendering"]
+    rendering = (
+        {
+            "source_rel": rendering_jobs[0].source_rel,
+            "detail": JOB_STATUS_LABELS["rendering"],
+        }
+        if rendering_jobs
+        else None
+    )
+
+    try:
+        media_browser = service.library.browse()
+    except ValueError:
+        media_browser = {"folders": [], "files": []}
+    folders = list(media_browser["folders"])
+    media_tree = [
+        {
+            "path": str(folder["path"]),
+            "shape": "mixed",
+            "dirs": None,
+            "files": None,
+        }
+        for folder in folders[:WEBGPU_MEDIA_ZONE_LIMIT]
+    ]
+    if not media_tree and media_browser["files"]:
+        media_tree.append(
+            {
+                "path": "미디어 루트",
+                "shape": "flat",
+                "dirs": None,
+                "files": len(media_browser["files"]),
+            }
+        )
+
+    return {
+        "slots": slots,
+        "phase_jobs": phase_job_views,
+        "phase_jobs_rest": max(
+            0,
+            len(phase_jobs) - len(phase_job_views),
+        ),
+        "workers": {
+            "total": worker_total,
+            "active": worker_active,
+            "transporting": transport_count,
+            "idle": max(0, worker_available - transport_count),
+        },
+        "state_counts": dashboard_state_counts(jobs),
+        "queue": queue,
+        "queue_rest": max(0, len(waiting) - len(queue)),
+        "blocked": blocked_views,
+        "blocked_rest": max(0, len(blocked_jobs) - WEBGPU_STOPPED_LIMIT),
+        "stopped": stopped_views,
+        "stopped_rest": max(0, len(stopped_jobs) - WEBGPU_STOPPED_LIMIT),
+        "paused": paused_views,
+        "paused_rest": max(0, len(paused_jobs) - WEBGPU_STOPPED_LIMIT),
+        "failed": failed_views,
+        "failed_rest": max(0, len(failed_jobs) - WEBGPU_STOPPED_LIMIT),
+        "completed": completed,
+        "completed_total": len(completed_jobs),
+        "rendering": rendering,
+        "gpu": _webgpu_gpu_view(snapshot),
+        "media_tree": media_tree,
+        "media_tree_rest": max(0, len(folders) - len(media_tree)),
+    }
+
+
 def comparison_audio_stage(jobs: Sequence[Any]) -> dict[str, str]:
     """여러 비교 작업의 오디오 준비 상태를 하나의 단계로 집계한다."""
     audio_stages = [
         stage
         for job in jobs
-        for stage in job_stage_view(job)
+        for stage in job_pipeline_phase_view(job)
         if stage["key"] == "audio extraction"
     ]
     states = {str(stage["state"]) for stage in audio_stages}
@@ -381,7 +766,411 @@ def media_actor_label(actors: Any) -> str:
     return names[0] if len(names) == 1 else "Group"
 
 
-TEMPLATES = Jinja2Templates(directory=PACKAGE_DIR / "templates")
+def _library_progress_entry(
+    entry: Mapping[str, Any],
+    latest_jobs: Mapping[str, Any],
+    *,
+    kind: str,
+) -> dict[str, Any]:
+    media_items = list(entry["media"])
+    total = len(media_items)
+    counts = {
+        "done": 0,
+        "running": 0,
+        "queued": 0,
+        "attention": 0,
+        "unprocessed": 0,
+    }
+    for media in media_items:
+        source_rel = str(media["path"])
+        latest = latest_jobs.get(source_rel)
+        if bool(media["has_subtitle"]) or (
+            latest is not None and latest.status == "completed"
+        ):
+            counts["done"] += 1
+        elif latest is not None and latest.status in {
+            "translation_paused",
+            "blocked",
+            "failed",
+        }:
+            counts["attention"] += 1
+        elif latest is not None and latest.status in RUNNING_STATUSES:
+            counts["running"] += 1
+        elif (
+            latest is not None
+            and latest.status in WAITING_STATUSES
+            and latest.status != "translation_paused"
+        ):
+            counts["queued"] += 1
+        else:
+            counts["unprocessed"] += 1
+    active = counts["running"] + counts["queued"] + counts["attention"]
+    return {
+        "kind": kind,
+        "name": entry["name"],
+        "path": entry["path"],
+        "image_path": entry["image_path"],
+        "done": counts["done"],
+        "total": total,
+        "remaining": total - counts["done"],
+        "active": active,
+        "attention": counts["attention"],
+        "segments": [
+            {
+                "state": state,
+                "percent": round(counts[state] * 100 / total, 1),
+            }
+            for state in (
+                "done",
+                "running",
+                "queued",
+                "attention",
+                "unprocessed",
+            )
+            if counts[state]
+        ],
+    }
+
+
+def library_progress_view(service: SubtitleOrchestrator) -> list[dict[str, Any]]:
+    latest_jobs = service.store.latest_jobs_by_source()
+    actors: list[dict[str, Any]] = []
+    for actor in service.library.actor_library_entries():
+        actors.append(
+            _library_progress_entry(actor, latest_jobs, kind="actor")
+        )
+    actors.sort(
+        key=lambda actor: (
+            -int(bool(actor["active"])),
+            -int(actor["attention"]),
+            -int(actor["active"]),
+            -int(actor["remaining"]),
+            str(actor["name"]).casefold(),
+        )
+    )
+
+    collections: list[dict[str, Any]] = []
+    variety = service.library.collection_library_entry(
+        "Variety",
+        name="버라이어티",
+    )
+    if variety is not None:
+        collections.append(
+            _library_progress_entry(variety, latest_jobs, kind="collection")
+        )
+    return [*collections, *actors[:ACTOR_PROGRESS_LIMIT]]
+
+
+def dashboard_state_counts(jobs: Sequence[Any]) -> dict[str, int]:
+    stopped = [
+        job
+        for job in jobs
+        if job.status == "blocked"
+        and str(job.error or "") in WEBGPU_USER_STOP_MESSAGES
+    ]
+    blocked = [
+        job
+        for job in jobs
+        if job.status == "blocked"
+        and str(job.error or "") not in WEBGPU_USER_STOP_MESSAGES
+    ]
+    return {
+        "running": sum(job.status in RUNNING_STATUSES for job in jobs),
+        "waiting": sum(
+            job.status in WAITING_STATUSES
+            and job.status != "translation_paused"
+            for job in jobs
+        ),
+        "paused": sum(job.status == "translation_paused" for job in jobs),
+        "blocked": len(blocked),
+        "stopped": len(stopped),
+        "failed": sum(job.status == "failed" for job in jobs),
+        "completed": sum(job.status in SUCCESS_STATUSES for job in jobs),
+    }
+
+
+def dashboard_pipeline_slots(
+    jobs: Sequence[Any],
+    *,
+    audio_workers: int,
+) -> list[dict[str, Any]]:
+    slots: list[dict[str, Any]] = []
+    for stage, status_name, stage_key, capacity in (
+        ("추출", "extracting", "audio extraction", max(1, audio_workers)),
+        ("전사", "transcription_running", "transcription", 1),
+        ("번역", "translation_running", "translation", 1),
+    ):
+        active = [job for job in jobs if job.status == status_name]
+        slot: dict[str, Any] = {
+            "stage": stage,
+            "capacity": capacity,
+            "active": len(active),
+            "job": None,
+            "job_id": None,
+            "detail": "",
+            "percent": None,
+        }
+        if active:
+            job = active[0]
+            percent, progress_detail = _webgpu_stage_progress(job, stage_key)
+            detail = []
+            if stage_key == "transcription":
+                backend = _webgpu_backend_label(job)
+                if backend:
+                    detail.append(backend)
+            if progress_detail:
+                detail.append(progress_detail)
+            if len(active) > 1:
+                detail.append(f"외 {len(active) - 1}건")
+            slot.update(
+                {
+                    "job": job.source_rel,
+                    "job_id": job.id,
+                    "detail": " · ".join(detail),
+                    "percent": percent,
+                }
+            )
+        slots.append(slot)
+    return slots
+
+
+def dashboard_job_view(job: Any, *, now: float) -> dict[str, Any]:
+    pipeline = job_progress_view(job)
+    backend = _webgpu_backend_label(job)
+    prompt = (
+        job.prompt_category_name
+        if job.operation in {"translate", "full"}
+        else ""
+    )
+    metadata = [
+        JOB_OPERATION_LABELS.get(str(job.operation), str(job.operation)),
+        backend,
+        prompt,
+    ]
+    return {
+        "id": job.id,
+        "source_rel": job.source_rel,
+        "status": job.status,
+        "status_label": JOB_STATUS_LABELS.get(job.status, job.status),
+        "phases": pipeline["phases"],
+        "endpoint": pipeline["endpoint"],
+        "percent": pipeline["percent"],
+        "elapsed_seconds": max(0, now - float(job.status_updated_at)),
+        "changed_at": job.status_updated_at,
+        "metadata": " · ".join(part for part in metadata if part),
+        "error": str(job.error or ""),
+        "can_retry": job.can_retry,
+        "can_delete": job.can_delete_record,
+    }
+
+
+def dashboard_2d_data(
+    service: SubtitleOrchestrator,
+    *,
+    audio_workers: int,
+    include_library_progress: bool = True,
+) -> dict[str, Any]:
+    jobs = service.store.list_jobs(
+        limit=None,
+        include_comparison_transcriptions=False,
+    )
+    now = time.time()
+    running = [job for job in jobs if job.status in RUNNING_STATUSES]
+    attention = [
+        job
+        for job in jobs
+        if job.status in {"translation_paused", "blocked", "failed"}
+    ]
+    completed = [job for job in jobs if job.status in SUCCESS_STATUSES]
+    waiting = sorted(
+        (
+            job
+            for job in jobs
+            if job.status in WAITING_STATUSES
+            and job.status != "translation_paused"
+        ),
+        key=lambda job: (job.created_at, job.id),
+    )
+
+    attention_views = []
+    for job in attention[:DASHBOARD_ATTENTION_LIMIT]:
+        view = dashboard_job_view(job, now=now)
+        if job.status == "translation_paused":
+            view.update(
+                status_key="paused",
+                status_label="일시 정지",
+                action="resume",
+            )
+        elif str(job.error or "") in WEBGPU_USER_STOP_MESSAGES:
+            view.update(
+                status_key="stopped",
+                status_label="정지",
+                action="retry",
+            )
+        elif job.status == "blocked":
+            view.update(
+                status_key="blocked",
+                status_label="중단",
+                action="retry",
+            )
+        else:
+            view.update(
+                status_key="failed",
+                status_label="실패",
+                action="retry",
+            )
+        current = job_progress_view(job)["current"] or {}
+        blocked_stage = str(job.blocked_stage or "")
+        stage_detail = (
+            JOB_STAGE_LABELS.get(blocked_stage, blocked_stage)
+            if job.status in {"blocked", "failed"} and blocked_stage
+            else str(current.get("label", ""))
+        )
+        if current.get("key") == blocked_stage and current.get("total"):
+            estimate = "≈" if current.get("total_is_estimate") else ""
+            stage_detail += (
+                f" {current['completed']}/{estimate}{current['total']}"
+            )
+        view["stage_detail"] = stage_detail
+        attention_views.append(view)
+
+    completed_views = []
+    for job in completed[:DASHBOARD_COMPLETED_LIMIT]:
+        view = dashboard_job_view(job, now=now)
+        view["result_label"] = {
+            "audio_completed": "추출 완료",
+            "transcription_completed": "전사 완료",
+            "completed": "자막 완료",
+        }.get(job.status, view["status_label"])
+        completed_views.append(view)
+
+    queue_views = []
+    for position, job in enumerate(
+        waiting[:DASHBOARD_QUEUE_LIMIT],
+        start=1,
+    ):
+        current = job_progress_view(job)["current"] or {}
+        queue_views.append(
+            {
+                "position": position,
+                "id": job.id,
+                "source_rel": job.source_rel,
+                "stage": current.get("label", "대기"),
+                "status": JOB_STATUS_LABELS.get(job.status, job.status),
+            }
+        )
+
+    slots = dashboard_pipeline_slots(jobs, audio_workers=audio_workers)
+    return {
+        "dashboard_counts": dashboard_state_counts(jobs),
+        "pipeline_slots": slots,
+        "pipeline_active": sum(int(slot["active"]) for slot in slots),
+        "pipeline_capacity": sum(int(slot["capacity"]) for slot in slots),
+        "running_jobs": [dashboard_job_view(job, now=now) for job in running],
+        "attention_jobs": attention_views,
+        "attention_rest": max(0, len(attention) - len(attention_views)),
+        "completed_jobs": completed_views,
+        "queue": queue_views,
+        "queue_rest": max(0, len(waiting) - len(queue_views)),
+        "pausable_translation_count": sum(
+            job.can_pause_translation for job in jobs
+        ),
+        "stoppable_job_count": sum(job.can_stop for job in jobs),
+        "retriable_job_count": sum(job.can_retry for job in jobs),
+        "library_progress": (
+            library_progress_view(service) if include_library_progress else []
+        ),
+        "updated_at": now,
+    }
+
+
+def flatten_media_display_folders(
+    library: MediaLibrary,
+    browser: Mapping[str, object],
+    rules: Sequence[object],
+) -> dict[str, object]:
+    """Lift files out of directories removed by a display-path rule."""
+    if not rules or not browser.get("folders"):
+        return dict(browser)
+    current_folder = str(browser.get("current_folder", ""))
+    files = list(browser.get("files", ()))
+    folders = []
+    for folder in browser.get("folders", ()):
+        if not isinstance(folder, Mapping):
+            continue
+        child = library.browse(str(folder["path"]))
+        child_files = list(child["files"])
+        lifted_files = []
+        for media in child_files:
+            source_path = str(media["path"])
+            display_path = shorten_display_path(source_path, rules)
+            display_parent = Path(display_path).parent
+            display_parent_text = (
+                "" if display_parent == Path(".") else display_parent.as_posix()
+            )
+            if (
+                display_path != source_path
+                and display_parent_text.casefold() == current_folder.casefold()
+            ):
+                lifted_files.append(media)
+        can_lift_folder = (
+            bool(child_files)
+            and len(lifted_files) == len(child_files)
+            and not child["folders"]
+            and len(files) + len(lifted_files) <= library.maximum_files
+        )
+        if can_lift_folder:
+            files.extend(lifted_files)
+        else:
+            folders.append(dict(folder))
+    files.sort(key=lambda media: str(media["path"]).casefold())
+    return {**browser, "folders": folders, "files": files}
+
+
+def path_display_template_context(request: Request) -> dict[str, object]:
+    service = getattr(request.app.state, "orchestrator", None)
+    return {
+        "path_display_rules": (
+            service.path_display_rules if service is not None else ()
+        )
+    }
+
+
+@pass_context
+def display_path_filter(context: Mapping[str, Any], value: object) -> str:
+    rules = context.get("path_display_rules", ())
+    return shorten_display_path(value, rules)
+
+
+@pass_context
+def display_filename_filter(
+    context: Mapping[str, Any],
+    value: object,
+) -> str:
+    return Path(display_path_filter(context, value)).name
+
+
+@pass_context
+def display_parent_path_filter(
+    context: Mapping[str, Any],
+    value: object,
+) -> str:
+    parent = Path(display_path_filter(context, value)).parent
+    return "" if str(parent) == "." else str(parent)
+
+
+@pass_context
+def display_paths_filter(
+    context: Mapping[str, Any],
+    values: Sequence[object],
+) -> list[str]:
+    return [display_path_filter(context, value) for value in values]
+
+
+TEMPLATES = Jinja2Templates(
+    directory=PACKAGE_DIR / "templates",
+    context_processors=[path_display_template_context],
+)
 TEMPLATES.env.filters["datetime"] = format_kst_timestamp
 TEMPLATES.env.filters["datetime_iso"] = format_kst_iso
 TEMPLATES.env.filters["filesize"] = lambda value: (
@@ -408,10 +1197,10 @@ TEMPLATES.env.filters["event_level"] = lambda value: EVENT_LEVEL_LABELS.get(
     str(value),
     str(value),
 )
-TEMPLATES.env.filters["filename"] = lambda value: Path(str(value)).name
-TEMPLATES.env.filters["parent_path"] = lambda value: (
-    "" if str(Path(str(value)).parent) == "." else str(Path(str(value)).parent)
-)
+TEMPLATES.env.filters["display_path"] = display_path_filter
+TEMPLATES.env.filters["display_paths"] = display_paths_filter
+TEMPLATES.env.filters["filename"] = display_filename_filter
+TEMPLATES.env.filters["parent_path"] = display_parent_path_filter
 
 
 def format_media_duration(value: object) -> str:
@@ -429,6 +1218,7 @@ def format_media_duration(value: object) -> str:
 
 
 TEMPLATES.env.filters["duration"] = format_media_duration
+TEMPLATES.env.filters["clock"] = lambda value: format_kst_timestamp(value)[11:19]
 
 
 def decode_source_groups(values: Sequence[str] | None) -> list[str]:
@@ -907,11 +1697,9 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         service = orchestrator(request)
         return {
             "request": request,
-            **job_list_context(
+            **dashboard_2d_data(
                 service,
-                jobs_page=1,
-                limit=DASHBOARD_JOB_LIMIT,
-                paginated=False,
+                audio_workers=configured_settings.audio_workers,
             ),
             "job_stats": job_stats(service),
             "csrf_token": request.session.get("csrf_token", ""),
@@ -922,8 +1710,24 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             "gpu_refresh_milliseconds": int(
                 configured_settings.gpu_metrics_refresh_seconds * 1000
             ),
-            "prompt_categories": service.active_prompt_categories(),
         }
+
+    def webgpu_dashboard_response(request: Request) -> HTMLResponse:
+        service = orchestrator(request)
+        snapshot = request.app.state.gpu_monitor.snapshot()
+        scene_data = webgpu_scene_context(
+            service,
+            snapshot,
+            audio_workers=configured_settings.audio_workers,
+        )
+        return TEMPLATES.TemplateResponse(
+            request,
+            "webgpu.html",
+            {
+                "gpu": scene_data["gpu"],
+                "scene_data": scene_data,
+            },
+        )
 
     def media_context(
         request: Request,
@@ -932,14 +1736,34 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         notice: str | None = None,
         folder: str = "",
         query: str = "",
+        actor: str = "",
     ) -> dict[str, Any]:
         service = orchestrator(request)
         normalized_query = query.strip()
+        normalized_actor = actor.strip()
         browser = (
-            service.library.search_by_title(normalized_query, folder)
-            if normalized_query
+            service.library.search_media(
+                title_query=normalized_query,
+                actor_query=normalized_actor,
+                relative_directory=folder,
+            )
+            if normalized_query or normalized_actor
             else service.library.browse(folder)
         )
+        browser = flatten_media_display_folders(
+            service.library,
+            browser,
+            service.path_display_rules,
+        )
+        for media_folder in browser["folders"]:
+            try:
+                media_folder["actor_image_path"] = (
+                    service.library.actor_profile_for_directory(
+                        str(media_folder["path"])
+                    )
+                )
+            except ValueError:
+                media_folder["actor_image_path"] = None
         latest_jobs = service.store.latest_jobs_by_source()
         completed_subtitles = service.store.latest_completed_subtitle_jobs()
         for media in browser["files"]:
@@ -1074,6 +1898,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             "remote_servers": service.remote_servers_view(),
             "prompt_categories": service.active_prompt_categories(),
             "search_query": normalized_query,
+            "actor_filter": normalized_actor,
             **browser,
         }
 
@@ -1595,14 +2420,36 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         translations_queued: int | None = None,
         skipped: int | None = None,
         folder: str = "",
+        view: str | None = None,
     ) -> Any:
         if not is_authenticated(request):
             return login_redirect()
+        if view is not None:
+            if view not in {"2d", "3d"}:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="invalid dashboard view",
+                )
+            response = RedirectResponse(
+                "/",
+                status_code=status.HTTP_303_SEE_OTHER,
+            )
+            response.set_cookie(
+                DASHBOARD_MODE_COOKIE,
+                view,
+                max_age=365 * 24 * 60 * 60,
+                httponly=True,
+                secure=configured_settings.secure_cookie,
+                samesite="strict",
+            )
+            return response
         if folder:
             return RedirectResponse(
                 media_location(folder),
                 status_code=status.HTTP_303_SEE_OTHER,
             )
+        if request.cookies.get(DASHBOARD_MODE_COOKIE) == "3d":
+            return webgpu_dashboard_response(request)
         notice = None
         if queued is not None and queued > 0:
             notice = f"작업 {queued}개를 등록했습니다."
@@ -1646,6 +2493,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         translations_queued: int | None = None,
         folder: str = "",
         q: str = "",
+        actor: str = "",
     ) -> Any:
         if not is_authenticated(request):
             return login_redirect()
@@ -1673,6 +2521,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                 notice=notice,
                 folder=folder,
                 query=q,
+                actor=actor,
             )
             response_status = status.HTTP_200_OK
         except ValueError as error:
@@ -1813,6 +2662,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         request: Request,
         saved: bool = False,
         prompt_saved: bool = False,
+        path_saved: bool = False,
     ) -> Any:
         if not is_authenticated(request):
             return login_redirect()
@@ -1824,6 +2674,8 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                 notice=(
                     "서버 설정을 저장했습니다."
                     if saved
+                    else "경로 표시 규칙을 저장했습니다."
+                    if path_saved
                     else "번역 프롬프트 설정을 저장했습니다."
                     if prompt_saved
                     else None
@@ -1918,6 +2770,84 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             )
         return RedirectResponse(
             "/settings?saved=true",
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+
+    def render_path_display_settings_error(
+        request: Request,
+        error: ValueError,
+    ) -> Any:
+        return TEMPLATES.TemplateResponse(
+            request,
+            "settings.html",
+            settings_context(request, error=str(error)),
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+    @app.post("/settings/path-display-rules", response_class=HTMLResponse)
+    def create_path_display_rule(
+        request: Request,
+        csrf_token: str = Form(""),
+        source_pattern: str = Form(...),
+        display_pattern: str = Form(...),
+    ) -> Any:
+        if not is_authenticated(request):
+            return login_redirect()
+        validate_csrf(request, csrf_token)
+        try:
+            orchestrator(request).create_path_display_rule(
+                source_pattern=source_pattern,
+                display_pattern=display_pattern,
+            )
+        except ValueError as error:
+            return render_path_display_settings_error(request, error)
+        return RedirectResponse(
+            "/settings?path_saved=true#path-display-rules",
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+
+    @app.post(
+        "/settings/path-display-rules/{rule_id}",
+        response_class=HTMLResponse,
+    )
+    def update_path_display_rule(
+        request: Request,
+        rule_id: str,
+        csrf_token: str = Form(""),
+        source_pattern: str = Form(...),
+        display_pattern: str = Form(...),
+    ) -> Any:
+        if not is_authenticated(request):
+            return login_redirect()
+        validate_csrf(request, csrf_token)
+        try:
+            orchestrator(request).update_path_display_rule(
+                rule_id,
+                source_pattern=source_pattern,
+                display_pattern=display_pattern,
+            )
+        except ValueError as error:
+            return render_path_display_settings_error(request, error)
+        return RedirectResponse(
+            "/settings?path_saved=true#path-display-rules",
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+
+    @app.post("/settings/path-display-rules/{rule_id}/delete")
+    def delete_path_display_rule(
+        request: Request,
+        rule_id: str,
+        csrf_token: str = Form(""),
+    ) -> Any:
+        if not is_authenticated(request):
+            return login_redirect()
+        validate_csrf(request, csrf_token)
+        try:
+            orchestrator(request).delete_path_display_rule(rule_id)
+        except ValueError as error:
+            return render_path_display_settings_error(request, error)
+        return RedirectResponse(
+            "/settings?path_saved=true#path-display-rules",
             status_code=status.HTTP_303_SEE_OTHER,
         )
 
@@ -2043,6 +2973,24 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             ) from error
         return FileResponse(poster)
 
+    @app.get(
+        "/media/actors/{actor_path:path}",
+        name="media_actor_image",
+    )
+    def media_actor_image(request: Request, actor_path: str) -> Any:
+        if not is_authenticated(request):
+            return login_redirect()
+        try:
+            actor_image = orchestrator(request).library.resolve_actor_image(
+                actor_path
+            )
+        except ValueError as error:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="actor image not found",
+            ) from error
+        return FileResponse(actor_image)
+
     @app.get("/jobs-fragment", response_class=HTMLResponse)
     def jobs_fragment(
         request: Request,
@@ -2052,12 +3000,38 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         status_group: str | None = None,
         stage_filter: str | None = None,
         compact: bool = False,
+        dashboard_section: str = "",
     ) -> Any:
         if not is_authenticated(request):
             raise HTTPException(status_code=401, detail="authentication required")
         if completed_page is not None and jobs_page == 1:
             jobs_page = completed_page
         service = orchestrator(request)
+        if dashboard_section:
+            templates = {
+                "pipeline": "_dashboard_pipeline.html",
+                "work": "_dashboard_work.html",
+                "side": "_dashboard_side.html",
+            }
+            template = templates.get(dashboard_section)
+            if template is None:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="invalid dashboard section",
+                )
+            context = dashboard_2d_data(
+                service,
+                audio_workers=configured_settings.audio_workers,
+                include_library_progress=dashboard_section == "side",
+            )
+            return TEMPLATES.TemplateResponse(
+                request,
+                template,
+                {
+                    **context,
+                    "csrf_token": request.session.get("csrf_token", ""),
+                },
+            )
         try:
             context = job_list_context(
                 service,
@@ -2123,7 +3097,15 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         return TEMPLATES.TemplateResponse(
             request,
             "_job_stats.html",
-            {"job_stats": job_stats(orchestrator(request))},
+            {
+                "job_stats": job_stats(orchestrator(request)),
+                "dashboard_counts": dashboard_state_counts(
+                    orchestrator(request).store.list_jobs(
+                        limit=None,
+                        include_comparison_transcriptions=False,
+                    )
+                ),
+            },
         )
 
     @app.get("/gpu-stats-fragment", response_class=HTMLResponse)
@@ -2173,6 +3155,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         folder_rels: list[str] | None = Form(None),
         return_folder: str = Form(""),
         return_query: str = Form(""),
+        return_actor: str = Form(""),
         csrf_token: str = Form(""),
         force_overwrite: bool = Form(False),
         backend: str = Form("auto"),
@@ -2274,6 +3257,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                     error=str(error),
                     folder=return_folder,
                     query=return_query,
+                    actor=return_actor,
                 )
             except ValueError:
                 context = media_context(request, error=str(error))
@@ -2297,6 +3281,8 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             query["folder"] = return_folder
         if return_query.strip():
             query["q"] = return_query.strip()
+        if return_actor.strip():
+            query["actor"] = return_actor.strip()
         return RedirectResponse(
             f"/media?{urlencode(query)}",
             status_code=status.HTTP_303_SEE_OTHER,

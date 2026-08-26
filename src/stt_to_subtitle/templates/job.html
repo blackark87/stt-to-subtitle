@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% import "_icons.html" as icons %}
-{% block title %}{{ job.source_rel }} · STT to Subtitle{% endblock %}
+{% block title %}{{ job.source_rel|display_path }} · STT to Subtitle{% endblock %}
 {% block head %}
   <script defer src="{{ url_for('static', path='/vr180-player.js') }}"></script>
   <script defer src="{{ url_for('static', path='/player.js') }}"></script>

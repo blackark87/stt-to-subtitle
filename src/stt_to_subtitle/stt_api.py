@@ -152,6 +152,7 @@ class STTAPISettings:
     whisperx_cache_dir: Path = Path("./var/cuda-cache/whisperx")
     debug_artifacts: bool = False
     debug_artifacts_dir: Path | None = None
+    work_dir: Path | None = None
 
     @classmethod
     def from_env(cls) -> STTAPISettings:
@@ -162,6 +163,11 @@ class STTAPISettings:
             ).expanduser(),
             api_token=os.environ.get("STT_API_TOKEN", ""),
             hf_token=os.environ.get("HF_TOKEN", ""),
+            work_dir=(
+                Path(os.environ["STT_WORK_DIR"]).expanduser()
+                if os.environ.get("STT_WORK_DIR", "").strip()
+                else None
+            ),
             device=os.environ.get("STT_DEVICE", "mps").strip(),
             diarization_device=os.environ.get(
                 "STT_DIARIZATION_DEVICE", "cpu"
@@ -233,6 +239,10 @@ class STTAPISettings:
     @property
     def artifacts_dir(self) -> Path:
         return self.debug_artifacts_dir or self.state_dir / "artifacts"
+
+    @property
+    def incoming_dir(self) -> Path:
+        return self.work_dir or self.state_dir / "incoming"
 
     def validate(self) -> None:
         if not self.hf_token.strip():
@@ -601,13 +611,22 @@ class TranscriptionService:
         settings.validate()
         self.settings = settings
         self.settings.state_dir.mkdir(parents=True, exist_ok=True)
-        self.incoming_dir = self.settings.state_dir / "incoming"
+        self.incoming_dir = self.settings.incoming_dir
         self.result_dir = self.settings.state_dir / "results"
         self.incoming_dir.mkdir(parents=True, exist_ok=True)
         self.result_dir.mkdir(parents=True, exist_ok=True)
         if self.settings.debug_artifacts:
             self.settings.artifacts_dir.mkdir(parents=True, exist_ok=True)
         self.store = TranscriptionStore(self.settings.state_dir / "jobs.sqlite3")
+        rebased_paths = self.store.rebase_audio_paths(
+            previous_root=self.settings.state_dir / "incoming",
+            current_root=self.incoming_dir,
+        )
+        if rebased_paths:
+            LOGGER.info(
+                "rebased saved upload paths for %d transcription job(s)",
+                rebased_paths,
+            )
         self._queue: queue.Queue[str | None] = queue.Queue()
         self._pipeline: SpeechPipeline | None = None
         # Held for the whole of a job so the idle reaper can never unload the

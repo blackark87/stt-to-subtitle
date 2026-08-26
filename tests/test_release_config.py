@@ -74,9 +74,15 @@ class ReleaseConfigurationTests(unittest.TestCase):
         self.assertIn(
             "WEB_STATE_DIR: /var/lib/stt", compose
         )
+        self.assertIn("WEB_WORK_DIR: /var/lib/stt-work", compose)
         self.assertIn(
             "STT_STATE_DIR: /var/lib/stt", compose
         )
+        self.assertIn("STT_WORK_DIR: /var/lib/stt-work", compose)
+        self.assertEqual(compose.count("target: /var/lib/stt-work"), 2)
+        self.assertNotIn("target: /var/lib/stt/jobs", compose)
+        self.assertNotIn("target: /var/lib/stt/incoming", compose)
+        self.assertEqual(compose.count("create_host_path: false"), 6)
         self.assertIn("target: /var/cache/stt", compose)
         self.assertNotIn("${STT_BASE_URL", compose)
         self.assertNotIn("STT_API_TOKEN:", compose)

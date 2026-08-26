@@ -15,7 +15,7 @@
               <strong class="recent-job-title">
                 {{ group.source_names[0] }}{% if group.source_count > 1 %} 외 {{ group.source_count - 1 }}개{% endif %}
               </strong>
-              <span class="recent-job-path" title="{{ group.source_rels|join(' · ') }}">
+              <span class="recent-job-path" title="{{ group.source_rels|display_paths|join(' · ') }}">
                 미디어 {{ group.source_count }}개 · 비교 기록 {{ group.record_count }}건
               </span>
             </div>

@@ -1,76 +1,46 @@
 {% extends "base.html" %}
 {% import "_icons.html" as icons %}
 {% block title %}대시보드 · STT to Subtitle{% endblock %}
+{% block body_class %}dashboard-option-b{% endblock %}
 {% block content %}
-  <div class="page-heading workspace-heading">
-    <div>
-      <p class="page-kicker">OVERVIEW</p>
-      <h1>대시보드</h1>
+  <header class="ob-topbar">
+    <h1>대시보드</h1>
+    <div data-update-url="/job-stats-fragment" aria-live="off">
+      {% include "_job_stats.html" %}
     </div>
-    <a class="button" href="/media">{{ icons.folder(16) }}새 작업 만들기</a>
-  </div>
+    <time class="ob-updated-at" datetime="{{ updated_at|datetime_iso }}">{{ updated_at|clock }} 갱신</time>
+    <button type="button" class="secondary compact" data-refresh>{{ icons.refresh(14) }}새로고침</button>
+    <a class="button secondary compact" href="/?view=3d">3D 대시보드</a>
+    <a class="button compact" href="/media">{{ icons.folder(14) }}미디어 선택</a>
+  </header>
 
-  {% if not remote_servers.configured %}
-    <p class="alert">
-      작업을 시작하려면 먼저 <a href="/settings">전사·번역 서버를 설정</a>하세요.
-    </p>
-  {% endif %}
-  {% if error %}<p class="alert">{{ error }}</p>{% endif %}
-  {% if notice %}<p class="notice">{{ notice }}</p>{% endif %}
+  <div class="ob-dashboard-content">
+    {% if not remote_servers.configured %}
+      <p class="alert"><a href="/settings">전사·번역 서버 설정</a>이 필요합니다.</p>
+    {% endif %}
+    {% if error %}<p class="alert">{{ error }}</p>{% endif %}
+    {% if notice %}<p class="notice">{{ notice }}</p>{% endif %}
 
-  <div data-update-url="/job-stats-fragment" aria-live="off">
-    {% include "_job_stats.html" %}
-  </div>
+    <div data-update-url="/jobs-fragment?dashboard_section=pipeline" aria-live="off">
+      {% include "_dashboard_pipeline.html" %}
+    </div>
 
-  <div class="dashboard-status-grid">
-    <section class="card service-card">
-      <div class="section-heading compact-heading">
-        <div>
-          <h2>서비스 연결</h2>
-        </div>
-        <a class="service-monitor-link" href="/settings">서버 설정{{ icons.chevron_right(15) }}</a>
+    <div class="ob-dashboard-grid">
+      <div data-update-url="/jobs-fragment?dashboard_section=work" aria-live="off">
+        {% include "_dashboard_work.html" %}
       </div>
-      <dl class="service-status-list">
-        <div>
-          <dt>전사 API</dt>
-          <dd class="connection-state{% if remote_servers.stt_base_url %} is-ready{% endif %}">
-            {{ "설정됨" if remote_servers.stt_base_url else "미설정" }}
-          </dd>
+      <aside class="ob-dashboard-side">
+        <div
+          data-gpu-update-url="/gpu-stats-fragment"
+          data-gpu-refresh-milliseconds="{{ gpu_refresh_milliseconds }}"
+          aria-live="polite"
+        >
+          {% include "_gpu_stats.html" %}
         </div>
-        <div>
-          <dt>번역 API</dt>
-          <dd class="connection-state{% if remote_servers.lm_base_url and remote_servers.lm_model %} is-ready{% endif %}">
-            {{ "설정됨" if remote_servers.lm_base_url and remote_servers.lm_model else "미설정" }}
-          </dd>
+        <div data-update-url="/jobs-fragment?dashboard_section=side" aria-live="off">
+          {% include "_dashboard_side.html" %}
         </div>
-      </dl>
-    </section>
-    <div
-      data-gpu-update-url="/gpu-stats-fragment"
-      data-gpu-refresh-milliseconds="{{ gpu_refresh_milliseconds }}"
-      aria-live="polite"
-    >
-      {% include "_gpu_stats.html" %}
+      </aside>
     </div>
   </div>
-
-  <section class="card recent-jobs-card dashboard-jobs-card">
-    <div class="section-heading">
-      <div>
-        <h2>최근 작업</h2>
-      </div>
-      <a class="button secondary compact" href="/jobs">전체 작업 보기{{ icons.chevron_right(14) }}</a>
-    </div>
-    <div data-update-url="/jobs-fragment?compact=true" aria-live="off">
-      {% set job_list_title = "최근 작업" %}
-      {% set show_bulk_actions = false %}
-      {% set translatable_job_ids = [] %}
-      {% set translatable_job_count = 0 %}
-      {% set stoppable_job_ids = [] %}
-      {% set stoppable_selection_count = 0 %}
-      {% set retriable_job_ids = [] %}
-      {% set retriable_selection_count = 0 %}
-      {% include "_jobs_table.html" %}
-    </div>
-  </section>
 {% endblock %}

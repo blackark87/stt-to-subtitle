@@ -10,6 +10,7 @@ import sqlite3
 import time
 from typing import Any, Callable, Iterator, Mapping
 
+from .storage_paths import rebase_stored_path
 from .time_display import format_kst_iso
 
 
@@ -60,6 +61,40 @@ class TranscriptionStore:
         hook: Callable[[str], None] | None,
     ) -> None:
         self._change_hook = hook
+
+    def rebase_audio_paths(
+        self,
+        *,
+        previous_root: Path,
+        current_root: Path,
+    ) -> int:
+        """Repoint saved uploads after their work storage root moves."""
+        if previous_root == current_root:
+            return 0
+        changed = 0
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT id, audio_path FROM transcription_jobs"
+            ).fetchall()
+            for row in rows:
+                original = str(row["audio_path"])
+                rebased = rebase_stored_path(
+                    original,
+                    previous_root=previous_root,
+                    current_root=current_root,
+                )
+                if rebased == original:
+                    continue
+                connection.execute(
+                    """
+                    UPDATE transcription_jobs
+                    SET audio_path = ?
+                    WHERE id = ?
+                    """,
+                    (rebased, str(row["id"])),
+                )
+                changed += 1
+        return changed
 
     def _notify_change(self, job_id: str) -> None:
         if self._change_hook is not None:
