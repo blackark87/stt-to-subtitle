@@ -16,7 +16,7 @@
       {% else %}
         <div class="ob-empty-row">대기 작업 없음</div>
       {% endfor %}
-      {% if queue_rest %}<a class="ob-more-row" href="/jobs?status_group=waiting">외 {{ queue_rest }}건</a>{% endif %}
+      {% if queue_rest %}<a class="ob-more-row" href="/jobs?state=waiting">외 {{ queue_rest }}건</a>{% endif %}
     </div>
   </section>
 

@@ -2483,9 +2483,11 @@ class JobStore:
     @staticmethod
     def _job_filter_clause(
         *,
+        operations: Collection[str] | None,
         statuses: Collection[str] | None,
         states: Collection[str] | None,
         phases: Collection[str] | None,
+        reason_codes: Collection[str] | None,
         legacy_phase_statuses: Collection[str] | None,
         include_comparison_transcriptions: bool,
     ) -> tuple[str, list[object]] | None:
@@ -2494,11 +2496,19 @@ class JobStore:
         ) -> tuple[str, ...] | None:
             return tuple(sorted(set(values))) if values is not None else None
 
+        operation_values = normalized(operations)
         status_values = normalized(statuses)
         state_values = normalized(states)
         phase_values = normalized(phases)
+        reason_values = normalized(reason_codes)
         legacy_phase_values = normalized(legacy_phase_statuses)
-        if () in (status_values, state_values, phase_values):
+        if () in (
+            operation_values,
+            status_values,
+            state_values,
+            phase_values,
+            reason_values,
+        ):
             return None
         if legacy_phase_values == ():
             legacy_phase_values = None
@@ -2506,8 +2516,10 @@ class JobStore:
         conditions: list[str] = []
         parameters: list[object] = []
         for column, values in (
+            ("operation", operation_values),
             ("status", status_values),
             ("state", state_values),
+            ("reason_code", reason_values),
         ):
             if values is None:
                 continue
@@ -2544,16 +2556,20 @@ class JobStore:
         limit: int | None = 100,
         *,
         offset: int = 0,
+        operations: Collection[str] | None = None,
         statuses: Collection[str] | None = None,
         states: Collection[str] | None = None,
         phases: Collection[str] | None = None,
+        reason_codes: Collection[str] | None = None,
         legacy_phase_statuses: Collection[str] | None = None,
         include_comparison_transcriptions: bool = True,
     ) -> list[PipelineJob]:
         filtered = self._job_filter_clause(
+            operations=operations,
             statuses=statuses,
             states=states,
             phases=phases,
+            reason_codes=reason_codes,
             legacy_phase_statuses=legacy_phase_statuses,
             include_comparison_transcriptions=include_comparison_transcriptions,
         )
@@ -2572,16 +2588,20 @@ class JobStore:
     def count_jobs(
         self,
         *,
+        operations: Collection[str] | None = None,
         statuses: Collection[str] | None = None,
         states: Collection[str] | None = None,
         phases: Collection[str] | None = None,
+        reason_codes: Collection[str] | None = None,
         legacy_phase_statuses: Collection[str] | None = None,
         include_comparison_transcriptions: bool = True,
     ) -> int:
         filtered = self._job_filter_clause(
+            operations=operations,
             statuses=statuses,
             states=states,
             phases=phases,
+            reason_codes=reason_codes,
             legacy_phase_statuses=legacy_phase_statuses,
             include_comparison_transcriptions=include_comparison_transcriptions,
         )

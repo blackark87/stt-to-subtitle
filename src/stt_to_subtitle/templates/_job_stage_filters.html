@@ -1,40 +1,27 @@
-<nav class="job-status-filter job-stage-filter" aria-label="작업 단계 필터">
-  <a
-    class="button{% if not selected_status_group and not selected_stage_filter %} is-filter-active{% else %} secondary{% endif %}"
-    href="/jobs"
-    {% if not selected_status_group and not selected_stage_filter %}aria-current="page"{% endif %}
-  >전체</a>
-  {% for stage in job_stage_filters %}
-    <div class="job-stage-filter-group">
-      <a
-        class="button{% if stage.key == selected_stage_filter %} is-filter-active{% elif stage.key == selected_stage_group %} is-filter-group-active{% else %} secondary{% endif %}"
-        href="/jobs?stage_filter={{ stage.key }}{% if selected_status_group %}&amp;status_group={{ selected_status_group }}{% endif %}"
-        {% if stage.key == selected_stage_filter %}aria-current="page"{% endif %}
-      >
-        <span>{{ stage.label }}</span>
-        <span
-          class="job-stage-filter-count"
-          aria-label="{{ job_stage_counts[stage.key] }}건"
-        >{{ job_stage_counts[stage.key] }}</span>
-      </a>
-      {% if stage.children %}
-        <div class="job-stage-filter-children" aria-label="{{ stage.label }} 세부 상태">
-          {% for child in stage.children %}
-            <a
-              class="button{% if child.key == selected_stage_filter %} is-filter-active{% else %} secondary{% endif %}"
-              href="/jobs?stage_filter={{ child.key }}{% if selected_status_group %}&amp;status_group={{ selected_status_group }}{% endif %}"
-              {% if child.key == selected_stage_filter %}aria-current="page"{% endif %}
-            >{{ child.label }}</a>
-          {% endfor %}
-        </div>
-      {% endif %}
+<nav class="job-filter-panel" aria-label="작업 목록 필터">
+  <div class="job-filter-heading">
+    <strong>작업 필터</strong>
+    {% if job_filters_active %}<a href="{{ job_filters_clear_url }}">전체 초기화</a>{% endif %}
+  </div>
+  {% for group in job_filter_groups %}
+    <div class="job-filter-row" data-filter-dimension="{{ group.key }}">
+      <span class="job-filter-label">{{ group.label }}</span>
+      <div class="job-filter-options">
+        <a
+          class="button secondary compact{% if not group.selected %} is-filter-active{% endif %}"
+          href="{{ group.clear_url }}"
+        >전체</a>
+        {% for option in group.options %}
+          <a
+            class="button secondary compact{% if option.selected %} is-filter-active{% endif %}"
+            href="{{ option.url }}"
+            {% if option.selected %}aria-current="page"{% endif %}
+          >
+            <span>{{ option.label }}</span>
+            <span class="job-filter-count" aria-label="{{ option.count }}건">{{ option.count }}</span>
+          </a>
+        {% endfor %}
+      </div>
     </div>
-  {% endfor %}
-  {% for state in job_status_filters %}
-    <a
-      class="button{% if selected_status_group == state.key %} is-filter-active{% else %} secondary{% endif %}"
-      href="/jobs?status_group={{ state.key }}{% if selected_stage_filter %}&amp;stage_filter={{ selected_stage_filter }}{% endif %}"
-      {% if selected_status_group == state.key %}aria-current="page"{% endif %}
-    >{{ state.label }}</a>
   {% endfor %}
 </nav>

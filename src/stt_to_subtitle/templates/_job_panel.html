@@ -47,7 +47,7 @@
     {% for stage in pipeline.phases %}
       <li
         class="job-stage is-{{ stage.state }}"
-        {% if stage.state in ['blocked', 'failed'] and job.error %}title="error: {{ job.error }}"{% endif %}
+        {% if stage.state == 'failed' and job.error %}title="error: {{ job.error }}"{% endif %}
       >
         <span class="job-stage-icon" aria-hidden="true">
           {%- if stage.state == 'done' %}{{ icons.check(13) }}
@@ -102,7 +102,7 @@
       <dt>확인 단계</dt>
       <dd>{{ job.blocked_stage|job_stage }}</dd>
     {% endif %}
-    {% if job.error %}<dt>오류</dt><dd class="error-text">{{ job.error }}</dd>{% endif %}
+    {% if job.state == 'failed' and job.error %}<dt>오류</dt><dd class="error-text">{{ job.error }}</dd>{% endif %}
     {% if job.srt_path %}<dt>SRT</dt><dd>{{ job.srt_path }}</dd>{% endif %}
     {% if job.ass_path %}<dt>ASS</dt><dd>{{ job.ass_path }}</dd>{% endif %}
   </dl>
@@ -142,15 +142,15 @@
       </form>
     {% endif %}
     {% if job.job_stop_requested %}
-      <span class="muted">전체 작업 중단 요청됨 · 현재 단계를 안전하게 마치는 중입니다.</span>
+      <span class="muted">작업 정지 요청됨 · 현재 단계를 안전하게 마치는 중입니다.</span>
     {% elif job.can_pause_translation and job.status in ["transcribed", "translation_running"] %}
       <form method="post" action="/jobs/{{ job.id }}/pause-translation">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-        <button type="submit" class="secondary">{{ icons.pause(16) }}번역 중단</button>
+        <button type="submit" class="secondary">{{ icons.pause(16) }}번역 일시 정지</button>
       </form>
     {% elif job.translation_pause_requested and job.status != "translation_paused" %}
       <span class="muted">
-        {% if job.status == "translation_running" %}현재 번역 청크를 저장한 뒤 중단합니다.{% else %}전사를 완료한 뒤 번역 전에 중단합니다.{% endif %}
+        {% if job.status == "translation_running" %}현재 번역 청크를 저장한 뒤 일시 정지합니다.{% else %}전사를 완료한 뒤 번역 전에 일시 정지합니다.{% endif %}
       </span>
     {% elif job.status == "translation_paused" %}
       <form method="post" action="/jobs/{{ job.id }}/resume-translation">
@@ -171,8 +171,10 @@
         data-confirm-message="{% if job.status == 'audio_completed' %}완료된 오디오 추출 기록을 삭제하시겠습니까? 원본 영상과 생성된 WAV는 삭제하지 않습니다.{% else %}이 작업 기록을 삭제하시겠습니까? 원본 영상과 생성·중간 파일은 삭제하지 않습니다.{% endif %}"
       >
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-        <input type="hidden" name="return_status_group" value="{{ return_status_group or '' }}">
-        <input type="hidden" name="return_stage_filter" value="{{ return_stage_filter or '' }}">
+        <input type="hidden" name="return_operation" value="{{ return_operation or '' }}">
+        <input type="hidden" name="return_phase" value="{{ return_phase or '' }}">
+        <input type="hidden" name="return_state" value="{{ return_state or '' }}">
+        <input type="hidden" name="return_reason_code" value="{{ return_reason_code or '' }}">
         <input type="hidden" name="return_jobs_page" value="{{ return_jobs_page or 1 }}">
         <button type="submit" class="danger">{{ icons.trash(16) }}{% if job.status == 'audio_completed' %}기록 삭제{% else %}작업 삭제{% endif %}</button>
       </form>

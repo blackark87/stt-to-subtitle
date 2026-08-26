@@ -369,7 +369,12 @@ class WebAppTests(unittest.TestCase):
                     force_overwrite=False,
                     options={},
                 )
-                service.store.update(blocked.id, status="blocked")
+                service.store.update(
+                    blocked.id,
+                    status="blocked",
+                    blocked_stage="transcription",
+                    error="blocked-internal-detail",
+                )
                 failed = service.store.create(
                     job_id="failed-job",
                     source_rel="failed.mkv",
@@ -393,26 +398,33 @@ class WebAppTests(unittest.TestCase):
                 )
 
                 dashboard = client.get("/")
-                running_page = client.get("/jobs?status_group=running")
-                blocked_page = client.get("/jobs?status_group=blocked")
-                stopped_page = client.get("/jobs?status_group=stopped")
+                stats = client.get("/job-stats-fragment")
+                running_page = client.get("/jobs?state=running")
+                blocked_page = client.get("/jobs?state=blocked")
+                blocked_detail = client.get(f"/jobs/{blocked.id}")
+                stopped_page = client.get("/jobs?state=stopped")
                 stopped_transcription_page = client.get(
-                    "/jobs?stage_filter=transcription&status_group=stopped"
+                    "/jobs?phase=transcription&state=stopped"
                 )
-                failed_page = client.get("/jobs?status_group=failed")
-                invalid_page = client.get("/jobs?status_group=unknown")
+                failed_page = client.get("/jobs?state=failed")
+                invalid_page = client.get("/jobs?state=unknown")
 
-            self.assertIn('href="/jobs?status_group=running"', dashboard.text)
-            self.assertIn('href="/jobs?status_group=blocked"', dashboard.text)
-            self.assertIn('href="/jobs?status_group=failed"', dashboard.text)
-            self.assertIn('href="/jobs?status_group=paused"', dashboard.text)
-            self.assertIn('href="/jobs?status_group=stopped"', dashboard.text)
-            self.assertIn('href="/jobs?status_group=waiting"', dashboard.text)
-            self.assertIn('href="/jobs?status_group=completed"', dashboard.text)
+            self.assertEqual(dashboard.status_code, 200)
+            self.assertIn('href="/jobs?state=running"', stats.text)
+            self.assertIn("진행 중 1", stats.text)
+            self.assertIn('href="/jobs?state=blocked"', stats.text)
+            self.assertIn('href="/jobs?state=failed"', stats.text)
+            self.assertIn('href="/jobs?state=stopped"', stats.text)
+            self.assertNotIn('href="/jobs?state=paused"', stats.text)
+            self.assertNotIn('href="/jobs?state=waiting"', stats.text)
+            self.assertNotIn('href="/jobs?state=done"', stats.text)
             self.assertIn("running.mkv", running_page.text)
             self.assertNotIn("blocked.mkv", running_page.text)
             self.assertNotIn("failed.mkv", running_page.text)
             self.assertIn("blocked.mkv", blocked_page.text)
+            self.assertNotIn("blocked-internal-detail", dashboard.text)
+            self.assertNotIn("blocked-internal-detail", blocked_page.text)
+            self.assertNotIn("blocked-internal-detail", blocked_detail.text)
             self.assertNotIn("stopped.mkv", blocked_page.text)
             self.assertNotIn("failed.mkv", blocked_page.text)
             self.assertIn("failed.mkv", failed_page.text)
@@ -426,12 +438,12 @@ class WebAppTests(unittest.TestCase):
                 stopped_transcription_page.text,
             )
             self.assertIn(
-                "data-update-url=\"/jobs-fragment?status_group=running",
+                "data-update-url=\"/jobs-fragment?state=running",
                 running_page.text,
             )
             self.assertEqual(invalid_page.status_code, 400)
 
-    def test_job_list_uses_two_level_pipeline_stage_filters(self) -> None:
+    def test_job_list_uses_orthogonal_operation_phase_state_filters(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
             media_root = root / "media"
@@ -458,87 +470,93 @@ class WebAppTests(unittest.TestCase):
                     )
                     service.store.update(job.id, status=status)
                 page = client.get("/jobs")
-                transcription = client.get(
-                    "/jobs?stage_filter=transcription"
-                )
+                transcription = client.get("/jobs?phase=transcription")
                 transcription_waiting = client.get(
-                    "/jobs?stage_filter=transcription_waiting"
+                    "/jobs?phase=transcription&state=waiting"
                 )
-                translation_completed = client.get(
-                    "/jobs?stage_filter=translation_completed"
-                )
-                completed = client.get("/jobs?stage_filter=completed")
-                invalid = client.get("/jobs?stage_filter=unknown")
+                completion = client.get("/jobs?phase=completion")
+                completed = client.get("/jobs?state=done")
+                invalid = client.get("/jobs?phase=unknown")
                 stage_counts = client.get(
-                    "/job-stage-filters-fragment"
-                    "?stage_filter=transcription"
+                    "/job-stage-filters-fragment?phase=transcription"
                 )
                 service.store.update("extracting", status="audio_ready")
                 refreshed_stage_counts = client.get(
-                    "/job-stage-filters-fragment"
-                    "?stage_filter=transcription"
+                    "/job-stage-filters-fragment?phase=transcription"
                 )
 
             self.assertEqual(page.status_code, 200)
-            for stage_filter, label in (
-                ("extraction", "추출"),
-                ("transcription", "전사"),
-                ("translation", "번역"),
-                ("completed", "완료"),
+            for operation_filter, label in (
+                ("extract", "추출 요청"),
+                ("transcribe", "전사 요청"),
+                ("translate", "번역 요청"),
+                ("full", "전체 파이프라인"),
             ):
                 self.assertIn(
-                    f'href="/jobs?stage_filter={stage_filter}"',
+                    f'href="/jobs?operation={operation_filter}"',
                     page.text,
                 )
                 self.assertIn(f"<span>{label}</span>", page.text)
-            for stage_filter in (
-                "transcription_waiting",
-                "transcription_running",
-                "transcription_completed",
-                "translation_waiting",
-                "translation_running",
-                "translation_completed",
+            for phase_filter, label in (
+                ("extraction", "추출"),
+                ("transcription", "전사"),
+                ("translation", "번역"),
+                ("completion", "작업 완료"),
             ):
                 self.assertIn(
-                    f'href="/jobs?stage_filter={stage_filter}"',
+                    f'href="/jobs?phase={phase_filter}"',
                     page.text,
                 )
-            self.assertEqual(page.text.count("job-stage-filter-children"), 2)
-            self.assertEqual(page.text.count("job-stage-filter-count"), 4)
+                self.assertIn(f"<span>{label}</span>", page.text)
+            for state_filter, label in (
+                ("waiting", "대기"),
+                ("running", "진행 중"),
+                ("paused", "일시 정지"),
+                ("blocked", "중단"),
+                ("stopped", "정지"),
+                ("failed", "실패"),
+                ("done", "완료"),
+            ):
+                self.assertIn(
+                    f'href="/jobs?state={state_filter}"',
+                    page.text,
+                )
+                self.assertIn(f"<span>{label}</span>", page.text)
+            self.assertEqual(page.text.count("job-filter-row"), 3)
             self.assertIn(
-                'data-update-url="/job-stage-filters-fragment?',
+                'data-update-url="/job-stage-filters-fragment"',
                 page.text,
             )
-            for stage_filter, label, count in (
+            for phase_filter, label, count in (
                 ("extraction", "추출", 1),
-                ("transcription", "전사", 3),
-                ("translation", "번역", 3),
-                ("completed", "완료", 2),
+                ("transcription", "전사", 2),
+                ("translation", "번역", 2),
+                ("completion", "작업 완료", 4),
             ):
                 self.assertRegex(
                     stage_counts.text,
-                    rf'href="/jobs\?stage_filter={stage_filter}"[^>]*>'
+                    rf'href="/jobs\?phase={phase_filter}"[^>]*>'
                     rf'\s*<span>{label}</span>\s*'
-                    rf'<span\s+class="job-stage-filter-count"\s+'
+                    rf'<span\s+class="job-filter-count"\s+'
                     rf'aria-label="{count}건"\s*>\s*{count}</span>',
                 )
             self.assertRegex(
                 refreshed_stage_counts.text,
-                r'href="/jobs\?stage_filter=extraction"[^>]*>\s*'
+                r'href="/jobs\?phase=extraction"[^>]*>\s*'
                 r'<span>추출</span>\s*<span\s+'
-                r'class="job-stage-filter-count"\s+aria-label="0건"\s*>'
+                r'class="job-filter-count"\s+aria-label="0건"\s*>'
                 r'\s*0</span>',
             )
             self.assertRegex(
                 refreshed_stage_counts.text,
-                r'href="/jobs\?stage_filter=transcription"[^>]*>\s*'
+                r'href="/jobs\?phase=transcription"[^>]*>\s*'
                 r'<span>전사</span>\s*<span\s+'
-                r'class="job-stage-filter-count"\s+aria-label="4건"\s*>'
-                r'\s*4</span>',
+                r'class="job-filter-count"\s+aria-label="3건"\s*>'
+                r'\s*3</span>',
             )
             self.assertIn("transcription-waiting.mkv", transcription.text)
             self.assertIn("transcription-running.mkv", transcription.text)
-            self.assertIn("transcription-completed.mkv", transcription.text)
+            self.assertNotIn("transcription-completed.mkv", transcription.text)
             self.assertNotIn("translation-waiting.mkv", transcription.text)
             self.assertIn(
                 "transcription-waiting.mkv",
@@ -550,17 +568,14 @@ class WebAppTests(unittest.TestCase):
             )
             self.assertIn(
                 "translation-completed.mkv",
-                translation_completed.text,
+                completion.text,
             )
-            self.assertNotIn(
-                "translation-running.mkv",
-                translation_completed.text,
-            )
+            self.assertIn("rendering.mkv", completion.text)
             self.assertNotIn("rendering.mkv", completed.text)
             self.assertIn("transcription-completed.mkv", completed.text)
             self.assertIn("completed.mkv", completed.text)
             self.assertIn(
-                "stage_filter=completed&amp;jobs_page=1",
+                'name="return_state" value="done"',
                 completed.text,
             )
             self.assertEqual(invalid.status_code, 400)
@@ -657,6 +672,10 @@ class WebAppTests(unittest.TestCase):
             self.assertIn('href="/jobs" class="is-active"', jobs.text)
             self.assertNotIn('class="topbar"', dashboard.text)
             self.assertIn("position: fixed", stylesheet.text)
+            self.assertIn(
+                "grid-template-columns: repeat(5, minmax(0, 1fr))",
+                stylesheet.text,
+            )
             self.assertIn(
                 "grid-template-columns: repeat(4, minmax(0, 1fr))",
                 stylesheet.text,
@@ -3222,11 +3241,11 @@ class WebAppTests(unittest.TestCase):
                 detail.text,
             )
             self.assertIn(
-                'href="/jobs?status_group=blocked&amp;jobs_page=2"',
+                'href="/jobs?state=blocked&amp;jobs_page=2"',
                 detail.text,
             )
             self.assertIn(
-                'name="return_status_group" value="blocked"',
+                'name="return_state" value="blocked"',
                 detail.text,
             )
             self.assertIn(
@@ -3234,11 +3253,11 @@ class WebAppTests(unittest.TestCase):
                 detail.text,
             )
             self.assertIn(
-                'name="return_status_group" value="blocked"',
+                'name="return_state" value="blocked"',
                 blocked_page.text,
             )
             self.assertIn(
-                'name="return_status_group" value="failed"',
+                'name="return_state" value="failed"',
                 failed_page.text,
             )
             self.assertIn(
@@ -3254,19 +3273,19 @@ class WebAppTests(unittest.TestCase):
             self.assertEqual(invalid_return_rejected.status_code, 400)
             self.assertEqual(
                 blocked_deleted.headers["location"],
-                "/jobs?status_group=blocked&jobs_page=1",
+                "/jobs?state=blocked",
             )
             self.assertEqual(
                 failed_deleted.headers["location"],
-                "/jobs?status_group=failed&jobs_page=1",
+                "/jobs?state=failed",
             )
             self.assertEqual(
                 deleted.headers["location"],
-                "/jobs?status_group=blocked&jobs_page=2",
+                "/jobs?state=blocked&jobs_page=2",
             )
             self.assertEqual(
                 audio_deleted.headers["location"],
-                "/jobs?stage_filter=extraction&jobs_page=3",
+                "/jobs?phase=extraction&jobs_page=3",
             )
             self.assertTrue(source.is_file())
             self.assertTrue(artifact.is_file())
@@ -3339,8 +3358,8 @@ class WebAppTests(unittest.TestCase):
                 running = service.store.get(running.id)
                 extraction = service.store.get(extraction.id)
 
-            self.assertIn("전체 번역 중단 (3)", fragment.text)
-            self.assertIn("전체 작업 중단 (4)", fragment.text)
+            self.assertIn("전체 번역 일시 정지 (3)", fragment.text)
+            self.assertIn("전체 작업 정지 (4)", fragment.text)
             self.assertIn(
                 'name="return_folder" value="series"',
                 fragment.text,
@@ -3364,7 +3383,7 @@ class WebAppTests(unittest.TestCase):
             self.assertEqual(queued.status, "blocked")
             self.assertTrue(running.job_stop_requested)
             self.assertEqual(extraction.status, "blocked")
-            self.assertIn("전체 작업 중단 요청됨", refreshed.text)
+            self.assertIn("작업 정지 요청됨", refreshed.text)
 
     def test_job_list_stops_selected_jobs_across_filtered_pages(self) -> None:
         with TemporaryDirectory() as directory:
@@ -3412,8 +3431,7 @@ class WebAppTests(unittest.TestCase):
             self.assertEqual(response.status_code, 303)
             self.assertEqual(
                 response.headers["location"],
-                "/jobs?stage_filter=translation_waiting&jobs_page=1"
-                "&jobs_stopped=2",
+                "/jobs?phase=translation&state=waiting&jobs_stopped=2",
             )
             self.assertTrue(all(job.status == "blocked" for job in selected))
             self.assertEqual(untouched.status, "transcribed")
@@ -3521,9 +3539,9 @@ class WebAppTests(unittest.TestCase):
                 service.store.update(failed.id, status="failed")
 
                 blocked_page = client.get(
-                    "/jobs?status_group=blocked&jobs_page=1"
+                    "/jobs?state=blocked&jobs_page=1"
                 )
-                failed_page = client.get("/jobs?status_group=failed")
+                failed_page = client.get("/jobs?state=failed")
                 response = client.post(
                     "/jobs/retry-selected",
                     data={
@@ -3531,7 +3549,7 @@ class WebAppTests(unittest.TestCase):
                             blocked_jobs[0].id,
                             blocked_jobs[-1].id,
                         ],
-                        "return_status_group": "blocked",
+                        "return_state": "blocked",
                         "return_jobs_page": "2",
                     },
                     follow_redirects=False,
@@ -3546,7 +3564,7 @@ class WebAppTests(unittest.TestCase):
                 global_response = client.post(
                     "/jobs/retry-all",
                     data={
-                        "return_status_group": "blocked",
+                        "return_state": "blocked",
                         "return_jobs_page": "2",
                     },
                     follow_redirects=False,
@@ -3572,7 +3590,8 @@ class WebAppTests(unittest.TestCase):
             )
             self.assertIn("목록 전체 선택", blocked_page.text)
             self.assertIn("선택 재시도", blocked_page.text)
-            self.assertIn("중단·실패 전체 재시도 (26)", blocked_page.text)
+            self.assertIn("전사 재시도 (25)", blocked_page.text)
+            self.assertIn("중단·정지·실패 전체 재시도 (26)", blocked_page.text)
             self.assertEqual(
                 failed_page.text.count("data-retry-job-checkbox"),
                 1,
@@ -3584,7 +3603,7 @@ class WebAppTests(unittest.TestCase):
             self.assertEqual(response.status_code, 303)
             self.assertEqual(
                 response.headers["location"],
-                "/jobs?status_group=blocked&jobs_page=1&jobs_retried=2",
+                "/jobs?state=blocked&jobs_retried=2",
             )
             self.assertIn(
                 "작업 2개를 재시도했습니다.",
@@ -3596,11 +3615,89 @@ class WebAppTests(unittest.TestCase):
             self.assertEqual(global_response.status_code, 303)
             self.assertEqual(
                 global_response.headers["location"],
-                "/jobs?status_group=blocked&jobs_page=1&jobs_retried=24",
+                "/jobs?state=blocked&jobs_retried=24",
             )
             self.assertIn("작업 24개를 재시도했습니다.", global_notice.text)
             self.assertEqual(remaining_blocked.status, "queued")
             self.assertEqual(remaining_failed.status, "queued")
+
+    def test_blocked_list_retries_one_phase_without_refiltering(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            with TestClient(create_app(self.settings(root, media_root))) as client:
+                service = client.app.state.orchestrator
+                service.stop()
+                transcription_ids = []
+                translation_ids = []
+                for phase, target in (
+                    ("transcription", transcription_ids),
+                    ("transcription", transcription_ids),
+                    ("translation", translation_ids),
+                    ("translation", translation_ids),
+                    ("translation", translation_ids),
+                ):
+                    job_id = f"{phase}-{len(target)}"
+                    job = service.store.create(
+                        job_id=job_id,
+                        source_rel=f"{job_id}.mkv",
+                        force_overwrite=False,
+                        options={},
+                    )
+                    service.store.update(
+                        job.id,
+                        status="blocked",
+                        blocked_stage=phase,
+                        error="dependency unavailable",
+                    )
+                    target.append(job.id)
+
+                blocked_page = client.get("/jobs?state=blocked")
+                response = client.post(
+                    "/jobs/retry-selected",
+                    data={
+                        "job_ids": transcription_ids,
+                        "return_state": "blocked",
+                    },
+                    follow_redirects=False,
+                )
+                transcription_jobs = [
+                    service.store.get(job_id) for job_id in transcription_ids
+                ]
+                translation_jobs = [
+                    service.store.get(job_id) for job_id in translation_ids
+                ]
+
+            self.assertIn("전사 재시도 (2)", blocked_page.text)
+            self.assertIn("번역 재시도 (3)", blocked_page.text)
+            self.assertIn(
+                'href="/jobs?phase=transcription&amp;state=blocked"',
+                blocked_page.text,
+            )
+            self.assertIn(
+                'href="/jobs?state=blocked&amp;reason_code=stt_unavailable"',
+                blocked_page.text,
+            )
+            self.assertIn(
+                'href="/jobs?state=blocked&amp;reason_code=lm_unavailable"',
+                blocked_page.text,
+            )
+            self.assertEqual(
+                blocked_page.text.count('name="job_ids"'),
+                5,
+            )
+            self.assertEqual(response.status_code, 303)
+            self.assertEqual(
+                response.headers["location"],
+                "/jobs?state=blocked&jobs_retried=2",
+            )
+            self.assertTrue(
+                all(job is not None and job.state == "waiting" for job in transcription_jobs)
+            )
+            self.assertTrue(
+                all(job is not None and job.state == "blocked" for job in translation_jobs)
+            )
 
     def test_all_jobs_are_merged_and_paginated_by_creation_time(self) -> None:
         with TemporaryDirectory() as directory:

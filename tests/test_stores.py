@@ -488,19 +488,26 @@ class JobStoreTests(unittest.TestCase):
                 source_rel="queued.mkv",
                 force_overwrite=False,
                 options={},
+                operation="extract",
             )
             blocked = store.create(
                 job_id="blocked-job",
                 source_rel="blocked.mkv",
                 force_overwrite=False,
                 options={},
+                operation="transcribe",
             )
-            store.update(blocked.id, status="blocked")
+            store.update(
+                blocked.id,
+                status="blocked",
+                blocked_stage="transcription",
+            )
             completed = store.create(
                 job_id="completed-job",
                 source_rel="completed.mkv",
                 force_overwrite=False,
                 options={},
+                operation="full",
             )
             store.update(completed.id, status="completed")
 
@@ -523,6 +530,18 @@ class JobStoreTests(unittest.TestCase):
                 store.count_jobs(states={"blocked", "failed"}),
                 1,
             )
+            self.assertEqual(store.count_jobs(operations={"extract"}), 1)
+            self.assertEqual(
+                [
+                    job.id
+                    for job in store.list_jobs(
+                        operations={"transcribe"},
+                        reason_codes={"stt_unavailable"},
+                    )
+                ],
+                [blocked.id],
+            )
+            self.assertEqual(store.count_jobs(reason_codes=set()), 0)
 
     def test_can_exclude_comparison_only_transcriptions(self) -> None:
         with TemporaryDirectory() as directory:

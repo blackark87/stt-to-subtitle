@@ -280,6 +280,54 @@ a { color: var(--accent); }
 }
 .job-stage-filter-children { display: flex; gap: 4px; padding-left: 8px; border-left: 2px solid var(--line); }
 .job-stage-filter-children .button { padding: 5px 8px; font-size: .76rem; }
+.job-filter-panel {
+  display: grid;
+  gap: 0;
+  margin: 0 0 20px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-card);
+  background: var(--card);
+  box-shadow: var(--shadow-xs);
+}
+.job-filter-heading,
+.job-filter-row {
+  display: grid;
+  grid-template-columns: 112px minmax(0, 1fr);
+  align-items: start;
+  gap: 12px;
+  padding: 10px 12px;
+}
+.job-filter-heading {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface-sunken);
+  font-size: .82rem;
+}
+.job-filter-heading a { font-size: .75rem; font-weight: 700; text-decoration: none; }
+.job-filter-row + .job-filter-row { border-top: 1px solid var(--line); }
+.job-filter-label { padding: 7px 2px; color: var(--muted); font-size: .76rem; font-weight: 750; }
+.job-filter-options { display: flex; min-width: 0; gap: 6px; flex-wrap: wrap; }
+.job-filter-options .button { min-height: 32px; padding: 5px 9px; font-size: .76rem; }
+.job-filter-options .is-filter-active {
+  border-color: var(--accent);
+  background: var(--accent-subtle);
+  color: var(--accent);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 25%, transparent);
+}
+.job-filter-count {
+  display: inline-grid;
+  min-width: 1.55em;
+  min-height: 1.55em;
+  place-items: center;
+  padding: 0 .36em;
+  border-radius: var(--radius-pill);
+  background: color-mix(in srgb, currentColor 11%, transparent);
+  font-size: .78em;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
 .result-preview { border-color: var(--line-strong); }
 h1 { font-size: 1.75rem; font-weight: 700; line-height: 1.25; letter-spacing: -0.01em; }
 h2 { font-size: 1.25rem; font-weight: 700; line-height: 1.35; }
@@ -1149,7 +1197,7 @@ code { overflow-wrap: anywhere; }
     width: 100%;
     min-width: 0;
     display: grid;
-    grid-template-columns: repeat(6, minmax(0, 1fr));
+    grid-template-columns: repeat(5, minmax(0, 1fr));
     gap: 4px;
   }
   .primary-nav a {
@@ -1313,6 +1361,19 @@ code { overflow-wrap: anywhere; }
     padding-left: 4px;
     white-space: nowrap;
   }
+
+  .job-filter-heading,
+  .job-filter-row { grid-template-columns: minmax(0, 1fr); gap: 6px; }
+  .job-filter-heading { grid-template-columns: minmax(0, 1fr) auto; }
+  .job-filter-label { padding: 0 2px; }
+  .job-filter-options {
+    flex-wrap: nowrap;
+    margin: 0 -12px;
+    overflow-x: auto;
+    padding: 0 12px 3px;
+    scrollbar-width: thin;
+  }
+  .job-filter-options .button { flex: none; }
 
   .job-list-heading { display: grid; grid-template-columns: minmax(0, 1fr); width: 100%; }
   .job-bulk-actions {

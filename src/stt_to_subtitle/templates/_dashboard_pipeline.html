@@ -10,7 +10,7 @@
           <header>
             <span class="ob-badge is-stage">{{ slot.stage }}</span>
             <span class="ob-badge{% if slot.job %} is-running{% endif %}">
-              {% if slot.job %}실행 {{ slot.active }} / {{ slot.capacity }}{% else %}유휴{% endif %}
+              {% if slot.job %}진행 중 {{ slot.active }} / {{ slot.capacity }}{% else %}유휴{% endif %}
             </span>
           </header>
           {% if slot.job %}
