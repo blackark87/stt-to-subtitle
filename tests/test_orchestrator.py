@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import threading
 import unittest
 from unittest.mock import Mock, patch
 
@@ -595,6 +596,61 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                 orchestrator._translation_executor.submit.call_count,
                 2,
             )
+
+    def test_running_stage_refreshes_and_releases_its_worker_lease(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            orchestrator = self.make_orchestrator(root, media_root)
+            try:
+                job = orchestrator.store.create(
+                    job_id="lease-heartbeat",
+                    source_rel="movie.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                orchestrator.store.claim_for_dispatch(
+                    job.id,
+                    "queued",
+                    "extracting",
+                    lease_owner=orchestrator._worker_id,
+                    lease_seconds=60,
+                )
+                refreshed = threading.Event()
+                refresh_lease = orchestrator.store.refresh_job_lease
+
+                def record_refresh(*args, **kwargs):
+                    result = refresh_lease(*args, **kwargs)
+                    refreshed.set()
+                    return result
+
+                def complete_stage(_job):
+                    self.assertTrue(refreshed.wait(timeout=1))
+                    orchestrator.store.update(job.id, status="audio_ready")
+
+                with patch(
+                    "stt_to_subtitle.orchestrator."
+                    "JOB_LEASE_HEARTBEAT_SECONDS",
+                    0.001,
+                ), patch.object(
+                    orchestrator.store,
+                    "refresh_job_lease",
+                    side_effect=record_refresh,
+                ) as heartbeat:
+                    orchestrator._run_stage(
+                        job.id,
+                        "audio extraction",
+                        complete_stage,
+                    )
+                completed = orchestrator.store.get(job.id)
+            finally:
+                orchestrator.stop()
+
+            heartbeat.assert_called()
+            self.assertEqual(completed.status, "audio_ready")
+            self.assertIsNone(completed.lease_owner)
+            self.assertIsNone(completed.lease_expires_at)
 
     def test_requires_web_server_settings_before_creating_job(self) -> None:
         with TemporaryDirectory() as directory:
@@ -1591,6 +1647,19 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                     stt_job_id="remote-stopping-job",
                     job_stop_requested=1,
                 )
+                actively_owned = orchestrator.store.create(
+                    job_id="active-other-worker",
+                    source_rel="active.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                orchestrator.store.claim_for_dispatch(
+                    actively_owned.id,
+                    "queued",
+                    "extracting",
+                    lease_owner="other-worker",
+                    lease_seconds=60,
+                )
                 orchestrator._stt_executor.submit = Mock()
 
                 recovered = orchestrator._reconcile_interrupted_jobs()
@@ -1624,6 +1693,18 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                     "transcription_running",
                 )
                 self.assertEqual(orchestrator._stt_executor.submit.call_count, 2)
+                active_after_reconcile = orchestrator.store.get(
+                    actively_owned.id
+                )
+                self.assertEqual(active_after_reconcile.status, "extracting")
+                self.assertEqual(
+                    active_after_reconcile.lease_owner,
+                    "other-worker",
+                )
+                self.assertEqual(
+                    orchestrator.store.get(remote.id).lease_owner,
+                    orchestrator._worker_id,
+                )
                 orchestrator._stt_executor.submit.assert_any_call(
                     orchestrator._run_stage,
                     remote.id,

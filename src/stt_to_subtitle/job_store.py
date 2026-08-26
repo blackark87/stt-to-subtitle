@@ -49,6 +49,12 @@ TRANSLATION_PAUSABLE_STATUSES = {
     "transcribed",
     "translation_running",
 }
+RUNNING_JOB_STATUSES = {
+    "extracting",
+    "transcription_running",
+    "translation_running",
+    "rendering",
+}
 PROMPT_NAME_MAX_LENGTH = 80
 PROMPT_TEXT_MAX_LENGTH = 50_000
 DEFAULT_PATH_DISPLAY_RULE_ID = "default-actress-content"
@@ -114,6 +120,8 @@ class PipelineJob:
     translation_chunks_completed: int
     translation_pause_requested: bool
     job_stop_requested: bool
+    lease_owner: str | None
+    lease_expires_at: float | None
     created_at: float
     status_updated_at: float
     updated_at: float
@@ -221,6 +229,8 @@ class JobStore:
         "translation_chunks_completed",
         "translation_pause_requested",
         "job_stop_requested",
+        "lease_owner",
+        "lease_expires_at",
     }
 
     def __init__(self, database_path: Path) -> None:
@@ -375,6 +385,8 @@ class JobStore:
                     translation_chunks_completed INTEGER NOT NULL DEFAULT 0,
                     translation_pause_requested INTEGER NOT NULL DEFAULT 0,
                     job_stop_requested INTEGER NOT NULL DEFAULT 0,
+                    lease_owner TEXT,
+                    lease_expires_at REAL,
                     created_at REAL NOT NULL,
                     status_updated_at REAL NOT NULL,
                     updated_at REAL NOT NULL
@@ -620,6 +632,12 @@ class JobStore:
                     "ALTER TABLE jobs ADD COLUMN job_stop_requested "
                     "INTEGER NOT NULL DEFAULT 0"
                 ),
+                "lease_owner": (
+                    "ALTER TABLE jobs ADD COLUMN lease_owner TEXT"
+                ),
+                "lease_expires_at": (
+                    "ALTER TABLE jobs ADD COLUMN lease_expires_at REAL"
+                ),
             }
             for column, statement in migrations.items():
                 if column not in columns:
@@ -653,6 +671,10 @@ class JobStore:
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS jobs_state_phase_idx "
                 "ON jobs(state, phase, created_at)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS jobs_lease_idx "
+                "ON jobs(status, lease_expires_at)"
             )
             structured_state_migration = "structured_job_state_v1"
             structured_state_applied = connection.execute(
@@ -1278,6 +1300,14 @@ class JobStore:
                 row["translation_pause_requested"]
             ),
             job_stop_requested=bool(row["job_stop_requested"]),
+            lease_owner=(
+                str(row["lease_owner"]) if row["lease_owner"] else None
+            ),
+            lease_expires_at=(
+                float(row["lease_expires_at"])
+                if row["lease_expires_at"] is not None
+                else None
+            ),
             created_at=float(row["created_at"]),
             status_updated_at=float(row["status_updated_at"]),
             updated_at=float(row["updated_at"]),
@@ -1552,11 +1582,13 @@ class JobStore:
 
     def dispatchable_ids_with_status(self, status: str) -> list[str]:
         with self._connect() as connection:
+            now = time.time()
             rows = connection.execute(
                 "SELECT id FROM jobs "
                 "WHERE status = ? AND job_stop_requested = 0 "
+                "AND (lease_expires_at IS NULL OR lease_expires_at <= ?) "
                 "ORDER BY created_at",
-                (status,),
+                (status, now),
             ).fetchall()
         return [str(row["id"]) for row in rows]
 
@@ -1565,7 +1597,14 @@ class JobStore:
         job_id: str,
         waiting_status: str,
         running_status: str,
+        *,
+        lease_owner: str = "legacy-dispatcher",
+        lease_seconds: float = 60.0,
     ) -> bool:
+        if not lease_owner.strip():
+            raise ValueError("lease owner is required")
+        if lease_seconds <= 0:
+            raise ValueError("lease seconds must be positive")
         translation_condition = (
             " AND translation_pause_requested = 0"
             if waiting_status == "transcribed"
@@ -1583,23 +1622,119 @@ class JobStore:
             result = connection.execute(
                 "UPDATE jobs SET status = ?, phase = ?, state = ?, "
                 "reason_code = NULL, blocked_stage = NULL, error = NULL, "
+                "lease_owner = ?, lease_expires_at = ?, "
                 "status_updated_at = ?, updated_at = ? "
-                "WHERE id = ? AND status = ? AND job_stop_requested = 0"
+                "WHERE id = ? AND status = ? AND job_stop_requested = 0 "
+                "AND (lease_expires_at IS NULL OR lease_expires_at <= ?)"
                 f"{translation_condition}",
                 (
                     running_status,
                     projected.phase.value,
                     projected.state.value,
+                    lease_owner,
+                    now + lease_seconds,
                     now,
                     now,
                     job_id,
                     waiting_status,
+                    now,
                 ),
             )
         claimed = result.rowcount == 1
         if claimed:
             self._notify_change(job_id)
         return claimed
+
+    def recoverable_running_jobs(
+        self,
+        statuses: Collection[str],
+    ) -> list[PipelineJob]:
+        if not statuses:
+            return []
+        placeholders = ", ".join("?" for _ in statuses)
+        now = time.time()
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT * FROM jobs
+                WHERE status IN ({placeholders})
+                  AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
+                ORDER BY created_at
+                """,
+                (*sorted(statuses), now),
+            ).fetchall()
+        return [
+            job for row in rows if (job := self._from_row(row)) is not None
+        ]
+
+    def claim_recovery_lease(
+        self,
+        job_id: str,
+        status: str,
+        *,
+        lease_owner: str,
+        lease_seconds: float,
+    ) -> bool:
+        if not lease_owner.strip():
+            raise ValueError("lease owner is required")
+        if lease_seconds <= 0:
+            raise ValueError("lease seconds must be positive")
+        now = time.time()
+        with self._connect() as connection:
+            result = connection.execute(
+                """
+                UPDATE jobs
+                SET lease_owner = ?, lease_expires_at = ?
+                WHERE id = ? AND status = ?
+                  AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
+                """,
+                (
+                    lease_owner,
+                    now + lease_seconds,
+                    job_id,
+                    status,
+                    now,
+                ),
+            )
+        return result.rowcount == 1
+
+    def refresh_job_lease(
+        self,
+        job_id: str,
+        *,
+        lease_owner: str,
+        lease_seconds: float,
+    ) -> bool:
+        if lease_seconds <= 0:
+            raise ValueError("lease seconds must be positive")
+        now = time.time()
+        with self._connect() as connection:
+            result = connection.execute(
+                """
+                UPDATE jobs
+                SET lease_expires_at = ?
+                WHERE id = ? AND lease_owner = ?
+                  AND lease_expires_at > ?
+                  AND status IN (
+                      'extracting', 'transcription_running',
+                      'translation_running', 'rendering'
+                  )
+                """,
+                (now + lease_seconds, job_id, lease_owner, now),
+            )
+        return result.rowcount == 1
+
+    def release_job_lease(self, job_id: str, *, lease_owner: str) -> bool:
+        with self._connect() as connection:
+            result = connection.execute(
+                """
+                UPDATE jobs
+                SET lease_owner = NULL, lease_expires_at = NULL
+                WHERE id = ? AND lease_owner = ?
+                """,
+                (job_id, lease_owner),
+            )
+        return result.rowcount == 1
 
     def update(self, job_id: str, **fields: Any) -> None:
         if not fields:
@@ -1666,6 +1801,9 @@ class JobStore:
         expanded = dict(fields)
         if "status" not in expanded:
             return expanded
+        if str(expanded["status"]) not in RUNNING_JOB_STATUSES:
+            expanded.setdefault("lease_owner", None)
+            expanded.setdefault("lease_expires_at", None)
         current = self.get(job_id)
         if current is None:
             return expanded
@@ -2476,6 +2614,7 @@ class JobStore:
                 UPDATE jobs
                 SET status = 'completed', srt_path = ?, ass_path = ?,
                     blocked_stage = NULL, error = NULL,
+                    lease_owner = NULL, lease_expires_at = NULL,
                     status_updated_at = ?, updated_at = ?
                 WHERE id = ?
                 """,

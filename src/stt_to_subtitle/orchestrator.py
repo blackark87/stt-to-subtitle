@@ -9,6 +9,7 @@ import json
 import logging
 import math
 from pathlib import Path
+import sqlite3
 import threading
 from typing import Any, Callable, Mapping, Sequence
 from uuid import uuid4
@@ -90,6 +91,8 @@ RUNNING_STAGE_BY_STATUS = {
     "translation_running": "translation",
     "rendering": "render",
 }
+JOB_LEASE_SECONDS = 60.0
+JOB_LEASE_HEARTBEAT_SECONDS = 15.0
 
 
 def _canonical_payload_hash(value: Any) -> str:
@@ -270,6 +273,7 @@ class SubtitleOrchestrator:
         self._stt_gate_lock = threading.RLock()
         self._lm_gate_lock = threading.RLock()
         self._subtitle_publication_lock = threading.RLock()
+        self._worker_id = f"web-{uuid4().hex}"
         saved_lm_gate = self.store.get_dependency_state("translation_lm")
         if settings.lm_manual_start:
             saved_lm_state = (
@@ -736,11 +740,17 @@ class SubtitleOrchestrator:
         self._scheduler.start()
 
     def _reconcile_interrupted_jobs(self) -> int:
-        interrupted = self.store.list_jobs(
-            limit=None,
-            statuses=RUNNING_STATUSES,
-        )
+        interrupted = self.store.recoverable_running_jobs(RUNNING_STATUSES)
+        recovered = 0
         for job in interrupted:
+            if not self.store.claim_recovery_lease(
+                job.id,
+                job.status,
+                lease_owner=self._worker_id,
+                lease_seconds=JOB_LEASE_SECONDS,
+            ):
+                continue
+            recovered += 1
             stage = RUNNING_STAGE_BY_STATUS[job.status]
             if job.job_stop_requested:
                 if (
@@ -821,7 +831,7 @@ class SubtitleOrchestrator:
                     "service restart detected; resumed from persisted "
                     f"checkpoint {target_status}",
                 )
-        return len(interrupted)
+        return recovered
 
     def _cancel_interrupted_transcription(self, job: PipelineJob) -> None:
         if self.stt_client is None or not job.stt_job_id:
@@ -2459,7 +2469,13 @@ class SubtitleOrchestrator:
     ) -> bool:
         waiting_ids = self.store.dispatchable_ids_with_status(waiting)
         for job_id in waiting_ids:
-            if not self.store.claim_for_dispatch(job_id, waiting, running):
+            if not self.store.claim_for_dispatch(
+                job_id,
+                waiting,
+                running,
+                lease_owner=self._worker_id,
+                lease_seconds=JOB_LEASE_SECONDS,
+            ):
                 continue
             self.store.add_event(job_id, "info", f"{stage} started")
             executor.submit(
@@ -2480,6 +2496,17 @@ class SubtitleOrchestrator:
         job = self.store.get(job_id)
         if job is None:
             return
+        lease_stop: threading.Event | None = None
+        lease_heartbeat: threading.Thread | None = None
+        if job.lease_owner == self._worker_id:
+            lease_stop = threading.Event()
+            lease_heartbeat = threading.Thread(
+                target=self._lease_heartbeat_loop,
+                args=(job_id, lease_stop),
+                name=f"pipeline-lease-{job_id[:8]}",
+                daemon=True,
+            )
+            lease_heartbeat.start()
         try:
             self._raise_if_job_stop_requested(job_id)
             operation(job)
@@ -2583,6 +2610,32 @@ class SubtitleOrchestrator:
             )
             self.store.add_event(job_id, "error", f"{stage} failed: {message}")
             LOGGER.exception("job %s %s failed", job_id, stage)
+        finally:
+            if lease_stop is not None:
+                lease_stop.set()
+            if lease_heartbeat is not None:
+                lease_heartbeat.join(timeout=1)
+            if job.lease_owner == self._worker_id:
+                self.store.release_job_lease(
+                    job_id,
+                    lease_owner=self._worker_id,
+                )
+
+    def _lease_heartbeat_loop(
+        self,
+        job_id: str,
+        stop_event: threading.Event,
+    ) -> None:
+        while not stop_event.wait(JOB_LEASE_HEARTBEAT_SECONDS):
+            try:
+                if not self.store.refresh_job_lease(
+                    job_id,
+                    lease_owner=self._worker_id,
+                    lease_seconds=JOB_LEASE_SECONDS,
+                ):
+                    return
+            except (OSError, RuntimeError, sqlite3.Error):
+                LOGGER.exception("job lease heartbeat failed for %s", job_id)
 
     def _raise_if_job_stop_requested(self, job_id: str) -> None:
         current = self.store.get(job_id)

@@ -673,6 +673,77 @@ class JobStoreTests(unittest.TestCase):
             self.assertEqual(store.get(stopped.id).status, "queued")
             self.assertEqual(store.get(paused.id).status, "transcribed")
 
+    def test_claims_refreshes_and_expires_worker_lease(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = JobStore(Path(directory) / "jobs.sqlite3")
+            job = store.create(
+                job_id="leased",
+                source_rel="movie.mkv",
+                force_overwrite=False,
+                options={},
+            )
+
+            claimed = store.claim_for_dispatch(
+                job.id,
+                "queued",
+                "extracting",
+                lease_owner="worker-a",
+                lease_seconds=60,
+            )
+            leased = store.get(job.id)
+
+            self.assertTrue(claimed)
+            self.assertEqual(leased.lease_owner, "worker-a")
+            self.assertGreater(leased.lease_expires_at, time.time())
+            self.assertFalse(
+                store.claim_recovery_lease(
+                    job.id,
+                    "extracting",
+                    lease_owner="worker-b",
+                    lease_seconds=60,
+                )
+            )
+            self.assertFalse(
+                store.refresh_job_lease(
+                    job.id,
+                    lease_owner="worker-b",
+                    lease_seconds=60,
+                )
+            )
+            self.assertTrue(
+                store.refresh_job_lease(
+                    job.id,
+                    lease_owner="worker-a",
+                    lease_seconds=60,
+                )
+            )
+            self.assertEqual(store.recoverable_running_jobs({"extracting"}), [])
+
+            store.update(job.id, lease_expires_at=time.time() - 1)
+            self.assertFalse(
+                store.refresh_job_lease(
+                    job.id,
+                    lease_owner="worker-a",
+                    lease_seconds=60,
+                )
+            )
+            self.assertEqual(
+                [item.id for item in store.recoverable_running_jobs({"extracting"})],
+                [job.id],
+            )
+            self.assertTrue(
+                store.claim_recovery_lease(
+                    job.id,
+                    "extracting",
+                    lease_owner="worker-b",
+                    lease_seconds=60,
+                )
+            )
+            store.update(job.id, status="audio_ready")
+            completed = store.get(job.id)
+            self.assertIsNone(completed.lease_owner)
+            self.assertIsNone(completed.lease_expires_at)
+
     def test_deletes_a_job_and_its_events(self) -> None:
         with TemporaryDirectory() as directory:
             store = JobStore(Path(directory) / "jobs.sqlite3")
@@ -1162,6 +1233,8 @@ class JobStoreTests(unittest.TestCase):
             self.assertEqual(job.phase, "extraction")
             self.assertEqual(job.state, "waiting")
             self.assertEqual(job.attempt, 1)
+            self.assertIsNone(job.lease_owner)
+            self.assertIsNone(job.lease_expires_at)
             stopped = JobStore(database_path).get("job-2")
             self.assertEqual(stopped.phase, "translation")
             self.assertEqual(stopped.state, "stopped")
