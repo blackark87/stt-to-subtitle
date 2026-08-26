@@ -2802,6 +2802,9 @@ class JobStore:
             rows = connection.execute(
                 """
                 SELECT generation.*,
+                       transcript.artifact_path AS transcript_artifact_path,
+                       prompt.revision_number AS prompt_revision_number,
+                       category.name AS prompt_category_name,
                        (
                            SELECT COUNT(*) FROM translation_items AS item
                            WHERE item.generation_id = generation.id
@@ -2812,6 +2815,12 @@ class JobStore:
                              AND batch.state = 'completed'
                        ) AS completed_batch_count
                 FROM translation_generations AS generation
+                LEFT JOIN transcript_revisions AS transcript
+                  ON transcript.id = generation.transcript_revision_id
+                LEFT JOIN prompt_revisions AS prompt
+                  ON prompt.id = generation.prompt_revision_id
+                LEFT JOIN prompt_categories AS category
+                  ON category.id = prompt.category_id
                 WHERE generation.job_id = ?
                 ORDER BY generation_number
                 """,
@@ -3751,6 +3760,24 @@ class JobStore:
             result["item_count"] = int(row["item_count"])
         if "completed_batch_count" in row.keys():
             result["completed_batch_count"] = int(row["completed_batch_count"])
+        if "transcript_artifact_path" in row.keys():
+            result["transcript_artifact_path"] = (
+                str(row["transcript_artifact_path"])
+                if row["transcript_artifact_path"] is not None
+                else None
+            )
+        if "prompt_revision_number" in row.keys():
+            result["prompt_revision_number"] = (
+                int(row["prompt_revision_number"])
+                if row["prompt_revision_number"] is not None
+                else None
+            )
+        if "prompt_category_name" in row.keys():
+            result["prompt_category_name"] = (
+                str(row["prompt_category_name"])
+                if row["prompt_category_name"] is not None
+                else None
+            )
         return result
 
     @staticmethod

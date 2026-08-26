@@ -9,6 +9,7 @@ from dataclasses import asdict
 import hmac
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import secrets
@@ -69,6 +70,7 @@ from .subtitle_validation import (
     render_webvtt as render_external_webvtt,
     subtitle_asset_hash,
 )
+from .translation_comparison import compare_translation_items
 from .time_display import (
     configure_kst_logging,
     format_kst_iso,
@@ -131,11 +133,12 @@ JOB_STATUS_FILTER_NAV = tuple(
 TRANSLATION_GENERATION_STATE_LABELS = {
     "partial": "부분 저장",
     "running": "진행 중",
-    "paused": "일시정지",
+    "paused": "일시 정지",
     "blocked": "중단",
     "failed": "실패",
     "stopped": "사용자 정지",
     "completed": "완료",
+    "interrupted": "재시작으로 종료",
 }
 TRANSLATION_GENERATION_ORIGIN_LABELS = {
     "automatic": "자동 번역",
@@ -147,6 +150,16 @@ SUBTITLE_GENERATION_ORIGIN_LABELS = {
     "rendered": "시스템 생성",
     "legacy": "기존 자막 가져옴",
 }
+TRANSLATION_COMPARISON_PAGE_LIMIT = 100
+TRANSLATION_COMPARISON_FILTERS = (
+    ("changes", "변경 항목"),
+    ("all", "전체"),
+    ("changed", "번역 변경"),
+    ("added", "추가"),
+    ("removed", "삭제"),
+    ("source_changed", "전사 세그먼트 변경"),
+    ("unchanged", "완전 동일"),
+)
 JOB_STAGE_FILTERS = {
     "extraction": {
         "phases": {"extraction"},
@@ -511,20 +524,76 @@ def job_contract_status_label(job: Any) -> str:
 def translation_generation_view(
     generations: Sequence[Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
-    return [
-        {
-            **dict(generation),
-            "state_label": TRANSLATION_GENERATION_STATE_LABELS.get(
-                str(generation.get("state", "")),
-                str(generation.get("state", "")),
-            ),
-            "origin_label": TRANSLATION_GENERATION_ORIGIN_LABELS.get(
-                str(generation.get("origin", "")),
-                str(generation.get("origin", "")),
-            ),
-        }
-        for generation in generations
-    ]
+    views = []
+    last_index = len(generations) - 1
+    for index, generation in enumerate(generations):
+        prompt_category_name = str(
+            generation.get("prompt_category_name") or ""
+        ).strip()
+        prompt_revision_number = generation.get("prompt_revision_number")
+        prompt_label = (
+            f"{prompt_category_name} · v{prompt_revision_number}"
+            if prompt_category_name and prompt_revision_number is not None
+            else None
+        )
+        views.append(
+            {
+                **dict(generation),
+                "state_label": TRANSLATION_GENERATION_STATE_LABELS.get(
+                    str(generation.get("state", "")),
+                    str(generation.get("state", "")),
+                ),
+                "origin_label": TRANSLATION_GENERATION_ORIGIN_LABELS.get(
+                    str(generation.get("origin", "")),
+                    str(generation.get("origin", "")),
+                ),
+                "prompt_label": prompt_label,
+                "is_default_base": index == last_index - 1,
+                "is_default_candidate": index == last_index,
+            }
+        )
+    return views
+
+
+def translation_generation_history(
+    service: SubtitleOrchestrator,
+    job_id: str,
+) -> list[dict[str, Any]]:
+    return translation_generation_view(
+        service.store.list_translation_generations(job_id)
+    )
+
+
+def translation_source_texts(
+    service: SubtitleOrchestrator,
+    job: Any,
+    generation: Mapping[str, Any],
+) -> dict[str, str]:
+    jobs_root = service.settings.jobs_dir.resolve()
+    raw_paths = [generation.get("transcript_artifact_path")]
+    if job.transcript_path not in raw_paths:
+        raw_paths.append(job.transcript_path)
+    for raw_path in raw_paths:
+        if not raw_path:
+            continue
+        try:
+            artifact = Path(str(raw_path)).resolve()
+            artifact.relative_to(jobs_root)
+            if (
+                not artifact.is_file()
+                or sha256_file(artifact) != generation.get("transcript_hash")
+            ):
+                continue
+            payload = json.loads(artifact.read_text(encoding="utf-8"))
+            if not isinstance(payload, Mapping):
+                continue
+            return {
+                str(segment["id"]): str(segment["text"])
+                for segment in validate_transcript(payload)
+            }
+        except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+            continue
+    return {}
 
 
 def subtitle_generation_view(
@@ -4202,8 +4271,9 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                     external_subtitles,
                 ),
                 "subtitle_validator": service.subtitle_validator_view(),
-                "translation_generations": translation_generation_view(
-                    service.store.list_translation_generations(job.id)
+                "translation_generations": translation_generation_history(
+                    service,
+                    job.id,
                 ),
                 "subtitle_generations": subtitle_generation_view(
                     service.store.list_subtitle_generations(job.id)
@@ -4280,8 +4350,9 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                     external_subtitles,
                 ),
                 "subtitle_validator": service.subtitle_validator_view(),
-                "translation_generations": translation_generation_view(
-                    service.store.list_translation_generations(job.id)
+                "translation_generations": translation_generation_history(
+                    service,
+                    job.id,
                 ),
                 "subtitle_generations": subtitle_generation_view(
                     service.store.list_subtitle_generations(job.id)
@@ -4774,6 +4845,172 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         return RedirectResponse(
             f"/jobs/{created.id}",
             status_code=status.HTTP_303_SEE_OTHER,
+        )
+
+    @app.get(
+        "/jobs/{job_id}/translation-comparison",
+        response_class=HTMLResponse,
+        name="translation_generation_comparison",
+    )
+    def translation_generation_comparison_page(
+        request: Request,
+        job_id: str,
+        base_generation_id: str = "",
+        candidate_generation_id: str = "",
+        comparison_filter: str = "changes",
+        comparison_page: int = 1,
+    ) -> Any:
+        if not is_authenticated(request):
+            return login_redirect()
+        service = orchestrator(request)
+        job = service.store.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="job not found")
+        generations = translation_generation_history(service, job.id)
+        if len(generations) < 2:
+            raise HTTPException(
+                status_code=400,
+                detail="비교할 번역 버전이 두 개 이상 필요합니다.",
+            )
+        if not base_generation_id:
+            base_generation_id = str(generations[-2]["id"])
+        if not candidate_generation_id:
+            candidate_generation_id = str(generations[-1]["id"])
+        generation_by_id = {
+            str(generation["id"]): generation
+            for generation in generations
+        }
+        base = generation_by_id.get(base_generation_id)
+        candidate = generation_by_id.get(candidate_generation_id)
+        if base is None or candidate is None:
+            raise HTTPException(
+                status_code=404,
+                detail="번역 버전을 찾을 수 없습니다.",
+            )
+        if base_generation_id == candidate_generation_id:
+            raise HTTPException(
+                status_code=400,
+                detail="서로 다른 번역 버전을 선택하세요.",
+            )
+        valid_filters = {key for key, _label in TRANSLATION_COMPARISON_FILTERS}
+        if comparison_filter not in valid_filters:
+            raise HTTPException(
+                status_code=400,
+                detail="번역 비교 필터가 올바르지 않습니다.",
+            )
+
+        try:
+            comparison = compare_translation_items(
+                service.store.translation_items(base_generation_id),
+                service.store.translation_items(candidate_generation_id),
+                base_source_texts=translation_source_texts(
+                    service,
+                    job,
+                    base,
+                ),
+                candidate_source_texts=translation_source_texts(
+                    service,
+                    job,
+                    candidate,
+                ),
+            )
+        except ValueError as error:
+            raise HTTPException(
+                status_code=409,
+                detail="저장된 번역 항목을 비교할 수 없습니다.",
+            ) from error
+        filter_predicates: dict[str, Callable[[Mapping[str, Any]], bool]] = {
+            "changes": lambda row: bool(row["has_change"]),
+            "all": lambda _row: True,
+            "changed": lambda row: row["state"] == "changed",
+            "added": lambda row: row["state"] == "added",
+            "removed": lambda row: row["state"] == "removed",
+            "source_changed": lambda row: bool(row["source_changed"]),
+            "unchanged": lambda row: not bool(row["has_change"]),
+        }
+        filtered_rows = [
+            row
+            for row in comparison["rows"]
+            if filter_predicates[comparison_filter](row)
+        ]
+        page_count = max(
+            1,
+            math.ceil(
+                len(filtered_rows) / TRANSLATION_COMPARISON_PAGE_LIMIT
+            ),
+        )
+        comparison_page = min(page_count, max(1, comparison_page))
+        offset = (
+            (comparison_page - 1) * TRANSLATION_COMPARISON_PAGE_LIMIT
+        )
+
+        def comparison_location(
+            selected_filter: str,
+            selected_page: int = 1,
+        ) -> str:
+            query = urlencode(
+                {
+                    "base_generation_id": base_generation_id,
+                    "candidate_generation_id": candidate_generation_id,
+                    "comparison_filter": selected_filter,
+                    "comparison_page": selected_page,
+                }
+            )
+            return (
+                f"/jobs/{quote(job.id, safe='')}/translation-comparison?{query}"
+            )
+
+        filter_counts = {
+            "changes": int(comparison["change_count"]),
+            "all": int(comparison["total_count"]),
+            "changed": int(comparison["changed_count"]),
+            "added": int(comparison["added_count"]),
+            "removed": int(comparison["removed_count"]),
+            "source_changed": int(comparison["source_changed_count"]),
+            "unchanged": int(comparison["total_count"])
+            - int(comparison["change_count"]),
+        }
+        return TEMPLATES.TemplateResponse(
+            request,
+            "translation_comparison.html",
+            {
+                "job": job,
+                "generations": generations,
+                "base_generation": base,
+                "candidate_generation": candidate,
+                "comparison": comparison,
+                "comparison_rows": filtered_rows[
+                    offset : offset + TRANSLATION_COMPARISON_PAGE_LIMIT
+                ],
+                "comparison_filter": comparison_filter,
+                "comparison_filters": [
+                    {
+                        "key": key,
+                        "label": label,
+                        "count": filter_counts[key],
+                        "url": comparison_location(key),
+                    }
+                    for key, label in TRANSLATION_COMPARISON_FILTERS
+                ],
+                "comparison_page": comparison_page,
+                "comparison_page_count": page_count,
+                "comparison_previous_url": (
+                    comparison_location(
+                        comparison_filter,
+                        comparison_page - 1,
+                    )
+                    if comparison_page > 1
+                    else None
+                ),
+                "comparison_next_url": (
+                    comparison_location(
+                        comparison_filter,
+                        comparison_page + 1,
+                    )
+                    if comparison_page < page_count
+                    else None
+                ),
+            },
         )
 
     @app.get(

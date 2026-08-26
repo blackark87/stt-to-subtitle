@@ -420,13 +420,40 @@
       <div><h2>번역 이력</h2></div>
       <span class="history-count">{{ translation_generations|length }}개 버전</span>
     </div>
+    {% if translation_generations|length > 1 %}
+      <form
+        method="get"
+        action="{{ url_for('translation_generation_comparison', job_id=job.id) }}"
+        class="translation-compare-launch"
+      >
+        <label>기준 버전
+          <select name="base_generation_id" required>
+            {% for generation in translation_generations %}
+              <option value="{{ generation.id }}"{% if generation.is_default_base %} selected{% endif %}>
+                버전 {{ generation.generation_number }} · {{ generation.state_label }}{% if generation.prompt_label %} · {{ generation.prompt_label }}{% endif %}
+              </option>
+            {% endfor %}
+          </select>
+        </label>
+        <label>비교 버전
+          <select name="candidate_generation_id" required>
+            {% for generation in translation_generations %}
+              <option value="{{ generation.id }}"{% if generation.is_default_candidate %} selected{% endif %}>
+                버전 {{ generation.generation_number }} · {{ generation.state_label }}{% if generation.prompt_label %} · {{ generation.prompt_label }}{% endif %}
+              </option>
+            {% endfor %}
+          </select>
+        </label>
+        <button type="submit" class="secondary">번역 비교</button>
+      </form>
+    {% endif %}
     <div class="stack">
       {% for generation in translation_generations|reverse %}
         <article class="notice">
           <strong>번역 버전 {{ generation.generation_number }} · {{ generation.state_label }}</strong>
           <span>
             {{ generation.origin_label }}{% if generation.model != "manual" %} · {{ generation.model }}{% endif %} ·
-            {{ generation.item_count }}개 항목
+            {{ generation.item_count }}개 항목{% if generation.prompt_label %} · {{ generation.prompt_label }}{% endif %}
           </span>
           <a
             class="button secondary"

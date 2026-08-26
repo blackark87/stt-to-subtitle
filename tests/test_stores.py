@@ -412,6 +412,7 @@ class JobStoreTests(unittest.TestCase):
                 config_hash="config-hash",
                 artifact_path=str(translation),
                 origin="automatic",
+                transcript_revision_id="transcript-v1",
             )
             store.create_subtitle_generation(
                 generation_id="subtitle-v1",
@@ -443,6 +444,12 @@ class JobStoreTests(unittest.TestCase):
                 self.assertIn(str(path), by_path)
             self.assertFalse(by_path[str(translation)].expected)
             self.assertTrue(by_path[str(subtitle_srt)].expected)
+            self.assertEqual(
+                store.list_translation_generations(job.id)[0][
+                    "transcript_artifact_path"
+                ],
+                str(historical_transcript),
+            )
 
     def test_lists_and_counts_jobs_by_status(self) -> None:
         with TemporaryDirectory() as directory:
@@ -1190,12 +1197,18 @@ class JobStoreTests(unittest.TestCase):
             self.assertEqual(second["generation_number"], 2)
             self.assertEqual(second["supersedes_generation_id"], first["id"])
             self.assertEqual(first["prompt_revision_id"], prompt_revision_id)
+            generation_history = store.list_translation_generations("job-1")
             self.assertEqual(
-                [
-                    item["state"]
-                    for item in store.list_translation_generations("job-1")
-                ],
+                [item["state"] for item in generation_history],
                 ["completed", "partial"],
+            )
+            self.assertEqual(
+                generation_history[0]["prompt_category_name"],
+                "JAV",
+            )
+            self.assertEqual(
+                generation_history[0]["prompt_revision_number"],
+                1,
             )
 
     def test_translation_generation_rejects_an_incomplete_item_set(self) -> None:

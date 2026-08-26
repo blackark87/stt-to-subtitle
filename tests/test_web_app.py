@@ -2657,6 +2657,28 @@ class WebAppTests(unittest.TestCase):
                     f"/jobs/{job.id}/translation-generations/"
                     f"{generations[-1]['id']}"
                 )
+                translation_comparison = client.get(
+                    f"/jobs/{job.id}/translation-comparison"
+                    f"?base_generation_id={generations[-2]['id']}"
+                    f"&candidate_generation_id={generations[-1]['id']}"
+                )
+                same_translation_comparison = client.get(
+                    f"/jobs/{job.id}/translation-comparison"
+                    f"?base_generation_id={generations[-1]['id']}"
+                    f"&candidate_generation_id={generations[-1]['id']}"
+                )
+                unchanged_translation_comparison = client.get(
+                    f"/jobs/{job.id}/translation-comparison"
+                    f"?base_generation_id={generations[-2]['id']}"
+                    f"&candidate_generation_id={generations[-1]['id']}"
+                    "&comparison_filter=unchanged"
+                )
+                invalid_translation_filter = client.get(
+                    f"/jobs/{job.id}/translation-comparison"
+                    f"?base_generation_id={generations[-2]['id']}"
+                    f"&candidate_generation_id={generations[-1]['id']}"
+                    "&comparison_filter=unknown"
+                )
                 subtitle_generations = (
                     service.store.list_subtitle_generations(job.id)
                 )
@@ -2711,11 +2733,24 @@ class WebAppTests(unittest.TestCase):
             self.assertIn("번역 이력", refreshed_page.text)
             self.assertIn("번역 버전 2 · 완료", refreshed_page.text)
             self.assertIn("직접 편집", refreshed_page.text)
+            self.assertIn("번역 비교", refreshed_page.text)
             self.assertEqual(generation_download.status_code, 200)
             self.assertEqual(
                 generation_download.json()["translations"][0]["text"],
                 "수정된 번역",
             )
+            self.assertEqual(translation_comparison.status_code, 200)
+            self.assertIn("번역 버전 비교", translation_comparison.text)
+            self.assertIn("안녕하세요", translation_comparison.text)
+            self.assertIn("수정된 번역", translation_comparison.text)
+            self.assertIn("번역 변경", translation_comparison.text)
+            self.assertIn("こんにちは", translation_comparison.text)
+            self.assertEqual(same_translation_comparison.status_code, 400)
+            self.assertIn(
+                "선택한 필터에 해당하는 항목이 없습니다.",
+                unchanged_translation_comparison.text,
+            )
+            self.assertEqual(invalid_translation_filter.status_code, 400)
             self.assertIn("자막 이력", refreshed_page.text)
             self.assertIn("자막 버전 1 · 게시 중", refreshed_page.text)
             self.assertEqual(subtitle_generation_download.status_code, 200)
