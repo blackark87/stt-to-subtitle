@@ -16,6 +16,7 @@ from .path_display import (
     PathDisplayRule,
     normalize_path_display_patterns,
 )
+from .job_state import JobPhase, JobReason, JobState, structured_state_from_legacy
 from .storage_paths import rebase_stored_path
 from .translation_prompt import (
     KOREAN_JAV_SYSTEM_PROMPT,
@@ -98,6 +99,10 @@ class PipelineJob:
     status: str
     force_overwrite: bool
     operation: str
+    phase: str
+    state: str
+    reason_code: str | None
+    attempt: int
     options: dict[str, Any]
     audio_path: str | None
     audio_sha256: str | None
@@ -161,7 +166,7 @@ class PipelineJob:
 
     @property
     def can_retry(self) -> bool:
-        return self.status in RETRYABLE_STATUSES
+        return self.state in {"blocked", "stopped", "failed"}
 
     @property
     def can_pause_translation(self) -> bool:
@@ -182,7 +187,7 @@ class PipelineJob:
     def can_delete_record(self) -> bool:
         return (
             self.status == "audio_completed"
-            or self.status in RETRYABLE_STATUSES
+            or self.can_retry
             or self.remote_transcription_missing
         )
 
@@ -201,6 +206,10 @@ class JobStore:
         "status",
         "force_overwrite",
         "operation",
+        "phase",
+        "state",
+        "reason_code",
+        "attempt",
         "options_json",
         "audio_path",
         "audio_sha256",
@@ -300,6 +309,10 @@ class JobStore:
                     status TEXT NOT NULL,
                     force_overwrite INTEGER NOT NULL,
                     operation TEXT NOT NULL DEFAULT 'full',
+                    phase TEXT NOT NULL DEFAULT 'extraction',
+                    state TEXT NOT NULL DEFAULT 'waiting',
+                    reason_code TEXT,
+                    attempt INTEGER NOT NULL DEFAULT 1,
                     options_json TEXT NOT NULL,
                     audio_path TEXT,
                     audio_sha256 TEXT,
@@ -522,6 +535,21 @@ class JobStore:
                     "ALTER TABLE jobs ADD COLUMN "
                     "operation TEXT NOT NULL DEFAULT 'full'"
                 ),
+                "phase": (
+                    "ALTER TABLE jobs ADD COLUMN "
+                    "phase TEXT NOT NULL DEFAULT 'extraction'"
+                ),
+                "state": (
+                    "ALTER TABLE jobs ADD COLUMN "
+                    "state TEXT NOT NULL DEFAULT 'waiting'"
+                ),
+                "reason_code": (
+                    "ALTER TABLE jobs ADD COLUMN reason_code TEXT"
+                ),
+                "attempt": (
+                    "ALTER TABLE jobs ADD COLUMN "
+                    "attempt INTEGER NOT NULL DEFAULT 1"
+                ),
                 "translation_chunks_total": (
                     "ALTER TABLE jobs ADD COLUMN translation_chunks_total "
                     "INTEGER NOT NULL DEFAULT 0"
@@ -568,6 +596,49 @@ class JobStore:
                 "CREATE INDEX IF NOT EXISTS jobs_status_updated_idx "
                 "ON jobs(status_updated_at DESC, created_at DESC)"
             )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS jobs_state_phase_idx "
+                "ON jobs(state, phase, created_at)"
+            )
+            structured_state_migration = "structured_job_state_v1"
+            structured_state_applied = connection.execute(
+                "SELECT 1 FROM schema_migrations WHERE name = ?",
+                (structured_state_migration,),
+            ).fetchone()
+            if structured_state_applied is None:
+                rows = connection.execute(
+                    "SELECT id, status, operation, blocked_stage, error FROM jobs"
+                ).fetchall()
+                for row in rows:
+                    projected = structured_state_from_legacy(
+                        status=str(row["status"]),
+                        operation=str(row["operation"]),
+                        blocked_stage=(
+                            str(row["blocked_stage"])
+                            if row["blocked_stage"]
+                            else None
+                        ),
+                        error=str(row["error"]) if row["error"] else None,
+                    )
+                    connection.execute(
+                        "UPDATE jobs SET phase = ?, state = ?, reason_code = ? "
+                        "WHERE id = ?",
+                        (
+                            projected.phase.value,
+                            projected.state.value,
+                            (
+                                projected.reason_code.value
+                                if projected.reason_code is not None
+                                else None
+                            ),
+                            str(row["id"]),
+                        ),
+                    )
+                connection.execute(
+                    "INSERT INTO schema_migrations (name, applied_at) "
+                    "VALUES (?, ?)",
+                    (structured_state_migration, time.time()),
+                )
             server_columns = {
                 str(row["name"])
                 for row in connection.execute(
@@ -1056,6 +1127,12 @@ class JobStore:
             status=str(row["status"]),
             force_overwrite=bool(row["force_overwrite"]),
             operation=str(row["operation"]),
+            phase=str(row["phase"]),
+            state=str(row["state"]),
+            reason_code=(
+                str(row["reason_code"]) if row["reason_code"] else None
+            ),
+            attempt=int(row["attempt"]),
             options=json.loads(str(row["options_json"])),
             audio_path=str(row["audio_path"]) if row["audio_path"] else None,
             audio_sha256=(
@@ -1105,15 +1182,20 @@ class JobStore:
         chunks_total_estimate: int = 0,
     ) -> PipelineJob:
         now = time.time()
+        projected = structured_state_from_legacy(
+            status=status,
+            operation=operation,
+        )
         with self._connect() as connection:
             connection.execute(
                 """
                 INSERT INTO jobs (
                     id, source_rel, status, force_overwrite, operation,
+                    phase, state, reason_code, attempt,
                     options_json, audio_path, audio_sha256,
                     chunks_total_estimate,
                     created_at, status_updated_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job_id,
@@ -1121,6 +1203,13 @@ class JobStore:
                     status,
                     int(force_overwrite),
                     operation,
+                    projected.phase.value,
+                    projected.state.value,
+                    (
+                        projected.reason_code.value
+                        if projected.reason_code is not None
+                        else None
+                    ),
                     json.dumps(dict(options), sort_keys=True),
                     audio_path,
                     audio_sha256,
@@ -1148,30 +1237,87 @@ class JobStore:
             ).fetchone()
         return self._from_row(row)
 
+    @staticmethod
+    def _job_filter_clause(
+        *,
+        statuses: Collection[str] | None,
+        states: Collection[str] | None,
+        phases: Collection[str] | None,
+        legacy_phase_statuses: Collection[str] | None,
+        include_comparison_transcriptions: bool,
+    ) -> tuple[str, list[object]] | None:
+        def normalized(
+            values: Collection[str] | None,
+        ) -> tuple[str, ...] | None:
+            return tuple(sorted(set(values))) if values is not None else None
+
+        status_values = normalized(statuses)
+        state_values = normalized(states)
+        phase_values = normalized(phases)
+        legacy_phase_values = normalized(legacy_phase_statuses)
+        if () in (status_values, state_values, phase_values):
+            return None
+        if legacy_phase_values == ():
+            legacy_phase_values = None
+
+        conditions: list[str] = []
+        parameters: list[object] = []
+        for column, values in (
+            ("status", status_values),
+            ("state", state_values),
+        ):
+            if values is None:
+                continue
+            placeholders = ", ".join("?" for _ in values)
+            conditions.append(f"{column} IN ({placeholders})")
+            parameters.extend(values)
+
+        if phase_values is not None:
+            phase_placeholders = ", ".join("?" for _ in phase_values)
+            if legacy_phase_values is not None:
+                status_placeholders = ", ".join(
+                    "?" for _ in legacy_phase_values
+                )
+                conditions.append(
+                    f"(phase IN ({phase_placeholders}) OR "
+                    f"status IN ({status_placeholders}))"
+                )
+                parameters.extend((*phase_values, *legacy_phase_values))
+            else:
+                conditions.append(f"phase IN ({phase_placeholders})")
+                parameters.extend(phase_values)
+        elif legacy_phase_values is not None:
+            placeholders = ", ".join("?" for _ in legacy_phase_values)
+            conditions.append(f"status IN ({placeholders})")
+            parameters.extend(legacy_phase_values)
+
+        if not include_comparison_transcriptions:
+            conditions.append(f"NOT ({_COMPARISON_TRANSCRIPTION_SQL})")
+        where = " WHERE " + " AND ".join(conditions) if conditions else ""
+        return where, parameters
+
     def list_jobs(
         self,
         limit: int | None = 100,
         *,
         offset: int = 0,
         statuses: Collection[str] | None = None,
+        states: Collection[str] | None = None,
+        phases: Collection[str] | None = None,
+        legacy_phase_statuses: Collection[str] | None = None,
         include_comparison_transcriptions: bool = True,
     ) -> list[PipelineJob]:
-        status_values = (
-            tuple(sorted(set(statuses))) if statuses is not None else None
+        filtered = self._job_filter_clause(
+            statuses=statuses,
+            states=states,
+            phases=phases,
+            legacy_phase_statuses=legacy_phase_statuses,
+            include_comparison_transcriptions=include_comparison_transcriptions,
         )
-        if status_values == ():
+        if filtered is None:
             return []
-        conditions: list[str] = []
-        parameters: list[object] = []
-        if status_values is not None:
-            placeholders = ", ".join("?" for _ in status_values)
-            conditions.append(f"status IN ({placeholders})")
-            parameters.extend(status_values)
-        if not include_comparison_transcriptions:
-            conditions.append(f"NOT ({_COMPARISON_TRANSCRIPTION_SQL})")
-        query = "SELECT * FROM jobs"
-        if conditions:
-            query += " WHERE " + " AND ".join(conditions)
+        where, parameters = filtered
+        query = "SELECT * FROM jobs" + where
         query += " ORDER BY status_updated_at DESC, created_at DESC"
         if limit is not None:
             query += " LIMIT ? OFFSET ?"
@@ -1184,62 +1330,54 @@ class JobStore:
         self,
         *,
         statuses: Collection[str] | None = None,
+        states: Collection[str] | None = None,
+        phases: Collection[str] | None = None,
+        legacy_phase_statuses: Collection[str] | None = None,
         include_comparison_transcriptions: bool = True,
     ) -> int:
-        status_values = (
-            tuple(sorted(set(statuses))) if statuses is not None else None
+        filtered = self._job_filter_clause(
+            statuses=statuses,
+            states=states,
+            phases=phases,
+            legacy_phase_statuses=legacy_phase_statuses,
+            include_comparison_transcriptions=include_comparison_transcriptions,
         )
-        if status_values == ():
+        if filtered is None:
             return 0
-        conditions: list[str] = []
-        parameters: list[object] = []
-        if status_values is not None:
-            placeholders = ", ".join("?" for _ in status_values)
-            conditions.append(f"status IN ({placeholders})")
-            parameters.extend(status_values)
-        if not include_comparison_transcriptions:
-            conditions.append(f"NOT ({_COMPARISON_TRANSCRIPTION_SQL})")
-        query = "SELECT COUNT(*) AS count FROM jobs"
-        if conditions:
-            query += " WHERE " + " AND ".join(conditions)
+        where, parameters = filtered
+        query = "SELECT COUNT(*) AS count FROM jobs" + where
         with self._connect() as connection:
             row = connection.execute(query, tuple(parameters)).fetchone()
         return int(row["count"]) if row is not None else 0
 
     def list_open_jobs(self) -> list[PipelineJob]:
-        placeholders = ", ".join("?" for _ in SUCCESS_STATUSES)
         with self._connect() as connection:
             rows = connection.execute(
-                f"""
+                """
                 SELECT * FROM jobs
-                WHERE status NOT IN ({placeholders})
+                WHERE state != 'done'
                 ORDER BY created_at DESC
-                """,
-                tuple(sorted(SUCCESS_STATUSES)),
+                """
             ).fetchall()
         return [job for row in rows if (job := self._from_row(row)) is not None]
 
     def list_successful_jobs(self, *, limit: int, offset: int) -> list[PipelineJob]:
-        placeholders = ", ".join("?" for _ in SUCCESS_STATUSES)
         with self._connect() as connection:
             rows = connection.execute(
-                f"""
+                """
                 SELECT * FROM jobs
-                WHERE status IN ({placeholders})
+                WHERE state = 'done'
                 ORDER BY created_at DESC
                 LIMIT ? OFFSET ?
                 """,
-                (*sorted(SUCCESS_STATUSES), limit, offset),
+                (limit, offset),
             ).fetchall()
         return [job for row in rows if (job := self._from_row(row)) is not None]
 
     def count_successful_jobs(self) -> int:
-        placeholders = ", ".join("?" for _ in SUCCESS_STATUSES)
         with self._connect() as connection:
             row = connection.execute(
-                f"SELECT COUNT(*) AS count FROM jobs "
-                f"WHERE status IN ({placeholders})",
-                tuple(sorted(SUCCESS_STATUSES)),
+                "SELECT COUNT(*) AS count FROM jobs WHERE state = 'done'",
             ).fetchone()
         return int(row["count"]) if row is not None else 0
 
@@ -1318,14 +1456,30 @@ class JobStore:
             if waiting_status == "transcribed"
             else ""
         )
+        current = self.get(job_id)
+        if current is None:
+            return False
+        projected = structured_state_from_legacy(
+            status=running_status,
+            operation=current.operation,
+        )
         with self._connect() as connection:
             now = time.time()
             result = connection.execute(
-                "UPDATE jobs SET status = ?, blocked_stage = NULL, "
-                "error = NULL, status_updated_at = ?, updated_at = ? "
+                "UPDATE jobs SET status = ?, phase = ?, state = ?, "
+                "reason_code = NULL, blocked_stage = NULL, error = NULL, "
+                "status_updated_at = ?, updated_at = ? "
                 "WHERE id = ? AND status = ? AND job_stop_requested = 0"
                 f"{translation_condition}",
-                (running_status, now, now, job_id, waiting_status),
+                (
+                    running_status,
+                    projected.phase.value,
+                    projected.state.value,
+                    now,
+                    now,
+                    job_id,
+                    waiting_status,
+                ),
             )
         claimed = result.rowcount == 1
         if claimed:
@@ -1335,6 +1489,8 @@ class JobStore:
     def update(self, job_id: str, **fields: Any) -> None:
         if not fields:
             return
+        fields = self._with_structured_state(job_id, fields)
+        self._validate_structured_fields(fields)
         unknown = set(fields) - self._UPDATABLE_FIELDS
         if unknown:
             raise ValueError(f"unsupported job fields: {sorted(unknown)}")
@@ -1362,6 +1518,8 @@ class JobStore:
     ) -> bool:
         if not statuses or not fields:
             return False
+        fields = self._with_structured_state(job_id, fields)
+        self._validate_structured_fields(fields)
         unknown = set(fields) - self._UPDATABLE_FIELDS
         if unknown:
             raise ValueError(f"unsupported job fields: {sorted(unknown)}")
@@ -1384,6 +1542,58 @@ class JobStore:
         if updated:
             self._notify_change(job_id)
         return updated
+
+    def _with_structured_state(
+        self,
+        job_id: str,
+        fields: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        expanded = dict(fields)
+        if "status" not in expanded:
+            return expanded
+        current = self.get(job_id)
+        if current is None:
+            return expanded
+        projected = structured_state_from_legacy(
+            status=str(expanded["status"]),
+            operation=str(expanded.get("operation", current.operation)),
+            blocked_stage=(
+                str(expanded["blocked_stage"])
+                if expanded.get("blocked_stage")
+                else current.blocked_stage
+            ),
+            error=(
+                str(expanded["error"])
+                if expanded.get("error")
+                else None
+            ),
+            detect_legacy_user_stop=False,
+        )
+        expanded.setdefault("phase", projected.phase.value)
+        expanded.setdefault("state", projected.state.value)
+        expanded.setdefault(
+            "reason_code",
+            (
+                projected.reason_code.value
+                if projected.reason_code is not None
+                else None
+            ),
+        )
+        return expanded
+
+    @staticmethod
+    def _validate_structured_fields(fields: Mapping[str, Any]) -> None:
+        try:
+            if "phase" in fields:
+                JobPhase(str(fields["phase"]))
+            if "state" in fields:
+                JobState(str(fields["state"]))
+            if fields.get("reason_code") is not None:
+                JobReason(str(fields["reason_code"]))
+        except ValueError as error:
+            raise ValueError("invalid structured job state") from error
+        if "attempt" in fields and int(fields["attempt"]) < 1:
+            raise ValueError("job attempt must be at least 1")
 
     def delete(self, job_id: str) -> bool:
         with self._connect() as connection:
@@ -2432,12 +2642,23 @@ class JobStore:
                     """
                     UPDATE jobs
                     SET status = 'blocked', blocked_stage = ?,
+                        phase = ?, state = 'blocked',
+                        reason_code = 'service_restarted',
                         error = 'service restarted during this stage',
                         job_stop_requested = 0,
-                        updated_at = ?
+                        status_updated_at = ?, updated_at = ?
                     WHERE id = ?
                     """,
-                    (stage, now, str(row["id"])),
+                    (
+                        stage,
+                        structured_state_from_legacy(
+                            status=str(row["status"]),
+                            operation="full",
+                        ).phase.value,
+                        now,
+                        now,
+                        str(row["id"]),
+                    ),
                 )
         for row in rows:
             self.add_event(

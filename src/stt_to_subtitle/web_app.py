@@ -34,7 +34,8 @@ from .artifacts import artifact_filename
 from .contracts import validate_transcript, validate_translation_items
 from .gpu_monitoring import GpuSnapshot, PrometheusGpuMonitor
 from .files import sha256_file
-from .job_store import RETRYABLE_STATUSES, RUNNING_STATUSES, SUCCESS_STATUSES
+from .job_store import RETRYABLE_STATUSES, SUCCESS_STATUSES
+from .job_state import JobState
 from .media_preview import (
     guess_media_type,
     iter_file_range,
@@ -55,8 +56,6 @@ from .orchestrator import (
     COMPARISON_PARENT_ID_OPTION,
     SubtitleOrchestrator,
     TRANSCRIPTION_COMPARISON_BACKENDS,
-    USER_SELECTED_STOP_MESSAGE,
-    USER_STOP_MESSAGE,
 )
 from .service_clients import (
     ExternalServiceError,
@@ -98,31 +97,36 @@ WEBGPU_STOPPED_LIMIT = 3
 WEBGPU_COMPLETED_LIMIT = 4
 WEBGPU_MEDIA_ZONE_LIMIT = 8
 WEBGPU_TRANSPORT_WINDOW_SECONDS = 30.0
-WEBGPU_USER_STOP_MESSAGES = {
-    USER_SELECTED_STOP_MESSAGE,
-    USER_STOP_MESSAGE,
-}
-WAITING_STATUSES = {
-    "queued",
-    "audio_ready",
-    "transcribed",
-    "translation_paused",
-    "translated",
-}
 JOB_STATUS_GROUPS = {
-    "running": RUNNING_STATUSES,
-    "blocked": {"blocked"},
-    "failed": {"failed"},
-    "waiting": WAITING_STATUSES,
-    "completed": SUCCESS_STATUSES,
+    "running": {JobState.RUNNING.value},
+    "waiting": {JobState.WAITING.value},
+    "paused": {JobState.PAUSED.value},
+    "blocked": {JobState.BLOCKED.value},
+    "stopped": {JobState.STOPPED.value},
+    "failed": {JobState.FAILED.value},
+    "completed": {JobState.DONE.value},
 }
 JOB_STATUS_GROUP_LABELS = {
     "running": "진행 중",
     "blocked": "중단",
     "failed": "실패",
     "waiting": "대기",
+    "paused": "일시 정지",
     "completed": "완료",
+    "stopped": "정지",
 }
+JOB_STATUS_FILTER_NAV = tuple(
+    {"key": key, "label": JOB_STATUS_GROUP_LABELS[key]}
+    for key in (
+        "waiting",
+        "running",
+        "paused",
+        "blocked",
+        "stopped",
+        "failed",
+        "completed",
+    )
+)
 TRANSLATION_GENERATION_STATE_LABELS = {
     "partial": "부분 저장",
     "running": "진행 중",
@@ -143,25 +147,39 @@ SUBTITLE_GENERATION_ORIGIN_LABELS = {
     "legacy": "기존 자막 가져옴",
 }
 JOB_STAGE_FILTERS = {
-    "extraction": {"queued", "extracting", "audio_completed"},
+    "extraction": {
+        "phases": {"extraction"},
+        "legacy_phase_statuses": {"audio_completed"},
+    },
     "transcription": {
-        "audio_ready",
-        "transcription_running",
-        "transcription_completed",
+        "phases": {"transcription"},
+        "legacy_phase_statuses": {"transcription_completed"},
     },
-    "transcription_waiting": {"audio_ready"},
-    "transcription_running": {"transcription_running"},
-    "transcription_completed": {"transcription_completed"},
+    "transcription_waiting": {
+        "phases": {"transcription"},
+        "states": {"waiting"},
+    },
+    "transcription_running": {
+        "phases": {"transcription"},
+        "states": {"running"},
+    },
+    "transcription_completed": {
+        "statuses": {"transcription_completed"},
+    },
     "translation": {
-        "transcribed",
-        "translation_running",
-        "translation_paused",
-        "translated",
+        "phases": {"translation"},
+        "legacy_phase_statuses": {"translated"},
     },
-    "translation_waiting": {"transcribed"},
-    "translation_running": {"translation_running"},
-    "translation_completed": {"translated"},
-    "completed": {"rendering", "completed"},
+    "translation_waiting": {
+        "phases": {"translation"},
+        "states": {"waiting"},
+    },
+    "translation_running": {
+        "phases": {"translation"},
+        "states": {"running"},
+    },
+    "translation_completed": {"statuses": {"translated"}},
+    "completed": {"states": {"done"}},
 }
 JOB_STAGE_FILTER_LABELS = {
     "extraction": "추출",
@@ -213,6 +231,22 @@ JOB_STATUS_LABELS = {
     "blocked": "중단",
     "failed": "실패",
 }
+JOB_STATE_LABELS = {
+    "waiting": "대기",
+    "running": "진행 중",
+    "paused": "일시 정지",
+    "blocked": "중단",
+    "stopped": "정지",
+    "failed": "실패",
+    "done": "완료",
+}
+JOB_PHASE_LABELS = {
+    "extraction": "추출",
+    "transcription": "전사",
+    "translation": "번역",
+    "render": "작업 완료",
+    "complete": "완료",
+}
 MEDIA_PROCESSING_LABELS = {
     "queued": "작업 대기",
     "extracting": "오디오 추출 중",
@@ -258,29 +292,13 @@ OPERATION_PHASES = {
     "translate": ("translation",),
     "full": PHASE_SEQUENCE,
 }
-OPERATION_SUCCESS_STATUS = {
-    "extract": "audio_completed",
-    "transcribe": "transcription_completed",
-    "translate": "completed",
-    "full": "completed",
-}
-STATUS_ACTIVE_STAGE = {
-    "extracting": ("audio extraction", "running"),
-    "audio_ready": ("transcription", "waiting"),
-    "transcription_running": ("transcription", "running"),
-    "transcription_completed": ("translation", "waiting"),
-    "transcribed": ("translation", "waiting"),
-    "translation_running": ("translation", "running"),
-    "translation_paused": ("translation", "paused"),
-    "translated": ("render", "waiting"),
-    "rendering": ("render", "running"),
-}
 STAGE_STATE_LABELS = {
     "done": "완료",
     "running": "진행 중",
     "waiting": "대기",
     "paused": "일시 정지",
     "blocked": "중단",
+    "stopped": "정지",
     "failed": "실패",
     "pending": "대기",
 }
@@ -342,6 +360,7 @@ def _job_progress_step(
                 "pending": "작업 완료 대기",
                 "paused": "작업 일시 정지",
                 "blocked": "작업 중단",
+                "stopped": "작업 정지",
                 "failed": "작업 실패",
             }[state]
             if kind == "endpoint"
@@ -352,42 +371,26 @@ def _job_progress_step(
 
 def job_pipeline_phase_view(job: Any) -> list[dict[str, Any]]:
     """실제 파이프라인의 세 phase 상태를 작업 범위와 무관하게 계산한다."""
-    status = str(job.status)
     operation = str(job.operation)
+    domain_phase = str(job.phase)
+    domain_state = str(job.state)
+    active = {
+        "extraction": "audio extraction",
+        "transcription": "transcription",
+        "translation": "translation",
+    }.get(domain_phase)
     finished_through = -1
-    active: str | None = None
-    active_state = "waiting"
-    if status == "audio_completed":
-        finished_through = 0
-    elif status == "transcription_completed":
-        finished_through = 1
-    elif status in {"translated", "rendering", "completed"}:
+    active_state = domain_state
+    if domain_phase == "complete" and domain_state == "done":
+        finished_through = {
+            "extract": 0,
+            "transcribe": 1,
+            "translate": 2,
+            "full": 2,
+        }.get(operation, 2)
+        active = None
+    elif domain_phase == "render":
         finished_through = len(PHASE_SEQUENCE) - 1
-    elif status in {"blocked", "failed"}:
-        blocked = str(job.blocked_stage or "")
-        if blocked in PHASE_SEQUENCE:
-            active = blocked
-            active_state = "blocked" if status == "blocked" else "failed"
-        elif blocked == JOB_ENDPOINT_KEY:
-            finished_through = len(PHASE_SEQUENCE) - 1
-    elif status == "queued":
-        active = (
-            "translation" if operation == "translate" else "audio extraction"
-        )
-        active_state = "waiting"
-    else:
-        active, active_state = STATUS_ACTIVE_STAGE.get(
-            status,
-            (
-                "translation"
-                if operation == "translate"
-                else "audio extraction",
-                "waiting",
-            ),
-        )
-        if active == JOB_ENDPOINT_KEY:
-            active = None
-            finished_through = len(PHASE_SEQUENCE) - 1
 
     view: list[dict[str, Any]] = []
     active_index = (
@@ -430,17 +433,19 @@ def job_stage_view(job: Any) -> list[dict[str, Any]]:
             kind="phase",
         )
 
-    status = str(job.status)
-    if status == OPERATION_SUCCESS_STATUS.get(operation, "completed"):
+    phase = str(job.phase)
+    state = str(job.state)
+    if phase == "complete" and state == "done":
         endpoint_state = "done"
-    elif status == "rendering":
-        endpoint_state = "running"
-    elif status == "translated":
-        endpoint_state = "waiting"
-    elif status in {"blocked", "failed"} and str(
-        job.blocked_stage or ""
-    ) == JOB_ENDPOINT_KEY:
-        endpoint_state = "blocked" if status == "blocked" else "failed"
+    elif phase == "render" and state in {
+        "waiting",
+        "running",
+        "paused",
+        "blocked",
+        "stopped",
+        "failed",
+    }:
+        endpoint_state = state
     else:
         endpoint_state = "pending"
     endpoint = _job_progress_step(
@@ -465,7 +470,14 @@ def job_progress_view(job: Any) -> dict[str, Any]:
             stage
             for stage in stages
             if stage["state"]
-            in {"running", "blocked", "failed", "paused", "waiting"}
+            in {
+                "running",
+                "blocked",
+                "stopped",
+                "failed",
+                "paused",
+                "waiting",
+            }
         ),
         stages[-1] if stages else None,
     )
@@ -484,6 +496,15 @@ def job_progress_view(job: Any) -> dict[str, Any]:
             stage["state"] == "done" for stage in stages
         ),
     }
+
+
+def job_contract_status_label(job: Any) -> str:
+    """Render the stable phase/state contract without exposing legacy status."""
+    if str(job.state) == JobState.DONE:
+        return JOB_STATUS_LABELS.get(str(job.status), "완료")
+    phase = JOB_PHASE_LABELS.get(str(job.phase), str(job.phase))
+    state = JOB_STATE_LABELS.get(str(job.state), str(job.state))
+    return " · ".join(part for part in (phase, state) if part)
 
 
 def translation_generation_view(
@@ -590,7 +611,7 @@ def webgpu_scene_context(
     )
     slots = dashboard_pipeline_slots(jobs, audio_workers=audio_workers)
 
-    phase_jobs = [job for job in jobs if job.status in RUNNING_STATUSES]
+    phase_jobs = [job for job in jobs if job.state == JobState.RUNNING]
     phase_job_views = []
     for job in phase_jobs[:WEBGPU_PHASE_JOB_LIMIT]:
         progress = job_progress_view(job)
@@ -616,8 +637,7 @@ def webgpu_scene_context(
     waiting = [
         job
         for job in jobs
-        if job.status in WAITING_STATUSES
-        and job.status != "translation_paused"
+        if job.state == JobState.WAITING
     ]
     queue = []
     for job in waiting[:WEBGPU_QUEUE_LIMIT]:
@@ -640,8 +660,11 @@ def webgpu_scene_context(
     ) -> dict[str, Any]:
         view: dict[str, Any] = {
             "source_rel": job.source_rel,
-            "status": job.status,
-            "status_label": JOB_STATUS_LABELS.get(job.status, job.status),
+            "phase": job.phase,
+            "state": job.state,
+            "reason_code": job.reason_code,
+            "status": job_contract_status_label(job),
+            "status_label": job_contract_status_label(job),
             "transport_pending": (
                 float(job.status_updated_at) >= transport_cutoff
             ),
@@ -658,22 +681,16 @@ def webgpu_scene_context(
         )
 
     paused_jobs = newest_status_first(
-        job for job in jobs if job.status == "translation_paused"
+        job for job in jobs if job.state == JobState.PAUSED
     )
     stopped_jobs = newest_status_first(
-        job
-        for job in jobs
-        if job.status == "blocked"
-        and str(job.error or "") in WEBGPU_USER_STOP_MESSAGES
+        job for job in jobs if job.state == JobState.STOPPED
     )
     blocked_jobs = newest_status_first(
-        job
-        for job in jobs
-        if job.status == "blocked"
-        and str(job.error or "") not in WEBGPU_USER_STOP_MESSAGES
+        job for job in jobs if job.state == JobState.BLOCKED
     )
     failed_jobs = newest_status_first(
-        job for job in jobs if job.status == "failed"
+        job for job in jobs if job.state == JobState.FAILED
     )
 
     stopped_views = [
@@ -699,7 +716,7 @@ def webgpu_scene_context(
                 transport_budget -= 1
                 transport_count += 1
 
-    completed_jobs = [job for job in jobs if job.status in SUCCESS_STATUSES]
+    completed_jobs = [job for job in jobs if job.state == JobState.DONE]
     completed = []
     for job in completed_jobs[:WEBGPU_COMPLETED_LIMIT]:
         detail = [JOB_STATUS_LABELS.get(job.status, job.status)]
@@ -713,7 +730,11 @@ def webgpu_scene_context(
             }
         )
 
-    rendering_jobs = [job for job in jobs if job.status == "rendering"]
+    rendering_jobs = [
+        job
+        for job in jobs
+        if job.phase == "render" and job.state == JobState.RUNNING
+    ]
     rendering = (
         {
             "source_rel": rendering_jobs[0].source_rel,
@@ -846,22 +867,19 @@ def _library_progress_entry(
         source_rel = str(media["path"])
         latest = latest_jobs.get(source_rel)
         if bool(media["has_subtitle"]) or (
-            latest is not None and latest.status == "completed"
+            latest is not None and latest.state == JobState.DONE
         ):
             counts["done"] += 1
-        elif latest is not None and latest.status in {
-            "translation_paused",
-            "blocked",
-            "failed",
+        elif latest is not None and latest.state in {
+            JobState.PAUSED,
+            JobState.BLOCKED,
+            JobState.STOPPED,
+            JobState.FAILED,
         }:
             counts["attention"] += 1
-        elif latest is not None and latest.status in RUNNING_STATUSES:
+        elif latest is not None and latest.state == JobState.RUNNING:
             counts["running"] += 1
-        elif (
-            latest is not None
-            and latest.status in WAITING_STATUSES
-            and latest.status != "translation_paused"
-        ):
+        elif latest is not None and latest.state == JobState.WAITING:
             counts["queued"] += 1
         else:
             counts["unprocessed"] += 1
@@ -923,30 +941,14 @@ def library_progress_view(service: SubtitleOrchestrator) -> list[dict[str, Any]]
 
 
 def dashboard_state_counts(jobs: Sequence[Any]) -> dict[str, int]:
-    stopped = [
-        job
-        for job in jobs
-        if job.status == "blocked"
-        and str(job.error or "") in WEBGPU_USER_STOP_MESSAGES
-    ]
-    blocked = [
-        job
-        for job in jobs
-        if job.status == "blocked"
-        and str(job.error or "") not in WEBGPU_USER_STOP_MESSAGES
-    ]
     return {
-        "running": sum(job.status in RUNNING_STATUSES for job in jobs),
-        "waiting": sum(
-            job.status in WAITING_STATUSES
-            and job.status != "translation_paused"
-            for job in jobs
-        ),
-        "paused": sum(job.status == "translation_paused" for job in jobs),
-        "blocked": len(blocked),
-        "stopped": len(stopped),
-        "failed": sum(job.status == "failed" for job in jobs),
-        "completed": sum(job.status in SUCCESS_STATUSES for job in jobs),
+        "running": sum(job.state == JobState.RUNNING for job in jobs),
+        "waiting": sum(job.state == JobState.WAITING for job in jobs),
+        "paused": sum(job.state == JobState.PAUSED for job in jobs),
+        "blocked": sum(job.state == JobState.BLOCKED for job in jobs),
+        "stopped": sum(job.state == JobState.STOPPED for job in jobs),
+        "failed": sum(job.state == JobState.FAILED for job in jobs),
+        "completed": sum(job.state == JobState.DONE for job in jobs),
     }
 
 
@@ -956,12 +958,16 @@ def dashboard_pipeline_slots(
     audio_workers: int,
 ) -> list[dict[str, Any]]:
     slots: list[dict[str, Any]] = []
-    for stage, status_name, stage_key, capacity in (
-        ("추출", "extracting", "audio extraction", max(1, audio_workers)),
-        ("전사", "transcription_running", "transcription", 1),
-        ("번역", "translation_running", "translation", 1),
+    for stage, phase_name, stage_key, capacity in (
+        ("추출", "extraction", "audio extraction", max(1, audio_workers)),
+        ("전사", "transcription", "transcription", 1),
+        ("번역", "translation", "translation", 1),
     ):
-        active = [job for job in jobs if job.status == status_name]
+        active = [
+            job
+            for job in jobs
+            if job.phase == phase_name and job.state == JobState.RUNNING
+        ]
         slot: dict[str, Any] = {
             "stage": stage,
             "capacity": capacity,
@@ -1012,7 +1018,11 @@ def dashboard_job_view(job: Any, *, now: float) -> dict[str, Any]:
         "id": job.id,
         "source_rel": job.source_rel,
         "status": job.status,
-        "status_label": JOB_STATUS_LABELS.get(job.status, job.status),
+        "phase": job.phase,
+        "state": job.state,
+        "reason_code": job.reason_code,
+        "attempt": job.attempt,
+        "status_label": job_contract_status_label(job),
         "phases": pipeline["phases"],
         "endpoint": pipeline["endpoint"],
         "percent": pipeline["percent"],
@@ -1036,19 +1046,24 @@ def dashboard_2d_data(
         include_comparison_transcriptions=False,
     )
     now = time.time()
-    running = [job for job in jobs if job.status in RUNNING_STATUSES]
+    running = [job for job in jobs if job.state == JobState.RUNNING]
     attention = [
         job
         for job in jobs
-        if job.status in {"translation_paused", "blocked", "failed"}
+        if job.state
+        in {
+            JobState.PAUSED,
+            JobState.BLOCKED,
+            JobState.STOPPED,
+            JobState.FAILED,
+        }
     ]
-    completed = [job for job in jobs if job.status in SUCCESS_STATUSES]
+    completed = [job for job in jobs if job.state == JobState.DONE]
     waiting = sorted(
         (
             job
             for job in jobs
-            if job.status in WAITING_STATUSES
-            and job.status != "translation_paused"
+            if job.state == JobState.WAITING
         ),
         key=lambda job: (job.created_at, job.id),
     )
@@ -1056,19 +1071,19 @@ def dashboard_2d_data(
     attention_views = []
     for job in attention[:DASHBOARD_ATTENTION_LIMIT]:
         view = dashboard_job_view(job, now=now)
-        if job.status == "translation_paused":
+        if job.state == JobState.PAUSED:
             view.update(
                 status_key="paused",
                 status_label="일시 정지",
                 action="resume",
             )
-        elif str(job.error or "") in WEBGPU_USER_STOP_MESSAGES:
+        elif job.state == JobState.STOPPED:
             view.update(
                 status_key="stopped",
                 status_label="정지",
                 action="retry",
             )
-        elif job.status == "blocked":
+        elif job.state == JobState.BLOCKED:
             view.update(
                 status_key="blocked",
                 status_label="중단",
@@ -1084,7 +1099,7 @@ def dashboard_2d_data(
         blocked_stage = str(job.blocked_stage or "")
         stage_detail = (
             JOB_STAGE_LABELS.get(blocked_stage, blocked_stage)
-            if job.status in {"blocked", "failed"} and blocked_stage
+            if job.state in {JobState.BLOCKED, JobState.FAILED} and blocked_stage
             else str(current.get("label", ""))
         )
         if current.get("key") == blocked_stage and current.get("total"):
@@ -1117,7 +1132,7 @@ def dashboard_2d_data(
                 "id": job.id,
                 "source_rel": job.source_rel,
                 "stage": current.get("label", "대기"),
-                "status": JOB_STATUS_LABELS.get(job.status, job.status),
+                "status": job_contract_status_label(job),
             }
         )
 
@@ -1241,6 +1256,7 @@ TEMPLATES.env.filters["job_status"] = lambda value: JOB_STATUS_LABELS.get(
     str(value),
     str(value),
 )
+TEMPLATES.env.filters["job_contract_status"] = job_contract_status_label
 TEMPLATES.env.filters["job_operation"] = lambda value: (
     JOB_OPERATION_LABELS.get(str(value), str(value))
 )
@@ -1470,10 +1486,6 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         return_stage_filter: str = "",
         **values: object,
     ) -> str:
-        if return_status_group and return_stage_filter:
-            raise ValueError(
-                "작업 상태와 단계 필터를 동시에 사용할 수 없습니다."
-            )
         if (
             return_status_group
             and return_status_group not in JOB_STATUS_GROUPS
@@ -1484,10 +1496,14 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         if return_stage_filter:
             query = {
                 "stage_filter": return_stage_filter,
+                "status_group": return_status_group or None,
                 "jobs_page": max(1, return_jobs_page),
                 **values,
             }
-            return f"/jobs?{urlencode(query)}"
+            filtered_query = {
+                key: value for key, value in query.items() if value is not None
+            }
+            return f"/jobs?{urlencode(filtered_query)}"
         if return_status_group:
             query = {
                 "status_group": return_status_group,
@@ -1512,10 +1528,10 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
     def job_stats(service: SubtitleOrchestrator) -> dict[str, int]:
         return {
             group: service.store.count_jobs(
-                statuses=statuses,
+                states=states,
                 include_comparison_transcriptions=False,
             )
-            for group, statuses in JOB_STATUS_GROUPS.items()
+            for group, states in JOB_STATUS_GROUPS.items()
         }
 
     def validate_job_list_filters(
@@ -1527,8 +1543,6 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             raise ValueError("지원하지 않는 작업 상태 필터입니다.")
         if stage_filter is not None and stage_filter not in JOB_STAGE_FILTERS:
             raise ValueError("지원하지 않는 작업 단계 필터입니다.")
-        if status_group is not None and stage_filter is not None:
-            raise ValueError("작업 상태와 단계 필터를 동시에 사용할 수 없습니다.")
 
     def job_stage_filter_context(
         service: SubtitleOrchestrator,
@@ -1540,13 +1554,31 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             status_group=status_group,
             stage_filter=stage_filter,
         )
+
+        def count_for_stage(stage_key: str) -> int:
+            spec = dict(JOB_STAGE_FILTERS[stage_key])
+            selected_states = (
+                JOB_STATUS_GROUPS[status_group]
+                if status_group is not None
+                else None
+            )
+            stage_states = spec.get("states")
+            if selected_states is not None:
+                spec["states"] = (
+                    set(stage_states) & set(selected_states)
+                    if stage_states is not None
+                    else selected_states
+                )
+            return service.store.count_jobs(
+                **spec,
+                include_comparison_transcriptions=False,
+            )
+
         return {
             "job_stage_filters": JOB_STAGE_FILTER_NAV,
+            "job_status_filters": JOB_STATUS_FILTER_NAV,
             "job_stage_counts": {
-                stage["key"]: service.store.count_jobs(
-                    statuses=JOB_STAGE_FILTERS[stage["key"]],
-                    include_comparison_transcriptions=False,
-                )
+                stage["key"]: count_for_stage(str(stage["key"]))
                 for stage in JOB_STAGE_FILTER_NAV
             },
             "selected_status_group": status_group,
@@ -1570,15 +1602,31 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             status_group=status_group,
             stage_filter=stage_filter,
         )
-        if stage_filter is not None:
-            statuses = JOB_STAGE_FILTERS[stage_filter]
-        elif status_group is not None:
-            statuses = JOB_STATUS_GROUPS[status_group]
-        else:
-            statuses = None
+        stage_spec = (
+            JOB_STAGE_FILTERS[stage_filter]
+            if stage_filter is not None
+            else {}
+        )
+        statuses = stage_spec.get("statuses")
+        phases = stage_spec.get("phases")
+        legacy_phase_statuses = stage_spec.get("legacy_phase_statuses")
+        stage_states = stage_spec.get("states")
+        group_states = (
+            JOB_STATUS_GROUPS[status_group]
+            if status_group is not None
+            else None
+        )
+        states = (
+            set(stage_states) & set(group_states)
+            if stage_states is not None and group_states is not None
+            else (stage_states if stage_states is not None else group_states)
+        )
         jobs_page = max(1, jobs_page) if paginated else 1
         job_count = service.store.count_jobs(
             statuses=statuses,
+            states=states,
+            phases=phases,
+            legacy_phase_statuses=legacy_phase_statuses,
             include_comparison_transcriptions=False,
         )
         jobs_offset = (jobs_page - 1) * limit
@@ -1589,12 +1637,15 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         open_jobs = [
             job
             for job in all_visible_jobs
-            if job.status not in SUCCESS_STATUSES
+            if job.state != JobState.DONE
         ]
         recent_jobs = service.store.list_jobs(
             limit=limit,
             offset=jobs_offset,
             statuses=statuses,
+            states=states,
+            phases=phases,
+            legacy_phase_statuses=legacy_phase_statuses,
             include_comparison_transcriptions=False,
         )
         latest_jobs = service.store.latest_jobs_by_source()
@@ -1612,6 +1663,8 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                 for job in all_visible_jobs
                 if job.can_stop
                 and (statuses is None or job.status in statuses)
+                and (states is None or job.state in states)
+                and (phases is None or job.phase in phases)
             }
             if paginated
             else set()
@@ -1622,6 +1675,8 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                 for job in all_visible_jobs
                 if job.can_retry
                 and (statuses is None or job.status in statuses)
+                and (states is None or job.state in states)
+                and (phases is None or job.phase in phases)
             }
             if paginated
             else set()
@@ -1633,19 +1688,26 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             query = {"jobs_page": page}
             if stage_filter is not None:
                 query = {"stage_filter": stage_filter, **query}
-            elif status_group is not None:
+            if status_group is not None:
                 query = {"status_group": status_group, **query}
             return "/jobs?" + urlencode(query)
 
-        label = (
-            JOB_STAGE_FILTER_LABELS[stage_filter]
-            if stage_filter is not None
-            else (
-                JOB_STATUS_GROUP_LABELS[status_group]
-                if status_group is not None
-                else "전체"
+        label = " · ".join(
+            part
+            for part in (
+                (
+                    JOB_STAGE_FILTER_LABELS[stage_filter]
+                    if stage_filter is not None
+                    else ""
+                ),
+                (
+                    JOB_STATUS_GROUP_LABELS[status_group]
+                    if status_group is not None
+                    else ""
+                ),
             )
-        )
+            if part
+        ) or "전체"
         filtered = status_group is not None or stage_filter is not None
         return {
             "recent_jobs": recent_jobs,
@@ -1835,21 +1897,22 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             source_rel = str(media["path"])
             latest = latest_jobs.get(source_rel)
             linked_job = None
-            if latest is not None and latest.status in {"blocked", "failed"}:
-                media["subtitle_state"] = latest.status
+            if latest is not None and latest.state in {
+                JobState.PAUSED,
+                JobState.BLOCKED,
+                JobState.STOPPED,
+                JobState.FAILED,
+            }:
+                media["subtitle_state"] = latest.state
                 stage = JOB_STAGE_LABELS.get(
                     str(latest.blocked_stage),
                     str(latest.blocked_stage or ""),
                 )
-                media["processing_label"] = JOB_STATUS_LABELS[latest.status]
+                media["processing_label"] = JOB_STATE_LABELS[latest.state]
                 if stage:
                     media["processing_label"] += f" · {stage}"
                 linked_job = latest
-            elif latest is not None and latest.status not in {
-                "audio_completed",
-                "transcription_completed",
-                "completed",
-            }:
+            elif latest is not None and latest.state != JobState.DONE:
                 media["subtitle_state"] = "running"
                 media["processing_label"] = MEDIA_PROCESSING_LABELS.get(
                     latest.status,
@@ -1884,11 +1947,9 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             media["job_id"] = linked_job.id if linked_job else None
             # 진행 중이 아니면 개별 선택은 열어 둔다. 완료된 항목을 다시
             # 번역하려면 직접 골라야 하기 때문이다.
-            media["selectable"] = latest is None or latest.status in {
-                "audio_completed",
-                "transcription_completed",
-                "completed",
-            }
+            media["selectable"] = (
+                latest is None or latest.state == JobState.DONE
+            )
             # '전체 선택'은 아직 자막이 없는 항목만 담는다.
             media["auto_selectable"] = not media["has_subtitle"] and (
                 latest is None
@@ -2122,24 +2183,32 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         comparison_jobs: Sequence[Any],
     ) -> dict[str, Any]:
         source_rels = transcription_comparison_source_key(comparison_jobs)
-        terminal_statuses = SUCCESS_STATUSES | RETRYABLE_STATUSES
         completed_count = sum(
-            job.status in SUCCESS_STATUSES for job in comparison_jobs
+            job.state == JobState.DONE for job in comparison_jobs
         )
         attention_count = sum(
-            job.status in RETRYABLE_STATUSES for job in comparison_jobs
+            job.state
+            in {JobState.BLOCKED, JobState.STOPPED, JobState.FAILED}
+            for job in comparison_jobs
         )
         blocked_count = sum(
-            job.status == "blocked" for job in comparison_jobs
+            job.state == JobState.BLOCKED for job in comparison_jobs
         )
         failed_count = sum(
-            job.status == "failed" for job in comparison_jobs
+            job.state == JobState.FAILED for job in comparison_jobs
         )
         active_count = sum(
-            job.status in RUNNING_STATUSES for job in comparison_jobs
+            job.state == JobState.RUNNING for job in comparison_jobs
         )
         terminal_count = sum(
-            job.status in terminal_statuses for job in comparison_jobs
+            job.state
+            in {
+                JobState.DONE,
+                JobState.BLOCKED,
+                JobState.STOPPED,
+                JobState.FAILED,
+            }
+            for job in comparison_jobs
         )
         waiting_count = max(
             0,

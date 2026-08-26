@@ -161,6 +161,38 @@ class TranscriptionStoreTests(unittest.TestCase):
 
 
 class JobStoreTests(unittest.TestCase):
+    def test_requires_explicit_structured_state_for_new_user_stops(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = JobStore(Path(directory) / "jobs.sqlite3")
+            job = store.create(
+                job_id="job-1",
+                source_rel="movie.mkv",
+                force_overwrite=False,
+                options={},
+            )
+
+            store.update(
+                job.id,
+                status="blocked",
+                blocked_stage="transcription",
+                error="사용자 요청으로 작업이 중단되었습니다.",
+            )
+            blocked = store.get(job.id)
+            self.assertEqual(blocked.state, "blocked")
+            self.assertEqual(blocked.reason_code, "stt_unavailable")
+
+            store.update(
+                job.id,
+                status="blocked",
+                state="stopped",
+                reason_code="user_stop",
+            )
+            stopped = store.get(job.id)
+            self.assertEqual(stopped.state, "stopped")
+            self.assertEqual(stopped.reason_code, "user_stop")
+            with self.assertRaisesRegex(ValueError, "invalid structured"):
+                store.update(job.id, state="attention")
+
     def test_rebases_only_artifacts_under_the_previous_work_root(self) -> None:
         with TemporaryDirectory() as directory:
             store = JobStore(Path(directory) / "jobs.sqlite3")
@@ -232,6 +264,14 @@ class JobStoreTests(unittest.TestCase):
             self.assertEqual(store.count_jobs(statuses=set()), 0)
             self.assertEqual(store.count_jobs(), 3)
             self.assertEqual(queued.status, "queued")
+            self.assertEqual(queued.phase, "extraction")
+            self.assertEqual(queued.state, "waiting")
+            self.assertEqual(store.get(blocked.id).state, "blocked")
+            self.assertEqual(store.get(completed.id).state, "done")
+            self.assertEqual(
+                store.count_jobs(states={"blocked", "failed"}),
+                1,
+            )
 
     def test_can_exclude_comparison_only_transcriptions(self) -> None:
         with TemporaryDirectory() as directory:
@@ -898,6 +938,9 @@ class JobStoreTests(unittest.TestCase):
             job = store.get("job-1")
             self.assertEqual(job.status, "blocked")
             self.assertEqual(job.blocked_stage, "translation")
+            self.assertEqual(job.phase, "translation")
+            self.assertEqual(job.state, "blocked")
+            self.assertEqual(job.reason_code, "service_restarted")
 
     def test_persists_chunk_progress_for_the_job_panel(self) -> None:
         with TemporaryDirectory() as directory:
@@ -962,6 +1005,16 @@ class JobStoreTests(unittest.TestCase):
                     """,
                     (now, now),
                 )
+                connection.execute(
+                    """
+                    INSERT INTO jobs VALUES (
+                        'job-2', 'stopped.mkv', 'blocked', 0, '{}',
+                        NULL, NULL, NULL, NULL, NULL, NULL, 'translation',
+                        '사용자 요청으로 작업이 중단되었습니다.', ?, ?
+                    )
+                    """,
+                    (now, now),
+                )
             connection.close()
 
             job = JobStore(database_path).get("job-1")
@@ -976,3 +1029,10 @@ class JobStoreTests(unittest.TestCase):
             self.assertFalse(job.translation_pause_requested)
             self.assertFalse(job.job_stop_requested)
             self.assertIsNone(job.ass_path)
+            self.assertEqual(job.phase, "extraction")
+            self.assertEqual(job.state, "waiting")
+            self.assertEqual(job.attempt, 1)
+            stopped = JobStore(database_path).get("job-2")
+            self.assertEqual(stopped.phase, "translation")
+            self.assertEqual(stopped.state, "stopped")
+            self.assertEqual(stopped.reason_code, "user_stop")

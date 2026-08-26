@@ -6,10 +6,11 @@
 
 ### 구현 진행 상태
 
-현재 작업 트리에는 계획의 세 번째 수직 슬라이스까지 반영됐다.
+현재 작업 트리에는 계획의 네 번째 수직 슬라이스까지 반영됐다.
 
 | 항목 | 반영 상태 | 남은 범위 |
 |---|---|---|
+| 작업 상태 계약 | `phase/state/reason_code/attempt` 영속 컬럼과 레거시 마이그레이션, 명시적 `stopped/user_stop`, 2D·3D·목록 공통 상태 집계, 단계+상태 결합 필터 | 스케줄러의 레거시 `status` 제거·전이 이벤트 코드·DB 전이 제약 |
 | 번역 LLM 수동 gate | 사용자가 시작할 때 `/models` 1회 확인, 연결 실패 시 gate 차단, 번역 중단 작업 수동 재개 | dependency state 영속화·reason code·재시작 복원 |
 | 외부 자막 | 같은 stem의 SRT/VTT/ASS 탐지, `외부 자막` 표시, 기본 WebVTT 재생 | 증분 asset/revision catalog·사용자별 재생 선택 |
 | 로컬 비교 | 시간 중첩 정렬, coverage·문장 유사도·경계 오차, 파일 해시별 SQLite 결과 | generation/publication FK·검증 알고리즘 version migration |
@@ -26,11 +27,11 @@
 
 그러나 작업이 많거나 외부 서비스가 내려간 상황에서 안정적으로 운영하려면 다음 문제를 우선 해결해야 한다.
 
-1. `작업 상태`, `파이프라인 단계`, `외부 서비스 상태`, `사용자 명령`이 하나의 `status`와 자유 형식 오류 문자열에 섞여 있다.
+1. 사용자 표시와 필터는 `phase/state/reason_code/attempt`로 분리됐지만 스케줄러 실행 전이는 아직 레거시 `status`를 호환 필드로 함께 사용한다.
 2. 언어 모델 수동 gate로 대기열 연쇄 실패는 차단했지만 gate가 프로세스 메모리에만 있어 재시작 복원과 구조화된 장애 사유가 없다.
 3. 웹 프로세스 재시작 시 실행 중이던 모든 작업을 일괄 `blocked`로 바꾸며, 단계별 자동 복구나 원격 STT 작업 재연결이 없다.
-4. 사용자 정지를 독립 상태가 아니라 `blocked + 특정 한국어 오류 문구`로 저장한다. UI와 필터가 문구 일치에 의존한다.
-5. 2D 대시보드, 3D 대시보드, 작업 목록이 동일한 원천 상태를 각자 다시 분류해 상태 수와 필터 의미가 달라질 수 있다.
+4. 사용자 정지는 신규 작업에서 명시적 `stopped/user_stop`으로 저장한다. 기존 한국어 오류 문구 판별은 과거 DB를 한 번 마이그레이션할 때만 사용한다.
+5. 2D 대시보드, 3D 대시보드, 작업 목록은 영속 `state`를 공통 원천으로 사용하고 작업 목록은 `phase + state` 결합 필터를 지원한다.
 6. 전사 중지 요청은 웹의 대기 루프만 중지하고 원격 STT 작업을 취소하지 않아 GPU 작업이 계속될 수 있다.
 7. 번역 결과는 generation·batch·segment 단위로 DB에 저장되고 JSON을 재생성할 수 있게 됐다. 다만 실행 중 프로세스 종료를 자동 reconcile하는 worker lease는 아직 없다.
 8. 프롬프트를 바꾼 재번역과 직접 편집은 별도 translation generation으로 보존하고, SRT/ASS도 generation별 보존·재게시할 수 있다. immutable prompt revision과 파일/DB startup reconcile은 아직 없다.

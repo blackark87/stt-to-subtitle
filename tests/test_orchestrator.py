@@ -1256,10 +1256,14 @@ class SubtitleOrchestratorTests(unittest.TestCase):
 
             self.assertEqual(stopped_count, 2)
             self.assertEqual(waiting_after_request.status, "blocked")
+            self.assertEqual(waiting_after_request.state, "stopped")
+            self.assertEqual(waiting_after_request.reason_code, "user_stop")
             self.assertIn("전체 작업", waiting_after_request.error)
             self.assertTrue(running_after_request.job_stop_requested)
             operation.assert_not_called()
             self.assertEqual(running_after_stop.status, "blocked")
+            self.assertEqual(running_after_stop.state, "stopped")
+            self.assertEqual(running_after_stop.reason_code, "user_stop")
             self.assertFalse(running_after_stop.job_stop_requested)
             self.assertEqual(paused_after_request.status, "translation_paused")
 
@@ -1304,6 +1308,8 @@ class SubtitleOrchestratorTests(unittest.TestCase):
 
             self.assertEqual(stopped_count, 2)
             self.assertEqual(waiting.status, "blocked")
+            self.assertEqual(waiting.state, "stopped")
+            self.assertEqual(waiting.reason_code, "user_stop")
             self.assertEqual(
                 waiting.error,
                 "사용자 요청으로 작업이 중단되었습니다.",
@@ -1363,10 +1369,15 @@ class SubtitleOrchestratorTests(unittest.TestCase):
 
             self.assertEqual(retried_count, 2)
             self.assertEqual(blocked.status, "audio_ready")
+            self.assertEqual(blocked.state, "waiting")
+            self.assertEqual(blocked.attempt, 2)
+            self.assertIsNone(blocked.reason_code)
             self.assertIsNone(blocked.blocked_stage)
             self.assertIsNone(blocked.error)
             self.assertFalse(blocked.job_stop_requested)
             self.assertEqual(failed.status, "queued")
+            self.assertEqual(failed.state, "waiting")
+            self.assertEqual(failed.attempt, 2)
             self.assertIsNone(failed.blocked_stage)
             self.assertIsNone(failed.error)
             self.assertEqual(queued.status, "queued")

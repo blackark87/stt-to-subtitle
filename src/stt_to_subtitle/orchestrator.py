@@ -39,6 +39,7 @@ from .job_store import (
     RETRYABLE_STATUSES,
     SUCCESS_STATUSES,
 )
+from .job_state import JobReason, JobState
 from .service_clients import (
     ExternalServiceError,
     OpenAICompatibleClient,
@@ -438,7 +439,7 @@ class SubtitleOrchestrator:
             if (
                 job is None
                 or job.blocked_stage != "translation"
-                or job.error in {USER_STOP_MESSAGE, USER_SELECTED_STOP_MESSAGE}
+                or job.state == JobState.STOPPED
             ):
                 continue
             try:
@@ -1580,6 +1581,7 @@ class SubtitleOrchestrator:
 
         retry_fields: dict[str, Any] = {
             "status": target_status,
+            "attempt": job.attempt + 1,
             "blocked_stage": None,
             "error": None,
             "translation_pause_requested": 0,
@@ -1892,6 +1894,8 @@ class SubtitleOrchestrator:
                 else:
                     fields = {
                         "status": "blocked",
+                        "state": JobState.STOPPED.value,
+                        "reason_code": JobReason.USER_STOP.value,
                         "blocked_stage": WAITING_STAGE_BY_STATUS[job.status],
                         "error": stop_message,
                         "translation_pause_requested": 0,
@@ -2183,6 +2187,11 @@ class SubtitleOrchestrator:
                 job_id,
                 status="blocked",
                 blocked_stage=stage,
+                reason_code=(
+                    JobReason.LM_UNAVAILABLE.value
+                    if stage == "translation"
+                    else JobReason.STT_UNAVAILABLE.value
+                ),
                 error=message,
             )
             self.store.add_event(job_id, "warning", f"{stage} blocked: {message}")
@@ -2206,6 +2215,7 @@ class SubtitleOrchestrator:
                 job_id,
                 status="failed",
                 blocked_stage=stage,
+                reason_code=JobReason.INTERNAL_ERROR.value,
                 error=message,
             )
             self.store.add_event(job_id, "error", f"{stage} failed: {message}")
@@ -2220,6 +2230,8 @@ class SubtitleOrchestrator:
         self.store.update(
             job_id,
             status="blocked",
+            state=JobState.STOPPED.value,
+            reason_code=JobReason.USER_STOP.value,
             blocked_stage=stage,
             error=USER_STOP_MESSAGE,
             translation_pause_requested=0,

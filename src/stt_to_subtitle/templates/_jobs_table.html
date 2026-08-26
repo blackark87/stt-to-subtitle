@@ -1,15 +1,17 @@
 {% import "_icons.html" as icons %}
 {% macro job_item(job) %}
   {% set pipeline = job|job_progress %}
-  {% set is_running = job.status in ['extracting', 'transcription_running', 'translation_running', 'rendering'] %}
-  {% set is_blocked = job.status == 'blocked' %}
-  {% set is_failed = job.status == 'failed' %}
-  {% set is_completed = job.status in ['audio_completed', 'transcription_completed', 'completed'] %}
+  {% set is_running = job.state == 'running' %}
+  {% set is_blocked = job.state == 'blocked' %}
+  {% set is_stopped = job.state == 'stopped' %}
+  {% set is_paused = job.state == 'paused' %}
+  {% set is_failed = job.state == 'failed' %}
+  {% set is_completed = job.state == 'done' %}
   {% set can_translate = job.id in translatable_job_ids %}
   {% set can_retry = job.id in retriable_job_ids %}
   {% set can_stop = job.id in stoppable_job_ids %}
-  {% set status_group = 'running' if is_running else ('blocked' if is_blocked else ('failed' if is_failed else ('completed' if is_completed else 'waiting'))) %}
-  <article class="recent-job-item recent-job-{{ job.status }}{% if is_completed %} is-completed{% endif %}">
+  {% set status_group = 'running' if is_running else ('paused' if is_paused else ('blocked' if is_blocked else ('stopped' if is_stopped else ('failed' if is_failed else ('completed' if is_completed else 'waiting'))))) %}
+  <article class="recent-job-item recent-job-{{ job.state }}{% if is_completed %} is-completed{% endif %}">
     <div class="recent-job-leading">
       <div class="recent-job-select">
         {% if can_translate %}
@@ -41,7 +43,7 @@
       </div>
       <div class="recent-job-status-icon recent-job-status-{{ status_group }}" aria-hidden="true">
         {% if status_group == 'running' %}{{ icons.activity(18) }}
-        {% elif status_group == 'blocked' %}{{ icons.pause(18) }}
+        {% elif status_group in ['paused', 'blocked', 'stopped'] %}{{ icons.pause(18) }}
         {% elif status_group == 'failed' %}{{ icons.alert_triangle(18) }}
         {% elif status_group == 'completed' %}{{ icons.check(18) }}
         {% else %}{{ icons.clock(18) }}
@@ -55,9 +57,9 @@
           {% if job.source_rel|parent_path %}<span class="recent-job-path">{{ job.source_rel|parent_path }}</span>{% endif %}
         </div>
         <span
-          class="status status-{{ job.status }}{% if job.error %} has-detail{% endif %}"
-          title="내부 상태: {{ job.status }}{% if job.error %}&#10;error: {{ job.error }}{% endif %}"
-        >{{ job.status|job_status }}</span>
+          class="status status-{{ job.state }}{% if job.error %} has-detail{% endif %}"
+          title="단계: {{ job.phase }} · 상태: {{ job.state }}{% if job.reason_code %} · 사유: {{ job.reason_code }}{% endif %}{% if job.error %}&#10;error: {{ job.error }}{% endif %}"
+        >{{ job|job_contract_status }}</span>
       </div>
       <div class="recent-job-meta">
         <span>상태 변경 <time datetime="{{ job.status_updated_at|datetime_iso }}">{{ job.status_updated_at|datetime }}</time></span>
@@ -98,6 +100,7 @@
               {%- if stage.state == 'done' %}{{ icons.check(13) }}
               {%- elif stage.state == 'running' %}{{ icons.activity(13) }}
               {%- elif stage.state == 'blocked' %}{{ icons.pause(13) }}
+              {%- elif stage.state == 'stopped' %}{{ icons.pause(13) }}
               {%- elif stage.state == 'failed' %}{{ icons.alert_triangle(13) }}
               {%- elif stage.state == 'paused' %}{{ icons.pause(13) }}
               {%- else %}{{ icons.clock(13) }}{% endif -%}

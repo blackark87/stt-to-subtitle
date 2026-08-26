@@ -8,7 +8,7 @@
     <div class="job-stage-filter-group">
       <a
         class="button{% if stage.key == selected_stage_filter %} is-filter-active{% elif stage.key == selected_stage_group %} is-filter-group-active{% else %} secondary{% endif %}"
-        href="/jobs?stage_filter={{ stage.key }}"
+        href="/jobs?stage_filter={{ stage.key }}{% if selected_status_group %}&amp;status_group={{ selected_status_group }}{% endif %}"
         {% if stage.key == selected_stage_filter %}aria-current="page"{% endif %}
       >
         <span>{{ stage.label }}</span>
@@ -22,7 +22,7 @@
           {% for child in stage.children %}
             <a
               class="button{% if child.key == selected_stage_filter %} is-filter-active{% else %} secondary{% endif %}"
-              href="/jobs?stage_filter={{ child.key }}"
+              href="/jobs?stage_filter={{ child.key }}{% if selected_status_group %}&amp;status_group={{ selected_status_group }}{% endif %}"
               {% if child.key == selected_stage_filter %}aria-current="page"{% endif %}
             >{{ child.label }}</a>
           {% endfor %}
@@ -30,14 +30,11 @@
       {% endif %}
     </div>
   {% endfor %}
-  <a
-    class="button{% if selected_status_group == 'blocked' %} is-filter-active{% else %} secondary{% endif %}"
-    href="/jobs?status_group=blocked"
-    {% if selected_status_group == 'blocked' %}aria-current="page"{% endif %}
-  >중단</a>
-  <a
-    class="button{% if selected_status_group == 'failed' %} is-filter-active{% else %} secondary{% endif %}"
-    href="/jobs?status_group=failed"
-    {% if selected_status_group == 'failed' %}aria-current="page"{% endif %}
-  >실패</a>
+  {% for state in job_status_filters %}
+    <a
+      class="button{% if selected_status_group == state.key %} is-filter-active{% else %} secondary{% endif %}"
+      href="/jobs?status_group={{ state.key }}{% if selected_stage_filter %}&amp;stage_filter={{ selected_stage_filter }}{% endif %}"
+      {% if selected_status_group == state.key %}aria-current="page"{% endif %}
+    >{{ state.label }}</a>
+  {% endfor %}
 </nav>

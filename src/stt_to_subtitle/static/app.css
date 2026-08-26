@@ -775,6 +775,10 @@ th, td { border-bottom: 1px solid var(--line); padding: 10px 8px; text-align: le
 .status-translation_paused { background: color-mix(in srgb, var(--warning-strong) 18%, var(--card)); color: var(--warning); }
 .status-blocked { background: color-mix(in srgb, var(--warning-strong) 14%, var(--card)); color: var(--warning); }
 .status-failed { background: color-mix(in srgb, var(--danger) 14%, var(--card)); color: var(--danger); }
+.status-running { background: color-mix(in srgb, var(--accent) 18%, var(--card)); color: var(--accent); }
+.status-done { background: color-mix(in srgb, var(--success) 16%, var(--card)); color: var(--success); }
+.status-paused, .status-blocked { background: color-mix(in srgb, var(--warning-strong) 14%, var(--card)); color: var(--warning); }
+.status-stopped { background: var(--line); color: var(--muted); }
 .status-stage-running { background: color-mix(in srgb, var(--accent) 18%, var(--card)); color: var(--accent); }
 .status-stage-done { background: color-mix(in srgb, var(--success) 16%, var(--card)); color: var(--success); }
 .status-stage-blocked { background: color-mix(in srgb, var(--warning-strong) 14%, var(--card)); color: var(--warning); }
@@ -889,6 +893,7 @@ th, td { border-bottom: 1px solid var(--line); padding: 10px 8px; text-align: le
 .job-stage.is-failed { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 40%, var(--line)); background: color-mix(in srgb, var(--danger) 8%, var(--card)); }
 .job-stage.is-blocked { color: var(--warning); border-color: color-mix(in srgb, var(--warning-strong) 35%, var(--line)); }
 .job-stage.is-paused { color: var(--warning); border-color: color-mix(in srgb, var(--warning-strong) 35%, var(--line)); }
+.job-stage.is-stopped { color: var(--muted); border-color: var(--line-strong); }
 .job-stage.is-waiting { color: var(--muted); border-style: dashed; }
 .job-stage.is-pending { color: var(--muted); border-style: dashed; background: transparent; opacity: .62; }
 .job-stage.is-pending .job-stage-label { color: var(--muted); font-weight: 650; }
@@ -899,6 +904,7 @@ th, td { border-bottom: 1px solid var(--line); padding: 10px 8px; text-align: le
 .job-endpoint.is-done { border-style: solid; border-color: color-mix(in srgb, var(--success) 30%, var(--line)); color: var(--success); }
 .job-endpoint.is-failed { border-style: solid; border-color: color-mix(in srgb, var(--danger) 40%, var(--line)); color: var(--danger); }
 .job-endpoint.is-blocked, .job-endpoint.is-paused { border-style: solid; border-color: color-mix(in srgb, var(--warning-strong) 35%, var(--line)); color: var(--warning); }
+.job-endpoint.is-stopped { border-style: solid; border-color: var(--line-strong); color: var(--muted); }
 .job-endpoint.is-pending { opacity: .62; }
 .job-detail-progress-path { margin: 8px 0 18px; }
 .job-detail-stage-strip { margin: 0; }
@@ -1421,6 +1427,7 @@ code { overflow-wrap: anywhere; }
 .ob-stages li.is-failed { border-style: solid; border-color: color-mix(in srgb, var(--danger) 42%, var(--line)); background: color-mix(in srgb, var(--danger) 9%, var(--card)); color: var(--danger); }
 .ob-stages li.is-blocked { border-style: solid; border-color: color-mix(in srgb, var(--warning) 42%, var(--line)); color: var(--warning); }
 .ob-stages li.is-paused { border-style: solid; border-color: color-mix(in srgb, var(--ob-paused) 42%, var(--line)); color: var(--ob-paused); }
+.ob-stages li.is-stopped { border-style: solid; border-color: var(--line-strong); color: var(--ob-hold); }
 .ob-stages li.is-pending { opacity: .62; }
 .ob-endpoint { display: inline-flex; align-items: center; gap: 5px; min-width: 92px; border: 1px dashed var(--line); border-radius: 6px; padding: 5px 7px; color: var(--muted); }
 .ob-endpoint strong { font-size: .66rem; line-height: 1.2; white-space: nowrap; }
@@ -1428,6 +1435,7 @@ code { overflow-wrap: anywhere; }
 .ob-endpoint.is-done { border-style: solid; border-color: color-mix(in srgb, var(--success) 36%, var(--line)); color: var(--success); }
 .ob-endpoint.is-failed { border-style: solid; border-color: color-mix(in srgb, var(--danger) 42%, var(--line)); color: var(--danger); }
 .ob-endpoint.is-blocked, .ob-endpoint.is-paused { border-style: solid; border-color: color-mix(in srgb, var(--warning) 42%, var(--line)); color: var(--warning); }
+.ob-endpoint.is-stopped { border-style: solid; border-color: var(--line-strong); color: var(--ob-hold); }
 .ob-endpoint.is-pending { opacity: .62; }
 .ob-running-percent { justify-self: end; color: var(--accent); font-size: .88rem; font-variant-numeric: tabular-nums; }
 .ob-elapsed { justify-self: end; color: var(--muted); font-size: .72rem; font-variant-numeric: tabular-nums; }

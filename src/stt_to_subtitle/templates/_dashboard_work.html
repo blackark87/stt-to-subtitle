@@ -32,7 +32,7 @@
                     {% if phase.state == 'done' %}{{ icons.check(11) }}
                     {% elif phase.state == 'running' %}{{ icons.activity(11) }}
                     {% elif phase.state == 'failed' %}{{ icons.alert_triangle(11) }}
-                    {% elif phase.state in ['blocked', 'paused'] %}{{ icons.pause(11) }}
+                    {% elif phase.state in ['blocked', 'paused', 'stopped'] %}{{ icons.pause(11) }}
                     {% else %}{{ icons.clock(11) }}{% endif %}
                   </span>
                   <strong>{{ phase.label }}</strong>

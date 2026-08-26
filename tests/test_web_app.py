@@ -19,6 +19,7 @@ if WEB_TESTS_AVAILABLE:
 
 from stt_to_subtitle.web_config import WebSettings
 from stt_to_subtitle.gpu_monitoring import GpuDevice, GpuSnapshot
+from stt_to_subtitle.job_state import structured_state_from_legacy
 
 if WEB_TESTS_AVAILABLE:
     from stt_to_subtitle.web_app import (
@@ -56,6 +57,17 @@ class _StageJob:
         self.translation_chunks_completed = 0
         for key, value in values.items():
             setattr(self, key, value)
+        projected = structured_state_from_legacy(
+            status=str(self.status),
+            operation=str(self.operation),
+            blocked_stage=(
+                str(self.blocked_stage) if self.blocked_stage else None
+            ),
+        )
+        if "phase" not in values:
+            self.phase = projected.phase.value
+        if "state" not in values:
+            self.state = projected.state.value
 
 
 @unittest.skipUnless(
@@ -364,25 +376,54 @@ class WebAppTests(unittest.TestCase):
                     options={},
                 )
                 service.store.update(failed.id, status="failed")
+                stopped = service.store.create(
+                    job_id="stopped-job",
+                    source_rel="stopped.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                service.store.update(
+                    stopped.id,
+                    status="blocked",
+                    state="stopped",
+                    reason_code="user_stop",
+                    blocked_stage="transcription",
+                    error="사용자 요청으로 작업이 중단되었습니다.",
+                )
 
                 dashboard = client.get("/")
                 running_page = client.get("/jobs?status_group=running")
                 blocked_page = client.get("/jobs?status_group=blocked")
+                stopped_page = client.get("/jobs?status_group=stopped")
+                stopped_transcription_page = client.get(
+                    "/jobs?stage_filter=transcription&status_group=stopped"
+                )
                 failed_page = client.get("/jobs?status_group=failed")
                 invalid_page = client.get("/jobs?status_group=unknown")
 
             self.assertIn('href="/jobs?status_group=running"', dashboard.text)
             self.assertIn('href="/jobs?status_group=blocked"', dashboard.text)
             self.assertIn('href="/jobs?status_group=failed"', dashboard.text)
+            self.assertIn('href="/jobs?status_group=paused"', dashboard.text)
+            self.assertIn('href="/jobs?status_group=stopped"', dashboard.text)
             self.assertIn('href="/jobs?status_group=waiting"', dashboard.text)
             self.assertIn('href="/jobs?status_group=completed"', dashboard.text)
             self.assertIn("running.mkv", running_page.text)
             self.assertNotIn("blocked.mkv", running_page.text)
             self.assertNotIn("failed.mkv", running_page.text)
             self.assertIn("blocked.mkv", blocked_page.text)
+            self.assertNotIn("stopped.mkv", blocked_page.text)
             self.assertNotIn("failed.mkv", blocked_page.text)
             self.assertIn("failed.mkv", failed_page.text)
             self.assertNotIn("blocked.mkv", failed_page.text)
+            self.assertIn("stopped.mkv", stopped_page.text)
+            self.assertNotIn("blocked.mkv", stopped_page.text)
+            self.assertIn("stopped.mkv", stopped_transcription_page.text)
+            self.assertNotIn("blocked.mkv", stopped_transcription_page.text)
+            self.assertIn(
+                "전사 · 정지 작업",
+                stopped_transcription_page.text,
+            )
             self.assertIn(
                 "data-update-url=\"/jobs-fragment?status_group=running",
                 running_page.text,
@@ -514,7 +555,8 @@ class WebAppTests(unittest.TestCase):
                 "translation-running.mkv",
                 translation_completed.text,
             )
-            self.assertIn("rendering.mkv", completed.text)
+            self.assertNotIn("rendering.mkv", completed.text)
+            self.assertIn("transcription-completed.mkv", completed.text)
             self.assertIn("completed.mkv", completed.text)
             self.assertIn(
                 "stage_filter=completed&amp;jobs_page=1",
@@ -781,6 +823,8 @@ class WebAppTests(unittest.TestCase):
                 service.store.update(
                     stopped.id,
                     status="blocked",
+                    state="stopped",
+                    reason_code="user_stop",
                     blocked_stage="transcription",
                     error="사용자 요청으로 작업이 중단되었습니다.",
                 )

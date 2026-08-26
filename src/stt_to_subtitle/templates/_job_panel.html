@@ -9,9 +9,9 @@
       <p class="section-kicker">현재 작업 상태</p>
       <h2>
         <span
-          class="status status-{{ job.status }}"
-          title="내부 상태: {{ job.status }}"
-        >{{ job.status|job_status }}</span>
+          class="status status-{{ job.state }}"
+          title="단계: {{ job.phase }} · 상태: {{ job.state }}{% if job.reason_code %} · 사유: {{ job.reason_code }}{% endif %}"
+        >{{ job|job_contract_status }}</span>
       </h2>
     </div>
     <p class="job-overview-updated">
@@ -52,7 +52,8 @@
         <span class="job-stage-icon" aria-hidden="true">
           {%- if stage.state == 'done' %}{{ icons.check(13) }}
           {%- elif stage.state == 'running' %}{{ icons.activity(13) }}
-          {%- elif stage.state == 'blocked' %}{{ icons.pause(13) }}
+              {%- elif stage.state == 'blocked' %}{{ icons.pause(13) }}
+              {%- elif stage.state == 'stopped' %}{{ icons.pause(13) }}
           {%- elif stage.state == 'failed' %}{{ icons.alert_triangle(13) }}
           {%- elif stage.state == 'paused' %}{{ icons.pause(13) }}
           {%- else %}{{ icons.clock(13) }}{% endif -%}

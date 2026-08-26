@@ -9,7 +9,7 @@
     <div>
       <p class="page-kicker">{{ label }}</p>
       <h1>{{ filename }}</h1>
-      <p class="job-source-path"><span class="status status-{{ job.status }}">{{ job.status|job_status }}</span></p>
+      <p class="job-source-path"><span class="status status-{{ job.state }}">{{ job|job_contract_status }}</span></p>
     </div>
     <a href="/jobs/{{ job.id }}" class="button secondary">{{ icons.chevron_left(16) }}작업 상세로</a>
   </div>

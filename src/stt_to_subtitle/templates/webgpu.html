@@ -153,9 +153,9 @@
               <div class="phase-path">
                 <ol class="stages" style="grid-template-columns: repeat({{ job.phases|length }}, minmax(0, 1fr))" aria-label="처리 단계">
                   {% for phase in job.phases %}
-                    {% set phase_class = 'done' if phase.state == 'done' else ('run' if phase.state == 'running' else ('fail' if phase.state == 'failed' else ('hold' if phase.state in ['paused', 'blocked'] else 'wait'))) %}
+                    {% set phase_class = 'done' if phase.state == 'done' else ('run' if phase.state == 'running' else ('fail' if phase.state == 'failed' else ('hold' if phase.state in ['paused', 'blocked', 'stopped'] else 'wait'))) %}
                     <li class="st {{ phase_class }}">
-                      <span class="st-i" aria-hidden="true">{% if phase.state == 'done' %}✓{% elif phase.state == 'running' %}●{% elif phase.state == 'failed' %}!{% elif phase.state in ['paused', 'blocked'] %}Ⅱ{% else %}·{% endif %}</span>
+                      <span class="st-i" aria-hidden="true">{% if phase.state == 'done' %}✓{% elif phase.state == 'running' %}●{% elif phase.state == 'failed' %}!{% elif phase.state in ['paused', 'blocked', 'stopped'] %}Ⅱ{% else %}·{% endif %}</span>
                       <strong class="st-l">{{ phase.label }}</strong>
                       <span class="st-c">{{ phase.progress_label }}</span>
                       <span class="bar"><i style="width: {{ phase.percent }}%"></i></span>
@@ -163,7 +163,7 @@
                   {% endfor %}
                 </ol>
                 {% if job.endpoint %}
-                  {% set endpoint_class = 'done' if job.endpoint.state == 'done' else ('run' if job.endpoint.state == 'running' else ('fail' if job.endpoint.state == 'failed' else ('hold' if job.endpoint.state in ['paused', 'blocked'] else 'wait'))) %}
+                  {% set endpoint_class = 'done' if job.endpoint.state == 'done' else ('run' if job.endpoint.state == 'running' else ('fail' if job.endpoint.state == 'failed' else ('hold' if job.endpoint.state in ['paused', 'blocked', 'stopped'] else 'wait'))) %}
                   <span class="endpoint-state {{ endpoint_class }}" title="작업 종료점">{% if job.endpoint.state == 'done' %}✓{% elif job.endpoint.state == 'running' %}●{% else %}·{% endif %} {{ job.endpoint.display_label }}</span>
                 {% endif %}
               </div>
