@@ -304,35 +304,60 @@ class RemoteServerSettings:
 
 @dataclass(frozen=True)
 class SubtitleValidatorSettings:
+    provider: str = "openai_compatible"
     base_url: str = ""
     token: str = ""
     model: str = ""
+    region: str = ""
 
     @property
     def is_complete(self) -> bool:
-        return all(value.strip() for value in (self.base_url, self.model))
+        try:
+            self.normalized()
+        except ValueError:
+            return False
+        return True
 
     def normalized(self) -> SubtitleValidatorSettings:
-        missing = [
-            name
-            for name, value in (
-                ("SUBTITLE_VALIDATOR_BASE_URL", self.base_url),
-                ("SUBTITLE_VALIDATOR_MODEL", self.model),
+        provider = self.provider.strip().lower()
+        region = self.region.strip().lower()
+        if provider not in {"openrouter", "bedrock", "openai_compatible"}:
+            raise ValueError("지원하지 않는 상용 LLM 제공자입니다.")
+        required = [("검증 모델", self.model)]
+        if provider == "openrouter":
+            required.append(("OpenRouter API 키", self.token))
+        elif provider == "bedrock":
+            required.extend(
+                (
+                    ("Amazon Bedrock 리전", self.region),
+                    ("Amazon Bedrock API 키", self.token),
+                )
             )
-            if not value.strip()
-        ]
+        else:
+            required.append(("OpenAI 호환 API 주소", self.base_url))
+        missing = [name for name, value in required if not value.strip()]
         if missing:
-            raise ValueError(
-                "required subtitle validator settings are missing: "
-                f"{', '.join(missing)}"
-            )
+            raise ValueError(f"필수 검증 설정이 없습니다: {', '.join(missing)}")
+        if provider == "bedrock" and not re.fullmatch(
+            r"[a-z]{2}(?:-gov)?-[a-z]+-\d+",
+            region,
+        ):
+            raise ValueError("Amazon Bedrock 리전 형식이 올바르지 않습니다.")
         return SubtitleValidatorSettings(
-            base_url=normalize_server_url(
-                self.base_url,
-                "SUBTITLE_VALIDATOR_BASE_URL",
+            provider=provider,
+            base_url=(
+                "https://openrouter.ai/api/v1"
+                if provider == "openrouter"
+                else ""
+                if provider == "bedrock"
+                else normalize_server_url(
+                    self.base_url,
+                    "SUBTITLE_VALIDATOR_BASE_URL",
+                )
             ),
             token=self.token,
             model=self.model.strip(),
+            region=region if provider == "bedrock" else "",
         )
 
 

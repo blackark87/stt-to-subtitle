@@ -78,6 +78,7 @@ from .time_display import (
     format_kst_iso,
     format_kst_timestamp,
 )
+from .transcription_progress import TRANSCRIPTION_STAGE_LABELS
 from .whisperx_worker import WHISPERX_MAX_CHUNK_LENGTH_SECONDS
 from .whisperjav_worker import (
     DEFAULT_ANIME_MAX_GROUP_SECONDS,
@@ -395,6 +396,29 @@ def _job_progress_step(
         ),
     }
     completed, total = chunk_counts.get(key, (0, 0))
+    internal_stage = (
+        str(getattr(job, "transcription_stage", "") or "")
+        if key == "transcription" and state != "done"
+        else ""
+    )
+    internal_stage_index = (
+        int(getattr(job, "transcription_stage_index", 0))
+        if internal_stage
+        else 0
+    )
+    internal_stage_total = (
+        int(getattr(job, "transcription_stage_total", 0))
+        if internal_stage
+        else 0
+    )
+    uses_stage_progress = bool(
+        internal_stage in TRANSCRIPTION_STAGE_LABELS
+        and internal_stage_total > 0
+        and 1 <= internal_stage_index <= internal_stage_total
+    )
+    if uses_stage_progress:
+        completed = max(0, internal_stage_index - 1)
+        total = internal_stage_total
     percent = (
         round(completed * 100 / total)
         if total
@@ -403,13 +427,25 @@ def _job_progress_step(
     if state != "done":
         percent = min(99, percent)
     count_label = ""
-    total_is_estimate = (
-        key == "transcription" and chunks_total_estimate > chunks_created
+    total_is_estimate = bool(
+        not uses_stage_progress
+        and key == "transcription"
+        and chunks_total_estimate > chunks_created
     )
-    if total:
+    if total and not uses_stage_progress:
         count_label = (
             f"{completed}/{('≈' if total_is_estimate else '')}{total}"
         )
+    internal_stage_label = (
+        TRANSCRIPTION_STAGE_LABELS.get(internal_stage, internal_stage)
+        if uses_stage_progress
+        else ""
+    )
+    stage_position_label = (
+        f"{internal_stage_index}/{internal_stage_total}단계"
+        if uses_stage_progress
+        else ""
+    )
     return {
         "key": key,
         "label": JOB_STAGE_LABELS.get(key, key),
@@ -419,10 +455,20 @@ def _job_progress_step(
         "completed": completed,
         "total": total,
         "total_is_estimate": total_is_estimate,
+        "progress_unit": "stage" if uses_stage_progress else "chunk",
+        "internal_stage": internal_stage if uses_stage_progress else "",
+        "internal_stage_label": internal_stage_label,
+        "internal_stage_index": internal_stage_index,
+        "internal_stage_total": internal_stage_total,
         "percent": percent,
         "progress_label": " · ".join(
             part
-            for part in (STAGE_STATE_LABELS[state], count_label)
+            for part in (
+                STAGE_STATE_LABELS[state],
+                internal_stage_label,
+                stage_position_label,
+                count_label,
+            )
             if part
         ),
         "display_label": (
@@ -1118,6 +1164,20 @@ def dashboard_state_counts(jobs: Sequence[Any]) -> dict[str, int]:
     }
 
 
+def retriable_state_summary(jobs: Sequence[Any]) -> str:
+    """Describe globally retriable jobs without hiding their actual state."""
+    return " · ".join(
+        f"{JOB_STATE_LABELS[state]} {count}"
+        for state in ("blocked", "stopped", "failed")
+        if (
+            count := sum(
+                job.can_retry and job.state == state
+                for job in jobs
+            )
+        )
+    )
+
+
 def dashboard_pipeline_slots(
     jobs: Sequence[Any],
     *,
@@ -1333,6 +1393,7 @@ def dashboard_2d_data(
         ),
         "stoppable_job_count": sum(job.can_stop for job in jobs),
         "retriable_job_count": sum(job.can_retry for job in jobs),
+        "retriable_job_summary": retriable_state_summary(jobs),
         "library_progress": (
             library_progress_view(service) if include_library_progress else []
         ),
@@ -1466,6 +1527,9 @@ TEMPLATES.env.filters["job_stage"] = lambda value: JOB_STAGE_LABELS.get(
 TEMPLATES.env.filters["job_stages"] = job_stage_view
 TEMPLATES.env.filters["actor_label"] = media_actor_label
 TEMPLATES.env.filters["job_progress"] = job_progress_view
+TEMPLATES.env.filters["transcription_stage_label"] = (
+    lambda value: TRANSCRIPTION_STAGE_LABELS.get(str(value), str(value))
+)
 TEMPLATES.env.filters["event_level"] = lambda value: EVENT_LEVEL_LABELS.get(
     str(value),
     str(value),
@@ -2141,6 +2205,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             "retriable_phase_groups": retriable_phase_groups,
             "stoppable_job_count": sum(job.can_stop for job in open_jobs),
             "retriable_job_count": sum(job.can_retry for job in open_jobs),
+            "retriable_job_summary": retriable_state_summary(open_jobs),
             "pausable_translation_count": sum(
                 job.can_pause_translation for job in open_jobs
             ),
@@ -3530,10 +3595,12 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
     def save_subtitle_validator_settings(
         request: Request,
         csrf_token: str = Form(""),
-        validator_base_url: str = Form(...),
+        validator_provider: str = Form("openai_compatible"),
+        validator_base_url: str = Form(""),
         validator_token: str = Form(""),
         clear_validator_token: bool = Form(False),
         validator_model: str = Form(...),
+        validator_region: str = Form(""),
     ) -> Any:
         if not is_authenticated(request):
             return login_redirect()
@@ -3541,7 +3608,9 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         service = orchestrator(request)
         current = service.subtitle_validator_view()
         stored = service.store.get_subtitle_validator_settings() or {}
+        normalized_provider = validator_provider.strip().lower()
         updated = SubtitleValidatorSettings(
+            provider=normalized_provider,
             base_url=validator_base_url,
             token=(
                 ""
@@ -3549,8 +3618,11 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                 else validator_token
                 if validator_token
                 else str(stored.get("token", ""))
+                if stored.get("provider") == normalized_provider
+                else ""
             ),
             model=validator_model,
+            region=validator_region,
         )
         try:
             service.update_subtitle_validator(updated)
@@ -3558,8 +3630,10 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             context = settings_context(request, error=str(error))
             context["subtitle_validator"] = {
                 **current,
+                "provider": normalized_provider,
                 "base_url": validator_base_url,
                 "model": validator_model,
+                "region": validator_region,
             }
             return TEMPLATES.TemplateResponse(
                 request,

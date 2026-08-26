@@ -212,6 +212,95 @@ class SubtitleValidationClientTests(unittest.TestCase):
             "json_schema",
         )
 
+    def test_openrouter_uses_fixed_endpoint_and_structured_routing(
+        self,
+    ) -> None:
+        response = Mock(status_code=200)
+        response.json.return_value = {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "severity": "pass",
+                                "summary": "통과",
+                                "findings": [],
+                            },
+                            ensure_ascii=False,
+                        )
+                    }
+                }
+            ]
+        }
+        client = SubtitleValidationClient(
+            "https://ignored.test/v1",
+            "openrouter-key",
+            "anthropic/claude-sonnet",
+            provider="openrouter",
+        )
+
+        with patch.object(client, "request", return_value=response) as request:
+            client.validate({"segments": []})
+
+        args, kwargs = request.call_args
+        self.assertEqual(
+            args,
+            ("POST", "https://openrouter.ai/api/v1/chat/completions"),
+        )
+        self.assertEqual(
+            kwargs["json"]["provider"],
+            {"require_parameters": True},
+        )
+
+    def test_bedrock_uses_converse_structured_output(self) -> None:
+        response = Mock(status_code=200)
+        response.json.return_value = {
+            "output": {
+                "message": {
+                    "content": [
+                        {
+                            "text": json.dumps(
+                                {
+                                    "severity": "pass",
+                                    "summary": "통과",
+                                    "findings": [],
+                                },
+                                ensure_ascii=False,
+                            )
+                        }
+                    ]
+                }
+            }
+        }
+        client = SubtitleValidationClient(
+            "",
+            "bedrock-key",
+            "us.anthropic.claude-sonnet-4-6",
+            provider="bedrock",
+            region="ap-northeast-2",
+        )
+
+        with patch.object(client, "request", return_value=response) as request:
+            client.validate({"segments": []})
+
+        args, kwargs = request.call_args
+        self.assertEqual(
+            args,
+            (
+                "POST",
+                "https://bedrock-runtime.ap-northeast-2.amazonaws.com/"
+                "model/us.anthropic.claude-sonnet-4-6/converse",
+            ),
+        )
+        self.assertEqual(
+            kwargs["json"]["outputConfig"]["textFormat"]["type"],
+            "json_schema",
+        )
+        schema = kwargs["json"]["outputConfig"]["textFormat"]["structure"][
+            "jsonSchema"
+        ]["schema"]
+        self.assertEqual(json.loads(schema)["type"], "object")
+
     def test_rejects_an_invalid_structured_validation(self) -> None:
         response = Mock(status_code=200)
         response.json.return_value = {
@@ -539,6 +628,67 @@ class STTAPIClientProgressTests(unittest.TestCase):
         self.assertEqual(client.request.call_count, 2)
         self.assertTrue(client.request.call_args_list[0].kwargs["stream"])
         sleep.assert_not_called()
+
+    def test_forwards_changed_internal_stage_progress(self) -> None:
+        events = self.event_stream(
+            {
+                "status": "running",
+                "stage_progress": {
+                    "stage": "primary_transcription",
+                    "index": 2,
+                    "total": 7,
+                },
+            },
+            {
+                "status": "running",
+                "stage_progress": {
+                    "stage": "primary_transcription",
+                    "index": 2,
+                    "total": 7,
+                },
+            },
+            {
+                "status": "completed",
+                "stage_progress": {
+                    "stage": "subtitle_normalization",
+                    "index": 7,
+                    "total": 7,
+                },
+            },
+        )
+        result = Mock(status_code=200)
+        result.json.return_value = {
+            "schema_version": 1,
+            "job_id": "remote-job",
+            "segments": [],
+        }
+        client = STTAPIClient("http://stt.test", "")
+        client.request = Mock(side_effect=[events, result])
+        progress = []
+
+        client.transcribe(
+            Path("/not-read.wav"),
+            options={},
+            idempotency_key="key",
+            existing_job_id="remote-job",
+            on_progress=progress.append,
+        )
+
+        self.assertEqual(
+            progress,
+            [
+                {
+                    "stage": "primary_transcription",
+                    "stage_index": 2,
+                    "stage_total": 7,
+                },
+                {
+                    "stage": "subtitle_normalization",
+                    "stage_index": 7,
+                    "stage_total": 7,
+                },
+            ],
+        )
 
 
 class TranslationResponseTests(unittest.TestCase):

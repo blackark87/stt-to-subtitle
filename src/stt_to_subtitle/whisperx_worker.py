@@ -16,6 +16,11 @@ from typing import Any, Mapping, Sequence
 from .files import write_json_atomic
 from .stt_quality import repetition_diagnostics
 from .stt_trace import StageArtifactRecorder
+from .transcription_progress import (
+    StageProgressCallback,
+    report_stage_progress,
+    write_stage_progress,
+)
 
 WHISPERX_PACKAGE_VERSION = "3.8.6"
 DEFAULT_WHISPERX_MODEL = "large-v3"
@@ -484,6 +489,7 @@ def run_whisperx(
     options: Mapping[str, Any],
     *,
     debug_artifact_dir: Path | None = None,
+    progress_callback: StageProgressCallback | None = None,
 ) -> dict[str, Any]:
     """Run WhisperX ASR, Japanese alignment, and speaker diarization."""
     import whisperx
@@ -543,7 +549,15 @@ def run_whisperx(
         raise ValueError("repetition_min_count must be at least 2")
     started = time.monotonic()
     recorder = StageArtifactRecorder(debug_artifact_dir)
+    hybrid = str(options.get("backend", "whisperx")) == "hybrid"
+    stage_total = 7 if hybrid else 4
 
+    report_stage_progress(
+        progress_callback,
+        "primary_transcription",
+        1,
+        stage_total,
+    )
     audio = whisperx.load_audio(str(audio_path))
     model = whisperx.load_model(
         model_name,
@@ -572,6 +586,12 @@ def run_whisperx(
         del model
         _release_cuda()
 
+    report_stage_progress(
+        progress_callback,
+        "forced_alignment",
+        2,
+        stage_total,
+    )
     align_model, align_metadata = whisperx.load_align_model(
         language_code=language,
         device=device,
@@ -595,6 +615,12 @@ def run_whisperx(
         del align_model
         _release_cuda()
 
+    report_stage_progress(
+        progress_callback,
+        "speaker_diarization",
+        3,
+        stage_total,
+    )
     diarization = DiarizationPipeline(
         token=hf_token,
         device=diarization_device,
@@ -621,6 +647,13 @@ def run_whisperx(
         del diarization
         _release_cuda()
 
+    if not hybrid:
+        report_stage_progress(
+            progress_callback,
+            "subtitle_normalization",
+            4,
+            stage_total,
+        )
     raw_segments = result.get("segments", [])
     if not isinstance(raw_segments, list):
         raw_segments = []
@@ -719,6 +752,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--options", required=True)
     parser.add_argument("--debug-dir", type=Path)
+    parser.add_argument("--progress", type=Path)
     return parser.parse_args()
 
 
@@ -731,6 +765,14 @@ def main() -> None:
         args.audio,
         options,
         debug_artifact_dir=args.debug_dir,
+        progress_callback=(
+            lambda stage, index, total: write_stage_progress(
+                args.progress,
+                stage,
+                index,
+                total,
+            )
+        ),
     )
     write_json_atomic(args.output, payload)
 

@@ -213,6 +213,32 @@ class JobStageViewTests(unittest.TestCase):
         self.assertEqual(transcription["completed"], 3)
         self.assertEqual(transcription["total"], 12)
 
+    def test_internal_stage_replaces_estimated_chunks_for_worker_backends(
+        self,
+    ) -> None:
+        from stt_to_subtitle.web_app import job_stage_view
+
+        stages = job_stage_view(
+            _StageJob(
+                status="transcription_running",
+                chunks_total_estimate=7390,
+                transcription_stage="primary_transcription",
+                transcription_stage_index=2,
+                transcription_stage_total=7,
+            )
+        )
+
+        transcription = next(s for s in stages if s["key"] == "transcription")
+        self.assertEqual(transcription["progress_unit"], "stage")
+        self.assertEqual(transcription["internal_stage_label"], "1차 전사")
+        self.assertEqual(
+            transcription["progress_label"],
+            "진행 중 · 1차 전사 · 2/7단계",
+        )
+        self.assertEqual(transcription["completed"], 1)
+        self.assertEqual(transcription["total"], 7)
+        self.assertFalse(transcription["total_is_estimate"])
+
     def test_pipeline_progress_combines_stage_and_chunk_progress(self) -> None:
         from stt_to_subtitle.web_app import job_progress_view
 
@@ -316,7 +342,9 @@ class WebAppTests(unittest.TestCase):
             media_root = root / "media"
             media_root.mkdir()
 
-            with TestClient(create_app(self.settings(root, media_root))) as client:
+            with TestClient(
+                create_app(self.settings(root, media_root))
+            ) as client:
                 service = client.app.state.orchestrator
                 service.stop()
                 job = service.store.create(
@@ -351,7 +379,9 @@ class WebAppTests(unittest.TestCase):
             root = Path(directory)
             media_root = root / "media"
             media_root.mkdir()
-            with TestClient(create_app(self.settings(root, media_root))) as client:
+            with TestClient(
+                create_app(self.settings(root, media_root))
+            ) as client:
                 service = client.app.state.orchestrator
                 service.stop()
                 running = service.store.create(
@@ -449,7 +479,9 @@ class WebAppTests(unittest.TestCase):
             root = Path(directory)
             media_root = root / "media"
             media_root.mkdir()
-            with TestClient(create_app(self.settings(root, media_root))) as client:
+            with TestClient(
+                create_app(self.settings(root, media_root))
+            ) as client:
                 service = client.app.state.orchestrator
                 service.stop()
                 for job_id, status in (
@@ -679,6 +711,12 @@ class WebAppTests(unittest.TestCase):
             )
             self.assertIn(
                 "grid-template-columns: repeat(4, minmax(0, 1fr))",
+                stylesheet.text,
+            )
+            self.assertIn("--control-height: 40px", stylesheet.text)
+            self.assertIn("--control-height-compact: 32px", stylesheet.text)
+            self.assertIn(
+                "min-height: var(--control-height-compact)",
                 stylesheet.text,
             )
 
@@ -1097,6 +1135,10 @@ class WebAppTests(unittest.TestCase):
             self.assertEqual(renderer_core.status_code, 200)
             self.assertEqual(stylesheet.status_code, 200)
             self.assertIn("--accent", stylesheet.text)
+            self.assertIn(
+                "--h-ctl: 40px; --h-sm: 32px; --h-badge: 32px",
+                stylesheet.text,
+            )
             self.assertEqual(app_stylesheet.status_code, 200)
             self.assertIn(".desktop-3d-only", app_stylesheet.text)
             self.assertIn(
@@ -1530,9 +1572,9 @@ class WebAppTests(unittest.TestCase):
                 saved = client.post(
                     "/settings/subtitle-validator",
                     data={
-                        "validator_base_url": "https://validator.test/v1/",
+                        "validator_provider": "openrouter",
                         "validator_token": "paid-secret",
-                        "validator_model": "paid-model",
+                        "validator_model": "anthropic/claude-sonnet",
                     },
                     follow_redirects=False,
                 )
@@ -1540,18 +1582,54 @@ class WebAppTests(unittest.TestCase):
                 refreshed = client.get("/settings?validator_saved=true")
 
             self.assertIn("상용 LLM 자막 검증", page.text)
+            self.assertIn("OpenRouter", page.text)
+            self.assertIn("Amazon Bedrock", page.text)
             self.assertEqual(saved.status_code, 303)
             self.assertEqual(
                 service.subtitle_validator_view(),
                 {
-                    "base_url": "https://validator.test/v1",
+                    "provider": "openrouter",
+                    "base_url": "https://openrouter.ai/api/v1",
                     "token_configured": True,
-                    "model": "paid-model",
+                    "model": "anthropic/claude-sonnet",
+                    "region": "",
                     "configured": True,
                 },
             )
             self.assertIn("상용 LLM 검증 설정을 저장했습니다.", refreshed.text)
             self.assertNotIn("paid-secret", refreshed.text)
+
+    def test_saves_bedrock_subtitle_validator_settings(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+
+            with TestClient(create_app(self.settings(root, media_root))) as client:
+                saved = client.post(
+                    "/settings/subtitle-validator",
+                    data={
+                        "validator_provider": "bedrock",
+                        "validator_region": "AP-NORTHEAST-2",
+                        "validator_token": "bedrock-secret",
+                        "validator_model": "us.anthropic.claude-sonnet-4-6",
+                    },
+                    follow_redirects=False,
+                )
+                service = client.app.state.orchestrator
+
+            self.assertEqual(saved.status_code, 303)
+            self.assertEqual(
+                service.subtitle_validator_view(),
+                {
+                    "provider": "bedrock",
+                    "base_url": "",
+                    "token_configured": True,
+                    "model": "us.anthropic.claude-sonnet-4-6",
+                    "region": "ap-northeast-2",
+                    "configured": True,
+                },
+            )
 
     def test_translation_settings_hide_runtime_controls_and_errors(self) -> None:
         with TemporaryDirectory() as directory:
@@ -2826,6 +2904,8 @@ class WebAppTests(unittest.TestCase):
             self.assertIn("20", page.text)
             self.assertIn("21 전체", page.text)
             self.assertIn("1 남음", page.text)
+            self.assertIn("전사 세그먼트", page.text)
+            self.assertNotIn("전사 청크", page.text)
             self.assertIn('class="job-stage-strip job-detail-stage-strip"', page.text)
             for stage_label in ("추출", "전사", "번역"):
                 self.assertIn(
@@ -2985,16 +3065,17 @@ class WebAppTests(unittest.TestCase):
 
             self.assertIn("전사 이력", page.text)
             self.assertIn("전사 리비전 1", page.text)
-            self.assertIn("전사 리비전 2 · 현재 사용 중", page.text)
+            self.assertIn("전사 리비전 2", page.text)
+            self.assertNotIn("현재 사용 중", page.text)
+            self.assertIn("자동 전사 · WhisperX", page.text)
+            self.assertNotIn("model-v1", page.text)
             self.assertIn('name="transcript_revision_id"', page.text)
             self.assertEqual(invalid.status_code, 400)
             self.assertEqual(selected.status_code, 303)
             self.assertEqual(refreshed.transcript_revision_id, "revision-1")
             self.assertEqual(generation["transcript_revision_id"], "revision-1")
-            self.assertIn(
-                "전사 리비전 1 · 현재 사용 중",
-                selected_page.text,
-            )
+            self.assertIn("전사 리비전 1", selected_page.text)
+            self.assertNotIn("현재 사용 중", selected_page.text)
 
     def test_media_cards_show_job_state_and_link_to_latest_detail(self) -> None:
         with TemporaryDirectory() as directory:
@@ -3503,7 +3584,10 @@ class WebAppTests(unittest.TestCase):
                 queued = service.store.get(queued.id)
 
             self.assertIn('action="/jobs/retry-all"', fragment.text)
-            self.assertIn("전체 재시도 (2)", fragment.text)
+            self.assertIn(
+                "전체 작업 재시도 (중단 1 · 실패 1)",
+                fragment.text,
+            )
             self.assertIn(
                 'name="return_folder" value="series"',
                 fragment.text,
@@ -3514,10 +3598,62 @@ class WebAppTests(unittest.TestCase):
                 "/media?folder=series&jobs_retried=2",
             )
             self.assertIn("작업 2개를 재시도했습니다.", notice.text)
-            self.assertIn("전체 재시도 (0)", refreshed.text)
+            self.assertIn("전체 작업 재시도", refreshed.text)
+            self.assertNotIn("전체 작업 재시도 (", refreshed.text)
             self.assertEqual(blocked.status, "queued")
             self.assertEqual(failed.status, "queued")
             self.assertEqual(queued.status, "queued")
+
+    def test_global_retry_action_names_stopped_jobs_outside_current_filter(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+
+            with TestClient(
+                create_app(self.settings(root, media_root))
+            ) as client:
+                service = client.app.state.orchestrator
+                service.stop()
+                service.store.create(
+                    job_id="waiting-extraction",
+                    source_rel="waiting-extraction.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                stopped = service.store.create(
+                    job_id="stopped-translation",
+                    source_rel="stopped-translation.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                service.store.update(
+                    stopped.id,
+                    status="blocked",
+                    state="stopped",
+                    blocked_stage="translation",
+                    reason_code="user_stop",
+                )
+
+                page = client.get(
+                    "/jobs?phase=extraction&state=waiting"
+                )
+                stopped = service.store.get(stopped.id)
+
+            self.assertEqual(page.status_code, 200)
+            self.assertEqual(stopped.state, "stopped")
+            self.assertIn(
+                "전체 작업 재시도 (정지 1)",
+                page.text,
+            )
+            self.assertRegex(
+                page.text,
+                r'href="/jobs\?phase=extraction&amp;state=stopped"\s*'
+                r'>\s*<span>정지</span>\s*'
+                r'<span class="job-filter-count" aria-label="0건">0</span>',
+            )
 
     def test_filtered_job_list_retries_selected_jobs_across_pages(self) -> None:
         with TemporaryDirectory() as directory:
@@ -3604,7 +3740,10 @@ class WebAppTests(unittest.TestCase):
             self.assertIn("목록 전체 선택", blocked_page.text)
             self.assertIn("선택 재시도", blocked_page.text)
             self.assertIn("전사 재시도 (25)", blocked_page.text)
-            self.assertIn("중단·정지·실패 전체 재시도 (26)", blocked_page.text)
+            self.assertIn(
+                "전체 작업 재시도 (중단 25 · 실패 1)",
+                blocked_page.text,
+            )
             self.assertEqual(
                 failed_page.text.count("data-retry-job-checkbox"),
                 1,

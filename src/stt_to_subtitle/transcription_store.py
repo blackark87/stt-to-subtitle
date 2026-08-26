@@ -12,6 +12,7 @@ from typing import Any, Callable, Iterator, Mapping
 
 from .storage_paths import rebase_stored_path
 from .time_display import format_kst_iso
+from .transcription_progress import validate_stage_progress
 
 
 @dataclass(frozen=True)
@@ -28,6 +29,9 @@ class TranscriptionJob:
     chunks_completed: int
     created_at: float
     updated_at: float
+    transcription_stage: str | None = None
+    transcription_stage_index: int = 0
+    transcription_stage_total: int = 0
     attempt: int = 1
     cancel_requested_at: float | None = None
     cancelled_at: float | None = None
@@ -62,6 +66,15 @@ class TranscriptionJob:
                 "in_progress": in_progress,
                 "report_every": report_every,
             },
+            "stage_progress": (
+                {
+                    "stage": self.transcription_stage,
+                    "index": self.transcription_stage_index,
+                    "total": self.transcription_stage_total,
+                }
+                if self.transcription_stage is not None
+                else None
+            ),
             "created_at": format_kst_iso(self.created_at),
             "updated_at": format_kst_iso(self.updated_at),
         }
@@ -145,6 +158,9 @@ class TranscriptionStore:
                     error TEXT,
                     chunks_created INTEGER NOT NULL DEFAULT 0,
                     chunks_completed INTEGER NOT NULL DEFAULT 0,
+                    transcription_stage TEXT,
+                    transcription_stage_index INTEGER NOT NULL DEFAULT 0,
+                    transcription_stage_total INTEGER NOT NULL DEFAULT 0,
                     attempt INTEGER NOT NULL DEFAULT 1,
                     cancel_requested_at REAL,
                     cancelled_at REAL,
@@ -175,6 +191,21 @@ class TranscriptionStore:
                     ALTER TABLE transcription_jobs
                     ADD COLUMN chunks_completed INTEGER NOT NULL DEFAULT 0
                     """
+                )
+            if "transcription_stage" not in columns:
+                connection.execute(
+                    "ALTER TABLE transcription_jobs "
+                    "ADD COLUMN transcription_stage TEXT"
+                )
+            if "transcription_stage_index" not in columns:
+                connection.execute(
+                    "ALTER TABLE transcription_jobs ADD COLUMN "
+                    "transcription_stage_index INTEGER NOT NULL DEFAULT 0"
+                )
+            if "transcription_stage_total" not in columns:
+                connection.execute(
+                    "ALTER TABLE transcription_jobs ADD COLUMN "
+                    "transcription_stage_total INTEGER NOT NULL DEFAULT 0"
                 )
             if "attempt" not in columns:
                 connection.execute(
@@ -238,6 +269,13 @@ class TranscriptionStore:
             chunks_completed=int(row["chunks_completed"]),
             created_at=float(row["created_at"]),
             updated_at=float(row["updated_at"]),
+            transcription_stage=(
+                str(row["transcription_stage"])
+                if row["transcription_stage"] is not None
+                else None
+            ),
+            transcription_stage_index=int(row["transcription_stage_index"]),
+            transcription_stage_total=int(row["transcription_stage_total"]),
             attempt=int(row["attempt"]),
             cancel_requested_at=(
                 float(row["cancel_requested_at"])
@@ -511,6 +549,9 @@ class TranscriptionStore:
                 SET status = 'queued', error = NULL, failure_code = NULL,
                     retryable = NULL, failure_scope = NULL,
                     chunks_created = 0, chunks_completed = 0,
+                    transcription_stage = NULL,
+                    transcription_stage_index = 0,
+                    transcription_stage_total = 0,
                     attempt = attempt + 1,
                     cancel_requested_at = NULL, cancelled_at = NULL,
                     updated_at = ?{options_assignment}
@@ -541,6 +582,40 @@ class TranscriptionStore:
             )
         if result.rowcount == 1:
             self._notify_change(job_id)
+
+    def update_stage_progress(
+        self,
+        job_id: str,
+        *,
+        stage: str,
+        index: int,
+        total: int,
+    ) -> bool:
+        stage_value, index_value, total_value = validate_stage_progress(
+            stage,
+            index,
+            total,
+        )
+        with self._connect() as connection:
+            result = connection.execute(
+                """
+                UPDATE transcription_jobs
+                SET transcription_stage = ?, transcription_stage_index = ?,
+                    transcription_stage_total = ?, updated_at = ?
+                WHERE id = ? AND status IN ('running', 'cancel_requested')
+                """,
+                (
+                    stage_value,
+                    index_value,
+                    total_value,
+                    time.time(),
+                    job_id,
+                ),
+            )
+        changed = result.rowcount == 1
+        if changed:
+            self._notify_change(job_id)
+        return changed
 
     def fail_interrupted_jobs(self) -> int:
         with self._connect() as connection:

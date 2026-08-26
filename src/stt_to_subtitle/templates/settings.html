@@ -170,30 +170,48 @@
         </p>
       </div>
     </div>
-    <form method="post" action="/settings/subtitle-validator" class="stack">
+    <form
+      method="post"
+      action="/settings/subtitle-validator"
+      class="stack"
+      data-validator-settings
+    >
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-      <label>OpenAI 호환 API 주소
+      <label>검증 제공자
+        <select name="validator_provider" data-validator-provider required>
+          <option value="openrouter"{% if subtitle_validator.provider == "openrouter" %} selected{% endif %}>OpenRouter</option>
+          <option value="bedrock"{% if subtitle_validator.provider == "bedrock" %} selected{% endif %}>Amazon Bedrock</option>
+          <option value="openai_compatible"{% if subtitle_validator.provider == "openai_compatible" %} selected{% endif %}>OpenAI 호환 직접 연결</option>
+        </select>
+      </label>
+      <label data-validator-field="base_url">OpenAI 호환 API 주소
         <input
           name="validator_base_url"
           type="url"
           value="{{ subtitle_validator.base_url }}"
           placeholder="https://api.example.com/v1"
-          required
         >
       </label>
-      <label>API 토큰
+      <label data-validator-field="region">Amazon Bedrock 리전
+        <input
+          name="validator_region"
+          value="{{ subtitle_validator.region }}"
+          placeholder="ap-northeast-2"
+        >
+      </label>
+      <label>API 키
         <input
           name="validator_token"
           type="password"
           value=""
-          placeholder="{% if subtitle_validator.token_configured %}저장된 토큰 유지{% else %}API 토큰{% endif %}"
+          placeholder="{% if subtitle_validator.token_configured %}저장된 API 키 유지{% else %}검증 제공자 API 키{% endif %}"
           autocomplete="new-password"
         >
       </label>
       {% if subtitle_validator.token_configured %}
         <label class="check">
           <input name="clear_validator_token" type="checkbox" value="true">
-          <span>저장된 검증 API 토큰 삭제</span>
+          <span>저장된 검증 API 키 삭제</span>
         </label>
       {% endif %}
       <label>검증 모델

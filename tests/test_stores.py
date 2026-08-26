@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 import signal
 import sqlite3
 import subprocess
@@ -60,10 +61,16 @@ class TranscriptionStoreTests(unittest.TestCase):
                 options={},
             )
             store.update("job-1", status="running")
+            store.update_stage_progress(
+                "job-1",
+                stage="primary_transcription",
+                index=1,
+                total=4,
+            )
             store.update_chunk_progress("job-1", created=2, completed=1)
             store.requeue("job-1")
 
-            self.assertEqual(changed_job_ids, ["job-1"] * 4)
+            self.assertEqual(changed_job_ids, ["job-1"] * 5)
 
     def test_counts_transcription_queue_states(self) -> None:
         with TemporaryDirectory() as directory:
@@ -141,6 +148,15 @@ class TranscriptionStoreTests(unittest.TestCase):
                 created=100,
                 completed=90,
             )
+            store.update("job-1", status="running")
+            self.assertTrue(
+                store.update_stage_progress(
+                    "job-1",
+                    stage="forced_alignment",
+                    index=2,
+                    total=4,
+                )
+            )
             store.update(
                 "job-1",
                 status="failed",
@@ -158,11 +174,56 @@ class TranscriptionStoreTests(unittest.TestCase):
             job = store.get("job-1")
             self.assertEqual(job.chunks_created, 0)
             self.assertEqual(job.chunks_completed, 0)
+            self.assertIsNone(job.transcription_stage)
+            self.assertEqual(job.transcription_stage_index, 0)
+            self.assertEqual(job.transcription_stage_total, 0)
             self.assertEqual(job.attempt, 2)
             self.assertEqual(job.options["chunk_length_seconds"], 30)
             self.assertIsNone(job.failure_code)
             self.assertIsNone(job.retryable)
             self.assertIsNone(job.failure_scope)
+
+    def test_persists_public_transcription_stage_progress(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = TranscriptionStore(Path(directory) / "jobs.sqlite3")
+            store.create(
+                job_id="job-1",
+                idempotency_key="key-1",
+                audio_path=Path(directory) / "audio.wav",
+                audio_sha256="abc",
+                options={"backend": "whisperjav"},
+            )
+            self.assertFalse(
+                store.update_stage_progress(
+                    "job-1",
+                    stage="scene_detection",
+                    index=1,
+                    total=7,
+                )
+            )
+            store.update("job-1", status="running")
+
+            self.assertTrue(
+                store.update_stage_progress(
+                    "job-1",
+                    stage="primary_transcription",
+                    index=2,
+                    total=7,
+                )
+            )
+
+            job = store.get("job-1")
+            self.assertEqual(job.transcription_stage, "primary_transcription")
+            self.assertEqual(job.transcription_stage_index, 2)
+            self.assertEqual(job.transcription_stage_total, 7)
+            self.assertEqual(
+                job.public_dict()["stage_progress"],
+                {
+                    "stage": "primary_transcription",
+                    "index": 2,
+                    "total": 7,
+                },
+            )
 
     def test_cancels_queued_job_immediately_and_running_job_cooperatively(
         self,
@@ -747,8 +808,8 @@ class JobStoreTests(unittest.TestCase):
             self.assertEqual(
                 snapshot["database"]["migrations"],
                 {
-                    "applied_count": 5,
-                    "latest_sequence": 40,
+                    "applied_count": 8,
+                    "latest_sequence": 52,
                     "unsequenced_count": 0,
                 },
             )
@@ -1375,17 +1436,21 @@ class JobStoreTests(unittest.TestCase):
             store = JobStore(database_path)
 
             store.save_subtitle_validator_settings(
+                provider="openrouter",
                 base_url="https://validator.test/v1",
                 token="paid-token",
                 model="paid-model",
+                region="",
             )
 
             self.assertEqual(
                 JobStore(database_path).get_subtitle_validator_settings(),
                 {
+                    "provider": "openrouter",
                     "base_url": "https://validator.test/v1",
                     "token": "paid-token",
                     "model": "paid-model",
+                    "region": "",
                 },
             )
 
@@ -1410,11 +1475,13 @@ class JobStoreTests(unittest.TestCase):
             updated = store.save_subtitle_llm_validation(
                 validation["id"],
                 result={"severity": "pass", "summary": "통과", "findings": []},
+                provider="openrouter",
                 model="paid-model",
                 input_hash="input-v1",
             )
 
             self.assertEqual(updated["llm"]["severity"], "pass")
+            self.assertEqual(updated["validator_provider"], "openrouter")
             self.assertEqual(
                 store.get_subtitle_validation(
                     job_id="job-1",
@@ -2046,6 +2113,30 @@ class JobStoreTests(unittest.TestCase):
             self.assertEqual(job.transcription_chunks_remaining, 4)
             self.assertEqual(job.chunk_progress_every, 10)
 
+    def test_persists_transcription_internal_stage_for_the_job_panel(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            store = JobStore(Path(directory) / "jobs.sqlite3")
+            store.create(
+                job_id="job-1",
+                source_rel="movie.mkv",
+                force_overwrite=False,
+                options={"backend": "hybrid"},
+            )
+
+            store.update(
+                "job-1",
+                transcription_stage="quality_analysis",
+                transcription_stage_index=4,
+                transcription_stage_total=7,
+            )
+
+            job = store.get("job-1")
+            self.assertEqual(job.transcription_stage, "quality_analysis")
+            self.assertEqual(job.transcription_stage_index, 4)
+            self.assertEqual(job.transcription_stage_total, 7)
+
     def test_adds_progress_columns_to_an_existing_web_database(self) -> None:
         with TemporaryDirectory() as directory:
             database_path = Path(directory) / "jobs.sqlite3"
@@ -2099,6 +2190,9 @@ class JobStoreTests(unittest.TestCase):
             self.assertEqual(job.chunks_completed, 0)
             self.assertEqual(job.chunks_total_estimate, 0)
             self.assertEqual(job.chunk_progress_every, 10)
+            self.assertIsNone(job.transcription_stage)
+            self.assertEqual(job.transcription_stage_index, 0)
+            self.assertEqual(job.transcription_stage_total, 0)
             self.assertEqual(job.operation, "full")
             self.assertEqual(job.translation_chunks_total, 0)
             self.assertEqual(job.translation_chunks_completed, 0)
@@ -2117,6 +2211,52 @@ class JobStoreTests(unittest.TestCase):
             self.assertEqual(stopped.phase, "translation")
             self.assertEqual(stopped.state, "stopped")
             self.assertEqual(stopped.reason_code, "user_stop")
+
+    def test_adds_internal_stage_columns_after_legacy_migration_completed(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            database_path = Path(directory) / "jobs.sqlite3"
+            JobStore(database_path)
+            with sqlite3.connect(database_path) as connection:
+                connection.execute(
+                    "DELETE FROM schema_migrations "
+                    "WHERE name = 'transcription_stage_progress_v1'"
+                )
+                connection.execute(
+                    "ALTER TABLE jobs DROP COLUMN transcription_stage"
+                )
+                connection.execute(
+                    "ALTER TABLE jobs DROP COLUMN transcription_stage_index"
+                )
+                connection.execute(
+                    "ALTER TABLE jobs DROP COLUMN transcription_stage_total"
+                )
+
+            JobStore(database_path)
+
+            with sqlite3.connect(database_path) as connection:
+                columns = {
+                    str(row[1])
+                    for row in connection.execute(
+                        "PRAGMA table_info(jobs)"
+                    ).fetchall()
+                }
+                migration = connection.execute(
+                    "SELECT name FROM schema_migrations "
+                    "WHERE name = 'transcription_stage_progress_v1'"
+                ).fetchone()
+            self.assertTrue(
+                {
+                    "transcription_stage",
+                    "transcription_stage_index",
+                    "transcription_stage_total",
+                }.issubset(columns)
+            )
+            self.assertEqual(
+                migration[0],
+                "transcription_stage_progress_v1",
+            )
 
     def test_adds_chunk_count_to_existing_transcript_revisions(self) -> None:
         with TemporaryDirectory() as directory:
@@ -2154,6 +2294,63 @@ class JobStoreTests(unittest.TestCase):
             revisions = store.transcript_revisions("job-1")
 
             self.assertEqual(revisions[0]["chunks_total"], 0)
+
+    def test_replaces_completed_chunk_estimate_with_segment_count(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            database_path = root / "jobs.sqlite3"
+            store = JobStore(database_path)
+            job = store.create(
+                job_id="job-1",
+                source_rel="movie.mkv",
+                force_overwrite=False,
+                options={"backend": "whisperjav"},
+            )
+            transcript_path = root / "transcript.json"
+            transcript_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "job_id": "remote-1",
+                        "segments": [
+                            {"id": "segment-1"},
+                            {"id": "segment-2"},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            store.record_transcript_revision(
+                revision_id="revision-1",
+                job_id=job.id,
+                audio_revision_id=None,
+                remote_job_id="remote-1",
+                backend="whisperjav",
+                model_revision="revision",
+                options_hash="options",
+                artifact_path=str(transcript_path),
+                content_hash="content",
+                origin="automatic",
+                status="transcription_completed",
+                chunks_total=7390,
+            )
+            with sqlite3.connect(database_path) as connection:
+                connection.execute(
+                    "DELETE FROM schema_migrations "
+                    "WHERE name = 'transcript_segment_counts_v1'"
+                )
+
+            migrated = JobStore(database_path)
+
+            refreshed = migrated.get(job.id)
+            revision = migrated.get_transcript_revision(
+                job.id,
+                "revision-1",
+            )
+            self.assertEqual(refreshed.chunks_created, 2)
+            self.assertEqual(refreshed.chunks_completed, 2)
+            self.assertEqual(refreshed.chunks_total_estimate, 2)
+            self.assertEqual(revision["chunks_total"], 2)
 
     def test_adds_structured_columns_to_existing_job_events(self) -> None:
         with TemporaryDirectory() as directory:

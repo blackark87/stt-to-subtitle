@@ -965,3 +965,25 @@ class WebSettingsTests(unittest.TestCase):
 
         self.assertEqual(normalized.base_url, "https://validator.test/v1")
         self.assertEqual(normalized.model, "paid-model")
+
+    def test_normalizes_openrouter_subtitle_validator_settings(self) -> None:
+        normalized = SubtitleValidatorSettings(
+            provider="openrouter",
+            base_url="https://ignored.test/v1",
+            token="openrouter-key",
+            model="anthropic/claude-sonnet",
+        ).normalized()
+
+        self.assertEqual(normalized.base_url, "https://openrouter.ai/api/v1")
+        self.assertEqual(normalized.region, "")
+
+    def test_normalizes_bedrock_subtitle_validator_settings(self) -> None:
+        normalized = SubtitleValidatorSettings(
+            provider="bedrock",
+            token="bedrock-key",
+            model="us.anthropic.claude-sonnet-4-6",
+            region=" AP-NORTHEAST-2 ",
+        ).normalized()
+
+        self.assertEqual(normalized.base_url, "")
+        self.assertEqual(normalized.region, "ap-northeast-2")

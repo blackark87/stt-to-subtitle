@@ -14,6 +14,7 @@ from stt_to_subtitle.web_config import (
 )
 from stt_to_subtitle.orchestrator import (
     SubtitleOrchestrator,
+    _transcription_model_revision,
     estimate_transcription_chunks,
 )
 from stt_to_subtitle.job_store import JobStore
@@ -26,6 +27,27 @@ from stt_to_subtitle.service_clients import (
 
 
 class SubtitleOrchestratorTests(unittest.TestCase):
+    def test_compacts_nested_transcription_model_metadata(self) -> None:
+        revision = _transcription_model_revision(
+            {
+                "model": {
+                    "id": "whisperjav-domain-ensemble",
+                    "revision": "ensemble-revision",
+                    "pass1": {
+                        "id": "litagin/anime-whisper",
+                        "revision": "pass1-revision",
+                    },
+                    "aligner": {
+                        "id": "Qwen/Qwen3-ForcedAligner-0.6B",
+                        "revision": "aligner-revision",
+                    },
+                }
+            },
+            fallback="whisperjav",
+        )
+
+        self.assertEqual(revision, "ensemble-revision")
+
     def test_uses_separate_work_storage_and_rebases_saved_paths(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2447,6 +2469,41 @@ class SubtitleOrchestratorTests(unittest.TestCase):
             self.assertEqual(untouched.status, "blocked")
             self.assertEqual(queued.status, "queued")
 
+    def test_retry_clears_terminal_remote_transcription_id(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            orchestrator = self.make_orchestrator(root, media_root)
+            try:
+                failed = orchestrator.store.create(
+                    job_id="failed-transcription",
+                    source_rel="failed.mkv",
+                    force_overwrite=False,
+                    options={},
+                    operation="transcribe",
+                )
+                audio_path = (
+                    root / "state" / "jobs" / failed.id / "audio.wav"
+                )
+                audio_path.parent.mkdir(parents=True)
+                audio_path.write_bytes(b"audio")
+                orchestrator.store.update(
+                    failed.id,
+                    status="failed",
+                    blocked_stage="transcription",
+                    audio_path=str(audio_path),
+                    stt_job_id="terminal-remote-job",
+                    error="worker failed",
+                )
+
+                retried = orchestrator.retry(failed.id)
+            finally:
+                orchestrator.stop()
+
+            self.assertEqual(retried.status, "audio_ready")
+            self.assertIsNone(retried.stt_job_id)
+
     def test_retry_reduces_legacy_whisperx_chunk_to_native_window(
         self,
     ) -> None:
@@ -2693,6 +2750,9 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                             "created": 20,
                             "completed": 10,
                             "in_progress": 10,
+                            "stage": "primary_transcription",
+                            "stage_index": 1,
+                            "stage_total": 7,
                         }
                     )
                     return {
@@ -2785,6 +2845,15 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                 },
             )
             self.assertEqual(completed_job.status, "completed")
+            self.assertEqual(completed_job.chunks_created, 1)
+            self.assertEqual(completed_job.chunks_completed, 1)
+            self.assertEqual(completed_job.chunks_total_estimate, 1)
+            self.assertEqual(
+                completed_job.transcription_stage,
+                "primary_transcription",
+            )
+            self.assertEqual(completed_job.transcription_stage_index, 1)
+            self.assertEqual(completed_job.transcription_stage_total, 7)
             self.assertEqual(
                 Path(completed_job.transcript_path).name,
                 "movie_translate.json",

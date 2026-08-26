@@ -20,6 +20,11 @@ from typing import Any, Mapping, Sequence
 import wave
 
 from .files import write_json_atomic
+from .transcription_progress import (
+    StageProgressCallback,
+    report_stage_progress,
+    write_stage_progress,
+)
 from .vendor.whisperjav import presets
 from .vendor.whisperjav.runner import Cue, run_ensemble
 
@@ -39,6 +44,9 @@ DEFAULT_ANIME_MAX_GROUP_SECONDS = 2.0
 DEFAULT_QWEN_MAX_GROUP_SECONDS = 3.0
 MIN_MAX_GROUP_SECONDS = 0.5
 MAX_MAX_GROUP_SECONDS = 30.0
+# WhisperFeatureExtractor uses a 200-sample reflection pad before STFT.
+# Reflection padding requires the input dimension to be greater than the pad.
+MIN_FORCED_ALIGNMENT_SAMPLES = 201
 
 
 @dataclass(frozen=True)
@@ -166,6 +174,19 @@ def _read_pcm16(audio_path: Path) -> tuple[Any, int]:
     return np.frombuffer(frames, dtype="<i2").astype("float32") / 32768.0, sample_rate
 
 
+def _create_forced_aligner(aligner_path: Path) -> Any:
+    from .vendor.whisperjav.modules.subtitle_pipeline.aligners.qwen3 import (
+        Qwen3ForcedAlignerAdapter,
+    )
+
+    return Qwen3ForcedAlignerAdapter(
+        aligner_id=str(aligner_path),
+        device=os.environ.get("STT_DEVICE", "cuda"),
+        dtype="auto",
+        language="Japanese",
+    )
+
+
 def align_cues(
     cues: Sequence[Cue],
     *,
@@ -178,39 +199,41 @@ def align_cues(
     Takes the decoded waveform rather than a path so the WAV is read once per
     job instead of once here and once in ``run_whisperjav``.
     """
-    from .vendor.whisperjav.modules.subtitle_pipeline.aligners.qwen3 import (
-        Qwen3ForcedAlignerAdapter,
-    )
+    alignable_indices: list[int] = []
+    slices: list[Any] = []
+    for cue_index, cue in enumerate(cues):
+        start_sample = max(0, round(cue.start * sample_rate))
+        end_sample = max(start_sample, round(cue.end * sample_rate))
+        audio_slice = audio[start_sample:end_sample].copy()
+        if len(audio_slice) < MIN_FORCED_ALIGNMENT_SAMPLES:
+            continue
+        alignable_indices.append(cue_index)
+        slices.append(audio_slice)
 
-    slices = [
-        audio[
-            max(0, round(cue.start * sample_rate)) :
-            max(0, round(cue.end * sample_rate))
-        ].copy()
-        for cue in cues
-    ]
-    aligner = Qwen3ForcedAlignerAdapter(
-        aligner_id=str(aligner_path),
-        device=os.environ.get("STT_DEVICE", "cuda"),
-        dtype="auto",
-        language="Japanese",
-    )
-    aligner.load()
-    try:
-        results = aligner.align_batch(
-            audio_paths=slices,
-            texts=[cue.text for cue in cues],
-            language="ja",
-            audio_durations=[cue.end - cue.start for cue in cues],
-        )
-    finally:
-        aligner.unload()
+    results_by_index: dict[int, Any] = {}
+    if slices:
+        aligner = _create_forced_aligner(aligner_path)
+        aligner.load()
+        try:
+            results = aligner.align_batch(
+                audio_paths=slices,
+                texts=[cues[index].text for index in alignable_indices],
+                language="ja",
+                audio_durations=[
+                    cues[index].end - cues[index].start
+                    for index in alignable_indices
+                ],
+            )
+        finally:
+            aligner.unload()
+        results_by_index.update(zip(alignable_indices, results))
 
     words: list[dict[str, Any]] = []
     fallback_count = 0
-    for cue_index, (cue, result) in enumerate(zip(cues, results), start=1):
+    for cue_index, cue in enumerate(cues, start=1):
         parent_id = f"whisperjav-cue-{cue_index:06d}"
-        aligned = list(result.words)
+        result = results_by_index.get(cue_index - 1)
+        aligned = list(result.words) if result is not None else []
         if not aligned:
             fallback_count += 1
             words.append(
@@ -251,6 +274,7 @@ def run_whisperjav(
     options: Mapping[str, Any],
     *,
     debug_artifact_dir: Path | None = None,
+    progress_callback: StageProgressCallback | None = None,
 ) -> dict[str, Any]:
     """Execute both ASR passes, merge, and final forced alignment."""
     started = time.monotonic()
@@ -277,8 +301,15 @@ def run_whisperjav(
             ),
             work_dir=Path(directory),
             debug_artifact_dir=debug_artifact_dir,
+            progress_callback=progress_callback,
         )
         cues = ensemble.cues
+        report_stage_progress(
+            progress_callback,
+            "forced_alignment",
+            5,
+            7,
+        )
         words, fallback_count = align_cues(
             cues,
             audio=audio,
@@ -389,6 +420,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--options", required=True)
     parser.add_argument("--debug-dir", type=Path)
+    parser.add_argument("--progress", type=Path)
     return parser.parse_args()
 
 
@@ -403,6 +435,14 @@ def main() -> None:
             args.audio,
             options,
             debug_artifact_dir=args.debug_dir,
+            progress_callback=(
+                lambda stage, index, total: write_stage_progress(
+                    args.progress,
+                    stage,
+                    index,
+                    total,
+                )
+            ),
         ),
     )
 

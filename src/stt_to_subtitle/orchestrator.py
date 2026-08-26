@@ -123,6 +123,30 @@ def _canonical_payload_hash(value: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _transcription_model_revision(
+    payload: Mapping[str, Any],
+    *,
+    fallback: str,
+) -> str:
+    explicit = payload.get("model_revision")
+    if explicit is not None and not isinstance(explicit, Mapping):
+        value = str(explicit).strip()
+        if value:
+            return value
+    model = payload.get("model")
+    if isinstance(model, Mapping):
+        for key in ("revision", "id"):
+            value = str(model.get(key, "")).strip()
+            if value:
+                return value
+    elif model is not None:
+        value = str(model).strip()
+        if value:
+            return value
+    backend = str(payload.get("backend", "")).strip()
+    return backend or fallback
+
+
 USER_STOP_MESSAGE = "사용자 요청으로 전체 작업이 중단되었습니다."
 USER_SELECTED_STOP_MESSAGE = "사용자 요청으로 작업이 중단되었습니다."
 TRANSLATION_PROMPT_OPTION = "translation_prompt"
@@ -398,9 +422,11 @@ class SubtitleOrchestrator:
     def subtitle_validator_view(self) -> dict[str, Any]:
         settings = self._subtitle_validator
         return {
+            "provider": settings.provider,
             "base_url": settings.base_url,
             "token_configured": bool(settings.token),
             "model": settings.model,
+            "region": settings.region,
             "configured": settings.is_complete,
         }
 
@@ -410,9 +436,11 @@ class SubtitleOrchestrator:
     ) -> SubtitleValidatorSettings:
         normalized = settings.normalized()
         self.store.save_subtitle_validator_settings(
+            provider=normalized.provider,
             base_url=normalized.base_url,
             token=normalized.token,
             model=normalized.model,
+            region=normalized.region,
         )
         self._subtitle_validator = normalized
         return normalized
@@ -433,10 +461,19 @@ class SubtitleOrchestrator:
             separators=(",", ":"),
         ).encode("utf-8")
         input_hash = hashlib.sha256(
-            settings.model.encode("utf-8") + b"\0" + encoded
+            settings.provider.encode("utf-8")
+            + b"\0"
+            + settings.region.encode("utf-8")
+            + b"\0"
+            + settings.base_url.encode("utf-8")
+            + b"\0"
+            + settings.model.encode("utf-8")
+            + b"\0"
+            + encoded
         ).hexdigest()
         if (
             validation["llm"] is not None
+            and validation["validator_provider"] == settings.provider
             and validation["validator_model"] == settings.model
             and validation["validator_input_hash"] == input_hash
         ):
@@ -447,11 +484,14 @@ class SubtitleOrchestrator:
                 settings.base_url,
                 settings.token,
                 settings.model,
+                provider=settings.provider,
+                region=settings.region,
                 request_observer=self.record_external_request,
             ).validate(payload)
             updated = self.store.save_subtitle_llm_validation(
                 validation_id,
                 result=result,
+                provider=settings.provider,
                 model=settings.model,
                 input_hash=input_hash,
             )
@@ -1354,6 +1394,9 @@ class SubtitleOrchestrator:
                     chunks_created=0,
                     chunks_completed=0,
                     chunks_total_estimate=chunk_estimate,
+                    transcription_stage=None,
+                    transcription_stage_index=0,
+                    transcription_stage_total=0,
                     translation_chunks_total=0,
                     translation_chunks_completed=0,
                     translation_pause_requested=0,
@@ -1438,7 +1481,7 @@ class SubtitleOrchestrator:
                     content_hash=sha256_file(transcript_path),
                     origin="imported",
                     status="transcribed",
-                    chunks_total=reusable.transcription_chunks_total,
+                    chunks_total=len(transcript_payload["segments"]),
                 )
                 if not persisted:
                     raise RuntimeError(
@@ -1852,7 +1895,7 @@ class SubtitleOrchestrator:
                 content_hash=sha256_file(transcript_path),
                 origin="imported",
                 status="transcribed",
-                chunks_total=reusable.transcription_chunks_total,
+                chunks_total=len(transcript_payload["segments"]),
             )
             if not persisted:
                 raise RuntimeError("imported transcript revision was not saved")
@@ -2202,8 +2245,15 @@ class SubtitleOrchestrator:
                 {
                     "chunks_created": 0,
                     "chunks_completed": 0,
+                    "transcription_stage": None,
+                    "transcription_stage_index": 0,
+                    "transcription_stage_total": 0,
                 }
             )
+        if target_status == "audio_ready":
+            # A manual retry must submit the persisted WAV again. Retaining a
+            # terminal remote ID would only replay its previous failed status.
+            retry_fields["stt_job_id"] = None
         if (
             target_status == "audio_ready"
             and job.audio_path
@@ -2815,7 +2865,7 @@ class SubtitleOrchestrator:
                 content_hash=sha256_file(artifact),
                 origin="manual",
                 status=None,
-                chunks_total=job.transcription_chunks_total,
+                chunks_total=len(payload["segments"]),
             ):
                 raise RuntimeError("manual transcript revision was not saved")
         else:
@@ -3448,16 +3498,24 @@ class SubtitleOrchestrator:
                 payload={"remote_job_id": remote_job_id},
             )
 
-        def update_chunk_progress(progress: Mapping[str, Any]) -> None:
-            created = int(progress["created"])
-            completed = int(progress["completed"])
-            report_every = int(progress.get("report_every", 10))
-            self._require_stage_update(
-                job,
-                chunks_created=created,
-                chunks_completed=completed,
-                chunk_progress_every=report_every,
-            )
+        def update_transcription_progress(progress: Mapping[str, Any]) -> None:
+            fields: dict[str, Any] = {}
+            if "created" in progress and "completed" in progress:
+                fields.update(
+                    chunks_created=int(progress["created"]),
+                    chunks_completed=int(progress["completed"]),
+                    chunk_progress_every=int(
+                        progress.get("report_every", 10)
+                    ),
+                )
+            if "stage" in progress:
+                fields.update(
+                    transcription_stage=str(progress["stage"]),
+                    transcription_stage_index=int(progress["stage_index"]),
+                    transcription_stage_total=int(progress["stage_total"]),
+                )
+            if fields:
+                self._require_stage_update(job, **fields)
 
         payload = stt_client.transcribe(
             Path(job.audio_path),
@@ -3465,7 +3523,7 @@ class SubtitleOrchestrator:
             idempotency_key=f"pipeline-{job.id}",
             existing_job_id=job.stt_job_id,
             on_job_created=save_remote_job,
-            on_progress=update_chunk_progress,
+            on_progress=update_transcription_progress,
             should_stop=lambda: bool(
                 (current := self.store.get(job.id))
                 and current.job_stop_requested
@@ -3529,16 +3587,10 @@ class SubtitleOrchestrator:
             next_status = "translation_paused"
         else:
             next_status = "transcribed"
-        final_chunk_total = (
-            max(current.chunks_created, current.chunks_total_estimate)
-            if current is not None
-            else 0
-        )
-        model_revision = str(
-            payload.get("model_revision")
-            or payload.get("model")
-            or payload.get("backend")
-            or options["backend"]
+        final_segment_count = len(payload["segments"])
+        model_revision = _transcription_model_revision(
+            payload,
+            fallback=str(options["backend"]),
         )
         lease_owner = (
             self._worker_id if job.lease_owner == self._worker_id else None
@@ -3557,7 +3609,7 @@ class SubtitleOrchestrator:
             content_hash=sha256_file(transcript_path),
             origin="automatic",
             status=next_status,
-            chunks_total=final_chunk_total,
+            chunks_total=final_segment_count,
             translation_pause_requested=translation_paused,
             lease_owner=lease_owner,
             lease_token=(job.lease_token if lease_owner is not None else None),
@@ -3574,7 +3626,7 @@ class SubtitleOrchestrator:
             payload={
                 "transcript_revision_id": revision_id,
                 "segment_count": len(payload["segments"]),
-                "chunks_total": final_chunk_total,
+                "chunks_total": final_segment_count,
             },
         )
         noise_filter = payload.get("noise_filter")

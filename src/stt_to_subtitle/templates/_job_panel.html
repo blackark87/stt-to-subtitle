@@ -30,7 +30,9 @@
       {% elif pipeline.current %}
         <span class="job-progress-current">
           {% if pipeline.current.kind == 'endpoint' %}{{ pipeline.current.display_label }}{% else %}현재 단계 {{ pipeline.current.label }} · {{ pipeline.current.state_label }}{% endif %}
-          {% if pipeline.current.total %}
+          {% if pipeline.current.progress_unit == 'stage' %}
+            · {{ pipeline.current.internal_stage_label }} · {{ pipeline.current.internal_stage_index }}/{{ pipeline.current.internal_stage_total }}단계
+          {% elif pipeline.current.total %}
             · {{ pipeline.current.completed }}/{% if pipeline.current.total_is_estimate %}약 {% endif %}{{ pipeline.current.total }} 청크
           {% endif %}
         </span>
@@ -61,6 +63,8 @@
         <span class="job-stage-label">{{ stage.label }}</span>
         {% if stage.key == 'render' and stage.state == 'done' %}
           <span class="job-stage-count" aria-hidden="true"></span>
+        {% elif stage.progress_unit == 'stage' %}
+          <span class="job-stage-count" title="{{ stage.internal_stage_label }}">{{ stage.internal_stage_index }}/{{ stage.internal_stage_total }}단계</span>
         {% elif stage.total %}
           <span class="job-stage-count">{{ stage.completed }}/{% if stage.total_is_estimate %}≈{% endif %}{{ stage.total }}</span>
         {% else %}
@@ -128,7 +132,7 @@
           <select name="transcript_revision_id" aria-label="번역에 사용할 전사 리비전" required>
             {% for revision in transcript_revisions %}
               <option value="{{ revision.id }}"{% if revision.is_active %} selected{% endif %}>
-                {{ revision.selector_label }}{% if revision.is_active %} · 현재 사용 중{% endif %}
+                {{ revision.selector_label }}
               </option>
             {% endfor %}
           </select>
@@ -399,10 +403,10 @@
       {% for revision in transcript_revisions|reverse %}
         <article class="notice">
           <strong>
-            {{ revision.selector_label }}{% if revision.is_active %} · 현재 사용 중{% endif %}
+            {{ revision.selector_label }}
           </strong>
           <span>
-            {{ revision.origin_label }}{% if revision.backend %} · {{ revision.backend|stt_backend }}{% endif %}{% if revision.model_revision and revision.model_revision not in ["manual", "imported"] %} · {{ revision.model_revision }}{% endif %}
+            {{ revision.origin_label }}{% if revision.backend %} · {{ revision.backend|stt_backend }}{% endif %}
           </span>
           <time class="muted" datetime="{{ revision.created_at|datetime_iso }}">{{ revision.created_at|datetime }}</time>
         </article>
@@ -504,12 +508,21 @@
     </div>
     <span class="history-count">{{ events|length }}개 기록</span>
   </div>
-  {% if job.transcription_chunks_total or job.translation_chunks_total %}
+  {% if job.transcription_stage or job.transcription_chunks_total or job.translation_chunks_total %}
     <div class="history-progress-grid">
-      {% if job.transcription_chunks_total %}
+      {% if job.transcription_stage and job.phase == 'transcription' and job.state == 'running' %}
         <div class="history-progress-item">
-          <strong>전사 청크</strong>
-          <progress value="{{ job.chunks_completed }}" max="{{ job.transcription_chunks_total }}" aria-label="전사 청크 진행률"></progress>
+          <strong>전사 내부 단계</strong>
+          <progress value="{{ job.transcription_stage_index }}" max="{{ job.transcription_stage_total }}" aria-label="전사 내부 단계 진행률"></progress>
+          <span class="chunk-progress">
+            <strong>{{ job.transcription_stage|transcription_stage_label }}</strong>
+            <span>/ {{ job.transcription_stage_index }}/{{ job.transcription_stage_total }}단계</span>
+          </span>
+        </div>
+      {% elif job.transcription_chunks_total %}
+        <div class="history-progress-item">
+          <strong>전사 세그먼트</strong>
+          <progress value="{{ job.chunks_completed }}" max="{{ job.transcription_chunks_total }}" aria-label="전사 세그먼트 처리 결과"></progress>
           <span class="chunk-progress">
             <strong>{{ job.chunks_completed }}</strong> 완료
             <span>/ {% if job.transcription_total_is_estimated %}약 {% endif %}{{ job.transcription_chunks_total }} 전체</span>

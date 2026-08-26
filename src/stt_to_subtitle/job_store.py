@@ -22,6 +22,7 @@ from .path_display import (
 )
 from .job_state import JobPhase, JobReason, JobState, structured_state_from_legacy
 from .storage_paths import rebase_stored_path
+from .transcription_progress import TRANSCRIPTION_STAGE_LABELS
 from .translation_prompt import (
     KOREAN_JAV_SYSTEM_PROMPT,
     KOREAN_JAV_REVIEW_PROMPT,
@@ -80,6 +81,8 @@ NONNEGATIVE_JOB_FIELDS = {
     "chunks_created",
     "chunks_completed",
     "chunks_total_estimate",
+    "transcription_stage_index",
+    "transcription_stage_total",
     "translation_chunks_total",
     "translation_chunks_completed",
     "lease_token",
@@ -177,6 +180,9 @@ class PipelineJob:
     chunks_completed: int
     chunks_total_estimate: int
     chunk_progress_every: int
+    transcription_stage: str | None
+    transcription_stage_index: int
+    transcription_stage_total: int
     translation_chunks_total: int
     translation_chunks_completed: int
     translation_pause_requested: bool
@@ -289,6 +295,9 @@ class JobStore:
         "chunks_completed",
         "chunks_total_estimate",
         "chunk_progress_every",
+        "transcription_stage",
+        "transcription_stage_index",
+        "transcription_stage_total",
         "translation_chunks_total",
         "translation_chunks_completed",
         "translation_pause_requested",
@@ -570,6 +579,9 @@ class JobStore:
                     chunks_completed INTEGER NOT NULL DEFAULT 0,
                     chunks_total_estimate INTEGER NOT NULL DEFAULT 0,
                     chunk_progress_every INTEGER NOT NULL DEFAULT 10,
+                    transcription_stage TEXT,
+                    transcription_stage_index INTEGER NOT NULL DEFAULT 0,
+                    transcription_stage_total INTEGER NOT NULL DEFAULT 0,
                     translation_chunks_total INTEGER NOT NULL DEFAULT 0,
                     translation_chunks_completed INTEGER NOT NULL DEFAULT 0,
                     translation_pause_requested INTEGER NOT NULL DEFAULT 0,
@@ -634,9 +646,11 @@ class JobStore:
 
                 CREATE TABLE IF NOT EXISTS subtitle_validator_settings (
                     id INTEGER PRIMARY KEY CHECK (id = 1),
+                    provider TEXT NOT NULL DEFAULT 'openai_compatible',
                     base_url TEXT NOT NULL,
                     token TEXT NOT NULL,
                     model TEXT NOT NULL,
+                    region TEXT NOT NULL DEFAULT '',
                     updated_at REAL NOT NULL
                 );
 
@@ -681,6 +695,7 @@ class JobStore:
                     candidate_hash TEXT NOT NULL,
                     metrics_json TEXT NOT NULL,
                     llm_json TEXT,
+                    validator_provider TEXT,
                     validator_model TEXT,
                     validator_input_hash TEXT,
                     created_at REAL NOT NULL,
@@ -951,6 +966,17 @@ class JobStore:
                 "ALTER TABLE jobs ADD COLUMN "
                 "chunk_progress_every INTEGER NOT NULL DEFAULT 10"
             ),
+            "transcription_stage": (
+                "ALTER TABLE jobs ADD COLUMN transcription_stage TEXT"
+            ),
+            "transcription_stage_index": (
+                "ALTER TABLE jobs ADD COLUMN transcription_stage_index "
+                "INTEGER NOT NULL DEFAULT 0"
+            ),
+            "transcription_stage_total": (
+                "ALTER TABLE jobs ADD COLUMN transcription_stage_total "
+                "INTEGER NOT NULL DEFAULT 0"
+            ),
             "ass_path": "ALTER TABLE jobs ADD COLUMN ass_path TEXT",
             "operation": (
                 "ALTER TABLE jobs ADD COLUMN "
@@ -1192,8 +1218,126 @@ class JobStore:
                     "correct_default_path_display_rule_v2",
                     self._correct_default_path_display_rule,
                 ),
+                Migration(
+                    50,
+                    "subtitle_validator_providers_v1",
+                    self._migrate_subtitle_validator_providers,
+                ),
+                Migration(
+                    51,
+                    "transcription_stage_progress_v1",
+                    self._migrate_transcription_stage_progress,
+                ),
+                Migration(
+                    52,
+                    "transcript_segment_counts_v1",
+                    self._migrate_transcript_segment_counts,
+                ),
             ),
         )
+
+    @staticmethod
+    def _migrate_transcript_segment_counts(
+        connection: sqlite3.Connection,
+    ) -> None:
+        rows = connection.execute(
+            """
+            SELECT id, created_by_job_id, artifact_path
+            FROM transcript_revisions
+            """
+        ).fetchall()
+        for row in rows:
+            try:
+                payload = json.loads(
+                    Path(str(row["artifact_path"])).read_text(encoding="utf-8")
+                )
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, Mapping):
+                continue
+            segments = payload.get("segments")
+            if not isinstance(segments, list):
+                continue
+            segment_count = len(segments)
+            revision_id = str(row["id"])
+            job_id = str(row["created_by_job_id"])
+            connection.execute(
+                "UPDATE transcript_revisions "
+                "SET chunks_total = ? WHERE id = ?",
+                (segment_count, revision_id),
+            )
+            connection.execute(
+                """
+                UPDATE jobs
+                SET chunks_created = ?, chunks_completed = ?,
+                    chunks_total_estimate = ?
+                WHERE id = ? AND transcript_revision_id = ?
+                """,
+                (
+                    segment_count,
+                    segment_count,
+                    segment_count,
+                    job_id,
+                    revision_id,
+                ),
+            )
+
+    @staticmethod
+    def _migrate_transcription_stage_progress(
+        connection: sqlite3.Connection,
+    ) -> None:
+        columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(jobs)").fetchall()
+        }
+        migrations = {
+            "transcription_stage": (
+                "ALTER TABLE jobs ADD COLUMN transcription_stage TEXT"
+            ),
+            "transcription_stage_index": (
+                "ALTER TABLE jobs ADD COLUMN transcription_stage_index "
+                "INTEGER NOT NULL DEFAULT 0"
+            ),
+            "transcription_stage_total": (
+                "ALTER TABLE jobs ADD COLUMN transcription_stage_total "
+                "INTEGER NOT NULL DEFAULT 0"
+            ),
+        }
+        for column, statement in migrations.items():
+            if column not in columns:
+                connection.execute(statement)
+
+    @staticmethod
+    def _migrate_subtitle_validator_providers(
+        connection: sqlite3.Connection,
+    ) -> None:
+        settings_columns = {
+            str(row["name"])
+            for row in connection.execute(
+                "PRAGMA table_info(subtitle_validator_settings)"
+            ).fetchall()
+        }
+        if "provider" not in settings_columns:
+            connection.execute(
+                "ALTER TABLE subtitle_validator_settings ADD COLUMN "
+                "provider TEXT NOT NULL DEFAULT 'openai_compatible'"
+            )
+        if "region" not in settings_columns:
+            connection.execute(
+                "ALTER TABLE subtitle_validator_settings ADD COLUMN "
+                "region TEXT NOT NULL DEFAULT ''"
+            )
+        validation_columns = {
+            str(row["name"])
+            for row in connection.execute(
+                "PRAGMA table_info(subtitle_validations)"
+            ).fetchall()
+        }
+        if "validator_provider" not in validation_columns:
+            connection.execute(
+                "ALTER TABLE subtitle_validations ADD COLUMN "
+                "validator_provider TEXT"
+            )
 
     @staticmethod
     def _seed_default_path_display_rule(
@@ -2278,7 +2422,7 @@ class JobStore:
         with self._connect() as connection:
             row = connection.execute(
                 """
-                SELECT base_url, token, model
+                SELECT provider, base_url, token, model, region
                 FROM subtitle_validator_settings
                 WHERE id = 1
                 """
@@ -2286,31 +2430,37 @@ class JobStore:
         if row is None:
             return None
         return {
+            "provider": str(row["provider"]),
             "base_url": str(row["base_url"]),
             "token": str(row["token"]),
             "model": str(row["model"]),
+            "region": str(row["region"]),
         }
 
     def save_subtitle_validator_settings(
         self,
         *,
+        provider: str,
         base_url: str,
         token: str,
         model: str,
+        region: str,
     ) -> None:
         with self._connect() as connection:
             connection.execute(
                 """
                 INSERT INTO subtitle_validator_settings (
-                    id, base_url, token, model, updated_at
-                ) VALUES (1, ?, ?, ?, ?)
+                    id, provider, base_url, token, model, region, updated_at
+                ) VALUES (1, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
+                    provider = excluded.provider,
                     base_url = excluded.base_url,
                     token = excluded.token,
                     model = excluded.model,
+                    region = excluded.region,
                     updated_at = excluded.updated_at
                 """,
-                (base_url, token, model, time.time()),
+                (provider, base_url, token, model, region, time.time()),
             )
 
     @staticmethod
@@ -2361,6 +2511,13 @@ class JobStore:
             chunks_completed=int(row["chunks_completed"]),
             chunks_total_estimate=int(row["chunks_total_estimate"]),
             chunk_progress_every=int(row["chunk_progress_every"]),
+            transcription_stage=(
+                str(row["transcription_stage"])
+                if row["transcription_stage"]
+                else None
+            ),
+            transcription_stage_index=int(row["transcription_stage_index"]),
+            transcription_stage_total=int(row["transcription_stage_total"]),
             translation_chunks_total=int(row["translation_chunks_total"]),
             translation_chunks_completed=int(
                 row["translation_chunks_completed"]
@@ -3347,6 +3504,12 @@ class JobStore:
                 JobState(str(fields["state"]))
             if fields.get("reason_code") is not None:
                 JobReason(str(fields["reason_code"]))
+            if (
+                fields.get("transcription_stage") is not None
+                and str(fields["transcription_stage"])
+                not in TRANSCRIPTION_STAGE_LABELS
+            ):
+                raise ValueError("unsupported transcription stage")
         except ValueError as error:
             raise ValueError("invalid structured job state") from error
         if "attempt" in fields and int(fields["attempt"]) < 1:
@@ -3356,6 +3519,19 @@ class JobStore:
             and int(fields["chunk_progress_every"]) < 1
         ):
             raise ValueError("chunk progress interval must be at least 1")
+        if {
+            "transcription_stage",
+            "transcription_stage_index",
+            "transcription_stage_total",
+        }.issubset(fields):
+            stage = fields["transcription_stage"]
+            index = int(fields["transcription_stage_index"])
+            total = int(fields["transcription_stage_total"])
+            if stage is None:
+                if index or total:
+                    raise ValueError("empty transcription stage has progress")
+            elif total < 1 or not 1 <= index <= total:
+                raise ValueError("invalid transcription stage position")
         for field in NONNEGATIVE_JOB_FIELDS & fields.keys():
             if int(fields[field]) < 0:
                 raise ValueError(f"{field} must not be negative")
@@ -4717,6 +4893,7 @@ class JobStore:
         validation_id: str,
         *,
         result: Mapping[str, Any],
+        provider: str,
         model: str,
         input_hash: str,
     ) -> dict[str, Any]:
@@ -4724,12 +4901,13 @@ class JobStore:
             updated = connection.execute(
                 """
                 UPDATE subtitle_validations
-                SET llm_json = ?, validator_model = ?,
+                SET llm_json = ?, validator_provider = ?, validator_model = ?,
                     validator_input_hash = ?, updated_at = ?
                 WHERE id = ?
                 """,
                 (
                     json.dumps(dict(result), ensure_ascii=False, sort_keys=True),
+                    provider,
                     model,
                     input_hash,
                     time.time(),
@@ -4765,6 +4943,11 @@ class JobStore:
             "llm": (
                 json.loads(str(row["llm_json"]))
                 if row["llm_json"] is not None
+                else None
+            ),
+            "validator_provider": (
+                str(row["validator_provider"])
+                if row["validator_provider"] is not None
                 else None
             ),
             "validator_model": (

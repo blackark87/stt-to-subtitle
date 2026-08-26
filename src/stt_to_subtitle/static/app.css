@@ -31,6 +31,9 @@
   --radius-lg: 16px;
   --radius-pill: 999px;
 
+  --control-height: 40px;
+  --control-height-compact: 32px;
+
   --shadow-xs: 0 1px 2px color-mix(in srgb, #0B0E14 8%, transparent);
   --shadow-sm: 0 4px 12px color-mix(in srgb, #0B0E14 10%, transparent);
   --shadow-md: 0 12px 32px color-mix(in srgb, #0B0E14 14%, transparent);
@@ -345,6 +348,7 @@ label { display: grid; gap: 6px; font-weight: 600; }
 label.check { display: flex; align-items: flex-start; gap: 9px; font-weight: 400; line-height: 1.5; }
 label.check span { word-break: keep-all; overflow-wrap: normal; }
 input, select, textarea, button, .button { font: inherit; border-radius: var(--radius-control); border: 1px solid var(--line); padding: 9px 12px; }
+input:not([type="checkbox"]):not([type="range"]), select, button, .button { min-height: var(--control-height); }
 input, select, textarea { background: var(--card); color: var(--text); width: 100%; }
 textarea { resize: vertical; }
 input[type="checkbox"] { width: 1.1rem; height: 1.1rem; min-width: 1.1rem; margin: .18rem 0 0; padding: 0; accent-color: var(--accent); flex: 0 0 auto; }
@@ -361,6 +365,7 @@ button, .button {
   color: var(--accent-ink);
   cursor: pointer;
   text-decoration: none;
+  line-height: 1.2;
   transition: background-color .15s ease, border-color .15s ease, box-shadow .15s ease, transform .1s ease;
 }
 button:hover, .button:hover {
@@ -385,7 +390,7 @@ button.danger:hover, .button.danger:hover {
   border-color: var(--danger);
   box-shadow: var(--shadow-sm);
 }
-button.compact, .button.compact { padding: 5px 10px; font-size: .86rem; gap: 4px; }
+button.compact, .button.compact { min-height: var(--control-height-compact); padding: 5px 10px; font-size: .86rem; gap: 4px; }
 button:disabled, .button:disabled { opacity: .5; cursor: not-allowed; box-shadow: none; transform: none; }
 .media-picker { min-width: 0; margin: 0; padding: 0; border: 0; }
 .media-search { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)) auto auto; gap: 8px; margin-bottom: 18px; }
@@ -565,8 +570,8 @@ button:disabled, .button:disabled { opacity: .5; cursor: not-allowed; box-shadow
 .media-filename { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .media-filename, .media-path, .media-size, .media-duration { color: var(--muted); font-size: .78rem; font-weight: 400; }
 .media-path { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.subtitle-state { width: max-content; max-width: 100%; margin-top: auto; border-radius: 999px; padding: 2px 8px; font-size: .77rem; font-weight: 750; white-space: nowrap; }
-.subtitle-state::before { content: ""; display: inline-block; width: 6px; height: 6px; margin-right: 6px; border-radius: 50%; background: currentColor; vertical-align: .08em; }
+.subtitle-state { display: inline-flex; align-items: center; gap: 6px; width: max-content; max-width: 100%; min-height: var(--control-height-compact); margin-top: auto; border: 1px solid transparent; border-radius: 999px; padding: 5px 10px; font-size: .77rem; font-weight: 750; line-height: 1.2; white-space: nowrap; }
+.subtitle-state::before { content: ""; display: inline-block; width: 6px; height: 6px; flex: none; border-radius: 50%; background: currentColor; }
 .subtitle-state.is-completed { background: color-mix(in srgb, var(--success) 16%, var(--card)); color: var(--success); }
 .subtitle-state.is-progress { background: color-mix(in srgb, var(--accent) 14%, var(--card)); color: var(--accent); }
 .subtitle-state.is-running { background: color-mix(in srgb, var(--accent) 16%, var(--card)); color: var(--accent); }
@@ -637,7 +642,7 @@ a.subtitle-state:hover { text-decoration: underline; }
 .comparison-translation-actions label,
 .comparison-transcript-picker { display: grid; gap: 5px; color: var(--muted); font-size: .78rem; font-weight: 650; }
 .comparison-translation-actions select,
-.comparison-transcript-picker select { min-width: 11rem; padding: 7px 9px; font-size: .84rem; }
+.comparison-transcript-picker select { min-width: 11rem; min-height: var(--control-height-compact); padding: 5px 9px; font-size: .84rem; }
 .comparison-progress { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 18px; }
 .comparison-progress span { color: var(--muted); font-size: .86rem; }
 .comparison-source { margin-top: 18px; }
@@ -688,7 +693,7 @@ a.subtitle-state:hover { text-decoration: underline; }
 .translation-diff-item > header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .translation-diff-item > header > div { display: flex; gap: 6px; flex-wrap: wrap; }
 .translation-diff-state,
-.translation-source-state { border-radius: 999px; padding: 3px 8px; font-size: .72rem; font-weight: 750; }
+.translation-source-state { display: inline-flex; align-items: center; min-height: var(--control-height-compact); border: 1px solid transparent; border-radius: 999px; padding: 5px 10px; font-size: .72rem; font-weight: 750; line-height: 1.2; }
 .translation-diff-state { background: var(--surface-well); color: var(--muted); }
 .translation-source-state { background: color-mix(in srgb, var(--accent) 13%, var(--card)); color: var(--accent); }
 .translation-source-diff,
@@ -860,7 +865,7 @@ th, td { border-bottom: 1px solid var(--line); padding: 10px 8px; text-align: le
 .table-actions { display: flex; align-items: center; gap: 10px; white-space: nowrap; }
 .table-actions form { margin: 0; }
 .table-actions button { padding: 6px 9px; font-size: .82rem; }
-.status { display: inline-flex; align-items: center; gap: 6px; border-radius: 999px; padding: 3px 9px; background: var(--line); font-size: .82rem; font-weight: 750; white-space: nowrap; }
+.status { display: inline-flex; align-items: center; gap: 6px; min-height: var(--control-height-compact); border: 1px solid transparent; border-radius: 999px; padding: 5px 10px; background: var(--line); font-size: .82rem; font-weight: 750; line-height: 1.2; white-space: nowrap; }
 .status::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
 .status-extracting,
 .status-audio_ready,
@@ -902,8 +907,10 @@ th, td { border-bottom: 1px solid var(--line); padding: 10px 8px; text-align: le
   display: inline-flex;
   align-items: center;
   gap: 6px;
+  min-height: var(--control-height-compact);
+  border: 1px solid transparent;
   border-radius: 999px;
-  padding: 4px 9px;
+  padding: 5px 10px;
   background: color-mix(in srgb, var(--line) 38%, transparent);
   color: var(--muted);
   font-size: .8rem;
@@ -1011,7 +1018,7 @@ th, td { border-bottom: 1px solid var(--line); padding: 10px 8px; text-align: le
 .status.has-detail { cursor: help; text-decoration: underline dotted currentColor; text-underline-offset: 3px; }
 .recent-job-actions { display: flex; align-items: flex-start; justify-content: flex-end; gap: 7px; flex-wrap: wrap; }
 .recent-job-actions form { display: flex; align-items: stretch; gap: 7px; margin: 0; flex-wrap: wrap; }
-.recent-job-actions select { width: auto; max-width: 12rem; padding: 5px 9px; font-size: .86rem; }
+.recent-job-actions select { width: auto; max-width: 12rem; min-height: var(--control-height-compact); padding: 5px 9px; font-size: .86rem; }
 .recent-jobs-empty { display: grid; justify-items: center; gap: 4px; border: 1px dashed var(--line); border-radius: 9px; padding: 28px 16px; text-align: center; }
 .recent-jobs-empty span { color: var(--muted); font-size: .88rem; }
 .comparison-history-section,
@@ -1035,19 +1042,15 @@ th, td { border-bottom: 1px solid var(--line); padding: 10px 8px; text-align: le
 .job-list-heading-copy { display: grid; gap: 2px; min-width: max-content; }
 .job-list-scope { color: var(--muted); font-size: .76rem; white-space: nowrap; }
 .job-bulk-actions { display: flex; justify-content: flex-end; gap: 7px; flex-wrap: wrap; }
-.job-bulk-actions form { margin: 0; }
+.job-bulk-actions form { display: inline-flex; align-items: center; margin: 0; }
 .job-translation-actions {
   display: flex;
   align-items: center;
   gap: 7px;
-  border: 1px solid var(--line);
-  border-radius: var(--radius-control);
-  padding: 7px;
-  background: var(--surface-sunken);
   flex-wrap: wrap;
 }
-.job-translation-actions select { width: auto; max-width: 13rem; padding: 6px 9px; font-size: .82rem; }
-.job-selection-count { padding: 0 4px; color: var(--muted); font-size: .82rem; white-space: nowrap; }
+.job-translation-actions select { width: auto; max-width: 13rem; min-height: var(--control-height-compact); padding: 5px 9px; font-size: .82rem; }
+.job-selection-count { display: inline-flex; align-items: center; min-height: var(--control-height-compact); padding: 0 4px; color: var(--muted); font-size: .82rem; white-space: nowrap; }
 .job-selection-count strong { color: var(--text); font-variant-numeric: tabular-nums; }
 .compact-heading { align-items: center; margin-bottom: 0; }
 .completed-job-list .recent-job-item { padding-block: 11px; background: transparent; }
@@ -1282,6 +1285,8 @@ code { overflow-wrap: anywhere; }
 }
 /* Touch sizing keys off the pointer, not the breakpoint, so tablets get it too. */
 @media (pointer: coarse), (max-width: 760px) {
+  :root { --control-height-compact: var(--control-height); }
+
   /* iOS Safari zooms the page whenever a focused control is under 16px */
   input:not([type="checkbox"]):not([type="range"]),
   select,
@@ -1292,8 +1297,8 @@ code { overflow-wrap: anywhere; }
   .comparison-transcript-picker select { font-size: 16px; }
 
   /* uniform tap targets across every control, compact or not */
-  button, .button { min-height: 40px; }
-  button.compact, .button.compact { min-height: 36px; padding: 7px 12px; }
+  button, .button { min-height: var(--control-height); }
+  button.compact, .button.compact { padding: 7px 12px; }
   .job-stage-filter-children .button { padding-right: 8px; padding-left: 8px; }
 }
 @media (max-width: 520px) {
@@ -1481,15 +1486,15 @@ code { overflow-wrap: anywhere; }
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  min-height: 22px;
-  padding: 3px 8px;
+  min-height: var(--control-height-compact);
+  padding: 5px 10px;
   border: 1px solid transparent;
   border-radius: 999px;
   background: var(--ob-well);
   color: var(--muted);
   font-size: .72rem;
   font-weight: 750;
-  line-height: 1;
+  line-height: 1.2;
   text-decoration: none;
   white-space: nowrap;
   font-variant-numeric: tabular-nums;

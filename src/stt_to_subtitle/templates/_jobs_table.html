@@ -84,7 +84,9 @@
           {% elif pipeline.current %}
             <span class="job-progress-current">
               {% if pipeline.current.kind == 'endpoint' %}{{ pipeline.current.display_label }}{% else %}현재 단계 {{ pipeline.current.label }} · {{ pipeline.current.state_label }}{% endif %}
-              {% if pipeline.current.total %}
+              {% if pipeline.current.progress_unit == 'stage' %}
+                · {{ pipeline.current.internal_stage_label }} · {{ pipeline.current.internal_stage_index }}/{{ pipeline.current.internal_stage_total }}단계
+              {% elif pipeline.current.total %}
                 · {{ pipeline.current.completed }}/{% if pipeline.current.total_is_estimate %}약 {% endif %}{{ pipeline.current.total }} 청크
               {% endif %}
             </span>
@@ -115,6 +117,8 @@
             <span class="job-stage-label">{{ stage.label }}</span>
             {% if stage.key == 'render' and stage.state == 'done' %}
               <span class="job-stage-count" aria-hidden="true"></span>
+            {% elif stage.progress_unit == 'stage' %}
+              <span class="job-stage-count" title="{{ stage.internal_stage_label }}">{{ stage.internal_stage_index }}/{{ stage.internal_stage_total }}단계</span>
             {% elif stage.total %}
               <span class="job-stage-count">{{ stage.completed }}/{% if stage.total_is_estimate %}≈{% endif %}{{ stage.total }}</span>
             {% else %}
@@ -280,7 +284,7 @@
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <input type="hidden" name="return_folder" value="{{ current_folder }}">
         {{ filter_return_fields() }}
-        <button type="submit" class="secondary compact"{% if not retriable_job_count %} disabled{% endif %}>{{ icons.refresh(14) }}중단·정지·실패 전체 재시도 ({{ retriable_job_count }})</button>
+        <button type="submit" class="secondary compact"{% if not retriable_job_count %} disabled{% endif %}>{{ icons.refresh(14) }}전체 작업 재시도{% if retriable_job_summary %} ({{ retriable_job_summary }}){% endif %}</button>
       </form>
       <form class="job-global-action" method="post" action="/jobs/pause-all-translations" data-confirm-message="대기·실행 중인 모든 번역을 일시 정지하시겠습니까? 오디오 추출과 전사는 계속 진행됩니다.">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">

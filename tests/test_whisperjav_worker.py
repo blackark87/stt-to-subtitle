@@ -3,7 +3,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
-from unittest.mock import call, patch
+from unittest.mock import Mock, call, patch
 
 from stt_to_subtitle.vendor.whisperjav import presets
 
@@ -14,6 +14,7 @@ from stt_to_subtitle.whisperjav_worker import (
     QWEN_MODEL_REVISION,
     WHISPERJAV_COMMIT,
     WhisperJAVOptions,
+    align_cues,
     parse_srt,
     run_whisperjav,
 )
@@ -56,6 +57,42 @@ class WhisperJAVWorkerTests(unittest.TestCase):
         self.assertEqual(second.model_id, "qwen-model")
         self.assertEqual(second.segmenter_kwargs()["max_group_duration_s"], 4.0)
         self.assertEqual(presets.MERGE_STRATEGY, "pass1_primary")
+
+    def test_short_cue_uses_fallback_without_reaching_forced_aligner(self) -> None:
+        aligner = SimpleNamespace(
+            load=Mock(),
+            unload=Mock(),
+            align_batch=Mock(
+                return_value=[
+                    SimpleNamespace(
+                        words=[SimpleNamespace(word="はい", start=0.0, end=0.5)]
+                    )
+                ]
+            ),
+        )
+        cues = [
+            Cue(0.0, 0.01, "短"),
+            Cue(1.0, 1.5, "はい"),
+        ]
+
+        with patch(
+            "stt_to_subtitle.whisperjav_worker._create_forced_aligner",
+            return_value=aligner,
+        ):
+            words, fallback_count = align_cues(
+                cues,
+                audio=[0.0] * 32000,
+                sample_rate=16000,
+                aligner_path=Path("/models/aligner"),
+            )
+
+        self.assertEqual(fallback_count, 1)
+        self.assertEqual(words[0]["timestamp_source"], "cue_fallback")
+        self.assertEqual(words[1]["timestamp_source"], "qwen3_forced_alignment")
+        self.assertEqual(
+            len(aligner.align_batch.call_args.kwargs["audio_paths"]),
+            1,
+        )
 
     def test_reports_pinned_models_after_ensemble_and_alignment(self) -> None:
         with TemporaryDirectory() as directory:
@@ -101,9 +138,17 @@ class WhisperJAVWorkerTests(unittest.TestCase):
                     "stt_to_subtitle.whisperjav_worker._read_pcm16",
                     return_value=(object(), 16000),
                 ):
+                    def run_with_progress(*args, **kwargs):
+                        callback = kwargs["progress_callback"]
+                        callback("scene_detection", 1, 7)
+                        callback("primary_transcription", 2, 7)
+                        callback("secondary_transcription", 3, 7)
+                        callback("transcription_merge", 4, 7)
+                        return ensemble
+
                     with patch(
                         "stt_to_subtitle.whisperjav_worker.run_ensemble",
-                        return_value=ensemble,
+                        side_effect=run_with_progress,
                     ) as run:
                         with patch(
                             "stt_to_subtitle.whisperjav_worker.align_cues",
@@ -119,7 +164,14 @@ class WhisperJAVWorkerTests(unittest.TestCase):
                                 0,
                             ),
                         ):
-                            result = run_whisperjav(audio_path, {})
+                            stage_progress = []
+                            result = run_whisperjav(
+                                audio_path,
+                                {},
+                                progress_callback=lambda *values: (
+                                    stage_progress.append(values)
+                                ),
+                            )
 
         self.assertEqual(
             snapshot.call_args_list,
@@ -155,6 +207,16 @@ class WhisperJAVWorkerTests(unittest.TestCase):
         )
         self.assertEqual(result["runtime"]["asr_pass_count"], 2)
         self.assertEqual(result["runtime"]["alignment_pass_count"], 1)
+        self.assertEqual(
+            stage_progress,
+            [
+                ("scene_detection", 1, 7),
+                ("primary_transcription", 2, 7),
+                ("secondary_transcription", 3, 7),
+                ("transcription_merge", 4, 7),
+                ("forced_alignment", 5, 7),
+            ],
+        )
 
     def test_payload_keeps_its_schema_and_gains_the_stage_breakdown(
         self,

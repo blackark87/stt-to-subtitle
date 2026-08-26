@@ -1,4 +1,26 @@
 document.addEventListener("DOMContentLoaded", () => {
+  const validatorForm = document.querySelector("[data-validator-settings]");
+  if (validatorForm) {
+    const provider = validatorForm.querySelector("[data-validator-provider]");
+    const fields = validatorForm.querySelectorAll("[data-validator-field]");
+    const updateValidatorFields = () => {
+      const selected = provider?.value || "openai_compatible";
+      for (const field of fields) {
+        const visible = field.dataset.validatorField === (
+          selected === "bedrock" ? "region" : "base_url"
+        ) && selected !== "openrouter";
+        field.hidden = !visible;
+        const input = field.querySelector("input");
+        if (input) {
+          input.disabled = !visible;
+          input.required = visible;
+        }
+      }
+    };
+    provider?.addEventListener("change", updateValidatorFields);
+    updateValidatorFields();
+  }
+
   const form = document.querySelector("[data-server-settings]");
   if (!form) return;
 

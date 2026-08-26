@@ -20,7 +20,7 @@ import subprocess
 import tempfile
 import threading
 import time
-from typing import Any, AsyncIterator, Mapping, Sequence
+from typing import Any, AsyncIterator, Callable, Mapping, Sequence
 from uuid import uuid4
 import wave
 
@@ -55,6 +55,7 @@ from .kotoba import (
     validate_device,
 )
 from .transcription_store import TranscriptionJob, TranscriptionStore
+from .transcription_progress import parse_stage_progress
 from .time_display import configure_kst_logging
 from .stt_quality import (
     NORMALIZATION_VERSION,
@@ -743,6 +744,8 @@ class TranscriptionService:
         command: Sequence[str],
         *,
         environment: Mapping[str, str],
+        progress_path: Path | None = None,
+        on_stage_progress: Callable[[str, int, int], None] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         self._raise_if_cancel_requested(job_id)
         process = subprocess.Popen(
@@ -757,6 +760,24 @@ class TranscriptionService:
         )
         with self._process_lock:
             self._active_processes[job_id] = process
+        last_stage_progress: tuple[str, int, int] | None = None
+
+        def forward_stage_progress() -> None:
+            nonlocal last_stage_progress
+            if progress_path is None or on_stage_progress is None:
+                return
+            try:
+                payload = json.loads(progress_path.read_text(encoding="utf-8"))
+                if not isinstance(payload, Mapping):
+                    return
+                progress = parse_stage_progress(payload)
+            except (OSError, ValueError):
+                return
+            if progress == last_stage_progress:
+                return
+            last_stage_progress = progress
+            on_stage_progress(*progress)
+
         try:
             try:
                 while True:
@@ -764,6 +785,7 @@ class TranscriptionService:
                         stdout, stderr = process.communicate(timeout=0.5)
                         break
                     except subprocess.TimeoutExpired:
+                        forward_stage_progress()
                         self._raise_if_cancel_requested(job_id)
             except TranscriptionCancelled:
                 self._signal_process(process, signal.SIGTERM)
@@ -777,6 +799,7 @@ class TranscriptionService:
             with self._process_lock:
                 self._active_processes.pop(job_id, None)
         self._raise_if_cancel_requested(job_id)
+        forward_stage_progress()
         return subprocess.CompletedProcess(
             command,
             process.returncode,
@@ -1128,7 +1151,9 @@ class TranscriptionService:
         if release_kotoba:
             self._release_pipeline()
         worker_result = self.result_dir / f".{job.id}.whisperx.json"
+        progress_path = self.result_dir / f".{job.id}.whisperx.progress.json"
         worker_result.unlink(missing_ok=True)
+        progress_path.unlink(missing_ok=True)
         worker_options = job.options if options is None else options
         LOGGER.info(
             "starting WhisperX worker for %s with batch_size=%s threads=%s",
@@ -1159,6 +1184,8 @@ class TranscriptionService:
             str(worker_result),
             "--options",
             json.dumps(worker_options, sort_keys=True),
+            "--progress",
+            str(progress_path),
         ]
         if self.settings.debug_artifacts:
             command.extend(
@@ -1172,6 +1199,15 @@ class TranscriptionService:
                 job.id,
                 command,
                 environment=environment,
+                progress_path=progress_path,
+                on_stage_progress=lambda stage, index, total: (
+                    self._record_stage_progress(
+                        job.id,
+                        stage=stage,
+                        index=index,
+                        total=total,
+                    )
+                ),
             )
             if completed.returncode != 0:
                 detail = (completed.stderr or completed.stdout).strip()
@@ -1192,6 +1228,7 @@ class TranscriptionService:
             return payload
         finally:
             worker_result.unlink(missing_ok=True)
+            progress_path.unlink(missing_ok=True)
 
     def _run_whisperjav_worker(
         self,
@@ -1203,8 +1240,10 @@ class TranscriptionService:
         self._release_pipeline()
         ensemble_result = self.result_dir / f".{job.id}.whisperjav.json"
         speaker_result = self.result_dir / f".{job.id}.speakers.json"
+        progress_path = self.result_dir / f".{job.id}.whisperjav.progress.json"
         ensemble_result.unlink(missing_ok=True)
         speaker_result.unlink(missing_ok=True)
+        progress_path.unlink(missing_ok=True)
         environment = os.environ.copy()
         environment.update(
             {
@@ -1241,6 +1280,8 @@ class TranscriptionService:
             str(ensemble_result),
             "--options",
             json.dumps(job.options, sort_keys=True),
+            "--progress",
+            str(progress_path),
         ]
         speaker_command = [
             str(self.settings.whisperx_python),
@@ -1264,18 +1305,46 @@ class TranscriptionService:
                 ["--debug-dir", str(artifact_dir / "pyannote")]
             )
         try:
-            for label, command, worker_environment in (
-                ("WhisperJAV", whisperjav_command, whisperjav_environment),
+            for label, command, worker_environment, worker_progress in (
+                (
+                    "WhisperJAV",
+                    whisperjav_command,
+                    whisperjav_environment,
+                    progress_path,
+                ),
                 (
                     "WhisperJAV speaker assignment",
                     speaker_command,
                     environment,
+                    None,
                 ),
             ):
+                if worker_progress is None:
+                    self._record_stage_progress(
+                        job.id,
+                        stage="speaker_diarization",
+                        index=6,
+                        total=7,
+                    )
                 completed = self._run_worker_process(
                     job.id,
                     command,
                     environment=worker_environment,
+                    progress_path=worker_progress,
+                    on_stage_progress=(
+                        (
+                            lambda stage, index, total: (
+                                self._record_stage_progress(
+                                    job.id,
+                                    stage=stage,
+                                    index=index,
+                                    total=total,
+                                )
+                            )
+                        )
+                        if worker_progress is not None
+                        else None
+                    ),
                 )
                 if completed.returncode != 0:
                     detail = (completed.stderr or completed.stdout).strip()
@@ -1283,6 +1352,12 @@ class TranscriptionService:
                         f"{label} worker failed"
                         + (f": {detail[-2000:]}" if detail else "")
                     )
+            self._record_stage_progress(
+                job.id,
+                stage="subtitle_normalization",
+                index=7,
+                total=7,
+            )
             try:
                 payload = json.loads(speaker_result.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError) as error:
@@ -1297,6 +1372,7 @@ class TranscriptionService:
         finally:
             ensemble_result.unlink(missing_ok=True)
             speaker_result.unlink(missing_ok=True)
+            progress_path.unlink(missing_ok=True)
 
     def _worker_loop(self) -> None:
         while True:
@@ -1544,6 +1620,12 @@ class TranscriptionService:
                     release_kotoba=True,
                     options=whisperx_options,
                 )
+                self._record_stage_progress(
+                    job.id,
+                    stage="quality_analysis",
+                    index=4,
+                    total=7,
+                )
                 raw_primary_segments = primary_result.get("segments")
                 if not isinstance(raw_primary_segments, list):
                     raise InvalidTranscriptionOutput(
@@ -1604,6 +1686,12 @@ class TranscriptionService:
                         job.id,
                     )
                 elif hybrid_options.rescue_scope == "windows":
+                    self._record_stage_progress(
+                        job.id,
+                        stage="rescue_transcription",
+                        index=5,
+                        total=7,
+                    )
                     (
                         window_segments,
                         fallback_result,
@@ -1616,6 +1704,12 @@ class TranscriptionService:
                     )
                     fallback_segments = add_segment_ids(window_segments)
                 else:
+                    self._record_stage_progress(
+                        job.id,
+                        stage="rescue_transcription",
+                        index=5,
+                        total=7,
+                    )
                     pipeline = self._get_pipeline()
                     fallback_result = run_pipeline(
                         pipeline,
@@ -1658,6 +1752,12 @@ class TranscriptionService:
                     0.0
                     if kotoba_skipped
                     else round(time.monotonic() - kotoba_started, 3)
+                )
+                self._record_stage_progress(
+                    job.id,
+                    stage="transcription_merge",
+                    index=6,
+                    total=7,
                 )
                 fused_segments, hybrid_quality = fuse_hybrid_segments(
                     primary_segments,
@@ -1791,7 +1891,19 @@ class TranscriptionService:
                         "speaker_debounce": speaker_debounce,
                     },
                 }
+                self._record_stage_progress(
+                    job.id,
+                    stage="subtitle_normalization",
+                    index=7,
+                    total=7,
+                )
             elif backend == "kotoba":
+                self._record_stage_progress(
+                    job.id,
+                    stage="primary_transcription",
+                    index=1,
+                    total=2,
+                )
                 raw_result = run_pipeline(
                     self._get_pipeline(),
                     Path(job.audio_path),
@@ -1837,6 +1949,12 @@ class TranscriptionService:
                     backend_quality["encoding_warning"] = dict(
                         encoding_warning
                     )
+                self._record_stage_progress(
+                    job.id,
+                    stage="subtitle_normalization",
+                    index=2,
+                    total=2,
+                )
             else:
                 raise RuntimeError(
                     f"unsupported transcription backend: {backend}"
@@ -2013,6 +2131,29 @@ class TranscriptionService:
             progress.in_progress,
             report_every,
         )
+
+    def _record_stage_progress(
+        self,
+        job_id: str,
+        *,
+        stage: str,
+        index: int,
+        total: int,
+    ) -> None:
+        self._raise_if_cancel_requested(job_id)
+        if self.store.update_stage_progress(
+            job_id,
+            stage=stage,
+            index=index,
+            total=total,
+        ):
+            LOGGER.info(
+                "transcription job %s stage %s (%d/%d)",
+                job_id,
+                stage,
+                index,
+                total,
+            )
 
     def _log_heartbeat(
         self,

@@ -1,6 +1,7 @@
 import asyncio
 import os
 import json
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -612,7 +613,7 @@ class STTAPIHelpersTests(unittest.TestCase):
                 updated_at=0.0,
             )
 
-            def fake_run(job_id, command, *, environment):
+            def fake_run(job_id, command, *, environment, **kwargs):
                 output = Path(command[command.index("--output") + 1])
                 output.write_text(
                     json.dumps(
@@ -647,6 +648,10 @@ class STTAPIHelpersTests(unittest.TestCase):
             )
             self.assertEqual(environment["HF_TOKEN"], "secret-hf-token")
             self.assertEqual(environment["PYTHONIOENCODING"], "utf-8")
+            self.assertIn("--progress", command)
+            self.assertIsNotNone(
+                run.call_args.kwargs["on_stage_progress"]
+            )
             self.assertEqual(result["model"]["id"], "large-v3")
 
             with patch.object(service, "_release_pipeline") as release:
@@ -705,8 +710,8 @@ class STTAPIHelpersTests(unittest.TestCase):
 
             commands = []
 
-            def fake_run(job_id, command, *, environment):
-                commands.append((job_id, command, environment))
+            def fake_run(job_id, command, *, environment, **kwargs):
+                commands.append((job_id, command, environment, kwargs))
                 output = Path(command[command.index("--output") + 1])
                 if "stt_to_subtitle.whisperjav_worker" in command:
                     output.write_text('{"words":[]}', encoding="utf-8")
@@ -743,11 +748,64 @@ class STTAPIHelpersTests(unittest.TestCase):
                 "stt_to_subtitle.whisperjav_worker", commands[0][1]
             )
             self.assertIn("stt_to_subtitle.speaker_worker", commands[1][1])
+            self.assertIn("--progress", commands[0][1])
+            self.assertIsNotNone(commands[0][3]["on_stage_progress"])
+            self.assertIsNone(commands[1][3]["on_stage_progress"])
             self.assertNotIn("secret-hf-token", commands[0][1])
             self.assertEqual(
                 commands[0][2]["HF_TOKEN"], "secret-hf-token"
             )
             self.assertEqual(result["model"]["id"], "whisperjav-domain-ensemble")
+
+    def test_worker_process_forwards_atomic_internal_stage_file(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            service = TranscriptionService(
+                STTAPISettings(
+                    state_dir=root / "state",
+                    api_token="",
+                    hf_token="token",
+                    device="cpu",
+                    diarization_device="cpu",
+                )
+            )
+            progress_path = root / "progress.json"
+            progress_path.write_text(
+                json.dumps(
+                    {
+                        "stage": "secondary_transcription",
+                        "index": 3,
+                        "total": 7,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            process = Mock(pid=1234, returncode=0)
+            process.communicate.side_effect = [
+                subprocess.TimeoutExpired(["worker"], 0.5),
+                ("stdout", "stderr"),
+            ]
+            stage_progress = []
+
+            with patch(
+                "stt_to_subtitle.stt_api.subprocess.Popen",
+                return_value=process,
+            ):
+                completed = service._run_worker_process(
+                    "job-id",
+                    ["worker"],
+                    environment={},
+                    progress_path=progress_path,
+                    on_stage_progress=lambda *values: (
+                        stage_progress.append(values)
+                    ),
+                )
+
+            self.assertEqual(completed.returncode, 0)
+            self.assertEqual(
+                stage_progress,
+                [("secondary_transcription", 3, 7)],
+            )
 
     def test_hybrid_job_runs_both_backends_and_rescues_failed_window(self) -> None:
         with TemporaryDirectory() as directory:

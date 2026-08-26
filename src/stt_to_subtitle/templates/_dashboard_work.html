@@ -63,7 +63,7 @@
         <h2>멈춤 <span class="ob-count">{{ attention_jobs|length + attention_rest }}</span></h2>
         <form method="post" action="/jobs/retry-all" data-confirm-message="중단·정지·실패한 작업을 모두 재시도하시겠습니까?">
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-          <button type="submit" class="secondary compact"{% if not retriable_job_count %} disabled{% endif %}>{{ icons.refresh(13) }}전체 재시도</button>
+          <button type="submit" class="secondary compact"{% if not retriable_job_count %} disabled{% endif %}>{{ icons.refresh(13) }}전체 작업 재시도{% if retriable_job_summary %} ({{ retriable_job_summary }}){% endif %}</button>
         </form>
       </header>
       <div class="ob-table" role="table" aria-label="멈춘 작업">

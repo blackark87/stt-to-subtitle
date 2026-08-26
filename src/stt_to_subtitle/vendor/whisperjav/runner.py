@@ -32,7 +32,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 import re
 import time
-from typing import Any
+from typing import Any, Callable
 
 from stt_to_subtitle.vendor.whisperjav.ensemble.merge import MergeEngine
 from stt_to_subtitle.vendor.whisperjav.presets import (
@@ -371,6 +371,7 @@ def run_ensemble(
     pass2: PassConfig,
     work_dir: Path,
     debug_artifact_dir: Path | None = None,
+    progress_callback: Callable[[str, int, int], None] | None = None,
 ) -> EnsembleResult:
     """Run both passes over shared scenes and merge them.
 
@@ -380,18 +381,24 @@ def run_ensemble(
     work_dir.mkdir(parents=True, exist_ok=True)
     stage_elapsed: dict[str, float] = {}
 
+    if progress_callback is not None:
+        progress_callback("scene_detection", 1, 7)
     scene_started = time.monotonic()
     scenes = detect_scenes(audio_path, work_dir / "scenes", audio_path.stem)
     stage_elapsed["scene_detect"] = round(time.monotonic() - scene_started, 3)
     if not scenes:
         raise RuntimeError("scene detection produced no scenes")
 
+    if progress_callback is not None:
+        progress_callback("primary_transcription", 2, 7)
     first = run_pass(
         pass1, scenes, work_dir, debug_artifact_dir=debug_artifact_dir
     )
     stage_elapsed["pass1"] = first.elapsed_seconds
 
     try:
+        if progress_callback is not None:
+            progress_callback("secondary_transcription", 3, 7)
         second = run_pass(
             pass2, scenes, work_dir, debug_artifact_dir=debug_artifact_dir
         )
@@ -404,6 +411,8 @@ def run_ensemble(
         )
     stage_elapsed["pass2"] = second.elapsed_seconds
 
+    if progress_callback is not None:
+        progress_callback("transcription_merge", 4, 7)
     merged = work_dir / "merged.srt"
     merge_started = time.monotonic()
     if second.status == "completed" and second.srt_path is not None:

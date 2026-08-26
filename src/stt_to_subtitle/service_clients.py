@@ -11,10 +11,12 @@ from pathlib import Path
 import threading
 import time
 from typing import Any, ContextManager
+from urllib.parse import quote
 
 import requests
 
 from .contracts import validate_transcript, validate_translation_items
+from .transcription_progress import parse_stage_progress
 from .translation_prompt import KOREAN_JAV_SYSTEM_PROMPT
 
 LOGGER = logging.getLogger(__name__)
@@ -451,6 +453,7 @@ class STTAPIClient(RetryingJSONClient):
         should_stop: Callable[[], bool] | None,
     ) -> Mapping[str, Any]:
         last_progress: tuple[int, int, int, int, bool] | None = None
+        last_stage_progress: tuple[str, int, int] | None = None
         for status_payload in self._status_events(
             job_id,
             should_stop=should_stop,
@@ -472,8 +475,9 @@ class STTAPIClient(RetryingJSONClient):
                 raise ExternalServiceError(
                     f"transcription job returned unknown status {remote_status}"
                 )
+            progress_update: dict[str, Any] = {}
             progress = status_payload.get("chunk_progress")
-            if on_progress is not None and isinstance(progress, Mapping):
+            if isinstance(progress, Mapping):
                 try:
                     current_progress = (
                         int(progress["created"]),
@@ -499,7 +503,7 @@ class STTAPIClient(RetryingJSONClient):
                     and any(current_progress)
                 ):
                     last_progress = current_progress
-                    on_progress(
+                    progress_update.update(
                         {
                             "created": current_progress[0],
                             "completed": current_progress[1],
@@ -508,6 +512,26 @@ class STTAPIClient(RetryingJSONClient):
                             "final": current_progress[4],
                         }
                     )
+            stage_payload = status_payload.get("stage_progress")
+            if isinstance(stage_payload, Mapping):
+                try:
+                    current_stage_progress = parse_stage_progress(stage_payload)
+                except ValueError:
+                    current_stage_progress = None
+                if (
+                    current_stage_progress is not None
+                    and current_stage_progress != last_stage_progress
+                ):
+                    last_stage_progress = current_stage_progress
+                    progress_update.update(
+                        {
+                            "stage": current_stage_progress[0],
+                            "stage_index": current_stage_progress[1],
+                            "stage_total": current_stage_progress[2],
+                        }
+                    )
+            if on_progress is not None and progress_update:
+                on_progress(progress_update)
             if remote_status in {"cancelled", "completed", "failed"}:
                 return status_payload
         raise ExternalServiceError(
@@ -885,6 +909,8 @@ class SubtitleValidationClient(RetryingJSONClient):
         token: str,
         model: str,
         *,
+        provider: str = "openai_compatible",
+        region: str = "",
         request_observer: RequestObserver | None = None,
     ) -> None:
         super().__init__(
@@ -896,14 +922,24 @@ class SubtitleValidationClient(RetryingJSONClient):
         )
         if not model.strip():
             raise ValueError("subtitle validator model name is required")
-        self.base_url = base_url.rstrip("/")
+        if provider not in {"openrouter", "bedrock", "openai_compatible"}:
+            raise ValueError("unsupported subtitle validator provider")
+        if provider == "bedrock" and not region.strip():
+            raise ValueError("subtitle validator Bedrock region is required")
+        self.base_url = (
+            "https://openrouter.ai/api/v1"
+            if provider == "openrouter"
+            else base_url.rstrip("/")
+        )
         self.model = model.strip()
+        self.provider = provider
+        self.region = region.strip()
 
     def validate(self, comparison: Mapping[str, Any]) -> dict[str, Any]:
         finding_schema = {
             "type": "object",
             "properties": {
-                "reference_index": {"type": "integer", "minimum": 0},
+                "reference_index": {"type": "integer"},
                 "category": {
                     "type": "string",
                     "enum": [
@@ -930,23 +966,29 @@ class SubtitleValidationClient(RetryingJSONClient):
                 "findings": {
                     "type": "array",
                     "items": finding_schema,
-                    "maxItems": 100,
                 },
             },
             "required": ["severity", "summary", "findings"],
             "additionalProperties": False,
         }
-        payload = {
+        system_prompt = (
+            "외부 자막을 한국어 기준 자막으로 보고 생성 자막을 검수하라. "
+            "의미 누락, 오역, 부자연스러운 표현, 타이밍 문제만 지적하고 "
+            "문체 차이만으로 실패 판정하지 마라. 결과는 한국어로 작성하라."
+        )
+        if self.provider == "bedrock":
+            return self._validate_bedrock(
+                comparison,
+                schema=schema,
+                system_prompt=system_prompt,
+            )
+        payload: dict[str, Any] = {
             "model": self.model,
             "temperature": 0,
             "messages": [
                 {
                     "role": "system",
-                    "content": (
-                        "외부 자막을 한국어 기준 자막으로 보고 생성 자막을 검수하라. "
-                        "의미 누락, 오역, 부자연스러운 표현, 타이밍 문제만 지적하고 "
-                        "문체 차이만으로 실패 판정하지 마라. 결과는 한국어로 작성하라."
-                    ),
+                    "content": system_prompt,
                 },
                 {
                     "role": "user",
@@ -962,6 +1004,8 @@ class SubtitleValidationClient(RetryingJSONClient):
                 },
             },
         }
+        if self.provider == "openrouter":
+            payload["provider"] = {"require_parameters": True}
         response = self.request(
             "POST",
             f"{self.base_url}/chat/completions",
@@ -971,7 +1015,7 @@ class SubtitleValidationClient(RetryingJSONClient):
         )
         if response.status_code != 200:
             raise ExternalServiceError(
-                "OpenAI-compatible subtitle validation failed: "
+                f"{self.provider} subtitle validation failed: "
                 f"HTTP {response.status_code}: {_safe_error(response)}"
             )
         try:
@@ -979,7 +1023,75 @@ class SubtitleValidationClient(RetryingJSONClient):
             result = json.loads(content) if isinstance(content, str) else content
         except (KeyError, IndexError, TypeError, ValueError) as error:
             raise ExternalServiceError(
-                "OpenAI-compatible subtitle validator returned invalid JSON"
+                f"{self.provider} subtitle validator returned invalid JSON"
+            ) from error
+        return _normalize_subtitle_validation(result)
+
+    def _validate_bedrock(
+        self,
+        comparison: Mapping[str, Any],
+        *,
+        schema: Mapping[str, Any],
+        system_prompt: str,
+    ) -> dict[str, Any]:
+        model_path = quote(self.model, safe="")
+        response = self.request(
+            "POST",
+            (
+                f"https://bedrock-runtime.{self.region}.amazonaws.com/"
+                f"model/{model_path}/converse"
+            ),
+            headers={**self.headers, "Content-Type": "application/json"},
+            json={
+                "system": [{"text": system_prompt}],
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "text": json.dumps(
+                                    comparison,
+                                    ensure_ascii=False,
+                                )
+                            }
+                        ],
+                    }
+                ],
+                "inferenceConfig": {"temperature": 0, "maxTokens": 4096},
+                "outputConfig": {
+                    "textFormat": {
+                        "type": "json_schema",
+                        "structure": {
+                            "jsonSchema": {
+                                "name": "subtitle_validation",
+                                "schema": json.dumps(
+                                    schema,
+                                    ensure_ascii=False,
+                                    separators=(",", ":"),
+                                ),
+                            }
+                        },
+                    }
+                },
+            },
+            metric_operation="validation",
+        )
+        if response.status_code != 200:
+            raise ExternalServiceError(
+                "bedrock subtitle validation failed: "
+                f"HTTP {response.status_code}: {_safe_error(response)}"
+            )
+        try:
+            blocks = response.json()["output"]["message"]["content"]
+            content = next(
+                block["text"]
+                for block in blocks
+                if isinstance(block, Mapping) and "text" in block
+            )
+            result = json.loads(content) if isinstance(content, str) else content
+        except (KeyError, StopIteration, TypeError, ValueError) as error:
+            raise ExternalServiceError(
+                "bedrock subtitle validator returned invalid JSON"
             ) from error
         return _normalize_subtitle_validation(result)
 
