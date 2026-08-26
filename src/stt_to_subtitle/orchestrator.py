@@ -750,6 +750,15 @@ class SubtitleOrchestrator:
                 "reconciled %d interrupted job(s) from persisted checkpoints",
                 recovered,
             )
+        translation_recovery = (
+            self.store.reconcile_interrupted_translation_attempts()
+        )
+        if translation_recovery["generation_count"]:
+            LOGGER.warning(
+                "reconciled %d translation generation(s) and %d batch(es)",
+                translation_recovery["generation_count"],
+                translation_recovery["batch_count"],
+            )
         self._scheduler.start()
 
     def _reconcile_interrupted_jobs(self) -> int:
@@ -790,6 +799,11 @@ class SubtitleOrchestrator:
                     )
                 else:
                     self._mark_job_stopped(job, stage)
+                    self.store.release_job_lease(
+                        job.id,
+                        lease_owner=self._worker_id,
+                        lease_token=lease_token,
+                    )
                 continue
 
             if (
@@ -851,6 +865,11 @@ class SubtitleOrchestrator:
                     "warning",
                     "service restart detected; resumed from persisted "
                     f"checkpoint {target_status}",
+                )
+                self.store.release_job_lease(
+                    job.id,
+                    lease_owner=self._worker_id,
+                    lease_token=lease_token,
                 )
         return recovered
 

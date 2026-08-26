@@ -1859,6 +1859,9 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                     orchestrator.store.get(translating.id).status,
                     "transcribed",
                 )
+                self.assertIsNone(
+                    orchestrator.store.get(translating.id).lease_owner
+                )
                 self.assertEqual(
                     orchestrator.store.get(rendering.id).status,
                     "translated",
@@ -1897,6 +1900,98 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                     orchestrator._cancel_interrupted_transcription,
                     ANY,
                 )
+            finally:
+                orchestrator.stop()
+
+    def test_start_reconciles_translation_ledger_before_scheduler(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            transcript_path = root / "transcript.json"
+            transcript_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "job_id": "remote-job",
+                        "segments": [
+                            {
+                                "id": "segment-000001",
+                                "start": 0.0,
+                                "end": 1.0,
+                                "speaker": "SPEAKER_00",
+                                "text": "こんにちは",
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            orchestrator = self.make_orchestrator(root, media_root)
+            try:
+                job = orchestrator.store.create(
+                    job_id="restart-translation-ledger",
+                    source_rel="movie.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                orchestrator.store.update(
+                    job.id,
+                    status="translation_running",
+                    transcript_path=str(transcript_path),
+                )
+                generation = orchestrator.store.create_translation_generation(
+                    generation_id="generation-restart",
+                    job_id=job.id,
+                    transcript_job_id="remote-job",
+                    transcript_hash="transcript-hash",
+                    prompt_hash="prompt-hash",
+                    endpoint_key="http://lm.test/v1",
+                    model="model",
+                    config_hash="config-hash",
+                    artifact_path="generation.json",
+                    origin="automatic",
+                )
+                attempt = (
+                    orchestrator.store.begin_translation_generation_attempt(
+                        generation["id"]
+                    )
+                )
+                orchestrator.store.start_translation_batch(
+                    generation["id"],
+                    batch_index=0,
+                    generation_attempt=attempt,
+                    items=[
+                        {
+                            "id": "segment-000001",
+                            "source_hash": "source-1",
+                        }
+                    ],
+                )
+                orchestrator._scheduler.start = Mock()
+
+                orchestrator.start()
+
+                recovered_job = orchestrator.store.get(job.id)
+                recovered_generation = (
+                    orchestrator.store.get_translation_generation(
+                        generation["id"]
+                    )
+                )
+                self.assertEqual(recovered_job.status, "transcribed")
+                self.assertIsNone(recovered_job.lease_owner)
+                self.assertEqual(
+                    recovered_generation["state"],
+                    "interrupted",
+                )
+                self.assertEqual(
+                    orchestrator.store.translation_batches(
+                        generation["id"]
+                    )[0]["state"],
+                    "interrupted",
+                )
+                orchestrator._scheduler.start.assert_called_once_with()
             finally:
                 orchestrator.stop()
 

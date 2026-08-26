@@ -68,6 +68,12 @@ _COMPARISON_TRANSCRIPTION_SQL = (
     "operation = 'transcribe' AND "
     "json_extract(options_json, '$.comparison_id') IS NOT NULL"
 )
+TRANSLATION_RESTART_INTERRUPTED = (
+    "service restart interrupted translation attempt"
+)
+TRANSLATION_BATCH_RESTART_INTERRUPTED = (
+    "service restart interrupted translation batch"
+)
 
 
 class WorkerLeaseLost(RuntimeError):
@@ -2729,6 +2735,106 @@ class JobStore:
             raise ValueError("translation generation not found")
         return int(row["attempt"])
 
+    def reconcile_interrupted_translation_attempts(self) -> dict[str, int]:
+        """Finalize the latest translation attempt after job recovery."""
+
+        now = time.time()
+        generation_count = 0
+        batch_count = 0
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT generation.id, job.status AS job_status,
+                       job.state AS job_state, job.error AS job_error
+                FROM translation_generations AS generation
+                JOIN jobs AS job ON job.id = generation.job_id
+                WHERE generation.state IN ('running', 'partial')
+                  AND job.status != 'translation_running'
+                  AND (
+                      generation.state = 'running'
+                      OR generation.attempt > 0
+                      OR EXISTS (
+                          SELECT 1 FROM translation_batches AS active_batch
+                          WHERE active_batch.generation_id = generation.id
+                            AND active_batch.state = 'running'
+                      )
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM translation_generations AS newer
+                      WHERE newer.job_id = generation.job_id
+                        AND newer.generation_number
+                            > generation.generation_number
+                  )
+                ORDER BY generation.created_at
+                """
+            ).fetchall()
+            for row in rows:
+                job_status = str(row["job_status"])
+                job_state = str(row["job_state"])
+                job_error = (
+                    str(row["job_error"]) if row["job_error"] else None
+                )
+                if job_state == JobState.STOPPED.value:
+                    target_state = "stopped"
+                elif job_status == "translation_paused":
+                    target_state = "paused"
+                elif job_status == "blocked":
+                    target_state = "blocked"
+                elif job_status == "failed":
+                    target_state = "failed"
+                else:
+                    target_state = "interrupted"
+                last_error = (
+                    None
+                    if target_state == "paused"
+                    else job_error or TRANSLATION_RESTART_INTERRUPTED
+                )
+                generation_id = str(row["id"])
+                updated = connection.execute(
+                    """
+                    UPDATE translation_generations
+                    SET state = ?, last_error = ?, updated_at = ?
+                    WHERE id = ? AND state IN ('running', 'partial')
+                      AND (
+                          state = 'running' OR attempt > 0
+                          OR EXISTS (
+                              SELECT 1
+                              FROM translation_batches AS active_batch
+                              WHERE active_batch.generation_id =
+                                  translation_generations.id
+                                AND active_batch.state = 'running'
+                          )
+                      )
+                      AND EXISTS (
+                          SELECT 1 FROM jobs
+                          WHERE jobs.id = translation_generations.job_id
+                            AND jobs.status != 'translation_running'
+                      )
+                    """,
+                    (target_state, last_error, now, generation_id),
+                )
+                if updated.rowcount != 1:
+                    continue
+                generation_count += 1
+                interrupted_batches = connection.execute(
+                    """
+                    UPDATE translation_batches
+                    SET state = 'interrupted', error = ?, updated_at = ?
+                    WHERE generation_id = ? AND state = 'running'
+                    """,
+                    (
+                        TRANSLATION_BATCH_RESTART_INTERRUPTED,
+                        now,
+                        generation_id,
+                    ),
+                )
+                batch_count += interrupted_batches.rowcount
+        return {
+            "generation_count": generation_count,
+            "batch_count": batch_count,
+        }
+
     def mark_translation_generation(
         self,
         generation_id: str,
@@ -2737,13 +2843,21 @@ class JobStore:
         error: str | None = None,
         generation_attempt: int | None = None,
     ) -> None:
-        if state not in {"partial", "paused", "blocked", "failed", "stopped"}:
+        if state not in {
+            "partial",
+            "paused",
+            "blocked",
+            "failed",
+            "stopped",
+            "interrupted",
+        }:
             raise ValueError("invalid translation generation state")
-        attempt_condition = (
-            " AND attempt = ?" if generation_attempt is not None else ""
-        )
+        attempt_condition = ""
         parameters: list[Any] = [state, error, time.time(), generation_id]
         if generation_attempt is not None:
+            attempt_condition = (
+                " AND attempt = ? AND state IN ('running', 'partial')"
+            )
             parameters.append(generation_attempt)
         with self._connect() as connection:
             updated = connection.execute(
@@ -2816,7 +2930,8 @@ class JobStore:
                 """
                 UPDATE translation_generations
                 SET updated_at = updated_at
-                WHERE id = ? AND attempt = ? AND state = 'running'
+                WHERE id = ? AND attempt = ?
+                  AND state IN ('running', 'partial')
                 """,
                 (generation_id, generation_attempt),
             )
@@ -2868,7 +2983,9 @@ class JobStore:
                 " AND EXISTS (SELECT 1 FROM translation_generations "
                 "WHERE translation_generations.id = "
                 "translation_batches.generation_id "
-                "AND translation_generations.attempt = ?)"
+                "AND translation_generations.attempt = ? "
+                "AND translation_generations.state "
+                "IN ('running', 'partial'))"
             )
             parameters.append(generation_attempt)
         with self._connect() as connection:
@@ -2975,6 +3092,7 @@ class JobStore:
                 UPDATE translation_generations
                 SET updated_at = updated_at
                 WHERE id = ? AND attempt = ?
+                  AND state IN ('running', 'partial')
                 """,
                 (generation_id, generation_attempt),
             )
@@ -3091,11 +3209,12 @@ class JobStore:
                     "translation generation items do not match transcript"
                 )
             now = time.time()
-            attempt_condition = (
-                " AND attempt = ?" if generation_attempt is not None else ""
-            )
+            attempt_condition = ""
             parameters: list[Any] = [now, now, generation_id]
             if generation_attempt is not None:
+                attempt_condition = (
+                    " AND attempt = ? AND state IN ('running', 'partial')"
+                )
                 parameters.append(generation_attempt)
             updated = connection.execute(
                 f"""

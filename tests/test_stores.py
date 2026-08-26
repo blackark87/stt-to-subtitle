@@ -1203,6 +1203,189 @@ class JobStoreTests(unittest.TestCase):
             self.assertEqual(second_token, first_token + 1)
             self.assertEqual(store.translation_items(generation["id"]), [])
 
+    def test_reconciles_interrupted_translation_attempts(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = JobStore(Path(directory) / "jobs.sqlite3")
+            job = store.create(
+                job_id="translation-interrupted",
+                source_rel="movie.mkv",
+                force_overwrite=False,
+                options={},
+                status="transcribed",
+            )
+            store.update(job.id, status="translation_running")
+            generation = store.create_translation_generation(
+                generation_id="generation-interrupted",
+                job_id=job.id,
+                transcript_job_id="remote-job",
+                transcript_hash="transcript-hash",
+                prompt_hash="prompt-hash",
+                endpoint_key="http://lm.test/v1",
+                model="model",
+                config_hash="config-hash",
+                artifact_path="generation.json",
+                origin="automatic",
+            )
+            attempt = store.begin_translation_generation_attempt(
+                generation["id"]
+            )
+            store.start_translation_batch(
+                generation["id"],
+                batch_index=0,
+                generation_attempt=attempt,
+                items=[{"id": "segment-1", "source_hash": "source-1"}],
+            )
+            store.update(job.id, status="transcribed")
+            pending_job = store.create(
+                job_id="translation-pending",
+                source_rel="pending.mkv",
+                force_overwrite=False,
+                options={},
+                status="transcribed",
+            )
+            pending_generation = store.create_translation_generation(
+                generation_id="generation-pending",
+                job_id=pending_job.id,
+                transcript_job_id="pending-remote-job",
+                transcript_hash="pending-transcript-hash",
+                prompt_hash="pending-prompt-hash",
+                endpoint_key="http://lm.test/v1",
+                model="model",
+                config_hash="pending-config-hash",
+                artifact_path="pending-generation.json",
+                origin="restart",
+            )
+
+            recovered = store.reconcile_interrupted_translation_attempts()
+
+            self.assertEqual(
+                recovered,
+                {"generation_count": 1, "batch_count": 1},
+            )
+            interrupted = store.get_translation_generation(generation["id"])
+            self.assertEqual(interrupted["state"], "interrupted")
+            self.assertIn("service restart", interrupted["last_error"])
+            interrupted_batch = store.translation_batches(generation["id"])[0]
+            self.assertEqual(interrupted_batch["state"], "interrupted")
+            self.assertEqual(
+                store.get_translation_generation(pending_generation["id"])[
+                    "state"
+                ],
+                "partial",
+            )
+            with self.assertRaises(WorkerLeaseLost):
+                store.save_translation_batch(
+                    generation["id"],
+                    batch_index=0,
+                    generation_attempt=attempt,
+                    kind="remote",
+                    items=[
+                        {
+                            "id": "segment-1",
+                            "text": "늦은 결과",
+                            "source_hash": "source-1",
+                            "segment_index": 0,
+                        }
+                    ],
+                )
+            next_attempt = store.begin_translation_generation_attempt(
+                generation["id"]
+            )
+            store.start_translation_batch(
+                generation["id"],
+                batch_index=1,
+                generation_attempt=next_attempt,
+                items=[{"id": "segment-1", "source_hash": "source-1"}],
+            )
+            self.assertEqual(next_attempt, attempt + 1)
+            self.assertEqual(
+                [
+                    batch["state"]
+                    for batch in store.translation_batches(generation["id"])
+                ],
+                ["interrupted", "running"],
+            )
+
+    def test_translation_reconcile_preserves_terminal_job_meaning(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = JobStore(Path(directory) / "jobs.sqlite3")
+            cases = (
+                (
+                    "paused",
+                    {"status": "translation_paused"},
+                    "paused",
+                    None,
+                ),
+                (
+                    "blocked",
+                    {
+                        "status": "blocked",
+                        "blocked_stage": "translation",
+                        "error": "model offline",
+                    },
+                    "blocked",
+                    "model offline",
+                ),
+                (
+                    "failed",
+                    {
+                        "status": "failed",
+                        "blocked_stage": "translation",
+                        "error": "invalid response",
+                    },
+                    "failed",
+                    "invalid response",
+                ),
+                (
+                    "stopped",
+                    {
+                        "status": "blocked",
+                        "state": "stopped",
+                        "reason_code": "user_stop",
+                        "blocked_stage": "translation",
+                        "error": "user stop",
+                    },
+                    "stopped",
+                    "user stop",
+                ),
+            )
+            generations: dict[str, str] = {}
+            for label, terminal_fields, _state, _error in cases:
+                job = store.create(
+                    job_id=f"translation-{label}",
+                    source_rel=f"{label}.mkv",
+                    force_overwrite=False,
+                    options={},
+                    status="transcribed",
+                )
+                store.update(job.id, status="translation_running")
+                generation = store.create_translation_generation(
+                    generation_id=f"generation-{label}",
+                    job_id=job.id,
+                    transcript_job_id=f"remote-{label}",
+                    transcript_hash=f"transcript-{label}",
+                    prompt_hash="prompt-hash",
+                    endpoint_key="http://lm.test/v1",
+                    model="model",
+                    config_hash=f"config-{label}",
+                    artifact_path=f"generation-{label}.json",
+                    origin="automatic",
+                )
+                store.begin_translation_generation_attempt(generation["id"])
+                store.update(job.id, **terminal_fields)
+                generations[label] = generation["id"]
+
+            recovered = store.reconcile_interrupted_translation_attempts()
+
+            self.assertEqual(recovered["generation_count"], len(cases))
+            self.assertEqual(recovered["batch_count"], 0)
+            for label, _terminal_fields, state, error in cases:
+                generation = store.get_translation_generation(
+                    generations[label]
+                )
+                self.assertEqual(generation["state"], state)
+                self.assertEqual(generation["last_error"], error)
+
     def test_versions_and_publishes_subtitle_pairs(self) -> None:
         with TemporaryDirectory() as directory:
             store = JobStore(Path(directory) / "jobs.sqlite3")

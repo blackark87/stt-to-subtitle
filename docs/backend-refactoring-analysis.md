@@ -6,7 +6,7 @@
 
 ### 구현 진행 상태
 
-현재 작업 트리에는 계획의 열일곱 번째 수직 슬라이스까지 반영됐다.
+현재 작업 트리에는 계획의 열여덟 번째 수직 슬라이스까지 반영됐다.
 
 | 항목 | 반영 상태 | 남은 범위 |
 |---|---|---|
@@ -16,10 +16,10 @@
 | 로컬 비교 | 시간 중첩 정렬, coverage·문장 유사도·경계 오차, 파일 해시별 SQLite 결과 | generation/publication FK·검증 알고리즘 version migration |
 | 상용 LLM 검증 | 번역 LLM과 분리된 설정, 명시적 1회 호출, 구조화 결과, 입력·모델 cache | provider별 adapter·비용/사용량 관측 |
 | 프롬프트 revision | 카테고리 생성·수정·보관·복원, 본문 변경별 immutable revision, 작업 snapshot·translation generation 고정 참조 | revision 비교·과거 revision 선택 UI |
-| 번역 generation | generation·batch·segment SQLite 원장, 입력 지문, prompt·transcript revision 참조, 배치 시도·실패, DB 기반 JSON 복구, 재번역·직접 편집 이력, generation attempt fencing | startup reconcile fault test |
+| 번역 generation | generation·batch·segment SQLite 원장, 입력 지문, prompt·transcript revision 참조, 배치 시도·실패, DB 기반 JSON 복구, 재번역·직접 편집 이력, generation attempt fencing, startup generation·batch reconcile | 강제 종료 시점별 실환경 fault test |
 | 자막 publication | source별 단일 게시 포인터, generation별 SRT/ASS와 해시, 다운로드·과거 버전 재게시, pair manifest·파일/DB startup reconcile | retention·교체 지점별 강제 종료 fault test |
 | 원격 STT 취소 | 멱등 cancel API, `cancel_requested/cancelled` 영속 상태, 웹의 취소 호출·최종 확인, WhisperX/JAV process group 종료, Kotoba 청크 경계 취소 | Kotoba diarization/postprocess 즉시 중단·실제 GPU 자원 fault test |
-| 시작 복구 | 추출 재대기, 원격 STT 재연결·유실 ID 멱등 재제출, 번역 체크포인트 대기 복원, 검증된 전사·번역 산출물 기반 렌더 재개, 게시 자막 pair reconcile, worker lease claim·heartbeat·만료 회수, 단조 증가 fencing token, 제한 시간 graceful drain, SIGKILL 뒤 lease 회수 test, 중지 요청 보존 | artifact 게시 교체 지점별 fault matrix |
+| 시작 복구 | 추출 재대기, 원격 STT 재연결·유실 ID 멱등 재제출, 번역 체크포인트 대기 복원, generation·batch 중단 attempt 확정, 복구 lease 즉시 반환, 검증된 전사·번역 산출물 기반 렌더 재개, 게시 자막 pair reconcile, worker lease claim·heartbeat·만료 회수, 단조 증가 fencing token, 제한 시간 graceful drain, SIGKILL 뒤 lease 회수 test, 중지 요청 보존 | artifact 게시 교체 지점별 fault matrix |
 | 오디오·전사 revision | source·추출 설정 hash 기반 WAV 재사용, immutable WAV·전사 JSON 경로, DB revision 원장·활성 포인터, 직접 편집·비교 선택의 별도 전사 revision, 번역 generation의 transcript revision 참조 | retention·orphan collector·과거 revision 선택 UI |
 | STT 실패 계약 | STT DB·API의 `failure_code/retryable/failure_scope`, segment/schema·OOM·인증·입력·처리·재시작 오류 분류, retryable 실패만 원격 재제출 | 실제 backend별 fault test·오류 코드 운영 지표 |
 | STT dispatch gate | 첫 연결 실패 시 영속 gate 차단, 뒤 작업 `audio_ready` 유지, 명시적 연결 확인의 제한된 3회 요청 후 중단 작업 재개 | 자동 recovery mode가 실제로 필요한지 운영 검증·회로 메트릭 |
@@ -35,11 +35,11 @@
 
 1. 사용자 표시와 필터는 `phase/state/reason_code/attempt`로 분리됐지만 스케줄러 실행 전이는 아직 레거시 `status`를 호환 필드로 함께 사용한다.
 2. 언어 모델 수동 gate와 마지막 상태·사유를 영속화했다. 웹 재시작 시 마지막 `offline/lost`를 복원하고, 이전 상태가 `ready`였어도 자동 호출·dispatch 없이 `offline/manual_start_required`로 시작한다.
-3. 웹 프로세스 재시작 시 실행 중 작업을 단계별로 reconcile한다. 원격 STT는 기존 ID에 재연결하고 ID가 유실됐으면 동일 멱등 키로 재제출한다. 번역 LLM은 자동 호출하지 않고 체크포인트를 대기로 복원한다.
+3. 웹 프로세스 재시작 시 실행 중 작업을 단계별로 reconcile한다. 원격 STT는 기존 ID에 재연결하고 ID가 유실됐으면 동일 멱등 키로 재제출한다. 번역 LLM은 자동 호출하지 않고 체크포인트를 대기로 복원하며, 실행 중이던 generation·batch attempt는 `interrupted`로 확정한다.
 4. 사용자 정지는 신규 작업에서 명시적 `stopped/user_stop`으로 저장한다. 기존 한국어 오류 문구 판별은 과거 DB를 한 번 마이그레이션할 때만 사용한다.
 5. 2D 대시보드, 3D 대시보드, 작업 목록은 영속 `state`를 공통 원천으로 사용하고 작업 목록은 `phase + state` 결합 필터를 지원한다.
 6. 전사 중지는 원격 STT cancel API를 호출하고 `cancelled` 확인 뒤 웹 작업을 `stopped/user_stop`으로 확정한다. WhisperX/JAV는 process group을 종료하고 Kotoba는 청크 경계에서 협력적으로 중지한다.
-7. 번역 결과는 generation·batch·segment 단위로 DB에 저장되고 JSON을 재생성할 수 있다. 실행 작업은 worker lease를 원자적으로 claim하고 heartbeat로 연장하며, 시작 복구는 유효한 다른 소유자의 lease를 건드리지 않고 만료된 작업만 회수한다. 번역 batch·완료 갱신은 현재 generation attempt와 일치해야 한다.
+7. 번역 결과는 generation·batch·segment 단위로 DB에 저장되고 JSON을 재생성할 수 있다. 실행 작업은 worker lease를 원자적으로 claim하고 heartbeat로 연장하며, 시작 복구는 유효한 다른 소유자의 lease를 건드리지 않고 만료된 작업만 회수한다. 번역 batch·완료 갱신은 현재 활성 generation attempt에서만 허용해 복구 전 worker의 늦은 쓰기를 거부한다.
 8. 프롬프트 본문 변경은 immutable prompt revision을 만들고 작업 snapshot과 translation generation이 해당 revision을 고정 참조한다. 프롬프트를 바꾼 재번역과 직접 편집은 별도 translation generation으로 보존하며, SRT/ASS도 generation별 보존·재게시할 수 있다.
 9. 미디어 옆의 `<filename>.srt/.vtt/.ass` 외부 자막 탐지·재생·로컬 비교는 추가됐지만 asset/revision/publication 관계와 증분 catalog는 아직 없다.
 10. STT 연결 실패는 영속 dispatch gate를 닫아 뒤 작업의 연쇄 실패를 막는다. 자동 background probe는 하지 않으며 사용자가 연결 확인/재개를 실행할 때만 제한된 확인 후 gate를 연다.
@@ -241,7 +241,7 @@ stateDiagram-v2
 | 대기 | DB 행 | 그대로 유지 | 대기 |
 | 오디오 추출 | 없음 | `queued`로 되돌려 단계 처음부터 자동 재실행 | 대기 → 진행 |
 | 전사 | 원격 `stt_job_id`, 원본 WAV | 원격 상태 조회 후 완료 결과 회수 또는 실행 재연결. 원격 작업 유실 시 동일 멱등 키로 재제출 | 진행 또는 외부 서비스 중단 |
-| 번역 | 번역 ID별 부분 결과 | transcript를 검증하고 `transcribed`로 복원. 수동 LLM gate가 열릴 때 미완료 논리 배치부터 재개 | 대기 또는 일시정지 |
+| 번역 | generation·batch·segment 원장 | transcript를 검증하고 `transcribed`로 복원. 실행 중 attempt와 batch는 `interrupted`로 확정하고 수동 LLM gate가 열릴 때 새 attempt로 미완료 segment부터 재개 | 대기 또는 일시정지 |
 | 렌더 | transcript/translation과 generation 원장 | 두 JSON 계약을 검증해 `translated`로 복원하고 전체 재렌더 | 대기 → 진행 → 완료 |
 | 사용자 중지 | 명시적 `stopped` | 자동 재개하지 않음 | 중지 |
 | 비재시도 실패 | `failed + reason_code` | 자동 재개하지 않음 | 실패 |
@@ -333,13 +333,21 @@ endpoint·model·batch 설정의 지문을 저장하고, 논리 배치는 호출
 성공 시 item과 함께 `completed`, 예외 시 `failed`로 기록한다. 부분 JSON은 DB item에서
 원자적으로 다시 생성하므로 JSON이 없거나 교체 도중 프로세스가 종료돼도 저장된
 세그먼트부터 재구성할 수 있다. 기존 단일 JSON은 첫 접근 시 legacy generation으로
-가져온다.
+가져온다. startup에서는 작업 체크포인트를 먼저 복원한 뒤 최신 실행 generation과
+`running` batch를 `interrupted`로 확정하고 복구 lease를 반환한다. 확정된 item은
+유지하며 다음 수동 재개는 새 attempt 번호를 사용한다. `attempt=0`인 신규 대기
+generation은 실제 실행이 시작되지 않았으므로 복구 대상에서 제외한다.
+
+여기서 `interrupted`는 프로세스 종료로 끊긴 내부 실행 attempt의 이력 상태다. 사용자
+표시 작업 state인 `blocked/중단`이나 처리 오류인 `failed/실패`로 승격하지 않으며,
+상위 작업은 `transcribed/waiting`으로 복원된다. 이전 attempt의 batch 저장·완료·오류
+갱신은 generation이 더 이상 활성 상태가 아니므로 거부된다.
 
 현재 수직 슬라이스 이후에도 다음 범위는 남는다.
 
-- 실행 중 종료된 generation·batch를 startup에서 어떤 상태로 확정할지
 - prompt 과거 revision을 UI에서 비교·선택하는 방법
 - revision·generation retention과 orphan 정리 정책
+- generation·batch 강제 종료 시점별 실환경 fault test
 
 부분 JSON의 관리 방법은 반드시 알아야 하며 공개된 영속 계약으로 만들어야 한다. 권장 구조는 DB를 실행·revision의 원장으로 사용하고 JSON을 특정 generation의 편집·교환 가능한 snapshot으로 취급하는 것이다.
 
@@ -357,7 +365,7 @@ translation_generations(
 
 translation_batches(
   generation_id, batch_index, input_hash, segment_ids_json,
-  state, attempt, next_retry_at, output_hash, error_code, updated_at,
+  state, generation_attempt, output_hash, error_code, updated_at,
   UNIQUE(generation_id, batch_index)
 )
 
@@ -803,7 +811,7 @@ src/stt_to_subtitle/
 
 | 질의 | 현재 코드 기준 답변 | 보고서 권고 |
 |---|---|---|
-| 번역 청크 DB 저장이 없어도 되는가 | 안 된다. 현재 generation·batch·item 원장을 추가해 성공·실패 시도와 부분 결과를 저장하고 JSON을 snapshot으로 재생성한다. | startup reconcile, lease, immutable prompt revision, publication까지 확장한다. |
+| 번역 청크 DB 저장이 없어도 되는가 | 안 된다. 현재 generation·batch·item 원장에 성공·실패·재시작 중단 attempt와 부분 결과를 저장하고 JSON을 snapshot으로 재생성한다. startup reconcile은 실행 중 batch를 실패가 아닌 `interrupted`로 확정하고 새 attempt에서 재개한다. | 강제 종료 시점별 실환경 fault test와 retention을 추가한다. |
 | 이미 요청된 Whisper/Kotoba/WhisperJAV를 취소할 수 있는가 | 가능하다. 대기 작업은 즉시 취소하고 WhisperX/JAV는 process group을 종료하며 Kotoba는 청크 경계에서 중지한다. 웹은 원격 `cancelled`를 확인한다. | Kotoba의 모델 로드·diarization·postprocess 즉시 중단이 필요하면 subprocess 격리를 추가한다. 취소와 사전 segmentation은 별도 요구다. |
 | 자막이 있는 상태에서 prompt 변경 재시도는 어떻게 되는가 | transcript와 기존 prompt·번역·자막 generation을 보존하고 새 prompt revision·translation generation으로 처리한다. 새 번역 완료 전 기존 게시본을 유지하며 과거 SRT/ASS를 다시 게시할 수 있다. | prompt·번역 비교 UI를 추가한다. |
 | `next_probe_at`은 계속 재시도한다는 뜻인가 | 번역 LLM이 평소 꺼져 있는 운영 환경에서는 호출 자체가 불필요하다. | LM은 manual gate로 두고 `next_probe_at`을 사용하지 않는다. STT처럼 자동 복구를 선택한 의존성에만 제한적으로 사용한다. |
@@ -814,6 +822,6 @@ src/stt_to_subtitle/
 
 ## 20. 최종 권고
 
-명시적 상태 모델과 공통 projection, 번역 LLM·STT dispatch gate, worker lease·fencing·graceful drain 기반 단계별 재시작 복구, immutable prompt/audio/transcript revision, 자막 pair manifest reconcile, backend별 STT 취소·실패 계약은 반영됐다. 다음 리팩터링 단위는 revision retention/orphan collector, 과거 revision 비교·선택 UI, artifact 게시 교체 지점별 fault matrix다. 자동 회복은 상시 가동 의존성에만 선택적으로 적용한다.
+명시적 상태 모델과 공통 projection, 번역 LLM·STT dispatch gate, worker lease·fencing·graceful drain 및 번역 attempt reconcile 기반 단계별 재시작 복구, immutable prompt/audio/transcript revision, 자막 pair manifest reconcile, backend별 STT 취소·실패 계약은 반영됐다. 다음 리팩터링 단위는 revision retention/orphan collector, 과거 revision 비교·선택 UI, artifact 게시 교체 지점별 fault matrix다. 자동 회복은 상시 가동 의존성에만 선택적으로 적용한다.
 
 동시에 transcript revision, translation generation/batch/item, external/generated subtitle asset, publication, validation을 영속 모델로 추가해야 한다. 그래야 프롬프트 수정 재번역, 부분 번역 재개, 외부 자막 재생·비교, 선택적 상용 LLM 평가, 자막 게시·rollback, WAV·전사본 재사용을 데이터 손실 없이 반복할 수 있다. 내부망 무인증 운영은 그대로 유지하고 인증보다 실행·파일·참조 무결성에 구현 역량을 집중한다.
