@@ -118,6 +118,13 @@ def prometheus_exposition(snapshot: Mapping[str, Any]) -> str:
         "database_foreign_key_violations",
         database.get("foreign_key_violation_count"),
     )
+    for statistic, value in _mapping(database.get("migrations")).items():
+        _append(
+            lines,
+            "database_migrations",
+            value,
+            {"statistic": statistic},
+        )
 
     remote_stt = _mapping(snapshot.get("remote_stt"))
     for state, key in (

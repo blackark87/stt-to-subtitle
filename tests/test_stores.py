@@ -726,6 +726,14 @@ class JobStoreTests(unittest.TestCase):
             self.assertTrue(snapshot["database"]["foreign_keys_enabled"])
             self.assertTrue(snapshot["database"]["valid"])
             self.assertEqual(
+                snapshot["database"]["migrations"],
+                {
+                    "applied_count": 5,
+                    "latest_sequence": 40,
+                    "unsequenced_count": 0,
+                },
+            )
+            self.assertEqual(
                 measurement["metric"],
                 "external.request.duration_seconds",
             )
@@ -2139,6 +2147,10 @@ class JobStoreTests(unittest.TestCase):
             )
             with sqlite3.connect(database_path) as connection:
                 connection.execute("DROP TABLE job_events")
+                connection.execute(
+                    "DELETE FROM schema_migrations "
+                    "WHERE name = 'legacy_schema_columns_v1'"
+                )
                 connection.execute(
                     """
                     CREATE TABLE job_events (

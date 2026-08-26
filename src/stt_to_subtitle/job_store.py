@@ -15,6 +15,7 @@ from typing import Any, Callable, Collection, Iterator, Mapping, Sequence
 from uuid import uuid4
 
 from .artifact_retention import ArtifactReference
+from .db_migrations import Migration, execute_sql_statements, run_migrations
 from .path_display import (
     PathDisplayRule,
     normalize_path_display_patterns,
@@ -815,6 +816,7 @@ class JobStore:
 
                 CREATE TABLE IF NOT EXISTS schema_migrations (
                     name TEXT PRIMARY KEY,
+                    sequence INTEGER,
                     applied_at REAL NOT NULL
                 );
 
@@ -852,244 +854,7 @@ class JobStore:
                     ON subtitle_generations(job_id, generation_number DESC);
                 """
             )
-            columns = {
-                str(row["name"])
-                for row in connection.execute("PRAGMA table_info(jobs)").fetchall()
-            }
-            migrations = {
-                "chunks_created": (
-                    "ALTER TABLE jobs ADD COLUMN "
-                    "chunks_created INTEGER NOT NULL DEFAULT 0"
-                ),
-                "chunks_completed": (
-                    "ALTER TABLE jobs ADD COLUMN "
-                    "chunks_completed INTEGER NOT NULL DEFAULT 0"
-                ),
-                "chunks_total_estimate": (
-                    "ALTER TABLE jobs ADD COLUMN "
-                    "chunks_total_estimate INTEGER NOT NULL DEFAULT 0"
-                ),
-                "chunk_progress_every": (
-                    "ALTER TABLE jobs ADD COLUMN "
-                    "chunk_progress_every INTEGER NOT NULL DEFAULT 10"
-                ),
-                "ass_path": "ALTER TABLE jobs ADD COLUMN ass_path TEXT",
-                "operation": (
-                    "ALTER TABLE jobs ADD COLUMN "
-                    "operation TEXT NOT NULL DEFAULT 'full'"
-                ),
-                "phase": (
-                    "ALTER TABLE jobs ADD COLUMN "
-                    "phase TEXT NOT NULL DEFAULT 'extraction'"
-                ),
-                "state": (
-                    "ALTER TABLE jobs ADD COLUMN "
-                    "state TEXT NOT NULL DEFAULT 'waiting'"
-                ),
-                "reason_code": (
-                    "ALTER TABLE jobs ADD COLUMN reason_code TEXT"
-                ),
-                "attempt": (
-                    "ALTER TABLE jobs ADD COLUMN "
-                    "attempt INTEGER NOT NULL DEFAULT 1"
-                ),
-                "translation_chunks_total": (
-                    "ALTER TABLE jobs ADD COLUMN translation_chunks_total "
-                    "INTEGER NOT NULL DEFAULT 0"
-                ),
-                "translation_chunks_completed": (
-                    "ALTER TABLE jobs ADD COLUMN translation_chunks_completed "
-                    "INTEGER NOT NULL DEFAULT 0"
-                ),
-                "translation_pause_requested": (
-                    "ALTER TABLE jobs ADD COLUMN translation_pause_requested "
-                    "INTEGER NOT NULL DEFAULT 0"
-                ),
-                "job_stop_requested": (
-                    "ALTER TABLE jobs ADD COLUMN job_stop_requested "
-                    "INTEGER NOT NULL DEFAULT 0"
-                ),
-                "lease_owner": (
-                    "ALTER TABLE jobs ADD COLUMN lease_owner TEXT"
-                ),
-                "lease_expires_at": (
-                    "ALTER TABLE jobs ADD COLUMN lease_expires_at REAL"
-                ),
-                "lease_token": (
-                    "ALTER TABLE jobs ADD COLUMN "
-                    "lease_token INTEGER NOT NULL DEFAULT 0"
-                ),
-                "audio_revision_id": (
-                    "ALTER TABLE jobs ADD COLUMN audio_revision_id TEXT"
-                ),
-                "transcript_revision_id": (
-                    "ALTER TABLE jobs ADD COLUMN transcript_revision_id TEXT"
-                ),
-            }
-            for column, statement in migrations.items():
-                if column not in columns:
-                    connection.execute(statement)
-            translation_columns = {
-                str(row["name"])
-                for row in connection.execute(
-                    "PRAGMA table_info(translation_generations)"
-                ).fetchall()
-            }
-            if "transcript_revision_id" not in translation_columns:
-                connection.execute(
-                    "ALTER TABLE translation_generations "
-                    "ADD COLUMN transcript_revision_id TEXT"
-                )
-            if "prompt_revision_id" not in translation_columns:
-                connection.execute(
-                    "ALTER TABLE translation_generations "
-                    "ADD COLUMN prompt_revision_id TEXT"
-                )
-            transcript_revision_columns = {
-                str(row["name"])
-                for row in connection.execute(
-                    "PRAGMA table_info(transcript_revisions)"
-                ).fetchall()
-            }
-            if "chunks_total" not in transcript_revision_columns:
-                connection.execute(
-                    "ALTER TABLE transcript_revisions ADD COLUMN "
-                    "chunks_total INTEGER NOT NULL DEFAULT 0"
-                )
-            event_columns = {
-                str(row["name"])
-                for row in connection.execute(
-                    "PRAGMA table_info(job_events)"
-                ).fetchall()
-            }
-            event_migrations = {
-                "event_code": (
-                    "ALTER TABLE job_events ADD COLUMN event_code "
-                    "TEXT NOT NULL DEFAULT 'job.message'"
-                ),
-                "from_state": (
-                    "ALTER TABLE job_events ADD COLUMN from_state TEXT"
-                ),
-                "to_state": (
-                    "ALTER TABLE job_events ADD COLUMN to_state TEXT"
-                ),
-                "phase": "ALTER TABLE job_events ADD COLUMN phase TEXT",
-                "attempt": "ALTER TABLE job_events ADD COLUMN attempt INTEGER",
-                "correlation_id": (
-                    "ALTER TABLE job_events ADD COLUMN correlation_id TEXT"
-                ),
-                "payload_json": (
-                    "ALTER TABLE job_events ADD COLUMN payload_json "
-                    "TEXT NOT NULL DEFAULT '{}'"
-                ),
-            }
-            for column, statement in event_migrations.items():
-                if column not in event_columns:
-                    connection.execute(statement)
-            prompt_columns = {
-                str(row["name"])
-                for row in connection.execute(
-                    "PRAGMA table_info(prompt_categories)"
-                ).fetchall()
-            }
-            if "active_revision_id" not in prompt_columns:
-                connection.execute(
-                    "ALTER TABLE prompt_categories "
-                    "ADD COLUMN active_revision_id TEXT"
-                )
-            if "status_updated_at" not in columns:
-                connection.execute(
-                    "ALTER TABLE jobs ADD COLUMN status_updated_at REAL"
-                )
-                connection.execute(
-                    """
-                    UPDATE jobs
-                    SET status_updated_at = COALESCE(
-                        (
-                            SELECT MAX(job_events.created_at)
-                            FROM job_events
-                            WHERE job_events.job_id = jobs.id
-                              AND job_events.message NOT LIKE
-                                  'transcription chunks:%'
-                              AND job_events.message NOT LIKE
-                                  'translation checkpoint saved%'
-                        ),
-                        updated_at,
-                        created_at
-                    )
-                    """
-                )
-            connection.execute(
-                "CREATE INDEX IF NOT EXISTS jobs_status_updated_idx "
-                "ON jobs(status_updated_at DESC, created_at DESC)"
-            )
-            connection.execute(
-                "CREATE INDEX IF NOT EXISTS jobs_state_phase_idx "
-                "ON jobs(state, phase, created_at)"
-            )
-            connection.execute(
-                "CREATE INDEX IF NOT EXISTS jobs_lease_idx "
-                "ON jobs(status, lease_expires_at)"
-            )
-            connection.execute(
-                "CREATE INDEX IF NOT EXISTS job_events_code_idx "
-                "ON job_events(event_code, created_at)"
-            )
-            connection.execute(
-                "CREATE INDEX IF NOT EXISTS job_events_created_idx "
-                "ON job_events(created_at, id)"
-            )
-            structured_state_migration = "structured_job_state_v1"
-            structured_state_applied = connection.execute(
-                "SELECT 1 FROM schema_migrations WHERE name = ?",
-                (structured_state_migration,),
-            ).fetchone()
-            if structured_state_applied is None:
-                rows = connection.execute(
-                    "SELECT id, status, operation, blocked_stage, error FROM jobs"
-                ).fetchall()
-                for row in rows:
-                    projected = structured_state_from_legacy(
-                        status=str(row["status"]),
-                        operation=str(row["operation"]),
-                        blocked_stage=(
-                            str(row["blocked_stage"])
-                            if row["blocked_stage"]
-                            else None
-                        ),
-                        error=str(row["error"]) if row["error"] else None,
-                    )
-                    connection.execute(
-                        "UPDATE jobs SET phase = ?, state = ?, reason_code = ? "
-                        "WHERE id = ?",
-                        (
-                            projected.phase.value,
-                            projected.state.value,
-                            (
-                                projected.reason_code.value
-                                if projected.reason_code is not None
-                                else None
-                            ),
-                            str(row["id"]),
-                        ),
-                    )
-                connection.execute(
-                    "INSERT INTO schema_migrations (name, applied_at) "
-                    "VALUES (?, ?)",
-                    (structured_state_migration, time.time()),
-                )
-            server_columns = {
-                str(row["name"])
-                for row in connection.execute(
-                    "PRAGMA table_info(remote_server_settings)"
-                ).fetchall()
-            }
-            if "translation_workers" not in server_columns:
-                connection.execute(
-                    "ALTER TABLE remote_server_settings ADD COLUMN "
-                    "translation_workers INTEGER NOT NULL DEFAULT 1"
-                )
-            self._repair_referential_integrity(connection)
+            self._run_schema_migrations(connection)
             now = time.time()
             connection.executemany(
                 """
@@ -1158,97 +923,348 @@ class JobStore:
                     """,
                     (revision_id, str(row["id"])),
                 )
-            default_rule_migration = "default_path_display_rule_v1"
-            default_rule_seeded = connection.execute(
-                "SELECT 1 FROM schema_migrations WHERE name = ?",
-                (default_rule_migration,),
-            ).fetchone()
-            if default_rule_seeded is None:
-                connection.execute(
-                    """
-                    INSERT OR IGNORE INTO path_display_rules (
-                        id, source_pattern, display_pattern,
-                        created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?)
-                    """,
-                    (
-                        DEFAULT_PATH_DISPLAY_RULE_ID,
-                        DEFAULT_PATH_DISPLAY_SOURCE,
-                        DEFAULT_PATH_DISPLAY_TARGET,
-                        now,
-                        now,
-                    ),
-                )
-                connection.execute(
-                    "INSERT INTO schema_migrations (name, applied_at) "
-                    "VALUES (?, ?)",
-                    (default_rule_migration, now),
-                )
-            corrected_rule_migration = "correct_default_path_display_rule_v2"
-            corrected_rule_applied = connection.execute(
-                "SELECT 1 FROM schema_migrations WHERE name = ?",
-                (corrected_rule_migration,),
-            ).fetchone()
-            if corrected_rule_applied is None:
-                conflicting_rule = connection.execute(
-                    "SELECT id FROM path_display_rules "
-                    "WHERE source_pattern = ? AND id != ?",
-                    (
-                        DEFAULT_PATH_DISPLAY_SOURCE,
-                        DEFAULT_PATH_DISPLAY_RULE_ID,
-                    ),
-                ).fetchone()
-                if conflicting_rule is None:
-                    connection.execute(
-                        """
-                        UPDATE path_display_rules
-                        SET source_pattern = ?, display_pattern = ?,
-                            updated_at = ?
-                        WHERE id = ? AND source_pattern = ?
-                          AND display_pattern = ?
-                        """,
-                        (
-                            DEFAULT_PATH_DISPLAY_SOURCE,
-                            DEFAULT_PATH_DISPLAY_TARGET,
-                            now,
-                            DEFAULT_PATH_DISPLAY_RULE_ID,
-                            LEGACY_PATH_DISPLAY_SOURCE,
-                            LEGACY_PATH_DISPLAY_TARGET,
-                        ),
-                    )
-                else:
-                    connection.execute(
-                        """
-                        DELETE FROM path_display_rules
-                        WHERE id = ? AND source_pattern = ?
-                          AND display_pattern = ?
-                        """,
-                        (
-                            DEFAULT_PATH_DISPLAY_RULE_ID,
-                            LEGACY_PATH_DISPLAY_SOURCE,
-                            LEGACY_PATH_DISPLAY_TARGET,
-                        ),
-                    )
-                connection.execute(
-                    "INSERT INTO schema_migrations (name, applied_at) "
-                    "VALUES (?, ?)",
-                    (corrected_rule_migration, now),
-                )
             self._install_integrity_triggers(connection)
             self._assert_foreign_key_integrity(connection)
+
+    @staticmethod
+    def _migrate_legacy_schema_columns(
+        connection: sqlite3.Connection,
+    ) -> None:
+        columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(jobs)").fetchall()
+        }
+        migrations = {
+            "chunks_created": (
+                "ALTER TABLE jobs ADD COLUMN "
+                "chunks_created INTEGER NOT NULL DEFAULT 0"
+            ),
+            "chunks_completed": (
+                "ALTER TABLE jobs ADD COLUMN "
+                "chunks_completed INTEGER NOT NULL DEFAULT 0"
+            ),
+            "chunks_total_estimate": (
+                "ALTER TABLE jobs ADD COLUMN "
+                "chunks_total_estimate INTEGER NOT NULL DEFAULT 0"
+            ),
+            "chunk_progress_every": (
+                "ALTER TABLE jobs ADD COLUMN "
+                "chunk_progress_every INTEGER NOT NULL DEFAULT 10"
+            ),
+            "ass_path": "ALTER TABLE jobs ADD COLUMN ass_path TEXT",
+            "operation": (
+                "ALTER TABLE jobs ADD COLUMN "
+                "operation TEXT NOT NULL DEFAULT 'full'"
+            ),
+            "phase": (
+                "ALTER TABLE jobs ADD COLUMN "
+                "phase TEXT NOT NULL DEFAULT 'extraction'"
+            ),
+            "state": (
+                "ALTER TABLE jobs ADD COLUMN "
+                "state TEXT NOT NULL DEFAULT 'waiting'"
+            ),
+            "reason_code": "ALTER TABLE jobs ADD COLUMN reason_code TEXT",
+            "attempt": (
+                "ALTER TABLE jobs ADD COLUMN "
+                "attempt INTEGER NOT NULL DEFAULT 1"
+            ),
+            "translation_chunks_total": (
+                "ALTER TABLE jobs ADD COLUMN translation_chunks_total "
+                "INTEGER NOT NULL DEFAULT 0"
+            ),
+            "translation_chunks_completed": (
+                "ALTER TABLE jobs ADD COLUMN translation_chunks_completed "
+                "INTEGER NOT NULL DEFAULT 0"
+            ),
+            "translation_pause_requested": (
+                "ALTER TABLE jobs ADD COLUMN translation_pause_requested "
+                "INTEGER NOT NULL DEFAULT 0"
+            ),
+            "job_stop_requested": (
+                "ALTER TABLE jobs ADD COLUMN job_stop_requested "
+                "INTEGER NOT NULL DEFAULT 0"
+            ),
+            "lease_owner": "ALTER TABLE jobs ADD COLUMN lease_owner TEXT",
+            "lease_expires_at": (
+                "ALTER TABLE jobs ADD COLUMN lease_expires_at REAL"
+            ),
+            "lease_token": (
+                "ALTER TABLE jobs ADD COLUMN "
+                "lease_token INTEGER NOT NULL DEFAULT 0"
+            ),
+            "audio_revision_id": (
+                "ALTER TABLE jobs ADD COLUMN audio_revision_id TEXT"
+            ),
+            "transcript_revision_id": (
+                "ALTER TABLE jobs ADD COLUMN transcript_revision_id TEXT"
+            ),
+        }
+        for column, statement in migrations.items():
+            if column not in columns:
+                connection.execute(statement)
+
+        translation_columns = {
+            str(row["name"])
+            for row in connection.execute(
+                "PRAGMA table_info(translation_generations)"
+            ).fetchall()
+        }
+        if "transcript_revision_id" not in translation_columns:
+            connection.execute(
+                "ALTER TABLE translation_generations "
+                "ADD COLUMN transcript_revision_id TEXT"
+            )
+        if "prompt_revision_id" not in translation_columns:
+            connection.execute(
+                "ALTER TABLE translation_generations "
+                "ADD COLUMN prompt_revision_id TEXT"
+            )
+        transcript_revision_columns = {
+            str(row["name"])
+            for row in connection.execute(
+                "PRAGMA table_info(transcript_revisions)"
+            ).fetchall()
+        }
+        if "chunks_total" not in transcript_revision_columns:
+            connection.execute(
+                "ALTER TABLE transcript_revisions ADD COLUMN "
+                "chunks_total INTEGER NOT NULL DEFAULT 0"
+            )
+
+        event_columns = {
+            str(row["name"])
+            for row in connection.execute(
+                "PRAGMA table_info(job_events)"
+            ).fetchall()
+        }
+        event_migrations = {
+            "event_code": (
+                "ALTER TABLE job_events ADD COLUMN event_code "
+                "TEXT NOT NULL DEFAULT 'job.message'"
+            ),
+            "from_state": (
+                "ALTER TABLE job_events ADD COLUMN from_state TEXT"
+            ),
+            "to_state": "ALTER TABLE job_events ADD COLUMN to_state TEXT",
+            "phase": "ALTER TABLE job_events ADD COLUMN phase TEXT",
+            "attempt": "ALTER TABLE job_events ADD COLUMN attempt INTEGER",
+            "correlation_id": (
+                "ALTER TABLE job_events ADD COLUMN correlation_id TEXT"
+            ),
+            "payload_json": (
+                "ALTER TABLE job_events ADD COLUMN payload_json "
+                "TEXT NOT NULL DEFAULT '{}'"
+            ),
+        }
+        for column, statement in event_migrations.items():
+            if column not in event_columns:
+                connection.execute(statement)
+
+        prompt_columns = {
+            str(row["name"])
+            for row in connection.execute(
+                "PRAGMA table_info(prompt_categories)"
+            ).fetchall()
+        }
+        if "active_revision_id" not in prompt_columns:
+            connection.execute(
+                "ALTER TABLE prompt_categories "
+                "ADD COLUMN active_revision_id TEXT"
+            )
+        if "status_updated_at" not in columns:
+            connection.execute(
+                "ALTER TABLE jobs ADD COLUMN status_updated_at REAL"
+            )
+            connection.execute(
+                """
+                UPDATE jobs
+                SET status_updated_at = COALESCE(
+                    (
+                        SELECT MAX(job_events.created_at)
+                        FROM job_events
+                        WHERE job_events.job_id = jobs.id
+                          AND job_events.message NOT LIKE
+                              'transcription chunks:%'
+                          AND job_events.message NOT LIKE
+                              'translation checkpoint saved%'
+                    ),
+                    updated_at,
+                    created_at
+                )
+                """
+            )
+
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS jobs_status_updated_idx "
+            "ON jobs(status_updated_at DESC, created_at DESC)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS jobs_state_phase_idx "
+            "ON jobs(state, phase, created_at)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS jobs_lease_idx "
+            "ON jobs(status, lease_expires_at)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS job_events_code_idx "
+            "ON job_events(event_code, created_at)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS job_events_created_idx "
+            "ON job_events(created_at, id)"
+        )
+        server_columns = {
+            str(row["name"])
+            for row in connection.execute(
+                "PRAGMA table_info(remote_server_settings)"
+            ).fetchall()
+        }
+        if "translation_workers" not in server_columns:
+            connection.execute(
+                "ALTER TABLE remote_server_settings ADD COLUMN "
+                "translation_workers INTEGER NOT NULL DEFAULT 1"
+            )
+
+    @staticmethod
+    def _migrate_structured_job_state(
+        connection: sqlite3.Connection,
+    ) -> None:
+        rows = connection.execute(
+            "SELECT id, status, operation, blocked_stage, error FROM jobs"
+        ).fetchall()
+        for row in rows:
+            projected = structured_state_from_legacy(
+                status=str(row["status"]),
+                operation=str(row["operation"]),
+                blocked_stage=(
+                    str(row["blocked_stage"])
+                    if row["blocked_stage"]
+                    else None
+                ),
+                error=str(row["error"]) if row["error"] else None,
+            )
+            connection.execute(
+                "UPDATE jobs SET phase = ?, state = ?, reason_code = ? "
+                "WHERE id = ?",
+                (
+                    projected.phase.value,
+                    projected.state.value,
+                    (
+                        projected.reason_code.value
+                        if projected.reason_code is not None
+                        else None
+                    ),
+                    str(row["id"]),
+                ),
+            )
+
+    def _run_schema_migrations(
+        self,
+        connection: sqlite3.Connection,
+    ) -> tuple[str, ...]:
+        return run_migrations(
+            connection,
+            (
+                Migration(
+                    5,
+                    "legacy_schema_columns_v1",
+                    self._migrate_legacy_schema_columns,
+                ),
+                Migration(
+                    10,
+                    "structured_job_state_v1",
+                    self._migrate_structured_job_state,
+                ),
+                Migration(
+                    20,
+                    "referential_integrity_v1",
+                    self._repair_referential_integrity,
+                ),
+                Migration(
+                    30,
+                    "default_path_display_rule_v1",
+                    self._seed_default_path_display_rule,
+                ),
+                Migration(
+                    40,
+                    "correct_default_path_display_rule_v2",
+                    self._correct_default_path_display_rule,
+                ),
+            ),
+        )
+
+    @staticmethod
+    def _seed_default_path_display_rule(
+        connection: sqlite3.Connection,
+    ) -> None:
+        now = time.time()
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO path_display_rules (
+                id, source_pattern, display_pattern,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                DEFAULT_PATH_DISPLAY_RULE_ID,
+                DEFAULT_PATH_DISPLAY_SOURCE,
+                DEFAULT_PATH_DISPLAY_TARGET,
+                now,
+                now,
+            ),
+        )
+
+    @staticmethod
+    def _correct_default_path_display_rule(
+        connection: sqlite3.Connection,
+    ) -> None:
+        conflicting_rule = connection.execute(
+            "SELECT id FROM path_display_rules "
+            "WHERE source_pattern = ? AND id != ?",
+            (
+                DEFAULT_PATH_DISPLAY_SOURCE,
+                DEFAULT_PATH_DISPLAY_RULE_ID,
+            ),
+        ).fetchone()
+        if conflicting_rule is None:
+            connection.execute(
+                """
+                UPDATE path_display_rules
+                SET source_pattern = ?, display_pattern = ?, updated_at = ?
+                WHERE id = ? AND source_pattern = ?
+                  AND display_pattern = ?
+                """,
+                (
+                    DEFAULT_PATH_DISPLAY_SOURCE,
+                    DEFAULT_PATH_DISPLAY_TARGET,
+                    time.time(),
+                    DEFAULT_PATH_DISPLAY_RULE_ID,
+                    LEGACY_PATH_DISPLAY_SOURCE,
+                    LEGACY_PATH_DISPLAY_TARGET,
+                ),
+            )
+            return
+        connection.execute(
+            """
+            DELETE FROM path_display_rules
+            WHERE id = ? AND source_pattern = ?
+              AND display_pattern = ?
+            """,
+            (
+                DEFAULT_PATH_DISPLAY_RULE_ID,
+                LEGACY_PATH_DISPLAY_SOURCE,
+                LEGACY_PATH_DISPLAY_TARGET,
+            ),
+        )
 
     @staticmethod
     def _repair_referential_integrity(
         connection: sqlite3.Connection,
     ) -> None:
-        migration = "referential_integrity_v1"
-        applied = connection.execute(
-            "SELECT 1 FROM schema_migrations WHERE name = ?",
-            (migration,),
-        ).fetchone()
-        if applied is not None:
-            return
-        connection.executescript(
+        execute_sql_statements(
+            connection,
             """
             UPDATE jobs
             SET audio_revision_id = NULL
@@ -1397,13 +1413,8 @@ class JobStore:
                 SELECT 1 FROM prompt_categories
                 WHERE prompt_categories.id = prompt_revisions.category_id
             );
-            """
+            """,
         )
-        connection.execute(
-            "INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)",
-            (migration, time.time()),
-        )
-
     @staticmethod
     def _install_integrity_triggers(connection: sqlite3.Connection) -> None:
         connection.executescript(
@@ -5172,6 +5183,15 @@ class JobStore:
             violations = connection.execute(
                 "PRAGMA foreign_key_check"
             ).fetchall()
+            migration_row = connection.execute(
+                """
+                SELECT COUNT(*) AS applied_count,
+                       MAX(sequence) AS latest_sequence,
+                       SUM(CASE WHEN sequence IS NULL THEN 1 ELSE 0 END)
+                           AS unsequenced_count
+                FROM schema_migrations
+                """
+            ).fetchone()
         check_result = (
             str(quick_check[0]) if quick_check is not None else "unavailable"
         )
@@ -5182,6 +5202,17 @@ class JobStore:
             "quick_check": check_result,
             "foreign_key_violation_count": len(violations),
             "valid": check_result == "ok" and not violations,
+            "migrations": {
+                "applied_count": int(migration_row["applied_count"]),
+                "latest_sequence": (
+                    int(migration_row["latest_sequence"])
+                    if migration_row["latest_sequence"] is not None
+                    else None
+                ),
+                "unsequenced_count": int(
+                    migration_row["unsequenced_count"] or 0
+                ),
+            },
         }
 
     def record_operational_measurement(

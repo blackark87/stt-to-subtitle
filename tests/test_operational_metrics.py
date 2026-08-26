@@ -24,6 +24,11 @@ class PrometheusExpositionTests(unittest.TestCase):
                     "valid": True,
                     "foreign_keys_enabled": True,
                     "foreign_key_violation_count": 0,
+                    "migrations": {
+                        "applied_count": 5,
+                        "latest_sequence": 40,
+                        "unsequenced_count": 0,
+                    },
                 },
                 "remote_stt": {
                     "running_job_ids": ["private-remote-id"],
@@ -54,6 +59,11 @@ class PrometheusExpositionTests(unittest.TestCase):
         )
         self.assertIn(
             'stt_to_subtitle_remote_stt_jobs{state="running"} 1',
+            output,
+        )
+        self.assertIn(
+            "stt_to_subtitle_database_migrations"
+            '{statistic="latest_sequence"} 40',
             output,
         )
         self.assertIn(

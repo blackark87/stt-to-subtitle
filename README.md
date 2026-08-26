@@ -400,6 +400,18 @@ cd /path/to/runtime
 
 `down`은 바인드 마운트된 상태·캐시·미디어를 삭제하지 않습니다.
 
+업그레이드 전 JobStore migration은 원본을 수정하지 않는 임시 SQLite backup에서
+검증할 수 있습니다. 결과에는 적용 예정 migration과 quick/FK check만 포함되며
+서버 설정·토큰·원본 경로는 출력하지 않습니다.
+
+```bash
+stt-check-migrations /path/to/jobs.sqlite3
+```
+
+운영 스냅샷은 `/api/operations/metrics` JSON과
+`/api/operations/metrics/prometheus` Prometheus text로 제공합니다. 웹 인증을
+켠 구성에서는 두 경로에도 인증이 필요합니다.
+
 웹 로그인을 사용하지 않는 구성은 신뢰할 수 있는 사설망 또는 VPN에서만
 실행하십시오. 인터넷에 직접 노출할 때는 HTTPS reverse proxy,
 `WEB_ADMIN_PASSWORD`, `WEB_SESSION_SECRET`, `WEB_SECURE_COOKIE=true`를

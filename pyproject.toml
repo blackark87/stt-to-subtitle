@@ -14,6 +14,7 @@ dependencies = []
 stt-transcribe = "stt_to_subtitle.cli:main"
 stt-api = "stt_to_subtitle.stt_api:main"
 stt-web = "stt_to_subtitle.web_app:main"
+stt-check-migrations = "stt_to_subtitle.migration_check:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

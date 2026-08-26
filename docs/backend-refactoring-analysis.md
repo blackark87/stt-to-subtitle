@@ -6,7 +6,7 @@
 
 ### 구현 진행 상태
 
-현재 작업 트리에는 계획의 스물여덟 번째 수직 슬라이스까지 반영됐다.
+현재 작업 트리에는 계획의 서른 번째 수직 슬라이스까지 반영됐다.
 
 | 항목 | 반영 상태 | 남은 범위 |
 |---|---|---|
@@ -24,7 +24,7 @@
 | STT 실패 계약 | STT DB·API의 `failure_code/retryable/failure_scope`, segment/schema·OOM·인증·입력·처리·재시작 오류 분류, retryable 실패만 원격 재제출 | 실제 backend별 fault test·오류 코드 운영 지표 |
 | STT dispatch gate | 첫 연결 실패 시 영속 gate 차단, 뒤 작업 `audio_ready` 유지, 명시적 연결 확인의 제한된 3회 요청 후 중단 작업 재개 | 자동 recovery mode가 실제로 필요한지 운영 검증·회로 메트릭 |
 | 이벤트·관측성 | 구조화 전이 이벤트, 단계 대기·처리 시간, 외부 API attempt별 결과·소요 시간, dependency readiness·gate 전이, STT 큐와 원격 실행·취소 수, artifact 감사·정리, startup reconcile, lease fencing 거부, 번역 checkpoint와 자막 검증 결과를 SQLite에 누적하고 JSON·Prometheus text로 제공 | lease 복구·중복 실행 방지 세부 counter |
-| DB 무결성 | 모든 SQLite 연결의 외래키 활성화, 시작 시 레거시 dangling FK/선택 포인터 정리, status-phase-state-reason projection·enum·수치 domain trigger, revision/generation/publication 소유 관계 guard, quick/FK check 운영 지표, 공유 WAV revision의 마지막 참조 기반 삭제 | 순번 기반 migration 모듈 분리·실운영 DB 사본 dry-run |
+| DB 무결성 | 외래키 활성화, 레거시 dangling 참조 정리, 상태 projection/domain·원장 소유 관계 guard, 공유 WAV 참조 보존, 순번·이름 ledger와 migration별 savepoint rollback, 레거시 ledger sequence backfill, quick/FK/migration 운영 지표, 원본 무변경 SQLite backup dry-run CLI | 실제 운영 DB 사본으로 배포 전 실행 |
 
 이하의 문제 분석은 최초 분석 시점 구조를 기준으로 하되, 구현이 끝난 절은 현재
 동작과 남은 범위로 갱신했다.
@@ -167,8 +167,8 @@ stateDiagram-v2
 | 자막 산출물 | SRT/ASS 각각 임시 저장하며 재번역 시 기존 배포 파일을 덮어씀 | versioned generation, publication pointer, rollback, 한 manifest로 파일 쌍 검증 | P0–P1 |
 | 외부 자막 | `<filename>.ko.srt/.ko.ass`만 생성 자막처럼 탐지하고 VTT·출처·비교 관계가 없음 | `<filename>.srt/.vtt/.ass`를 `외부 자막`으로 등록, 기본 재생, 로컬 비교 검증, 선택적 상용 LLM 평가 | P0–P1 |
 | 화면 집계 | 화면별 상태 재분류 | 공통 projection DTO, 동일한 phase/state 필터 계약 | P0 |
-| 이벤트·관측성 | 사용자 메시지와 구조화 이벤트를 함께 저장하고 `/api/operations/metrics`에서 상태·단계·대기/처리 시간·attempt·reason·lease·dependency 스냅샷 제공 | 외부 API·원격 큐·artifact reconcile 세부 counter와 Prometheus adapter | P1 |
-| DB 스키마 | 반복 가능한 migration marker, 모든 연결의 FK 활성화, 레거시 dangling 참조 복구, 상태 projection/domain·revision/generation/publication 관계 trigger, 무결성 운영 지표 | 순번 기반 migration 모듈 분리·실운영 DB 사본 dry-run | P1 |
+| 이벤트·관측성 | 구조화 이벤트와 외부 API·dependency gate·원격 큐·artifact/recovery·lease/checkpoint/검증 measurement를 JSON·Prometheus로 제공 | 비용·token·분포 지표와 실운영 alert 규칙 | P1 |
+| DB 스키마 | 순번형 migration runner·이름/sequence ledger·savepoint rollback, 레거시 컬럼/상태/dangling 참조/경로 규칙 migration, 모든 연결의 FK 활성화, 상태 projection/domain·원장 관계 trigger, 무결성·migration 운영 지표, backup dry-run CLI | 실제 운영 DB 사본으로 배포 전 dry-run | P1 |
 | 내부망 운영 | 비밀번호가 비어 있으면 인증이 비활성화되지만 보고서·설정 계약이 불명확 | 무인증 운영을 명시적 지원 계약으로 고정하고 경로·입력·로그 안전성만 유지 | P1 |
 | 미디어 라이브러리 | 파일시스템 중심 조회·집계 | 증분 카탈로그, 변경 감지, 배우 없는 콘텐츠 분류 | P2 |
 | 테스트 | 단위 테스트 중심, 주요 정상·부분 실패 검증 | 장애 연쇄·복구·취소 경합·projection 일관성·fault injection 테스트 | P0–P1 |
@@ -614,14 +614,16 @@ jobs(
 - repository enum 검증과 DB trigger를 함께 적용해 허용 operation/status/phase/state/reason, attempt·진행 수치·boolean domain 및 레거시 status와 구조화 projection의 일치를 고정했다.
 - SQLite 연결마다 `PRAGMA foreign_keys=ON`을 적용하고 켜지지 않으면 즉시 시작을 중단한다.
 - `(state, current_phase, next_retry_at, created_at)` 인덱스를 추가한다.
-- 문자열 컬럼 존재 여부를 확인하는 즉석 변경 대신 순차적이고 반복 실행 가능한 schema migration을 사용한다.
+- 레거시 컬럼 보강, 구조화 상태 변환, dangling 참조 복구, 기본 경로 규칙 보정을 `db_migrations.py`의 순번형 runner로 실행한다. 각 migration은 고유 sequence·name을 DB ledger에 기록하고 savepoint 안에서 본문과 기록을 함께 확정하며, 실패하면 해당 migration 쓰기를 rollback한다.
 - job event에는 `event_code`, `from_state`, `to_state`, `phase`, `attempt`, `correlation_id`, `payload_json`을 추가했다. 기존 행은 `job.message`로 호환하고 신규 작업 생성·단계 시작/완료/중단/실패·정지·일시정지·재개·복구·재번역·자막 검증/게시 이벤트를 코드로 구분한다.
 - 기존 `blocked + 사용자 중지 오류 문구` 데이터는 배포 마이그레이션에서 `stopped + user_stop`으로 변환한다.
 - 알 수 없는 레거시 오류는 억지 분류하지 않고 `blocked + legacy_unclassified`로 보존해 운영자가 검토할 수 있게 한다.
 - `jobs`는 실행 상태만 담당하고 transcript revision, translation generation/batch/item, subtitle publication은 별도 테이블로 분리한다.
 - 활성 산출물은 `media_assets.published_subtitle_generation_id` 같은 명시적 참조로 가리키며, 파일 존재 여부만으로 최신 버전을 추론하지 않는다.
 
-`referential_integrity_v1` 시작 마이그레이션은 존재하지 않는 WAV/전사 선택 포인터를 `NULL`로 되돌리고, job/generation/category가 없는 종속 event·validation·batch·item·publication 원장을 정리한다. 선택 가능한 FK는 산출물 hash 원장을 보존하도록 `NULL` 처리하며, 마이그레이션 뒤 `PRAGMA foreign_key_check`가 남으면 시작을 중단한다. 신규 쓰기는 trigger로 job revision 존재 여부, translation/subtitle generation의 같은 job 소유 관계, publication의 source/job/generation 일치를 검증한다. 작업 레코드 삭제 시 공유 WAV revision은 다른 job이나 transcript가 참조하는 동안 유지하고 마지막 참조가 사라진 뒤에만 원장에서 제거한다.
+현재 순서는 `5 legacy_schema_columns_v1 → 10 structured_job_state_v1 → 20 referential_integrity_v1 → 30 default_path_display_rule_v1 → 40 correct_default_path_display_rule_v2`다. 기존 name-only ledger는 시작 시 알려진 migration의 sequence를 backfill하고 sequence 변경·중복을 거부한다. `referential_integrity_v1`은 존재하지 않는 WAV/전사 선택 포인터를 `NULL`로 되돌리고, job/generation/category가 없는 종속 event·validation·batch·item·publication 원장을 정리한다. 선택 가능한 FK는 산출물 hash 원장을 보존하도록 `NULL` 처리하며, 마이그레이션 뒤 `PRAGMA foreign_key_check`가 남으면 시작을 중단한다. 신규 쓰기는 trigger로 job revision 존재 여부, translation/subtitle generation의 같은 job 소유 관계, publication의 source/job/generation 일치를 검증한다. 작업 레코드 삭제 시 공유 WAV revision은 다른 job이나 transcript가 참조하는 동안 유지하고 마지막 참조가 사라진 뒤에만 원장에서 제거한다.
+
+`stt-check-migrations <jobs.sqlite3>`는 SQLite backup API로 WAL을 포함한 일관된 임시 사본을 만든 뒤 동일한 JobStore 초기화와 quick/FK/migration 검사를 실행한다. 출력은 새로 적용된 migration과 sequence backfill, 무결성 요약만 포함하고 원본 DB·WAL을 변경하거나 원본 경로·서버 설정·credential을 출력하지 않는다.
 
 단일 웹 인스턴스에서는 SQLite를 유지할 수 있다. 다중 웹 스케줄러를 실제로 운영해야 할 때 lease 경쟁, 알림 지연, 쓰기 경합을 측정한 뒤 PostgreSQL이나 브로커 전환을 판단한다.
 
@@ -643,6 +645,7 @@ jobs(
 - superseded worker의 lease fencing 거부와 번역 checkpoint source별 재사용·무효화 item 수
 - 명시적 dependency readiness 결과·gate 상태 전이와 로컬/상용 LLM 자막 검증 완료·실패·cache hit 수
 - SQLite 외래키 활성 여부, quick check 결과, FK 위반 수
+- 적용 migration 수·최신 sequence·sequence 미지정 레거시 marker 수
 
 추가해야 할 세부 운영 지표:
 
@@ -816,6 +819,8 @@ src/stt_to_subtitle/
 34. 외부 요청 재시도별 결과·시간에 URL·헤더·본문·token이 포함되지 않고, STT readiness 큐·원격 실행/취소 ID·artifact 감사/정리·startup reconcile measurement가 재시작 뒤에도 운영 JSON에 유지되는지 확인
 35. lease fencing 거부와 번역 checkpoint 재사용·무효화가 실제 전이 지점에서 누적되고, Prometheus text에는 원격 job ID 없이 유효한 이름·escape·개수만 노출되는지 확인
 36. STT·번역 LLM의 명시적 readiness와 gate 전이가 background 호출 없이 누적되고, 로컬·상용 LLM 자막 검증의 완료·실패·cache hit가 실제 호출 여부와 일치하는지 확인
+37. 순번형 migration이 sequence 순서로 한 번만 실행되고, 기존 name-only ledger를 backfill하며, 실패한 migration의 부분 쓰기와 ledger 기록을 savepoint로 함께 rollback하는지 확인
+38. migration dry-run이 SQLite backup 사본에만 변경을 적용하고 원본 bytes를 유지하며, 적용 migration·sequence backfill·quick/FK 결과만 경로 없이 반환하는지 확인
 
 ## 18. 피해야 할 변경
 
@@ -849,6 +854,6 @@ src/stt_to_subtitle/
 
 ## 20. 최종 권고
 
-명시적 상태 모델과 공통 projection, 번역 LLM·STT dispatch gate, worker lease·fencing·graceful drain 및 번역 attempt reconcile 기반 단계별 재시작 복구, 비교·선택 가능한 immutable prompt revision, 세그먼트 ID 기반 translation generation 비교, 선택·재사용 가능한 immutable audio/transcript revision, 참조 기반 artifact 보존·수동 orphan 정리, 최초·재게시 cutpoint를 포함한 자막 pair manifest reconcile, backend별 STT 취소·실패 계약, 구조화 전이 이벤트, 외부 요청·dependency gate·원격 STT 큐·artifact/startup reconcile·lease fencing·checkpoint·자막 검증 영속 measurement, JSON·Prometheus 운영 스냅샷, SQLite 외래키·상태 projection·원장 소유 관계 guard는 반영됐다. 다음 리팩터링 단위는 순번형 migration 모듈 분리와 실환경 fault 검증이다. 자동 회복은 상시 가동 의존성에만 선택적으로 적용한다.
+명시적 상태 모델과 공통 projection, 번역 LLM·STT dispatch gate, worker lease·fencing·graceful drain 및 번역 attempt reconcile 기반 단계별 재시작 복구, 비교·선택 가능한 immutable prompt revision, 세그먼트 ID 기반 translation generation 비교, 선택·재사용 가능한 immutable audio/transcript revision, 참조 기반 artifact 보존·수동 orphan 정리, 최초·재게시 cutpoint를 포함한 자막 pair manifest reconcile, backend별 STT 취소·실패 계약, 구조화 전이 이벤트, 외부 요청·dependency gate·원격 STT 큐·artifact/startup reconcile·lease fencing·checkpoint·자막 검증 영속 measurement, JSON·Prometheus 운영 스냅샷, 순번형 migration runner와 원본 무변경 dry-run, SQLite 외래키·상태 projection·원장 소유 관계 guard는 반영됐다. 다음 검증 단위는 실제 운영 DB 사본 dry-run과 파일시스템·GPU worker fault test다. 자동 회복은 상시 가동 의존성에만 선택적으로 적용한다.
 
 동시에 transcript revision, translation generation/batch/item, external/generated subtitle asset, publication, validation을 영속 모델로 추가해야 한다. 그래야 프롬프트 수정 재번역, 부분 번역 재개, 외부 자막 재생·비교, 선택적 상용 LLM 평가, 자막 게시·rollback, WAV·전사본 재사용을 데이터 손실 없이 반복할 수 있다. 내부망 무인증 운영은 그대로 유지하고 인증보다 실행·파일·참조 무결성에 구현 역량을 집중한다.
