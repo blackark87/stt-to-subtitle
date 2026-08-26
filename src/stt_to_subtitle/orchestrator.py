@@ -102,6 +102,13 @@ RUNNING_STAGE_BY_STATUS = {
     "translation_running": "translation",
     "rendering": "render",
 }
+EVENT_PHASE_BY_STAGE = {
+    "audio extraction": "extraction",
+    "extraction": "extraction",
+    "transcription": "transcription",
+    "translation": "translation",
+    "render": "render",
+}
 JOB_LEASE_SECONDS = 60.0
 JOB_LEASE_HEARTBEAT_SECONDS = 15.0
 JOB_SHUTDOWN_GRACE_SECONDS = 5.0
@@ -875,6 +882,10 @@ class SubtitleOrchestrator:
                         "warning",
                         "service restart detected; confirming requested "
                         "remote transcription cancellation",
+                        event_code="recovery.stop_confirmation",
+                        from_state=job.state,
+                        phase="transcription",
+                        payload={"remote_job_id": job.stt_job_id},
                     )
                     self._submit_stage(
                         self._stt_executor,
@@ -903,6 +914,10 @@ class SubtitleOrchestrator:
                     "warning",
                     "service restart detected; reconnecting remote "
                     f"transcription {job.stt_job_id}",
+                    event_code="transcription.reconnected",
+                    from_state=job.state,
+                    phase="transcription",
+                    payload={"remote_job_id": job.stt_job_id},
                 )
                 self._submit_stage(
                     self._stt_executor,
@@ -951,6 +966,13 @@ class SubtitleOrchestrator:
                     "warning",
                     "service restart detected; resumed from persisted "
                     f"checkpoint {target_status}",
+                    event_code="recovery.checkpoint_resumed",
+                    from_state=job.state,
+                    attempt=job.attempt + 1,
+                    payload={
+                        "previous_status": job.status,
+                        "target_status": target_status,
+                    },
                 )
                 self.store.release_job_lease(
                     job.id,
@@ -2114,6 +2136,13 @@ class SubtitleOrchestrator:
             job.id,
             "info",
             f"manual retry requested; resuming from {target_status}",
+            event_code="job.retry_requested",
+            from_state=job.state,
+            attempt=job.attempt + 1,
+            payload={
+                "previous_status": job.status,
+                "target_status": target_status,
+            },
         )
         retried = self.store.get(job.id)
         if retried is None:
@@ -2322,6 +2351,14 @@ class SubtitleOrchestrator:
                 if selected_revision_id
                 else ""
             ),
+            event_code="translation.generation_created",
+            from_state=job.state,
+            phase="translation",
+            payload={
+                "generation_number": generation["generation_number"],
+                "transcript_revision_id": selected_revision_id,
+                "prompt_revision_id": generation.get("prompt_revision_id"),
+            },
         )
         restarted = self.store.get(job.id)
         if restarted is None:
@@ -2393,7 +2430,14 @@ class SubtitleOrchestrator:
             self.store.update(job.id, translation_pause_requested=1)
         else:
             raise ValueError("translation is not waiting or running")
-        self.store.add_event(job.id, "info", "translation pause requested")
+        self.store.add_event(
+            job.id,
+            "info",
+            "translation pause requested",
+            event_code="translation.pause_requested",
+            from_state=job.state,
+            phase="translation",
+        )
         paused = self.store.get(job.id)
         if paused is None:
             raise RuntimeError("paused job could not be read")
@@ -2424,6 +2468,10 @@ class SubtitleOrchestrator:
                         job.id,
                         "info",
                         "bulk translation pause requested",
+                        event_code="translation.pause_requested",
+                        from_state=job.state,
+                        phase="translation",
+                        payload={"scope": "bulk"},
                     )
                     paused_count += 1
                     break
@@ -2465,7 +2513,18 @@ class SubtitleOrchestrator:
                     {job.status},
                     **fields,
                 ):
-                    self.store.add_event(job.id, "warning", event_message)
+                    self.store.add_event(
+                        job.id,
+                        "warning",
+                        event_message,
+                        event_code=(
+                            "job.stop_requested"
+                            if job.status in RUNNING_STATUSES
+                            else "job.stopped"
+                        ),
+                        from_state=job.state,
+                        phase=job.phase,
+                    )
                     if (
                         job.status == "transcription_running"
                         and job.stt_job_id
@@ -2504,7 +2563,14 @@ class SubtitleOrchestrator:
             blocked_stage=None,
             error=None,
         )
-        self.store.add_event(job.id, "info", "translation resume requested")
+        self.store.add_event(
+            job.id,
+            "info",
+            "translation resume requested",
+            event_code="translation.resume_requested",
+            from_state=job.state,
+            phase="translation",
+        )
         resumed = self.store.get(job.id)
         if resumed is None:
             raise RuntimeError("resumed job could not be read")
@@ -2769,7 +2835,19 @@ class SubtitleOrchestrator:
             )
             if lease_token is None:
                 continue
-            self.store.add_event(job_id, "info", f"{stage} started")
+            self.store.add_event(
+                job_id,
+                "info",
+                f"{stage} started",
+                event_code="stage.started",
+                from_state=JobState.WAITING.value,
+                to_state=JobState.RUNNING.value,
+                phase=EVENT_PHASE_BY_STAGE[stage],
+                payload={
+                    "waiting_status": waiting,
+                    "running_status": running,
+                },
+            )
             self._submit_stage(
                 executor,
                 job_id,
@@ -2887,6 +2965,14 @@ class SubtitleOrchestrator:
                 job_id,
                 level,
                 f"{stage} {outcome}: {message}",
+                event_code=f"stage.{outcome}",
+                from_state=JobState.RUNNING.value,
+                phase=EVENT_PHASE_BY_STAGE[stage],
+                payload={
+                    "failure_code": error.failure_code,
+                    "reason_code": reason_code,
+                    "retryable": bool(error.retryable),
+                },
             )
             getattr(LOGGER, level)(
                 "job %s %s %s: %s",
@@ -2921,7 +3007,21 @@ class SubtitleOrchestrator:
                     message,
                     reason_code=JobReason.LM_UNAVAILABLE.value,
                 )
-            self.store.add_event(job_id, "warning", f"{stage} blocked: {message}")
+            self.store.add_event(
+                job_id,
+                "warning",
+                f"{stage} blocked: {message}",
+                event_code="stage.blocked",
+                from_state=JobState.RUNNING.value,
+                phase=EVENT_PHASE_BY_STAGE[stage],
+                payload={
+                    "reason_code": (
+                        JobReason.LM_UNAVAILABLE.value
+                        if stage == "translation"
+                        else JobReason.STT_UNAVAILABLE.value
+                    )
+                },
+            )
             LOGGER.warning("job %s %s blocked: %s", job_id, stage, message)
         except TranslationPaused:
             current = self.store.get(job_id)
@@ -2936,7 +3036,14 @@ class SubtitleOrchestrator:
                     translation_pause_requested=1,
                 ):
                     return
-                self.store.add_event(job_id, "info", "translation paused")
+                self.store.add_event(
+                    job_id,
+                    "info",
+                    "translation paused",
+                    event_code="stage.paused",
+                    from_state=JobState.RUNNING.value,
+                    phase="translation",
+                )
         except BaseException as error:
             message = self._sanitize_error(str(error) or error.__class__.__name__)
             if not self._update_stage_job(
@@ -2947,7 +3054,15 @@ class SubtitleOrchestrator:
                 error=message,
             ):
                 return
-            self.store.add_event(job_id, "error", f"{stage} failed: {message}")
+            self.store.add_event(
+                job_id,
+                "error",
+                f"{stage} failed: {message}",
+                event_code="stage.failed",
+                from_state=JobState.RUNNING.value,
+                phase=EVENT_PHASE_BY_STAGE[stage],
+                payload={"reason_code": JobReason.INTERNAL_ERROR.value},
+            )
             LOGGER.exception("job %s %s failed", job_id, stage)
         finally:
             if lease_stop is not None:
@@ -3011,7 +3126,15 @@ class SubtitleOrchestrator:
             job_stop_requested=0,
         ):
             return
-        self.store.add_event(job.id, "warning", "job stopped by user request")
+        self.store.add_event(
+            job.id,
+            "warning",
+            "job stopped by user request",
+            event_code="job.stopped",
+            from_state=job.state,
+            phase=EVENT_PHASE_BY_STAGE[stage],
+            payload={"reason_code": JobReason.USER_STOP.value},
+        )
 
     def _extract(self, job: PipelineJob) -> None:
         source = self.library.resolve_file(job.source_rel)
@@ -3052,6 +3175,13 @@ class SubtitleOrchestrator:
                     "info",
                     "audio extraction reused immutable revision "
                     f"{revision['id']}",
+                    event_code="stage.completed",
+                    from_state=JobState.RUNNING.value,
+                    phase="extraction",
+                    payload={
+                        "audio_revision_id": revision["id"],
+                        "reused": True,
+                    },
                 )
                 return
         revision_id = uuid4().hex
@@ -3099,6 +3229,14 @@ class SubtitleOrchestrator:
             "info",
             "audio extraction completed "
             f"({audio_path.stat().st_size} bytes{progress_detail})",
+            event_code="stage.completed",
+            from_state=JobState.RUNNING.value,
+            phase="extraction",
+            payload={
+                "audio_revision_id": revision_id,
+                "chunks_total_estimate": chunk_estimate,
+                "reused": False,
+            },
         )
 
     def _transcribe(self, job: PipelineJob) -> None:
@@ -3190,6 +3328,10 @@ class SubtitleOrchestrator:
                 job.id,
                 "info",
                 f"remote transcription job accepted: {remote_job_id}",
+                event_code="transcription.remote_accepted",
+                from_state=JobState.RUNNING.value,
+                phase="transcription",
+                payload={"remote_job_id": remote_job_id},
             )
 
         def update_chunk_progress(progress: Mapping[str, Any]) -> None:
@@ -3312,6 +3454,14 @@ class SubtitleOrchestrator:
             job.id,
             "info",
             f"transcription completed ({len(payload['segments'])} segments)",
+            event_code="stage.completed",
+            from_state=JobState.RUNNING.value,
+            phase="transcription",
+            payload={
+                "transcript_revision_id": revision_id,
+                "segment_count": len(payload["segments"]),
+                "chunks_total": final_chunk_total,
+            },
         )
         noise_filter = payload.get("noise_filter")
         if isinstance(noise_filter, Mapping):
@@ -3911,6 +4061,14 @@ class SubtitleOrchestrator:
             "translation generation "
             f"{generation['generation_number']} completed "
             f"({len(completed_translations)} segments)",
+            event_code="stage.completed",
+            from_state=JobState.RUNNING.value,
+            phase="translation",
+            payload={
+                "translation_generation_id": generation["id"],
+                "generation_number": generation["generation_number"],
+                "segment_count": len(completed_translations),
+            },
         )
 
     def _subtitle_generation_artifact_paths(
@@ -4402,6 +4560,12 @@ class SubtitleOrchestrator:
             "info",
             "subtitle generation "
             f"{generation['generation_number']} published",
+            event_code="subtitle.published",
+            phase="complete",
+            payload={
+                "subtitle_generation_id": generation["id"],
+                "generation_number": generation["generation_number"],
+            },
         )
         published_job = self.store.get(job.id)
         if published_job is None:
@@ -4430,6 +4594,13 @@ class SubtitleOrchestrator:
             "subtitles written: "
             f"{Path(refreshed.srt_path).name}, "
             f"{Path(refreshed.ass_path).name}",
+            event_code="stage.completed",
+            from_state=JobState.RUNNING.value,
+            phase="render",
+            payload={
+                "srt_filename": Path(refreshed.srt_path).name,
+                "ass_filename": Path(refreshed.ass_path).name,
+            },
         )
 
     def _render_artifacts(

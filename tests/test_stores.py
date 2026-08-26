@@ -572,6 +572,115 @@ class JobStoreTests(unittest.TestCase):
 
             self.assertEqual(changed_job_ids, [job.id] * 4)
 
+    def test_persists_structured_job_events_and_blocks_sensitive_payloads(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            store = JobStore(Path(directory) / "jobs.sqlite3")
+            job = store.create(
+                job_id="job-1",
+                source_rel="movie.mkv",
+                force_overwrite=False,
+                options={},
+            )
+            store.add_event(
+                job.id,
+                "info",
+                "extraction started",
+                event_code="stage.started",
+                from_state="waiting",
+                to_state="running",
+                phase="extraction",
+                attempt=2,
+                correlation_id="run-2",
+                payload={"running_status": "extracting"},
+            )
+
+            created, started = store.events(job.id)
+
+            self.assertEqual(created["event_code"], "job.created")
+            self.assertIsNone(created["from_state"])
+            self.assertEqual(created["to_state"], "waiting")
+            self.assertEqual(created["phase"], "extraction")
+            self.assertEqual(created["attempt"], 1)
+            self.assertEqual(created["correlation_id"], "job-1:1")
+            self.assertEqual(
+                created["payload"],
+                {"legacy_status": "queued", "operation": "full"},
+            )
+            self.assertEqual(started["event_code"], "stage.started")
+            self.assertEqual(started["from_state"], "waiting")
+            self.assertEqual(started["to_state"], "running")
+            self.assertEqual(started["phase"], "extraction")
+            self.assertEqual(started["attempt"], 2)
+            self.assertEqual(started["correlation_id"], "run-2")
+            self.assertEqual(
+                started["payload"],
+                {"running_status": "extracting"},
+            )
+            with self.assertRaisesRegex(ValueError, "sensitive keys"):
+                store.add_event(
+                    job.id,
+                    "info",
+                    "must not persist",
+                    payload={"connection": {"access_token": "secret"}},
+                )
+
+    def test_builds_operational_metrics_from_structured_events(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = JobStore(Path(directory) / "jobs.sqlite3")
+            job = store.create(
+                job_id="job-1",
+                source_rel="movie.mkv",
+                force_overwrite=False,
+                options={},
+                operation="extract",
+            )
+            lease_token = store.claim_for_dispatch(
+                job.id,
+                "queued",
+                "extracting",
+                lease_owner="worker-1",
+                lease_seconds=60,
+            )
+            self.assertIsNotNone(lease_token)
+            store.add_event(
+                job.id,
+                "info",
+                "audio extraction started",
+                event_code="stage.started",
+                from_state="waiting",
+                to_state="running",
+                phase="extraction",
+            )
+            store.update(job.id, status="audio_completed")
+            store.add_event(
+                job.id,
+                "info",
+                "audio extraction completed",
+                event_code="stage.completed",
+                from_state="running",
+                phase="extraction",
+            )
+
+            snapshot = store.operational_metrics()
+            extraction = snapshot["events"]["stages"]["extraction"]
+
+            self.assertEqual(snapshot["schema_version"], 1)
+            self.assertEqual(snapshot["jobs"]["total"], 1)
+            self.assertEqual(snapshot["jobs"]["by_state"]["done"], 1)
+            self.assertEqual(snapshot["jobs"]["by_phase"]["complete"], 1)
+            self.assertEqual(snapshot["jobs"]["max_attempt"], 1)
+            self.assertEqual(snapshot["leases"]["active"], 0)
+            self.assertEqual(snapshot["events"]["by_code"]["job.created"], 1)
+            self.assertEqual(extraction["started"], 1)
+            self.assertEqual(extraction["outcomes"]["stage.completed"], 1)
+            self.assertEqual(extraction["wait_seconds"]["samples"], 1)
+            self.assertEqual(
+                extraction["processing_seconds"]["samples"],
+                1,
+            )
+
     def test_seeds_edits_and_archives_prompt_categories(self) -> None:
         with TemporaryDirectory() as directory:
             database_path = Path(directory) / "jobs.sqlite3"
@@ -1799,3 +1908,37 @@ class JobStoreTests(unittest.TestCase):
             revisions = store.transcript_revisions("job-1")
 
             self.assertEqual(revisions[0]["chunks_total"], 0)
+
+    def test_adds_structured_columns_to_existing_job_events(self) -> None:
+        with TemporaryDirectory() as directory:
+            database_path = Path(directory) / "jobs.sqlite3"
+            with sqlite3.connect(database_path) as connection:
+                connection.execute(
+                    """
+                    CREATE TABLE job_events (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        job_id TEXT NOT NULL,
+                        level TEXT NOT NULL,
+                        message TEXT NOT NULL,
+                        created_at REAL NOT NULL
+                    )
+                    """
+                )
+                connection.execute(
+                    """
+                    INSERT INTO job_events (
+                        job_id, level, message, created_at
+                    ) VALUES ('legacy-job', 'warning', 'legacy event', 1.0)
+                    """
+                )
+
+            events = JobStore(database_path).events("legacy-job")
+
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0]["event_code"], "job.message")
+            self.assertIsNone(events[0]["from_state"])
+            self.assertIsNone(events[0]["to_state"])
+            self.assertIsNone(events[0]["phase"])
+            self.assertIsNone(events[0]["attempt"])
+            self.assertIsNone(events[0]["correlation_id"])
+            self.assertEqual(events[0]["payload"], {})

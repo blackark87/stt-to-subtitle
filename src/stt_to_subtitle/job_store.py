@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 from pathlib import Path
+import re
 import sqlite3
 import time
 from typing import Any, Callable, Collection, Iterator, Mapping, Sequence
@@ -74,6 +75,19 @@ TRANSLATION_RESTART_INTERRUPTED = (
 )
 TRANSLATION_BATCH_RESTART_INTERRUPTED = (
     "service restart interrupted translation batch"
+)
+EVENT_CODE_PATTERN = re.compile(r"^[a-z0-9]+(?:[._-][a-z0-9]+)*$")
+EVENT_PAYLOAD_MAX_BYTES = 16 * 1024
+SENSITIVE_EVENT_KEY_PARTS = frozenset(
+    {
+        "authorization",
+        "credential",
+        "password",
+        "secret",
+        "token",
+        "api_key",
+        "apikey",
+    }
 )
 
 
@@ -536,8 +550,28 @@ class JobStore:
                     job_id TEXT NOT NULL,
                     level TEXT NOT NULL,
                     message TEXT NOT NULL,
+                    event_code TEXT NOT NULL DEFAULT 'job.message',
+                    from_state TEXT,
+                    to_state TEXT,
+                    phase TEXT,
+                    attempt INTEGER,
+                    correlation_id TEXT,
+                    payload_json TEXT NOT NULL DEFAULT '{}',
                     created_at REAL NOT NULL,
-                    FOREIGN KEY (job_id) REFERENCES jobs(id)
+                    FOREIGN KEY (job_id) REFERENCES jobs(id),
+                    CHECK (from_state IS NULL OR from_state IN (
+                        'waiting', 'running', 'paused', 'blocked',
+                        'stopped', 'failed', 'done'
+                    )),
+                    CHECK (to_state IS NULL OR to_state IN (
+                        'waiting', 'running', 'paused', 'blocked',
+                        'stopped', 'failed', 'done'
+                    )),
+                    CHECK (phase IS NULL OR phase IN (
+                        'extraction', 'transcription', 'translation',
+                        'render', 'complete'
+                    )),
+                    CHECK (attempt IS NULL OR attempt >= 1)
                 );
 
                 CREATE TABLE IF NOT EXISTS remote_server_settings (
@@ -874,6 +908,36 @@ class JobStore:
                     "ALTER TABLE transcript_revisions ADD COLUMN "
                     "chunks_total INTEGER NOT NULL DEFAULT 0"
                 )
+            event_columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(job_events)"
+                ).fetchall()
+            }
+            event_migrations = {
+                "event_code": (
+                    "ALTER TABLE job_events ADD COLUMN event_code "
+                    "TEXT NOT NULL DEFAULT 'job.message'"
+                ),
+                "from_state": (
+                    "ALTER TABLE job_events ADD COLUMN from_state TEXT"
+                ),
+                "to_state": (
+                    "ALTER TABLE job_events ADD COLUMN to_state TEXT"
+                ),
+                "phase": "ALTER TABLE job_events ADD COLUMN phase TEXT",
+                "attempt": "ALTER TABLE job_events ADD COLUMN attempt INTEGER",
+                "correlation_id": (
+                    "ALTER TABLE job_events ADD COLUMN correlation_id TEXT"
+                ),
+                "payload_json": (
+                    "ALTER TABLE job_events ADD COLUMN payload_json "
+                    "TEXT NOT NULL DEFAULT '{}'"
+                ),
+            }
+            for column, statement in event_migrations.items():
+                if column not in event_columns:
+                    connection.execute(statement)
             prompt_columns = {
                 str(row["name"])
                 for row in connection.execute(
@@ -918,6 +982,14 @@ class JobStore:
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS jobs_lease_idx "
                 "ON jobs(status, lease_expires_at)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS job_events_code_idx "
+                "ON job_events(event_code, created_at)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS job_events_created_idx "
+                "ON job_events(created_at, id)"
             )
             structured_state_migration = "structured_job_state_v1"
             structured_state_applied = connection.execute(
@@ -1802,6 +1874,11 @@ class JobStore:
             job_id,
             "info",
             "job queued" if status == "queued" else f"job created in {status}",
+            event_code="job.created",
+            to_state=projected.state.value,
+            phase=projected.phase.value,
+            attempt=1,
+            payload={"operation": operation, "legacy_status": status},
         )
         job = self.get(job_id)
         if job is None:
@@ -4013,14 +4090,135 @@ class JobStore:
             "updated_at": float(row["updated_at"]),
         }
 
-    def add_event(self, job_id: str, level: str, message: str) -> None:
+    @staticmethod
+    def _event_payload_json(payload: Mapping[str, Any] | None) -> str:
+        document = dict(payload or {})
+        credential_suffixes = tuple(
+            f"_{part}" for part in SENSITIVE_EVENT_KEY_PARTS
+        )
+
+        def reject_sensitive_keys(value: Any) -> None:
+            if isinstance(value, Mapping):
+                for key, nested in value.items():
+                    normalized = str(key).strip().lower()
+                    if (
+                        normalized != "lease_token"
+                        and (
+                            normalized in SENSITIVE_EVENT_KEY_PARTS
+                            or normalized.endswith(credential_suffixes)
+                        )
+                    ):
+                        raise ValueError(
+                            "sensitive keys are not allowed in event payloads"
+                        )
+                    reject_sensitive_keys(nested)
+            elif isinstance(value, (list, tuple)):
+                for nested in value:
+                    reject_sensitive_keys(nested)
+
+        reject_sensitive_keys(document)
+        try:
+            encoded = json.dumps(
+                document,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        except (TypeError, ValueError) as error:
+            raise ValueError("event payload must be JSON serializable") from error
+        if len(encoded.encode("utf-8")) > EVENT_PAYLOAD_MAX_BYTES:
+            raise ValueError("event payload exceeds 16 KiB")
+        return encoded
+
+    def add_event(
+        self,
+        job_id: str,
+        level: str,
+        message: str,
+        *,
+        event_code: str = "job.message",
+        from_state: str | None = None,
+        to_state: str | None = None,
+        phase: str | None = None,
+        attempt: int | None = None,
+        correlation_id: str | None = None,
+        payload: Mapping[str, Any] | None = None,
+    ) -> None:
+        normalized_code = event_code.strip().lower()
+        if (
+            not normalized_code
+            or len(normalized_code) > 100
+            or EVENT_CODE_PATTERN.fullmatch(normalized_code) is None
+        ):
+            raise ValueError("invalid event code")
+        payload_json = self._event_payload_json(payload)
         with self._connect() as connection:
+            current = connection.execute(
+                "SELECT phase, state, attempt FROM jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            resolved_phase = (
+                phase
+                if phase is not None
+                else (str(current["phase"]) if current is not None else None)
+            )
+            resolved_to_state = (
+                to_state
+                if to_state is not None
+                else (str(current["state"]) if current is not None else None)
+            )
+            resolved_attempt = (
+                attempt
+                if attempt is not None
+                else (int(current["attempt"]) if current is not None else None)
+            )
+            try:
+                if from_state is not None:
+                    JobState(from_state)
+                if resolved_to_state is not None:
+                    JobState(resolved_to_state)
+                if resolved_phase is not None:
+                    JobPhase(resolved_phase)
+            except ValueError as error:
+                raise ValueError("invalid structured event state") from error
+            if resolved_attempt is not None and resolved_attempt < 1:
+                raise ValueError("event attempt must be at least 1")
+            resolved_correlation_id = (
+                correlation_id.strip()
+                if correlation_id is not None
+                else (
+                    f"{job_id}:{resolved_attempt}"
+                    if resolved_attempt is not None
+                    else None
+                )
+            )
+            if resolved_correlation_id == "":
+                resolved_correlation_id = None
+            if (
+                resolved_correlation_id is not None
+                and len(resolved_correlation_id) > 200
+            ):
+                raise ValueError("event correlation ID exceeds 200 characters")
             connection.execute(
                 """
-                INSERT INTO job_events (job_id, level, message, created_at)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO job_events (
+                    job_id, level, message, event_code, from_state, to_state,
+                    phase, attempt, correlation_id, payload_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (job_id, level, message[:4000], time.time()),
+                (
+                    job_id,
+                    level,
+                    message[:4000],
+                    normalized_code,
+                    from_state,
+                    resolved_to_state,
+                    resolved_phase,
+                    resolved_attempt,
+                    resolved_correlation_id,
+                    payload_json,
+                    time.time(),
+                ),
             )
         self._notify_change(job_id)
 
@@ -4028,7 +4226,8 @@ class JobStore:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT level, message, created_at
+                SELECT level, message, event_code, from_state, to_state,
+                       phase, attempt, correlation_id, payload_json, created_at
                 FROM job_events
                 WHERE job_id = ?
                 ORDER BY id DESC
@@ -4040,7 +4239,244 @@ class JobStore:
             {
                 "level": str(row["level"]),
                 "message": str(row["message"]),
+                "event_code": str(row["event_code"]),
+                "from_state": (
+                    str(row["from_state"])
+                    if row["from_state"] is not None
+                    else None
+                ),
+                "to_state": (
+                    str(row["to_state"])
+                    if row["to_state"] is not None
+                    else None
+                ),
+                "phase": (
+                    str(row["phase"])
+                    if row["phase"] is not None
+                    else None
+                ),
+                "attempt": (
+                    int(row["attempt"])
+                    if row["attempt"] is not None
+                    else None
+                ),
+                "correlation_id": (
+                    str(row["correlation_id"])
+                    if row["correlation_id"] is not None
+                    else None
+                ),
+                "payload": json.loads(str(row["payload_json"])),
                 "created_at": float(row["created_at"]),
             }
             for row in reversed(rows)
         ]
+
+    def operational_metrics(
+        self,
+        *,
+        window_seconds: float = 24 * 60 * 60,
+    ) -> dict[str, Any]:
+        if window_seconds <= 0:
+            raise ValueError("metrics window must be positive")
+        now = time.time()
+        with self._connect() as connection:
+            jobs = connection.execute(
+                """
+                SELECT phase, state, reason_code, attempt, status,
+                       status_updated_at, lease_owner, lease_expires_at
+                FROM jobs
+                """
+            ).fetchall()
+            dependencies = connection.execute(
+                """
+                SELECT dependency, state, reason_code, updated_at
+                FROM dependency_states
+                ORDER BY dependency
+                """
+            ).fetchall()
+            event_count_rows = connection.execute(
+                """
+                SELECT event_code, COUNT(*) AS event_count
+                FROM job_events
+                WHERE created_at >= ?
+                GROUP BY event_code
+                ORDER BY event_code
+                """,
+                (now - window_seconds,),
+            ).fetchall()
+            event_rows = connection.execute(
+                """
+                SELECT id, job_id, event_code, phase, attempt,
+                       from_state, to_state, created_at
+                FROM job_events
+                WHERE created_at >= ?
+                  AND (
+                      event_code IN (
+                          'stage.started', 'stage.completed',
+                          'stage.blocked', 'stage.failed', 'stage.paused',
+                          'job.stopped'
+                      )
+                      OR to_state = 'waiting'
+                  )
+                ORDER BY id
+                """,
+                (now - window_seconds,),
+            ).fetchall()
+
+        state_counts = {state.value: 0 for state in JobState}
+        phase_counts = {phase.value: 0 for phase in JobPhase}
+        phase_state_counts = {
+            phase.value: {state.value: 0 for state in JobState}
+            for phase in JobPhase
+        }
+        reason_counts: dict[str, int] = {}
+        oldest_waiting_seconds: dict[str, float | None] = {
+            phase.value: None for phase in JobPhase
+        }
+        active_leases = 0
+        expired_running_leases = 0
+        total_retries = 0
+        max_attempt = 0
+        for row in jobs:
+            phase = str(row["phase"])
+            state = str(row["state"])
+            state_counts[state] = state_counts.get(state, 0) + 1
+            phase_counts[phase] = phase_counts.get(phase, 0) + 1
+            phase_states = phase_state_counts.setdefault(phase, {})
+            phase_states[state] = phase_states.get(state, 0) + 1
+            reason = row["reason_code"]
+            if reason is not None:
+                reason_key = str(reason)
+                reason_counts[reason_key] = reason_counts.get(reason_key, 0) + 1
+            attempt = int(row["attempt"])
+            total_retries += max(0, attempt - 1)
+            max_attempt = max(max_attempt, attempt)
+            if state == JobState.WAITING.value:
+                age = max(0.0, now - float(row["status_updated_at"]))
+                previous = oldest_waiting_seconds.get(phase)
+                oldest_waiting_seconds[phase] = (
+                    age if previous is None else max(previous, age)
+                )
+            lease_expires_at = row["lease_expires_at"]
+            if row["lease_owner"] is not None and lease_expires_at is not None:
+                if float(lease_expires_at) > now:
+                    active_leases += 1
+                elif str(row["status"]) in RUNNING_JOB_STATUSES:
+                    expired_running_leases += 1
+
+        event_code_counts = {
+            str(row["event_code"]): int(row["event_count"])
+            for row in event_count_rows
+        }
+        stage_metrics = {
+            phase.value: {
+                "started": 0,
+                "outcomes": {},
+                "wait_seconds": [],
+                "processing_seconds": [],
+            }
+            for phase in JobPhase
+            if phase is not JobPhase.COMPLETE
+        }
+        waiting_since: dict[tuple[str, int], float] = {}
+        active_starts: dict[tuple[str, int, str], float] = {}
+        terminal_codes = {
+            "stage.completed",
+            "stage.blocked",
+            "stage.failed",
+            "stage.paused",
+            "job.stopped",
+        }
+        for row in event_rows:
+            event_code = str(row["event_code"])
+            attempt_value = row["attempt"]
+            phase_value = row["phase"]
+            if attempt_value is None:
+                continue
+            attempt = int(attempt_value)
+            job_key = (str(row["job_id"]), attempt)
+            created_at = float(row["created_at"])
+            if event_code == "stage.started" and phase_value is not None:
+                phase = str(phase_value)
+                metrics = stage_metrics.get(phase)
+                if metrics is not None:
+                    metrics["started"] += 1
+                    entered_waiting_at = waiting_since.pop(job_key, None)
+                    if entered_waiting_at is not None:
+                        metrics["wait_seconds"].append(
+                            max(0.0, created_at - entered_waiting_at)
+                        )
+                    active_starts[(job_key[0], attempt, phase)] = created_at
+            elif event_code in terminal_codes and phase_value is not None:
+                phase = str(phase_value)
+                metrics = stage_metrics.get(phase)
+                if metrics is not None:
+                    outcomes = metrics["outcomes"]
+                    outcomes[event_code] = outcomes.get(event_code, 0) + 1
+                    started_at = active_starts.pop(
+                        (job_key[0], attempt, phase),
+                        None,
+                    )
+                    if started_at is not None:
+                        metrics["processing_seconds"].append(
+                            max(0.0, created_at - started_at)
+                        )
+            if row["to_state"] == JobState.WAITING.value:
+                waiting_since[job_key] = created_at
+
+        def summarize(values: list[float]) -> dict[str, float | int | None]:
+            if not values:
+                return {"samples": 0, "average": None, "maximum": None}
+            return {
+                "samples": len(values),
+                "average": round(sum(values) / len(values), 3),
+                "maximum": round(max(values), 3),
+            }
+
+        summarized_stages = {
+            phase: {
+                "started": int(metrics["started"]),
+                "outcomes": dict(sorted(metrics["outcomes"].items())),
+                "wait_seconds": summarize(metrics["wait_seconds"]),
+                "processing_seconds": summarize(
+                    metrics["processing_seconds"]
+                ),
+            }
+            for phase, metrics in stage_metrics.items()
+        }
+        return {
+            "schema_version": 1,
+            "generated_at": now,
+            "window_seconds": window_seconds,
+            "jobs": {
+                "total": len(jobs),
+                "by_state": state_counts,
+                "by_phase": phase_counts,
+                "by_phase_state": phase_state_counts,
+                "by_reason": dict(sorted(reason_counts.items())),
+                "oldest_waiting_seconds": oldest_waiting_seconds,
+                "total_retries": total_retries,
+                "max_attempt": max_attempt,
+            },
+            "leases": {
+                "active": active_leases,
+                "expired_running": expired_running_leases,
+            },
+            "dependencies": [
+                {
+                    "dependency": str(row["dependency"]),
+                    "state": str(row["state"]),
+                    "reason_code": (
+                        str(row["reason_code"])
+                        if row["reason_code"] is not None
+                        else None
+                    ),
+                    "updated_at": float(row["updated_at"]),
+                }
+                for row in dependencies
+            ],
+            "events": {
+                "by_code": dict(sorted(event_code_counts.items())),
+                "stages": summarized_stages,
+            },
+        }

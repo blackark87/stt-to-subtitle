@@ -1921,6 +1921,33 @@ class WebAppTests(unittest.TestCase):
         self.assertTrue(run.call_args.kwargs["proxy_headers"])
         self.assertEqual(run.call_args.kwargs["forwarded_allow_ips"], "*")
 
+    def test_exposes_operational_metrics_as_structured_json(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            with TestClient(
+                create_app(self.settings(root, media_root))
+            ) as client:
+                service = client.app.state.orchestrator
+                service.stop()
+                service.store.create(
+                    job_id="queued-job",
+                    source_rel="movie.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+
+                response = client.get("/api/operations/metrics")
+
+            self.assertEqual(response.status_code, 200)
+            payload = response.json()
+            self.assertEqual(payload["schema_version"], 1)
+            self.assertEqual(payload["jobs"]["total"], 1)
+            self.assertEqual(payload["jobs"]["by_state"]["waiting"], 1)
+            self.assertEqual(payload["events"]["by_code"]["job.created"], 1)
+            self.assertIn("extraction", payload["events"]["stages"])
+
     def test_recent_jobs_and_history_use_readable_responsive_layout(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)

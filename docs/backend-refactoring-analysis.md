@@ -6,11 +6,11 @@
 
 ### 구현 진행 상태
 
-현재 작업 트리에는 계획의 스물세 번째 수직 슬라이스까지 반영됐다.
+현재 작업 트리에는 계획의 스물네 번째 수직 슬라이스까지 반영됐다.
 
 | 항목 | 반영 상태 | 남은 범위 |
 |---|---|---|
-| 작업 상태 계약 | `phase/state/reason_code/attempt` 영속 컬럼과 레거시 마이그레이션, 명시적 `stopped/user_stop`, 2D·3D·목록 공통 상태 집계, 단계+상태 결합 필터 | 스케줄러의 레거시 `status` 제거·전이 이벤트 코드·DB 전이 제약 |
+| 작업 상태 계약 | `phase/state/reason_code/attempt` 영속 컬럼과 레거시 마이그레이션, 명시적 `stopped/user_stop`, 2D·3D·목록 공통 상태 집계, 단계+상태 결합 필터, 구조화 전이 이벤트 | 스케줄러의 레거시 `status` 제거·DB 전이 제약 |
 | 번역 LLM 수동 gate | 사용자가 시작할 때 `/models` 1회 확인, 연결 실패 시 gate 차단, 번역 중단 작업 수동 재개, dependency state·reason 영속화, 재시작 시 자동 호출 없이 gate 닫기 | 운영 지표·실환경 장애 복구 검증 |
 | 외부 자막 | 같은 stem의 SRT/VTT/ASS 탐지, `외부 자막` 표시, 기본 WebVTT 재생 | 증분 asset/revision catalog·사용자별 재생 선택 |
 | 로컬 비교 | 시간 중첩 정렬, coverage·문장 유사도·경계 오차, 파일 해시별 SQLite 결과 | generation/publication FK·검증 알고리즘 version migration |
@@ -23,6 +23,7 @@
 | 오디오·전사 revision | source·추출 설정 hash 기반 WAV 재사용, immutable WAV·전사 JSON 경로, DB revision 원장·활성 포인터, 직접 편집·비교 선택의 별도 전사 revision, 번역 generation의 transcript revision 참조, 전체 DB 참조 기반 감사·명시적 orphan 정리, 과거 전사 revision 선택·무결성 검증·새 번역 generation 연동 | revision 간 전사 내용 비교가 필요하면 후속 추가 |
 | STT 실패 계약 | STT DB·API의 `failure_code/retryable/failure_scope`, segment/schema·OOM·인증·입력·처리·재시작 오류 분류, retryable 실패만 원격 재제출 | 실제 backend별 fault test·오류 코드 운영 지표 |
 | STT dispatch gate | 첫 연결 실패 시 영속 gate 차단, 뒤 작업 `audio_ready` 유지, 명시적 연결 확인의 제한된 3회 요청 후 중단 작업 재개 | 자동 recovery mode가 실제로 필요한지 운영 검증·회로 메트릭 |
+| 이벤트·관측성 | 기존 메시지와 분리된 `event_code/from_state/to_state/phase/attempt/correlation_id/payload`, 민감 payload 키 거부, 최근 24시간 단계 대기·처리 시간과 상태·사유·lease·dependency JSON 스냅샷 | 외부 API 재시도·원격 STT 큐·artifact reconcile 세부 계측 및 Prometheus adapter |
 
 이하의 문제 분석은 최초 분석 시점 구조를 기준으로 하되, 구현이 끝난 절은 현재
 동작과 남은 범위로 갱신했다.
@@ -164,7 +165,7 @@ stateDiagram-v2
 | 자막 산출물 | SRT/ASS 각각 임시 저장하며 재번역 시 기존 배포 파일을 덮어씀 | versioned generation, publication pointer, rollback, 한 manifest로 파일 쌍 검증 | P0–P1 |
 | 외부 자막 | `<filename>.ko.srt/.ko.ass`만 생성 자막처럼 탐지하고 VTT·출처·비교 관계가 없음 | `<filename>.srt/.vtt/.ass`를 `외부 자막`으로 등록, 기본 재생, 로컬 비교 검증, 선택적 상용 LLM 평가 | P0–P1 |
 | 화면 집계 | 화면별 상태 재분류 | 공통 projection DTO, 동일한 phase/state 필터 계약 | P0 |
-| 이벤트·관측성 | 자유 형식 이벤트와 기본 진행률 | 이벤트 코드, attempt/correlation ID, 단계 시간·대기 시간·회로 상태 메트릭 | P1 |
+| 이벤트·관측성 | 사용자 메시지와 구조화 이벤트를 함께 저장하고 `/api/operations/metrics`에서 상태·단계·대기/처리 시간·attempt·reason·lease·dependency 스냅샷 제공 | 외부 API·원격 큐·artifact reconcile 세부 counter와 Prometheus adapter | P1 |
 | DB 스키마 | 코드 내부 수동 컬럼 추가 | 버전 마이그레이션, 제약 조건, 인덱스, 외래키 활성화 | P1 |
 | 내부망 운영 | 비밀번호가 비어 있으면 인증이 비활성화되지만 보고서·설정 계약이 불명확 | 무인증 운영을 명시적 지원 계약으로 고정하고 경로·입력·로그 안전성만 유지 | P1 |
 | 미디어 라이브러리 | 파일시스템 중심 조회·집계 | 증분 카탈로그, 변경 감지, 배우 없는 콘텐츠 분류 | P2 |
@@ -612,7 +613,7 @@ jobs(
 - SQLite 연결마다 `PRAGMA foreign_keys=ON`을 적용한다.
 - `(state, current_phase, next_retry_at, created_at)` 인덱스를 추가한다.
 - 문자열 컬럼 존재 여부를 확인하는 즉석 변경 대신 순차적이고 반복 실행 가능한 schema migration을 사용한다.
-- job event에는 `event_code`, `from_state`, `to_state`, `phase`, `attempt`, `correlation_id`, `payload_json`을 둔다.
+- job event에는 `event_code`, `from_state`, `to_state`, `phase`, `attempt`, `correlation_id`, `payload_json`을 추가했다. 기존 행은 `job.message`로 호환하고 신규 작업 생성·단계 시작/완료/중단/실패·정지·일시정지·재개·복구·재번역·자막 검증/게시 이벤트를 코드로 구분한다.
 - 기존 `blocked + 사용자 중지 오류 문구` 데이터는 배포 마이그레이션에서 `stopped + user_stop`으로 변환한다.
 - 알 수 없는 레거시 오류는 억지 분류하지 않고 `blocked + legacy_unclassified`로 보존해 운영자가 검토할 수 있게 한다.
 - `jobs`는 실행 상태만 담당하고 transcript revision, translation generation/batch/item, subtitle publication은 별도 테이블로 분리한다.
@@ -624,20 +625,25 @@ jobs(
 
 ## 12. 관측성과 운영 기능
 
-추가해야 할 최소 운영 지표:
+현재 `/api/operations/metrics`는 다음 값을 구조화 JSON으로 제공한다.
 
-- 단계별 대기 시간과 처리 시간
-- 상태별 작업 수 및 가장 오래된 대기 작업 나이
+- 상태·단계·단계별 상태 작업 수와 가장 오래된 대기 작업 나이
+- 작업 retry 합계·최대 attempt와 reason code 분포
+- 활성 lease·실행 상태에서 만료된 lease 수
+- 영속 dependency gate 상태와 갱신 시각
+- 최근 24시간 event code 수, 단계별 시작·결과·대기 시간·처리 시간 표본/평균/최댓값
+
+추가해야 할 세부 운영 지표:
+
 - 외부 API 요청·재시도·소진 횟수
-- STT 영속 gate 상태와 마지막 명시적 readiness 결과, LLM 수동 gate 상태와 마지막 사용자 확인 결과
-- 작업별 attempt 수와 reason code 분포
-- lease 만료·복구·중복 실행 방지 횟수
+- 마지막 명시적 readiness 요청 결과와 회로 전이 횟수
+- lease 복구·fencing 거부·중복 실행 방지 누적 횟수
 - 원격 STT 큐 길이, 실행 작업 ID, 취소 대기 수
 - 번역 체크포인트 재사용·무효화 횟수
 - 산출물 manifest 검증 실패 수
 - 외부 자막 revision 수, 로컬 비교 coverage, 상용 LLM 검증 호출·cache hit·실패 수
 
-로그는 사용자용 메시지와 별개로 구조화한다. 토큰 마스킹은 초기 환경설정 값뿐 아니라 관리 화면에서 변경된 현재 런타임 토큰 전체에 적용해야 한다. 원격 서버 URL, job ID, attempt ID는 추적에 필요하지만 인증 헤더·토큰·원문 전체는 기록하지 않는다.
+로그는 사용자용 메시지와 별개로 구조화했다. event payload는 16 KiB로 제한하고 token·password·authorization·credential·secret·API key 이름을 거부한다. 토큰 마스킹은 초기 환경설정 값뿐 아니라 관리 화면에서 변경된 현재 런타임 토큰 전체에 적용해야 한다. 원격 job ID와 attempt/correlation ID는 추적에 사용하지만 인증 헤더·토큰·원문 전체는 기록하지 않는다.
 
 ## 13. 내부망 무인증 운영과 안전 경계
 
@@ -799,6 +805,7 @@ src/stt_to_subtitle/
 29. 과거 revision·generation 파일은 DB 참조가 남아 있으면 보존되고, 미참조 파일만 보류기간·감사 token 검증 후 명시적으로 정리되는지 확인
 30. 서로 다른 prompt·transcript revision의 번역 generation을 비교할 때 변경·추가·삭제·전사 세그먼트 변경 집계와 필터 결과가 일치하는지 확인
 31. 과거 transcript revision 선택 시 소유 관계·경로·hash·JSON 계약을 검증하고, 유효한 경우에만 활성 포인터와 새 translation generation이 같은 revision을 참조하는지 확인
+32. 기존 job event 테이블을 구조화 컬럼으로 반복 마이그레이션하고 단계 전이·attempt·correlation·payload를 보존하며 민감 payload 키를 거부하는지 확인. 같은 이벤트로 운영 스냅샷의 단계 대기/처리 표본과 상태 집계가 일치하는지 확인
 
 ## 18. 피해야 할 변경
 
@@ -832,6 +839,6 @@ src/stt_to_subtitle/
 
 ## 20. 최종 권고
 
-명시적 상태 모델과 공통 projection, 번역 LLM·STT dispatch gate, worker lease·fencing·graceful drain 및 번역 attempt reconcile 기반 단계별 재시작 복구, 비교·선택 가능한 immutable prompt revision, 세그먼트 ID 기반 translation generation 비교, 선택·재사용 가능한 immutable audio/transcript revision, 참조 기반 artifact 보존·수동 orphan 정리, 최초·재게시 cutpoint를 포함한 자막 pair manifest reconcile, backend별 STT 취소·실패 계약은 반영됐다. 다음 리팩터링 단위는 구조화 이벤트·운영 지표와 DB 외래키·전이 제약이다. 자동 회복은 상시 가동 의존성에만 선택적으로 적용한다.
+명시적 상태 모델과 공통 projection, 번역 LLM·STT dispatch gate, worker lease·fencing·graceful drain 및 번역 attempt reconcile 기반 단계별 재시작 복구, 비교·선택 가능한 immutable prompt revision, 세그먼트 ID 기반 translation generation 비교, 선택·재사용 가능한 immutable audio/transcript revision, 참조 기반 artifact 보존·수동 orphan 정리, 최초·재게시 cutpoint를 포함한 자막 pair manifest reconcile, backend별 STT 취소·실패 계약, 구조화 전이 이벤트와 운영 JSON 스냅샷은 반영됐다. 다음 리팩터링 단위는 DB 외래키·전이 제약과 미계측 외부 API·원격 큐·artifact reconcile 지표다. 자동 회복은 상시 가동 의존성에만 선택적으로 적용한다.
 
 동시에 transcript revision, translation generation/batch/item, external/generated subtitle asset, publication, validation을 영속 모델로 추가해야 한다. 그래야 프롬프트 수정 재번역, 부분 번역 재개, 외부 자막 재생·비교, 선택적 상용 LLM 평가, 자막 게시·rollback, WAV·전사본 재사용을 데이터 손실 없이 반복할 수 있다. 내부망 무인증 운영은 그대로 유지하고 인증보다 실행·파일·참조 무결성에 구현 역량을 집중한다.

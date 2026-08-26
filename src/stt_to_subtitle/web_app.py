@@ -3625,6 +3625,12 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             },
         )
 
+    @app.get("/api/operations/metrics")
+    def operations_metrics(request: Request) -> Any:
+        if not is_authenticated(request):
+            raise HTTPException(status_code=401, detail="authentication required")
+        return orchestrator(request).store.operational_metrics()
+
     @app.post("/jobs", response_class=HTMLResponse)
     def create_job(
         request: Request,
@@ -4452,7 +4458,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                 parse_subtitle(external_subtitles[0]),
                 parse_subtitle(candidate_path),
             )
-            service.store.save_subtitle_validation(
+            validation = service.store.save_subtitle_validation(
                 job_id=job.id,
                 source_rel=job.source_rel,
                 external_path=str(external_subtitles[0]),
@@ -4465,6 +4471,8 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                 job.id,
                 "info",
                 "외부 자막 비교 검증 완료",
+                event_code="subtitle.validation_completed",
+                payload={"validation_id": validation["id"]},
             )
         except (OSError, UnicodeError, ValueError) as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
@@ -4507,6 +4515,12 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                 "상용 LLM 자막 검증 저장 결과 재사용"
                 if cached
                 else "상용 LLM 자막 검증 완료",
+                event_code=(
+                    "subtitle.llm_validation_cache_hit"
+                    if cached
+                    else "subtitle.llm_validation_completed"
+                ),
+                payload={"validation_id": validation["id"]},
             )
         except (ExternalServiceError, ValueError) as error:
             raise HTTPException(
