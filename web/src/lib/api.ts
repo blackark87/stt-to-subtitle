@@ -238,6 +238,30 @@ media: (params: { folder?: string; q?: string; actor?: string } = {}) => {
     translation_workers: number;
   }) => request<unknown>("/settings/servers", { method: "PUT", ...json(body) }),
 
+  job: (id: string) => request<PipelineJob>(`/jobs/${encodeURIComponent(id)}`),
+
+  jobEvents: (id: string) =>
+    request<{ items: { created_at?: string; level?: string; message?: string; event?: string }[] }>(
+      `/jobs/${encodeURIComponent(id)}/events?limit=200`,
+    ),
+
+  /** 전사(일본어) / 번역(한국어) 산출물. 없으면 null. */
+  artifact: async (id: string, kind: "transcript" | "translation"): Promise<unknown | null> => {
+    const response = await fetch(
+      `/api/v1/jobs/${encodeURIComponent(id)}/artifacts/${kind}`,
+      { headers: { Accept: "application/json" } },
+    );
+    if (!response.ok) return null;
+    try {
+      return (await response.json()) as unknown;
+    } catch {
+      return null;
+    }
+  },
+
+  mediaFileUrl: (sourceRel: string) => `/api/v1/media/file?path=${encodeURIComponent(sourceRel)}`,
+  subtitlesUrl: (id: string) => `/api/v1/jobs/${encodeURIComponent(id)}/subtitles.vtt`,
+
   comparisons: () =>
     request<ListPayload<{ id: string; source_rels: string[]; jobs: PipelineJob[]; updated_at: number }>>(
       "/comparisons",
