@@ -39,6 +39,7 @@ services:
       traefik.http.routers.stt-to-subtitle.tls: "true"
       traefik.http.routers.stt-to-subtitle.tls.certresolver: ${TRAEFIK_CERT_RESOLVER:-letsencrypt}
       traefik.http.routers.stt-to-subtitle.service: stt-to-subtitle
+      traefik.http.routers.stt-to-subtitle.middlewares: lan-only@file
       traefik.http.services.stt-to-subtitle.loadbalancer.server.port: "8080"
     environment:
       # Next 의 rewrite 가 /api/v1 을 backend 로 넘긴다.
