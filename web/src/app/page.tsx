@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback } from "react";
+import { useCallback, useState } from "react";
 import { Icon } from "@/components/Icon";
 import { Freshness } from "@/components/Freshness";
 import { api, type PipelineJob } from "@/lib/api";
@@ -13,7 +13,7 @@ import {
   type JobPhase,
   type JobState,
 } from "@/lib/domain";
-import { clock, fileName, parentPath, percent } from "@/lib/format";
+import { clock, elapsed, fileName, parentPath, percent } from "@/lib/format";
 import { useLiveQuery } from "@/lib/useLiveQuery";
 
 /* design/templates/dashboard.html (38dbb0d) 구조를 그대로 옮긴다. */
@@ -74,6 +74,23 @@ function stageStates(job: PipelineJob): { label: string; state: JobState | "pend
 export default function DashboardPage() {
   const fetcher = useCallback(() => api.dashboard(), []);
   const { data, status, error, updatedAt, refresh } = useLiveQuery(fetcher, DASHBOARD_INTERVAL_MS);
+
+  const [acting, setActing] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
+
+  const act = async (task: () => Promise<unknown>) => {
+    setActing(true);
+    setActionError(null);
+    try {
+      await task();
+      // mutation 직후 폴링 주기를 기다리지 않는다.
+      await refresh();
+    } catch (reason) {
+      setActionError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setActing(false);
+    }
+  };
 
   const jobs = data?.recent_jobs ?? [];
   const counts = data?.state_counts ?? {};
@@ -266,12 +283,17 @@ export default function DashboardPage() {
                   </h2>
                 </div>
                 <div className="card-body flush">
+                  {actionError ? (
+                    <p role="alert" style={{ margin: 0, padding: "8px 12px", color: "var(--bad)", fontSize: ".8rem" }}>
+                      {actionError}
+                    </p>
+                  ) : null}
                   <div className="tbl">
                     <div className="tr head" style={{ gridTemplateColumns: "92px minmax(0, 1fr) 250px 168px" }}>
                       <span>상태</span>
                       <span>작업</span>
                       <span>사유</span>
-                      <span className="r">갱신</span>
+                      <span className="r">동작</span>
                     </div>
                     {stopped.map((job) => {
                       const state = asJobState(job.state);
@@ -302,8 +324,40 @@ export default function DashboardPage() {
                           >
                             {reason}
                           </span>
-                          <span className="r m" style={{ fontSize: ".78rem", color: "var(--muted)" }}>
-                            {clock(job.updated_at)}
+                          <span className="btns" style={{ justifyContent: "flex-end" }}>
+                            {state === "paused" ? (
+                              <button
+                                type="button"
+                                className="btn sec sm"
+                                disabled={acting}
+                                onClick={() => void act(() => api.resumeTranslation(job.id))}
+                              >
+                                <Icon name="play" size={13} />
+                                재개
+                              </button>
+                            ) : (
+                              <button
+                                type="button"
+                                className="btn sec sm"
+                                disabled={acting}
+                                onClick={() => void act(() => api.retryJob(job.id))}
+                              >
+                                <Icon name="refresh" size={13} />
+                                재시도
+                              </button>
+                            )}
+                            <button
+                              type="button"
+                              className="btn dgr sm"
+                              disabled={acting}
+                              onClick={() => {
+                                if (!window.confirm(`${fileName(job.source_rel)} 기록을 삭제할까요?`)) return;
+                                void act(() => api.deleteJob(job.id));
+                              }}
+                            >
+                              <Icon name="trash" size={13} />
+                              삭제
+                            </button>
                           </span>
                         </div>
                       );
@@ -321,8 +375,8 @@ export default function DashboardPage() {
                 <div className="tbl">
                   <div className="tr head" style={{ gridTemplateColumns: "minmax(0, 1fr) 120px 120px 100px" }}>
                     <span>작업</span>
-                    <span className="r">전사</span>
-                    <span className="r">번역</span>
+                    <span className="r">엔진</span>
+                    <span className="r">총 소요</span>
                     <span className="r">완료 시각</span>
                   </div>
                   {completed.length === 0 ? (
@@ -341,10 +395,11 @@ export default function DashboardPage() {
                           <span>{parentPath(job.source_rel)}</span>
                         </div>
                         <span className="r m" style={{ fontSize: ".78rem" }}>
-                          {job.chunks_completed || "—"}
+                          {String(job.options?.backend ?? "—")}
                         </span>
-                        <span className="r m" style={{ fontSize: ".78rem" }}>
-                          {job.translation_chunks_completed || "—"}
+                        {/* 단계별 소요는 저장되지 않는다. 있는 값(생성~갱신)만 쓴다. */}
+                        <span className="r m" style={{ fontSize: ".78rem", fontWeight: 600 }}>
+                          {elapsed(job.created_at, job.updated_at)}
                         </span>
                         <span className="r m" style={{ fontSize: ".78rem", fontWeight: 600 }}>
                           {clock(job.updated_at)}
