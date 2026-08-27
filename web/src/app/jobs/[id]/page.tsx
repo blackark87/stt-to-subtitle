@@ -9,14 +9,16 @@ import {
   PHASE_LABEL,
   STATE_LABEL,
   asJobState,
+  canPauseTranslation,
+  canResumeTranslation,
+  canRetryJob,
+  canStopJob,
   reasonLabel,
   type JobPhase,
   type JobState,
 } from "@/lib/domain";
-import { fileName, parentPath } from "@/lib/format";
+import { clock, fileName, parentPath, percent } from "@/lib/format";
 import { useLiveQuery } from "@/lib/useLiveQuery";
-
-/* design/mockup body_JobDetail.html: 결과 미리보기 + 자막(2열) + 기록. */
 
 const INTERVAL_MS = 5000;
 
@@ -38,15 +40,22 @@ interface Segment {
   ko: string;
 }
 
+interface ArtifactResult {
+  version: string;
+  segments: Segment[];
+  error: string | null;
+}
+
 function timecode(seconds: number): string {
-  const total = Math.max(0, Math.floor(seconds));
+  const safe = Math.max(0, seconds);
+  const total = Math.floor(safe);
   const h = Math.floor(total / 3600);
   const m = Math.floor((total % 3600) / 60);
   const s = total % 60;
-  return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+  const ms = Math.floor((safe - total) * 1000);
+  return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}.${String(ms).padStart(3, "0")}`;
 }
 
-/** 산출물 스키마가 배열/객체 어느 쪽이어도 목록을 뽑는다. */
 function itemsOf(payload: unknown): Record<string, unknown>[] {
   if (Array.isArray(payload)) return payload as Record<string, unknown>[];
   if (payload && typeof payload === "object") {
@@ -61,48 +70,79 @@ function itemsOf(payload: unknown): Record<string, unknown>[] {
 
 export default function JobDetailPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = use(params);
-
   const fetcher = useCallback(() => api.job(id), [id]);
-  const { data: job, status, error, updatedAt, refresh } = useLiveQuery(fetcher, INTERVAL_MS);
+  const { data: detail, status, error, updatedAt, refreshing, refresh } = useLiveQuery(fetcher, INTERVAL_MS);
+  const job = detail?.job ?? null;
+  const state = job ? asJobState(job.state) : null;
 
-  const [segments, setSegments] = useState<Segment[]>([]);
+  const artifactVersion = `${id}:${job?.updated_at ?? "pending"}`;
+  const [artifactResult, setArtifactResult] = useState<ArtifactResult | null>(null);
+  const currentArtifact = artifactResult?.version === artifactVersion ? artifactResult : null;
+  const artifactLoading = currentArtifact == null;
+  const artifactError = currentArtifact?.error ?? null;
+  const segments = useMemo(
+    () => currentArtifact?.segments ?? [],
+    [currentArtifact],
+  );
   const [current, setCurrent] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const cueRefs = useRef(new Map<string, HTMLLIElement>());
 
-  // 전사(일본어)와 번역(한국어)을 id 로 합친다. 시안의 병기 목록이 이걸 요구한다.
   useEffect(() => {
     let cancelled = false;
     void (async () => {
-      const [transcript, translation] = await Promise.all([
-        api.artifact(id, "transcript"),
-        api.artifact(id, "translation"),
-      ]);
-      if (cancelled) return;
-      const korean = new Map<string, string>();
-      for (const item of itemsOf(translation)) {
-        const key = String(item.id ?? "");
-        if (key) korean.set(key, String(item.text ?? ""));
+      try {
+        const [transcript, translation] = await Promise.all([
+          api.artifact(id, "transcript"),
+          api.artifact(id, "translation"),
+        ]);
+        if (cancelled) return;
+        const korean = new Map<string, string>();
+        for (const item of itemsOf(translation)) {
+          const key = String(item.id ?? "");
+          if (key) korean.set(key, String(item.text ?? ""));
+        }
+        const nextSegments = itemsOf(transcript).map((item, index) => {
+          const key = String(item.id ?? index);
+          return {
+            id: key,
+            start: Number(item.start ?? 0),
+            end: Number(item.end ?? 0),
+            ja: String(item.text ?? ""),
+            ko: korean.get(key) ?? "",
+          };
+        });
+        setArtifactResult({ version: artifactVersion, segments: nextSegments, error: null });
+      } catch (reason) {
+        if (!cancelled) {
+          setArtifactResult({
+            version: artifactVersion,
+            segments: [],
+            error: reason instanceof Error ? reason.message : String(reason),
+          });
+        }
       }
-      const merged = itemsOf(transcript).map((item) => {
-        const key = String(item.id ?? "");
-        return {
-          id: key,
-          start: Number(item.start ?? 0),
-          end: Number(item.end ?? 0),
-          ja: String(item.text ?? ""),
-          ko: korean.get(key) ?? "",
-        };
-      });
-      setSegments(merged);
     })();
-    return () => {
-      cancelled = true;
-    };
-  }, [id]);
+    return () => { cancelled = true; };
+  }, [artifactVersion, id]);
 
-  const translated = useMemo(() => segments.filter((s) => s.ko).length, [segments]);
+  useEffect(() => {
+    if (current) cueRefs.current.get(current)?.scrollIntoView({ block: "nearest" });
+  }, [current]);
+
+  const translated = useMemo(() => segments.filter((segment) => segment.ko).length, [segments]);
+  const progress = useMemo(() => {
+    if (!job) return null;
+    if (job.phase === "transcription") {
+      return percent(job.chunks_completed, Math.max(job.chunks_created, job.chunks_total_estimate));
+    }
+    if (job.phase === "translation") {
+      return percent(job.translation_chunks_completed, job.translation_chunks_total);
+    }
+    return state === "done" ? 100 : null;
+  }, [job, state]);
 
   const seek = (segment: Segment) => {
     const video = videoRef.current;
@@ -124,71 +164,82 @@ export default function JobDetailPage({ params }: { params: Promise<{ id: string
     }
   };
 
-  const state = job ? asJobState(job.state) : null;
+  const hasSubtitle = Boolean(detail?.subtitle_generations?.length);
 
   return (
     <>
       <header className="topbar">
-        <Link className="btn sec sm" href="/jobs">
+        <Link className="btn sec" href="/jobs">
           <Icon name="chevron_left" size={14} />
           작업 목록
         </Link>
-        <h1 style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-          {job ? fileName(job.source_rel) : "작업"}
-        </h1>
+        <div className="page-title job-title">
+          <h1>{job ? fileName(job.source_rel) : "작업 상세"}</h1>
+          <p>{job ? parentPath(job.source_rel) : "작업 정보를 불러오는 중입니다."}</p>
+        </div>
         {state ? <span className={BADGE_CLASS[state]}>{STATE_LABEL[state]}</span> : null}
-        <span style={{ marginLeft: "auto" }}>
-          <Freshness status={status} updatedAt={updatedAt} error={error} />
-        </span>
+        <span className="topbar-spacer" />
+        <Freshness status={status} updatedAt={updatedAt} error={error} refreshing={refreshing} />
       </header>
 
       <div className="content">
-        {actionError ? (
-          <p role="alert" style={{ margin: 0, color: "var(--bad)", fontSize: ".82rem" }}>{actionError}</p>
-        ) : null}
+        {actionError ? <p role="alert" className="notice error">{actionError}</p> : null}
 
-        <section className="card">
+        <section className="card progress-overview" aria-labelledby="job-progress-title">
           <div className="card-head">
-            <h2>진행</h2>
-            <span className="btns">
-              <span className="b line">{job ? (PHASE_LABEL[job.phase as JobPhase] ?? job.phase) : "—"}</span>
-              {job?.reason_code ? <span className="b hold">{reasonLabel(job.reason_code)}</span> : null}
-              <button type="button" className="btn sec sm" disabled={!job || busy} onClick={() => void act(() => api.retryJob(id))}>
-                <Icon name="refresh" size={13} />
-                재시도
-              </button>
-              <button type="button" className="btn sec sm" disabled={!job || busy} onClick={() => void act(() => api.resumeTranslation(id))}>
-                <Icon name="play" size={13} />
-                번역 재개
-              </button>
-              <button type="button" className="btn dgr sm" disabled={!job || busy} onClick={() => void act(() => api.stopJob(id))}>
-                <Icon name="alert_triangle" size={13} />
-                정지
-              </button>
-            </span>
+            <div>
+              <h2 id="job-progress-title">작업 진행</h2>
+              <span className="sub" title={job ? (PHASE_LABEL[job.phase as JobPhase] ?? job.phase) : "불러오는 중"}>{job ? (PHASE_LABEL[job.phase as JobPhase] ?? job.phase) : "불러오는 중"}</span>
+            </div>
+            <div className="btns">
+              {state && canRetryJob(state) ? (
+                <button type="button" className="btn sec" disabled={busy} onClick={() => void act(() => api.retryJob(id))}>
+                  <Icon name="refresh" size={14} />재시도
+                </button>
+              ) : null}
+              {state && canResumeTranslation(state) ? (
+                <button type="button" className="btn" disabled={busy} onClick={() => void act(() => api.resumeTranslation(id))}>
+                  <Icon name="play" size={14} />번역 재개
+                </button>
+              ) : null}
+              {job && canPauseTranslation(state, job.phase) ? (
+                <button type="button" className="btn sec" disabled={busy} onClick={() => void act(() => api.pauseTranslation(id))}>
+                  <Icon name="pause" size={14} />번역 일시정지
+                </button>
+              ) : null}
+              {state && canStopJob(state) ? (
+                <button type="button" className="btn dgr" disabled={busy} onClick={() => {
+                  if (!window.confirm("이 작업을 정지할까요?")) return;
+                  void act(() => api.stopJob(id));
+                }}>
+                  <Icon name="alert_triangle" size={14} />정지
+                </button>
+              ) : null}
+            </div>
           </div>
-          <div className="card-body">
-            <div className="t-name">
-              <b>{job ? fileName(job.source_rel) : "—"}</b>
-              <span className="m">{job ? parentPath(job.source_rel) : ""}</span>
+          <div className="card-body progress-body">
+            <div>
+              <span className="eyebrow">현재 상태</span>
+              <strong>{state ? STATE_LABEL[state] : "확인 중"}</strong>
+              {job?.reason_code ? <span className="reason-text" title={reasonLabel(job.reason_code) ?? undefined}>{reasonLabel(job.reason_code)}</span> : null}
+            </div>
+            <div className="progress-measure">
+              <span>{progress == null ? "진행률 계산 중" : `${progress}%`}</span>
+              <progress max={100} value={progress ?? undefined} aria-label="작업 진행률" />
             </div>
           </div>
         </section>
 
-        <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1.45fr) minmax(340px, .55fr)", gap: 14, alignItems: "start" }}>
+        <div className="detail-layout">
           <section className="card">
             <div className="card-head">
               <h2>결과 미리보기</h2>
-              <span className="btns">
-                <a className="btn sec sm" href={`/api/v1/jobs/${encodeURIComponent(id)}/subtitle.srt`}>
-                  <Icon name="download" size={13} />
-                  SRT
-                </a>
-                <a className="btn sec sm" href={`/api/v1/jobs/${encodeURIComponent(id)}/subtitle.ass`}>
-                  <Icon name="download" size={13} />
-                  ASS
-                </a>
-              </span>
+              {hasSubtitle ? (
+                <span className="btns">
+                  <a className="btn sec" href={`/api/v1/jobs/${encodeURIComponent(id)}/subtitle.srt`}><Icon name="download" size={14} />SRT</a>
+                  <a className="btn sec" href={`/api/v1/jobs/${encodeURIComponent(id)}/subtitle.ass`}><Icon name="download" size={14} />ASS</a>
+                </span>
+              ) : <span className="sub" title="자막 생성 후 다운로드할 수 있습니다.">자막 생성 후 다운로드할 수 있습니다.</span>}
             </div>
             <div className="card-body">
               {job ? (
@@ -198,85 +249,68 @@ export default function JobDetailPage({ params }: { params: Promise<{ id: string
                   preload="metadata"
                   playsInline
                   crossOrigin="anonymous"
-                  style={{ width: "100%", aspectRatio: "16 / 9", borderRadius: "var(--r-md)", background: "#10131A" }}
+                  className="video-preview"
                   onTimeUpdate={(event) => {
                     const t = event.currentTarget.currentTime;
-                    const hit = segments.find((s) => t >= s.start && t < s.end);
+                    const hit = segments.find((segment) => t >= segment.start && t < segment.end);
                     setCurrent(hit ? hit.id : null);
                   }}
                 >
                   <source src={api.mediaFileUrl(job.source_rel)} />
-                  <track kind="subtitles" srcLang="ko" label="한국어" default src={api.subtitlesUrl(id)} />
+                  {hasSubtitle ? <track kind="subtitles" srcLang="ko" label="한국어" default src={api.subtitlesUrl(id)} /> : null}
                 </video>
-              ) : (
-                <p style={{ margin: 0, color: "var(--muted)", fontSize: ".82rem" }}>불러오는 중</p>
-              )}
+              ) : <div className="empty-state"><strong>작업을 불러오는 중입니다</strong></div>}
             </div>
           </section>
 
-          <section className="card">
+          <section className="card cue-card">
             <div className="card-head">
-              <h2>자막</h2>
-              <span className="btns">
-                <span className="b run">
-                  {translated} / {segments.length}
-                </span>
-              </span>
+              <div><h2>자막</h2><span className="sub" title={`${translated} / ${segments.length}개 번역`}>{translated} / {segments.length}개 번역</span></div>
             </div>
-            <div className="card-body flush" style={{ maxHeight: 520, overflow: "auto" }}>
-              <div className="tbl" role="listbox" aria-label="자막 대사 목록">
-                {segments.length === 0 ? (
-                  <div className="tr empty" style={{ gridTemplateColumns: "minmax(0, 1fr)" }}>
-                    아직 전사 결과가 없습니다
-                  </div>
-                ) : (
-                  segments.map((segment) => {
+            <div className="cue-scroll">
+              {artifactError ? <p className="notice error" role="alert">{artifactError}</p> : null}
+              {segments.length === 0 ? (
+                <div className="empty-state">
+                  <strong>{artifactLoading ? "산출물을 불러오는 중입니다" : "아직 전사 결과가 없습니다"}</strong>
+                  <span>작업이 진행 중이면 완료되는 대로 자동 갱신됩니다.</span>
+                </div>
+              ) : (
+                <ol className="cue-list" aria-label="자막 대사 목록">
+                  {segments.map((segment) => {
                     const on = current === segment.id;
                     return (
-                      <div
-                        key={segment.id}
-                        role="option"
-                        tabIndex={0}
-                        aria-selected={on}
-                        onClick={() => seek(segment)}
-                        onKeyDown={(event) => {
-                          if (event.key === "Enter" || event.key === " ") seek(segment);
-                        }}
-                        className={on ? "tr on-run" : "tr"}
-                        style={{
-                          gridTemplateColumns: "96px minmax(0, 1fr)",
-                          alignItems: "start",
-                          paddingTop: 7,
-                          paddingBottom: 7,
-                          cursor: "pointer",
-                        }}
-                      >
-                        <span
-                          className="code"
-                          style={{
-                            fontSize: ".7rem",
-                            color: on ? "var(--accent)" : "var(--muted)",
-                            fontWeight: on ? 600 : 400,
-                          }}
-                        >
-                          {timecode(segment.start)}
-                        </span>
-                        <span style={{ minWidth: 0 }}>
-                          <span style={{ display: "block", fontSize: ".84rem", fontWeight: on ? 650 : 400 }}>
-                            {segment.ko || "— 번역 대기"}
+                      <li key={segment.id} ref={(node) => { if (node) cueRefs.current.set(segment.id, node); else cueRefs.current.delete(segment.id); }}>
+                        <button type="button" className={on ? "cue-button is-current" : "cue-button"} onClick={() => seek(segment)}>
+                          <span className="code cue-time">{timecode(segment.start)}</span>
+                          <span className="cue-copy">
+                            <strong>{segment.ko || "번역 대기"}</strong>
+                            <span lang="ja">{segment.ja}</span>
                           </span>
-                          <span style={{ display: "block", marginTop: 2, fontSize: ".74rem", color: "var(--muted)" }}>
-                            {segment.ja}
-                          </span>
-                        </span>
-                      </div>
+                        </button>
+                      </li>
                     );
-                  })
-                )}
-              </div>
+                  })}
+                </ol>
+              )}
             </div>
           </section>
         </div>
+
+        <section className="card" aria-labelledby="event-title">
+          <div className="card-head">
+            <h2 id="event-title">작업 기록</h2>
+            <span className="sub" title={`${detail?.events.length ?? 0}건`}>{detail?.events.length ?? 0}건</span>
+          </div>
+          <div className="event-list">
+            {(detail?.events ?? []).length ? detail?.events.slice(-100).reverse().map((event, index) => (
+              <div className="event-row" key={`${event.created_at ?? "event"}-${index}`}>
+                <time className="code">{clock(event.created_at)}</time>
+                <span className={event.level === "error" ? "b bad" : "b line"}>{event.level ?? "기록"}</span>
+                <span>{event.message ?? event.event_code ?? "—"}</span>
+              </div>
+            )) : <div className="empty-state compact"><strong>기록이 없습니다</strong></div>}
+          </div>
+        </section>
       </div>
     </>
   );

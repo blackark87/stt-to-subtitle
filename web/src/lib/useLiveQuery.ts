@@ -42,37 +42,30 @@ export function useLiveQuery<T>(
   const [updatedAt, setUpdatedAt] = useState<Date | null>(null);
   const [refreshing, setRefreshing] = useState(false);
 
-  // fetcher 는 렌더마다 새 함수일 수 있으므로 ref 에 담아 effect 재실행을 막는다.
-  // 렌더 중에 ref 를 쓰면 안 되므로 커밋 이후에 갱신한다.
-  const fetcherRef = useRef(fetcher);
-  useEffect(() => {
-    fetcherRef.current = fetcher;
-  });
-
-  const inFlight = useRef(false);
   const mounted = useRef(true);
+  const requestVersion = useRef(0);
 
   const run = useCallback(async () => {
-    if (inFlight.current) return;
-    inFlight.current = true;
+    const version = ++requestVersion.current;
     setRefreshing(true);
     try {
-      const next = await fetcherRef.current();
-      if (!mounted.current) return;
+      const next = await fetcher();
+      if (!mounted.current || version !== requestVersion.current) return;
       setData(next);
       setUpdatedAt(new Date());
       setError(null);
       setStatus("ok");
     } catch (reason) {
-      if (!mounted.current) return;
+      if (!mounted.current || version !== requestVersion.current) return;
       // 이전 data 는 그대로 둔다. 다만 status 로 신선하지 않음을 알린다.
       setError(reason instanceof Error ? reason.message : String(reason));
       setStatus("error");
     } finally {
-      inFlight.current = false;
-      if (mounted.current) setRefreshing(false);
+      if (mounted.current && version === requestVersion.current) {
+        setRefreshing(false);
+      }
     }
-  }, []);
+  }, [fetcher]);
 
   useEffect(() => {
     mounted.current = true;
@@ -81,7 +74,7 @@ export function useLiveQuery<T>(
       if (document.visibilityState === "visible") void run();
     };
 
-    void run();
+    queueMicrotask(() => void run());
     const timer = window.setInterval(tick, intervalMs);
 
     const onVisibility = () => {
@@ -91,6 +84,7 @@ export function useLiveQuery<T>(
 
     return () => {
       mounted.current = false;
+      requestVersion.current += 1;
       window.clearInterval(timer);
       document.removeEventListener("visibilitychange", onVisibility);
     };

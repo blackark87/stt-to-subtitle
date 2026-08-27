@@ -168,3 +168,19 @@ export function reasonLabel(value: string | null): string | null {
     ? REASON_LABEL[value as JobReason]
     : value;
 }
+
+export function canRetryJob(state: JobState | null): boolean {
+  return state === "blocked" || state === "failed" || state === "stopped";
+}
+
+export function canStopJob(state: JobState | null): boolean {
+  return state === "waiting" || state === "running";
+}
+
+export function canPauseTranslation(state: JobState | null, phase: string): boolean {
+  return state === "running" && phase === "translation";
+}
+
+export function canResumeTranslation(state: JobState | null): boolean {
+  return state === "paused";
+}

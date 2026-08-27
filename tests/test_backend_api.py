@@ -47,6 +47,7 @@ class BackendAPIBoundaryTests(unittest.TestCase):
         self.assertIn("/api/v1/jobs/{job_id}/artifacts/{kind}", paths)
         self.assertIn("/api/v1/media", paths)
         self.assertIn("/api/v1/media/file", paths)
+        self.assertIn("/api/v1/dashboard/library-progress", paths)
         self.assertIn("/api/v1/settings", paths)
         self.assertIn("/api/v1/settings/servers", paths)
         self.assertIn("/api/v1/runtimes", paths)
@@ -89,6 +90,7 @@ class BackendAPIBoundaryTests(unittest.TestCase):
                 health = client.get("/healthz")
                 readiness = client.get("/readyz")
                 jobs = client.get("/api/v1/jobs")
+                dashboard = client.get("/api/v1/dashboard")
                 settings_response = client.get("/api/v1/settings")
 
         self.assertEqual(health.status_code, 200)
@@ -97,6 +99,10 @@ class BackendAPIBoundaryTests(unittest.TestCase):
         self.assertEqual(jobs.status_code, 200)
         self.assertEqual(jobs.json()["items"], [])
         self.assertEqual(jobs.json()["total"], 0)
+        self.assertEqual(dashboard.status_code, 200)
+        self.assertEqual(dashboard.json()["active_jobs"], [])
+        self.assertEqual(dashboard.json()["attention_jobs"], [])
+        self.assertEqual(dashboard.json()["recent_completed"], [])
         self.assertEqual(settings_response.status_code, 200)
         self.assertNotIn(
             "stt_token",
@@ -142,6 +148,55 @@ class BackendAPIBoundaryTests(unittest.TestCase):
         self.assertEqual(listed.status_code, 200)
         self.assertEqual(listed.json()["total"], 2)
         self.assertEqual(deleted.status_code, 204)
+
+    def test_media_api_applies_display_rules_and_actor_profiles(self) -> None:
+        from fastapi.testclient import TestClient
+
+        from stt_to_subtitle.backend_api import create_backend_app
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            actor = media_root / "av" / "japan" / "Actor"
+            title = actor / "ABC-001"
+            (actor / ".actors").mkdir(parents=True)
+            title.mkdir()
+            (actor / ".actors" / "Actor.jpg").write_bytes(b"profile")
+            (title / "ABC-001.mp4").write_bytes(b"media")
+            settings = BackendSettings(
+                state_dir=root / "state",
+                media_root=media_root,
+                stt_base_url="http://runtime:8100",
+                stt_token="",
+                lm_base_url="",
+                lm_token="",
+                lm_model="",
+            )
+            with TestClient(create_backend_app(settings)) as client:
+                actor_listing = client.get(
+                    "/api/v1/media",
+                    params={"folder": "av/japan"},
+                )
+                media_listing = client.get(
+                    "/api/v1/media",
+                    params={"folder": "av/japan/Actor"},
+                )
+
+        self.assertEqual(actor_listing.status_code, 200)
+        self.assertEqual(
+            actor_listing.json()["folders"][0]["actor_image_path"],
+            "av/japan/Actor/.actors/Actor.jpg",
+        )
+        self.assertEqual(media_listing.status_code, 200)
+        self.assertEqual(media_listing.json()["folders"], [])
+        self.assertEqual(
+            media_listing.json()["files"][0]["path"],
+            "av/japan/Actor/ABC-001/ABC-001.mp4",
+        )
+        self.assertEqual(
+            media_listing.json()["files"][0]["display_path"],
+            "av/japan/Actor/ABC-001.mp4",
+        )
 
 
 if __name__ == "__main__":

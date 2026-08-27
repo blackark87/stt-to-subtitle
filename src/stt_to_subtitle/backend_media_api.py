@@ -9,6 +9,7 @@ from fastapi import APIRouter, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, StreamingResponse
 
 from .backend_common import public_value, service_from_request
+from .media_display import decorate_media_listing, flatten_media_display_folders
 from .media_preview import guess_media_type, iter_file_range, parse_byte_range
 from .subtitle_validation import parse_subtitle, render_webvtt
 from .backend_config import group_multipart_media
@@ -23,8 +24,11 @@ def browse_media(
     folder: str = "",
     q: str = "",
     actor: str = "",
+    folder_sort: str = "name",
+    folder_limit: int | None = Query(default=None, ge=1, le=100),
 ) -> dict[str, Any]:
-    library = service_from_request(request).library
+    service = service_from_request(request)
+    library = service.library
     try:
         listing = (
             library.search_media(
@@ -37,8 +41,22 @@ def browse_media(
         )
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
-    listing = dict(listing)
+    listing = flatten_media_display_folders(
+        library,
+        listing,
+        service.path_display_rules,
+    )
     listing["files"] = group_multipart_media(listing.get("files", []))
+    try:
+        listing = decorate_media_listing(
+            library,
+            listing,
+            service.path_display_rules,
+            folder_sort=folder_sort,
+            folder_limit=folder_limit,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
     return public_value(listing)
 
 

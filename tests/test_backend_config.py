@@ -104,6 +104,7 @@ class MediaLibraryTests(unittest.TestCase):
                 ["Series"],
             )
             self.assertNotIn("video_count", root_view["folders"][0])
+            self.assertIsInstance(root_view["folders"][0]["modified_at"], float)
             self.assertEqual(
                 [file["name"] for file in root_view["files"]],
                 ["root-video.mp4"],

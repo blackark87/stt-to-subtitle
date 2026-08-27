@@ -25,6 +25,8 @@ from .backend_contracts import (
     TranslationModelLookupRequest,
 )
 from .job_state import JobPhase, JobReason, JobState
+from .gpu_monitoring import gpu_snapshot_payload
+from .library_progress import summarize_library_progress
 from .operational_metrics import prometheus_exposition
 from .orchestrator import DEFAULT_ARTIFACT_CLEANUP_AGE_DAYS
 from .service_clients import ExternalServiceError, list_openai_compatible_models
@@ -42,6 +44,13 @@ router = APIRouter(prefix="/api/v1")
 def dashboard(request: Request) -> dict[str, Any]:
     service = service_from_request(request)
     monitor = getattr(request.app.state, "gpu_monitor", None)
+    active_states = {state.value for state in JobState if state is not JobState.DONE}
+    attention_states = {
+        JobState.BLOCKED.value,
+        JobState.FAILED.value,
+        JobState.PAUSED.value,
+        JobState.STOPPED.value,
+    }
     return {
         "state_counts": {
             state.value: service.store.count_jobs(
@@ -63,12 +72,45 @@ def dashboard(request: Request) -> dict[str, Any]:
                 include_comparison_transcriptions=False,
             )
         ),
+        "active_jobs": jobs_payload(
+            service.store.list_jobs(
+                states=active_states,
+                limit=100,
+                include_comparison_transcriptions=False,
+            )
+        ),
+        "recent_completed": jobs_payload(
+            service.store.list_jobs(
+                states={JobState.DONE.value},
+                limit=10,
+                include_comparison_transcriptions=False,
+            )
+        ),
+        "attention_jobs": jobs_payload(
+            service.store.list_jobs(
+                states=attention_states,
+                limit=10,
+                include_comparison_transcriptions=False,
+            )
+        ),
         "dependencies": {
             "transcription": service.stt_gate_state,
             "translation": service.translation_circuit_state,
         },
-        "gpu": public_value(monitor.snapshot()) if monitor is not None else None,
+        "gpu": gpu_snapshot_payload(monitor.snapshot())
+        if monitor is not None
+        else None,
     }
+
+
+@router.get("/dashboard/library-progress")
+def dashboard_library_progress(request: Request) -> dict[str, Any]:
+    service = service_from_request(request)
+    items = summarize_library_progress(
+        service.library.actor_library_entries(),
+        service.store.latest_jobs_by_source(),
+    )
+    return {"items": public_value(items), "total": len(items)}
 
 
 @router.get("/capabilities")
@@ -441,7 +483,7 @@ def gpu_metrics(request: Request) -> dict[str, Any]:
     monitor = getattr(request.app.state, "gpu_monitor", None)
     if monitor is None:
         raise HTTPException(status_code=503, detail="GPU monitor is not initialized")
-    return public_value(monitor.snapshot())
+    return gpu_snapshot_payload(monitor.snapshot())
 
 
 @router.get("/operations/database-integrity")

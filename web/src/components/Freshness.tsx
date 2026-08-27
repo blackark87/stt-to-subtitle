@@ -12,10 +12,12 @@ export function Freshness({
   status,
   updatedAt,
   error,
+  refreshing = false,
 }: {
   status: LiveStatus;
   updatedAt: Date | null;
   error: string | null;
+  refreshing?: boolean;
 }) {
   const [, setTick] = useState(0);
   useEffect(() => {
@@ -27,17 +29,18 @@ export function Freshness({
 
   if (status === "error") {
     return (
-      <span className="fresh bad" role="status" title={error ?? undefined}>
+      <span className="fresh bad" title={error ?? undefined}>
         <i aria-hidden />
-        연결 실패 · 마지막 갱신 {relativeFromNow(updatedAt)}
+        <span role="alert" aria-label={error ? `연결 실패: ${error}` : "연결 실패"}>연결 실패</span>
+        <span aria-hidden> · 마지막 갱신 {relativeFromNow(updatedAt)}</span>
       </span>
     );
   }
 
   return (
-    <span className="fresh" role="status">
+    <span className="fresh">
       <i aria-hidden />
-      {relativeFromNow(updatedAt)} 갱신
+      {refreshing ? "갱신 중" : `${relativeFromNow(updatedAt)} 갱신`}
     </span>
   );
 }

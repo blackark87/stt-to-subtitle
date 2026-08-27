@@ -743,10 +743,15 @@ class MediaLibrary:
             ):
                 continue
             if child.is_dir():
+                try:
+                    modified_at = child.stat().st_mtime
+                except OSError:
+                    modified_at = None
                 folders.append(
                     {
                         "name": child.name,
                         "path": child.relative_to(self.root).as_posix(),
+                        "modified_at": modified_at,
                     }
                 )
             elif (

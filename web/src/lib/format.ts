@@ -10,10 +10,13 @@ export function parentPath(path: string): string {
 }
 
 /** 백엔드는 KST ISO 문자열을 준다. 표시에는 시:분:초만 쓴다. */
-export function clock(value: string | null | undefined): string {
+export function clock(value: string | number | null | undefined): string {
   if (!value) return "-";
-  const parsed = new Date(value);
-  if (Number.isNaN(parsed.getTime())) return value;
+  const normalized = typeof value === "number" && value < 1_000_000_000_000
+    ? value * 1000
+    : value;
+  const parsed = new Date(normalized);
+  if (Number.isNaN(parsed.getTime())) return String(value);
   return parsed.toLocaleTimeString("ko-KR", { hour12: false });
 }
 

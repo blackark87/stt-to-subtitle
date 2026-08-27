@@ -20,6 +20,7 @@ const PATHS: Record<string, string> = {
   pencil: "<path d=\"M12 20h9\"/><path d=\"M16.5 3.5 20.5 7.5 8 20H4v-4Z\"/>",
   play: "<polygon points=\"6 3 20 12 6 21 6 3\" fill=\"currentColor\" stroke=\"none\"/>",
   refresh: "<path d=\"M4 12a8 8 0 0 1 13.86-5.66\"/><polyline points=\"18 2 18 7 13 7\"/><path d=\"M20 12a8 8 0 0 1-13.86 5.66\"/><polyline points=\"6 22 6 17 11 17\"/>",
+  search: "<circle cx=\"11\" cy=\"11\" r=\"7\"/><line x1=\"16\" y1=\"16\" x2=\"21\" y2=\"21\"/>",
   settings: "<line x1=\"4\" y1=\"6\" x2=\"20\" y2=\"6\"/><circle cx=\"9\" cy=\"6\" r=\"2\"/><line x1=\"4\" y1=\"12\" x2=\"20\" y2=\"12\"/><circle cx=\"15\" cy=\"12\" r=\"2\"/><line x1=\"4\" y1=\"18\" x2=\"20\" y2=\"18\"/><circle cx=\"9\" cy=\"18\" r=\"2\"/>",
   trash: "<path d=\"M3 6h18\"/><path d=\"M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2\"/><path d=\"M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6\"/><line x1=\"10\" y1=\"11\" x2=\"10\" y2=\"17\"/><line x1=\"14\" y1=\"11\" x2=\"14\" y2=\"17\"/>",
 };

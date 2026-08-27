@@ -4,6 +4,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import type { ReactNode } from "react";
 import { Icon, type IconName } from "@/components/Icon";
+import { ThemeToggle } from "@/components/ThemeToggle";
 
 /** design/templates/base.html (38dbb0d) 의 셸을 그대로 옮긴다. */
 const NAV: { href: string; icon: IconName; label: string }[] = [
@@ -19,6 +20,7 @@ export function AppShell({ children }: { children: ReactNode }) {
 
   return (
     <div className="app-shell">
+      <a className="skip-link" href="#main-content">본문으로 건너뛰기</a>
       <aside className="sidebar">
         <Link className="brand" href="/">
           <span className="brand-mark" aria-hidden>
@@ -50,14 +52,15 @@ export function AppShell({ children }: { children: ReactNode }) {
 
         {/* 3D 대시보드 전환. Next 라우터를 타지 않는 정적 페이지라 <a> 를 쓴다. */}
         <div className="sidebar-foot">
+          <ThemeToggle />
           <a className="btn sec sm" href="/webgpu.html" style={{ width: "100%", justifyContent: "flex-start" }}>
-            <Icon name="compare" size={15} />
+            <Icon name="dashboard" size={15} />
             3D 대시보드
           </a>
         </div>
       </aside>
 
-      <div className="frame">{children}</div>
+      <main className="frame" id="main-content">{children}</main>
     </div>
   );
 }

@@ -1,14 +1,20 @@
 "use client";
 
-import { useCallback, useState } from "react";
+import Link from "next/link";
+import { useRouter, useSearchParams } from "next/navigation";
+import { useCallback, useMemo, useState } from "react";
 import { Icon } from "@/components/Icon";
 import { Freshness } from "@/components/Freshness";
 import { api } from "@/lib/api";
 import {
+  JOB_PHASES,
   PHASE_LABEL,
   STATE_LABEL,
   STATE_ORDER,
   asJobState,
+  canPauseTranslation,
+  canRetryJob,
+  canStopJob,
   reasonLabel,
   type JobPhase,
   type JobState,
@@ -41,17 +47,65 @@ const ROW_CLASS: Record<JobState, string> = {
 const GRID = "36px 92px minmax(0, 1fr) 110px minmax(0, 220px) 100px";
 
 export default function JobsPage() {
-  const [filter, setFilter] = useState<readonly JobState[]>([]);
+  const router = useRouter();
+  const searchParams = useSearchParams();
+  const stateFilter = useMemo(() =>
+    searchParams.getAll("state").filter((value): value is JobState => STATE_ORDER.includes(value as JobState)),
+    [searchParams],
+  );
+  const phaseFilter = useMemo(() =>
+    searchParams.getAll("phase").filter((value): value is JobPhase => JOB_PHASES.includes(value as JobPhase)),
+    [searchParams],
+  );
   const [selected, setSelected] = useState<ReadonlySet<string>>(new Set());
   const [busy, setBusy] = useState(false);
+  const [limit, setLimit] = useState(200);
   const [actionError, setActionError] = useState<string | null>(null);
 
   const fetcher = useCallback(
-    () => api.jobs({ limit: 200, state: filter.length ? filter : undefined }),
-    [filter],
+    () => api.jobs({
+      limit,
+      state: stateFilter.length ? stateFilter : undefined,
+      phase: phaseFilter.length ? phaseFilter : undefined,
+    }),
+    [limit, phaseFilter, stateFilter],
   );
-  const { data, status, error, updatedAt, refresh } = useLiveQuery(fetcher, JOBS_INTERVAL_MS);
-  const jobs = data?.items ?? [];
+  const { data, status, error, updatedAt, refreshing, refresh } = useLiveQuery(fetcher, JOBS_INTERVAL_MS);
+  const jobs = useMemo(() => data?.items ?? [], [data?.items]);
+
+  const setFilter = (key: "state" | "phase", next: readonly string[]) => {
+    const params = new URLSearchParams(searchParams.toString());
+    params.delete(key);
+    next.forEach((value) => params.append(key, value));
+    const suffix = params.toString();
+    router.replace(suffix ? `/jobs?${suffix}` : "/jobs", { scroll: false });
+  };
+
+  const clearFilters = () => {
+    const params = new URLSearchParams(searchParams.toString());
+    params.delete("state");
+    params.delete("phase");
+    params.delete("reason_code");
+    const suffix = params.toString();
+    router.replace(suffix ? `/jobs?${suffix}` : "/jobs", { scroll: false });
+    setSelected(new Set());
+  };
+
+  const activeFilterCount = stateFilter.length + phaseFilter.length;
+
+  const selectedJobs = useMemo(
+    () => jobs.filter((job) => selected.has(job.id)),
+    [jobs, selected],
+  );
+  const retryIds = selectedJobs
+    .filter((job) => canRetryJob(asJobState(job.state)))
+    .map((job) => job.id);
+  const pauseIds = selectedJobs
+    .filter((job) => canPauseTranslation(asJobState(job.state), job.phase))
+    .map((job) => job.id);
+  const stopIds = selectedJobs
+    .filter((job) => canStopJob(asJobState(job.state)))
+    .map((job) => job.id);
 
   const toggle = (id: string) =>
     setSelected((current) => {
@@ -61,8 +115,7 @@ export default function JobsPage() {
       return next;
     });
 
-  const run = async (action: (ids: string[]) => Promise<unknown>) => {
-    const ids = [...selected];
+  const run = async (ids: string[], action: (ids: string[]) => Promise<unknown>) => {
     if (!ids.length) return;
     setBusy(true);
     setActionError(null);
@@ -82,9 +135,9 @@ export default function JobsPage() {
       <header className="topbar">
         <h1>작업 목록</h1>
         <span style={{ marginLeft: "auto" }}>
-          <Freshness status={status} updatedAt={updatedAt} error={error} />
+          <Freshness status={status} updatedAt={updatedAt} error={error} refreshing={refreshing} />
         </span>
-        <button type="button" className="btn sec sm" onClick={() => void refresh()}>
+        <button type="button" className="btn sec sm" disabled={refreshing} onClick={() => void refresh()}>
           <Icon name="refresh" size={14} />
           새로고침
         </button>
@@ -94,35 +147,38 @@ export default function JobsPage() {
         <section className="card">
           <div className="card-head">
             <h2>필터</h2>
-            {filter.length ? (
-              <button type="button" className="btn sec sm" onClick={() => setFilter([])}>
+            {activeFilterCount ? (
+              <button type="button" className="btn sec sm" onClick={clearFilters}>
                 전체 해제
               </button>
             ) : null}
           </div>
           <div className="card-body">
-            <div className="rail">
-              {STATE_ORDER.map((state) => {
-                const on = filter.includes(state);
-                return (
-                  <button
-                    key={state}
-                    type="button"
-                    aria-pressed={on}
-                    className={on ? "chip on" : "chip"}
-                    style={{ paddingLeft: 9 }}
-                    onClick={() =>
-                      setFilter((current) =>
-                        current.includes(state)
-                          ? current.filter((value) => value !== state)
-                          : [...current, state],
-                      )
-                    }
-                  >
-                    {STATE_LABEL[state]}
-                  </button>
-                );
-              })}
+            <div className="job-filter-stack">
+              <div className="job-filter-row">
+                <strong>처리 단계</strong>
+                <div className="rail">
+                  {JOB_PHASES.map((phase) => {
+                    const on = phaseFilter.includes(phase);
+                    return <button key={phase} type="button" aria-pressed={on} className={on ? "chip on" : "chip"} onClick={() => {
+                      setSelected(new Set());
+                      setFilter("phase", on ? phaseFilter.filter((value) => value !== phase) : [...phaseFilter, phase]);
+                    }}>{PHASE_LABEL[phase]}</button>;
+                  })}
+                </div>
+              </div>
+              <div className="job-filter-row">
+                <strong>작업 상태</strong>
+                <div className="rail">
+                  {STATE_ORDER.map((state) => {
+                    const on = stateFilter.includes(state);
+                    return <button key={state} type="button" aria-pressed={on} className={on ? "chip on" : "chip"} onClick={() => {
+                      setSelected(new Set());
+                      setFilter("state", on ? stateFilter.filter((value) => value !== state) : [...stateFilter, state]);
+                    }}>{STATE_LABEL[state]}</button>;
+                  })}
+                </div>
+              </div>
             </div>
           </div>
         </section>
@@ -136,17 +192,21 @@ export default function JobsPage() {
               </span>
             </h2>
             <span className="btns">
-              <button type="button" className="btn sec sm" disabled={!selected.size || busy} onClick={() => void run(api.retryJobs)}>
+              <span className="selection-summary" aria-live="polite">{selectedJobs.length ? `${selectedJobs.length}건 선택` : "작업을 선택하세요"}</span>
+              <button type="button" className="btn sec sm" disabled={!retryIds.length || busy} onClick={() => void run(retryIds, api.retryJobs)}>
                 <Icon name="refresh" size={13} />
-                재시도
+                재시도 {retryIds.length || ""}
               </button>
-              <button type="button" className="btn sec sm" disabled={!selected.size || busy} onClick={() => void run(api.pauseTranslations)}>
+              <button type="button" className="btn sec sm" disabled={!pauseIds.length || busy} onClick={() => void run(pauseIds, api.pauseTranslations)}>
                 <Icon name="pause" size={13} />
-                번역 일시정지
+                번역 일시정지 {pauseIds.length || ""}
               </button>
-              <button type="button" className="btn dgr sm" disabled={!selected.size || busy} onClick={() => void run(api.stopJobs)}>
+              <button type="button" className="btn dgr sm" disabled={!stopIds.length || busy} onClick={() => {
+                if (!window.confirm(`선택한 ${stopIds.length}건의 작업을 정지할까요?`)) return;
+                void run(stopIds, api.stopJobs);
+              }}>
                 <Icon name="alert_triangle" size={13} />
-                정지
+                정지 {stopIds.length || ""}
               </button>
             </span>
           </div>
@@ -156,18 +216,25 @@ export default function JobsPage() {
                 {actionError}
               </p>
             ) : null}
-            <div className="tbl">
-              <div className="tr head" style={{ gridTemplateColumns: GRID }}>
-                <span />
-                <span>상태</span>
-                <span>작업</span>
-                <span>단계</span>
-                <span>사유</span>
-                <span className="r">갱신</span>
+            <div className="tbl" role="table" aria-label="작업 목록">
+              <div className="tr head" role="row" style={{ gridTemplateColumns: GRID }}>
+                <span role="columnheader">
+                  <input
+                    type="checkbox"
+                    checked={jobs.length > 0 && selectedJobs.length === jobs.length}
+                    onChange={(event) => setSelected(event.target.checked ? new Set(jobs.map((job) => job.id)) : new Set())}
+                    aria-label="현재 표시 작업 전체 선택"
+                  />
+                </span>
+                <span role="columnheader">상태</span>
+                <span role="columnheader">작업</span>
+                <span role="columnheader">단계</span>
+                <span role="columnheader">사유</span>
+                <span role="columnheader" className="r">갱신</span>
               </div>
               {jobs.length === 0 ? (
-                <div className="tr empty" style={{ gridTemplateColumns: "minmax(0, 1fr)" }}>
-                  {status === "loading" ? "불러오는 중" : "조건에 맞는 작업 없음"}
+                <div className="tr empty" role="row" style={{ gridTemplateColumns: "minmax(0, 1fr)" }}>
+                  <span role="cell">{status === "loading" ? "불러오는 중" : "조건에 맞는 작업 없음"}</span>
                 </div>
               ) : (
                 jobs.map((job) => {
@@ -178,31 +245,34 @@ export default function JobsPage() {
                     <div
                       key={job.id}
                       className={`tr ${state ? ROW_CLASS[state] : ""}`}
+                      role="row"
                       aria-selected={on}
                       style={{ gridTemplateColumns: GRID }}
                     >
-                      <input
-                        type="checkbox"
-                        checked={on}
-                        onChange={() => toggle(job.id)}
-                        aria-label={`${fileName(job.source_rel)} 선택`}
-                      />
-                      <span className={state ? BADGE_CLASS[state] : "b"}>
+                      <span role="cell"><input
+                          type="checkbox"
+                          checked={on}
+                          onChange={() => toggle(job.id)}
+                          aria-label={`${fileName(job.source_rel)} 선택`}
+                        /></span>
+                      <span role="cell" className={state ? BADGE_CLASS[state] : "b"} data-label="상태">
                         {state ? STATE_LABEL[state] : job.state}
                       </span>
-                      <div className="t-name">
-                        <b>{fileName(job.source_rel)}</b>
+                      <div role="cell" className="t-name" data-label="작업" title={job.source_rel}>
+                        <b><Link href={`/jobs/${encodeURIComponent(job.id)}`}>{fileName(job.source_rel)}</Link></b>
                         <span>{parentPath(job.source_rel)}</span>
                       </div>
-                      <span className="b line">{PHASE_LABEL[job.phase as JobPhase] ?? job.phase}</span>
+                      <span role="cell" className="b line" data-label="단계">{PHASE_LABEL[job.phase as JobPhase] ?? job.phase}</span>
                       <span
+                        role="cell"
                         className="m"
+                        data-label="사유"
                         title={reason}
                         style={{ fontSize: ".76rem", color: "var(--muted)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
                       >
                         {reason}
                       </span>
-                      <span className="r m" style={{ fontSize: ".78rem", color: "var(--muted)" }}>
+                      <span role="cell" className="r m" data-label="갱신" style={{ fontSize: ".78rem", color: "var(--muted)" }}>
                         {clock(job.updated_at)}
                       </span>
                     </div>
@@ -210,6 +280,13 @@ export default function JobsPage() {
                 })
               )}
             </div>
+            {(data?.total ?? 0) > jobs.length ? (
+              <div className="load-more">
+                <button type="button" className="btn sec" onClick={() => setLimit((value) => value + 200)}>
+                  더 보기 · {jobs.length} / {data?.total ?? 0}
+                </button>
+              </div>
+            ) : null}
           </div>
         </section>
       </div>

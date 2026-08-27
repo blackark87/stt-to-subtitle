@@ -85,12 +85,15 @@ Prometheus에는 다음 경보가 포함됩니다. 알림 전송은 Alertmanager
 생성됩니다. 메인 STT 프로젝트에서는 다음과 같이 GPU 연결 오버레이를 함께
 적용합니다.
 
+메인 프로젝트 루트에서 실행합니다.
+
 ```bash
-docker compose \
-  -f compose.yaml \
-  -f compose.gpu-monitoring.yaml \
-  up -d --build web
+./scripts/compose-gpu.sh up -d --build web backend
 ```
+
+이 래퍼는 `GPU_MONITORING_NETWORK`에 지정한 공유 네트워크가 없으면 배포 전에
+중단하므로, 오버레이 누락이나 서로 다른 네트워크 이름으로 인한 DNS 장애를
+즉시 확인할 수 있습니다.
 
 STT 대시보드는 `http://prometheus:9090`의 현재 DCGM 메트릭을 직접 표시합니다.
 Grafana 로그인, API 토큰 또는 외부 페이지 이동은 필요하지 않습니다. 두

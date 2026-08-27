@@ -1,4 +1,5 @@
 from pathlib import Path
+import stat
 import tomllib
 import unittest
 
@@ -220,6 +221,26 @@ class ReleaseConfigurationTests(unittest.TestCase):
         self.assertIn('if [ "$runtime_uid" -eq 0 ]', launcher)
         self.assertIn('export PUID="$runtime_uid"', launcher)
         self.assertIn('export PGID="$runtime_gid"', launcher)
+
+    def test_gpu_compose_launcher_requires_shared_network_and_overlay(self) -> None:
+        launcher = (ROOT / "scripts/compose-gpu.sh").read_text(encoding="utf-8")
+        overlay = (ROOT / "compose.gpu-monitoring.yaml").read_text(
+            encoding="utf-8"
+        )
+        observability = (ROOT / "gpu-observability/compose.yaml").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn('docker network inspect "$monitoring_network"', launcher)
+        self.assertIn("No Prometheus container is attached", launcher)
+        self.assertTrue((ROOT / "scripts/compose-gpu.sh").stat().st_mode & stat.S_IXUSR)
+        self.assertIn("compose.gpu-monitoring.yaml", launcher)
+        self.assertIn("GPU_PROMETHEUS_URL:", overlay)
+        self.assertIn("external: true", overlay)
+        self.assertIn("${GPU_MONITORING_NETWORK:-gpu-monitoring}", overlay)
+        self.assertIn(
+            "${GPU_MONITORING_NETWORK:-gpu-monitoring}", observability
+        )
 
     def test_runtime_requirements_have_no_platform_wrapper_files(self) -> None:
         self.assertTrue((ROOT / "requirements-api.txt").is_file())

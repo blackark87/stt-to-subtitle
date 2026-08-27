@@ -248,13 +248,13 @@ API로 제공합니다.
 전용 Compose 오버레이를 함께 적용합니다.
 
 ```bash
-docker compose \
-  -f compose.yaml \
-  -f compose.gpu-monitoring.yaml \
-  up -d --build web backend
+./scripts/compose-gpu.sh up -d --build web backend
 ```
 
 이 구성에서는 기본 `GPU_PROMETHEUS_URL`이 `http://prometheus:9090`입니다.
+`compose-gpu.sh`는 공유 네트워크가 실제로 존재하는지 먼저 확인하고 두 Compose
+파일을 항상 함께 적용합니다. 일반 `compose.sh`만 사용하면 Backend가 관측
+네트워크에 연결되지 않으므로 내부 호스트명 `prometheus`를 해석할 수 없습니다.
 Prometheus와 DCGM Exporter는 호스트 포트를 공개하지 않으며 두 프로젝트는
 공유 내부 네트워크로만 통신합니다. `GPU_PROMETHEUS_TOKEN`은 별도 리버스
 프록시를 통해 Prometheus에 접속할 때만 필요합니다. 자세한 실행 및 Grafana

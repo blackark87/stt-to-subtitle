@@ -1,11 +1,13 @@
 import * as THREE from "three";
 
+await window.__SCENE_DATA_READY__;
 const DATA = window.__SCENE_DATA__;
 addEventListener("unhandledrejection", () => {
-  const backendState = document.getElementById("backend");
-  backendState.textContent = "3D 초기화 실패";
-  backendState.className = "b bad dot";
+  const rendererState = document.getElementById("renderer-status");
+  rendererState.textContent = "3D 초기화 실패";
+  rendererState.className = "b bad dot";
 });
+const REDUCED_MOTION = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
 /* ── 팔레트 ───────────────────────────────────────────────────────────
    구역 러그는 장식이라 레퍼런스의 탁한 파스텔을 그대로 쓴다.
@@ -670,12 +672,18 @@ const ARCHIVE_RACKS_PER_FLOOR = 4;
 const ARCHIVE_BINS_PER_RACK = 24;
 const ARCHIVE_FLOOR_CAPACITY = ARCHIVE_RACKS_PER_FLOOR * ARCHIVE_BINS_PER_RACK;
 const ARCHIVE_FLOOR_HEIGHT = 1.9;
-const ARCHIVE_FLOORS = Math.max(1, Math.ceil(DATA.completed_total / ARCHIVE_FLOOR_CAPACITY));
+// 누적 완료 수가 커져도 DOM/geometry가 선형으로 폭증하지 않도록 시각화만 상한을 둔다.
+const MAX_ARCHIVE_FLOORS = 6;
+const archiveVisualTotal = Math.min(
+  DATA.completed_total,
+  ARCHIVE_FLOOR_CAPACITY * MAX_ARCHIVE_FLOORS,
+);
+const ARCHIVE_FLOORS = Math.max(1, Math.ceil(archiveVisualTotal / ARCHIVE_FLOOR_CAPACITY));
 const ARCHIVE_TOP_Y = 0.14 + (ARCHIVE_FLOORS - 1) * ARCHIVE_FLOOR_HEIGHT + 1.65;
 const archiveCx = (ARCHIVE_X0 + ARCHIVE_X1) / 2;
 const archiveCz = (ARCHIVE_Z0 + ARCHIVE_Z1) / 2;
 const archiveFilledBins = [];
-let archiveRemaining = DATA.completed_total;
+let archiveRemaining = archiveVisualTotal;
 
 for (let floorIndex = 0; floorIndex < ARCHIVE_FLOORS; floorIndex++) {
   const floorY = 0.14 + floorIndex * ARCHIVE_FLOOR_HEIGHT;
@@ -741,6 +749,7 @@ DATA.completed.forEach((job, index) => {
     kind: "done",
     title: job.source_rel.split("/").pop(),
     detail: job.detail,
+    href: job.href,
   };
   pickable.push(bin);
 });
@@ -790,7 +799,7 @@ DATA.queue.forEach((item, i) => {
   const c = crate(i === 0 ? C.crateHi : C.crate);
   c.position.set(ROOMS.queue.cx - 1.4 + col * 1.35, 0.04 + rowI * 0.38, ROOM_CZ + 0.5 - rowI * 0.6);
   c.traverse((o) => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; o.userData.pickRoot = c; } });
-  c.userData = { kind: "queue", title: item.title, detail: item.stage + " · " + item.status };
+  c.userData = { kind: "queue", title: item.title, detail: item.stage + " · " + item.status, href: item.href };
   layers.queue.add(c);
   pickable.push(c);
 });
@@ -809,23 +818,24 @@ if (DATA.queue_rest) {
   const busy = !!(slot && slot.job);
   const hasPct = busy && Number.isFinite(slot.percent);
   const pct = hasPct ? slot.percent : 0;
-  const runLabel = hasPct ? pct + "%" : `RUN ${slot?.active || 1}/${slot?.capacity || 1}`;
+  const runLabel = hasPct ? pct + "%" : `${slot?.count || 1} JOBS`;
   const m = phaseStation(stage, R.cx, ROOM_CZ - 0.9, R.rug,
                          busy ? runLabel : "IDLE",
                          busy ? (slot.detail || "").replace(/[^\x20-\x7E]/g, "").trim() || "-" : "no job");
   m.group.traverse((o) => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; o.userData.pickRoot = m.group; } });
   m.group.userData = busy
     ? { kind: "job", stage, title: slot.job, detail: slot.detail,
+        href: slot.href,
         ...(hasPct ? { percent: pct } : {}) }
     : { kind: "idle", stage, title: stage + " 유휴" };
   layers.stations.add(m.group);
   pickable.push(m.group);
 
-  pin(`${dot(busy ? CSS.accent : CSS.mute)}${stage}${busy ? ` <span class="n">${hasPct ? pct + "%" : `${slot.active}/${slot.capacity}`}</span>` : ' <span class="n">유휴</span>'}`,
+  pin(`${dot(busy ? CSS.accent : CSS.mute)}${stage}${busy ? ` <span class="n">${hasPct ? pct + "%" : `${slot.count || 1}건`}</span>` : ' <span class="n">유휴</span>'}`,
       { x: R.cx, y: 0, z: ROOM_Z0 + 0.4 }, 1.7, "", "stations");
 
   if (busy) {
-    const activeWorkers = Math.min(slot.active, slot.capacity);
+    const activeWorkers = 1;
     for (let i = 0; i < activeWorkers; i++) {
       const op = person(R.rug);
       op.position.set(R.cx + 1.45 + (i % 2) * 0.42, 0, ROOM_CZ - 0.2 - Math.floor(i / 2) * 0.62);
@@ -855,6 +865,7 @@ if (DATA.rendering) {
     kind: "job", endpoint: DATA.rendering.endpoint,
     title: DATA.rendering.source_rel.split("/").pop(),
     detail: DATA.rendering.detail,
+    href: DATA.rendering.href,
   };
   layers.done.add(rendering);
   pickable.push(rendering);
@@ -911,10 +922,10 @@ for (let rackIndex = 0; rackIndex < 5; rackIndex++) {
   layers.gpu.add(cabinet);
 }
 
-// 휴게소 — 실행 중이 아닌 실제 worker만 이곳에 상주한다.
+// 휴게소 — 실행 중이 아닌 파이프라인 단계를 추상화해 표시한다.
 const LOUNGE_CX = -1.2;
 room(LOUNGE_CX, FRONT_CZ, 4.8, FRONT_D, C.rug.lounge, layers.stations, 1.35);
-pin(`${dot(CSS.ok)}휴게소 <span class="n">${DATA.workers.idle}/${DATA.workers.total}명</span>`,
+pin(`${dot(CSS.ok)}유휴 단계 <span class="n">${DATA.workers.idle}/${DATA.workers.total}</span>`,
     { x: LOUNGE_CX, y: 0, z: FRONT_Z0 + 0.35 }, 1.9, "", "stations");
 
 function loungeSofa(x, z) {
@@ -1210,6 +1221,7 @@ function statusCargo(job, kind, tint, group, x, y, z, color) {
     title: job.source_rel.split("/").pop(),
     status: job.status_label,
     detail: kind === "failed" ? (job.error || "") : "",
+    href: job.href,
   };
   group.add(cargo);
   pickable.push(cargo);
@@ -1262,6 +1274,7 @@ function statusBay({ cx, cz, routeZ, group, jobs, rest, label, kind, layer, rug,
     title: job.source_rel.split("/").pop(),
     status: job.status_label,
     detail: kind === "failed" ? (job.error || "") : "",
+    href: job.href,
   };
   const handler = person(0x758294);
   handler.position.set(0, 0, -0.82);
@@ -1441,6 +1454,23 @@ document.getElementById("reset").onclick = () => {
   frameCamera(); placeCam();
 };
 document.getElementById("refresh").onclick = () => location.reload();
+canvas.addEventListener("keydown", (event) => {
+  const panStep = event.shiftKey ? 1.5 : 0.6;
+  if (event.key === "ArrowLeft") panX -= panStep;
+  else if (event.key === "ArrowRight") panX += panStep;
+  else if (event.key === "ArrowUp") panZ -= panStep;
+  else if (event.key === "ArrowDown") panZ += panStep;
+  else if (event.key === "+" || event.key === "=") zoom = Math.min(3.6, zoom * 1.1);
+  else if (event.key === "-" || event.key === "_") zoom = Math.max(0.55, zoom * 0.9);
+  else if (event.key === "Home") {
+    yaw = 0.72; elevation = 0.62; zoom = 1; panX = 0; panZ = 0;
+  } else return;
+  event.preventDefault();
+  panX = Math.max(-16, Math.min(16, panX));
+  panZ = Math.max(-14, Math.min(14, panZ));
+  frameCamera();
+  placeCam();
+});
 
 /* ── 선택 ───────────────────────────────────────────────────────────── */
 const ray = new THREE.Raycaster();
@@ -1482,7 +1512,7 @@ function hoverAt(ev) {
 }
 function clickAt(ev) {
   const o = pickAt(ev);
-  if (o?.userData.href) {
+  if (o?.userData.href && ["start", "dir"].includes(o.userData.kind)) {
     location.assign(o.userData.href);
     return;
   }
@@ -1524,7 +1554,8 @@ function setDetail(u) {
     ${u.stage ? `<div class="kv"><span>단계</span><span>${h(u.stage)}</span></div>` : ""}
     ${u.endpoint ? `<div class="kv"><span>종료점</span><span>${h(u.endpoint)}</span></div>` : ""}
     ${u.percent !== undefined ? `<div class="kv"><span>진행</span><span>${u.percent}%</span></div>` : ""}
-    ${u.detail ? `<p class="muted" style="margin: 10px 0 0; font-size: .8rem; line-height: 1.5">${h(u.detail)}</p>` : ""}`;
+    ${u.detail ? `<p class="muted" style="margin: 10px 0 0; font-size: .8rem; line-height: 1.5">${h(u.detail)}</p>` : ""}
+    ${u.href ? `<a class="btn sec sm" style="margin-top: 12px" href="${h(u.href)}">작업 상세</a>` : ""}`;
 }
 
 document.querySelectorAll("[data-layer]").forEach((cb) => {
@@ -1558,28 +1589,30 @@ function updatePins() {
 function loop(now) {
   const t = now / 1000;
 
-  for (const op of stageOps) {
-    const s = Math.sin(t * 2.1 + op.phase);
-    op.rig.arms[0].rotation.x = -1.1 + s * 0.22;
-    op.rig.arms[1].rotation.x = -1.1 - s * 0.22;
-    op.rig.body.position.y = 0.57 + Math.sin(t * 1.4 + op.phase) * 0.012;
-  }
+  if (!REDUCED_MOTION) {
+    for (const op of stageOps) {
+      const s = Math.sin(t * 2.1 + op.phase);
+      op.rig.arms[0].rotation.x = -1.1 + s * 0.22;
+      op.rig.arms[1].rotation.x = -1.1 - s * 0.22;
+      op.rig.body.position.y = 0.57 + Math.sin(t * 1.4 + op.phase) * 0.012;
+    }
 
-  updateLoungeWorkers(t);
-  updateLoungeChat(t);
-  updateStatusTransports(t);
+    updateLoungeWorkers(t);
+    updateLoungeChat(t);
+    updateStatusTransports(t);
 
-  startConsole.btn.material.emissiveIntensity = 0.55 + (Math.sin(t * 2.6) * 0.5 + 0.5) * 0.9;
+    startConsole.btn.material.emissiveIntensity = 0.55 + (Math.sin(t * 2.6) * 0.5 + 0.5) * 0.9;
 
-  for (const b of failedPulse) {
-    b.mesh.material.emissiveIntensity = 0.7 + (Math.sin(t * 3 + b.phase) * 0.5 + 0.5) * 1.1;
+    for (const b of failedPulse) {
+      b.mesh.material.emissiveIntensity = 0.7 + (Math.sin(t * 3 + b.phase) * 0.5 + 0.5) * 1.1;
+    }
   }
 
   updatePins();
   renderer.render(scene, camera);
 }
 
-const badge = document.getElementById("backend");
+const badge = document.getElementById("renderer-status");
 const isWebGPU = renderer.backend?.isWebGPUBackend === true;
 badge.textContent = isWebGPU ? "WebGPU" : "WebGL2 폴백";
 badge.className = "b dot " + (isWebGPU ? "run" : "wait");

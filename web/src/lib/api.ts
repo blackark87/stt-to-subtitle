@@ -50,6 +50,8 @@ export interface GpuDevice {
   memory_percent: number | null;
   memory_used_gib: number | null;
   memory_total_gib: number | null;
+  memory_used_mib?: number | null;
+  memory_total_mib?: number | null;
   temperature_celsius: number | null;
   power_watts: number | null;
 }
@@ -58,6 +60,11 @@ export interface GpuSnapshot {
   available: boolean;
   configured: boolean;
   devices: GpuDevice[];
+  error: string;
+  error_code: string;
+  observed_at: number | null;
+  last_success_at: number | null;
+  stale: boolean;
 }
 
 export interface DependencyState {
@@ -67,23 +74,36 @@ export interface DependencyState {
   [key: string]: unknown;
 }
 
+export type DependencyStatus = DependencyState | string;
+
 export interface DashboardPayload {
   state_counts: Record<string, number>;
   phase_counts: Record<string, number>;
   recent_jobs: PipelineJob[];
-  dependencies: { transcription: DependencyState; translation: DependencyState };
+  active_jobs: PipelineJob[];
+  attention_jobs: PipelineJob[];
+  recent_completed: PipelineJob[];
+  dependencies: { transcription: DependencyStatus; translation: DependencyStatus };
   gpu: GpuSnapshot | null;
 }
 
 export interface MediaFolder {
   path: string;
   name: string;
+  display_path?: string;
+  display_name?: string;
+  modified_at: number | null;
+  actor_image_path?: string | null;
   has_subtitle?: boolean;
 }
 
 export interface MediaFile {
   path: string;
+  paths?: string[];
   name: string;
+  display_path?: string;
+  display_paths?: string[];
+  display_name?: string;
   size: number;
   duration_seconds: number | null;
   has_subtitle: boolean;
@@ -100,6 +120,7 @@ export interface MediaListing {
   parent_folder: string | null;
   breadcrumbs: { name: string; path: string }[];
   folders: MediaFolder[];
+  folder_total?: number;
   files: MediaFile[];
 }
 
@@ -120,13 +141,41 @@ export interface ServerSettings {
 export interface SettingsPayload {
   servers: ServerSettings;
   runtimes: RuntimeEndpoint[];
+  path_display_rules: PathDisplayRule[];
   prompt_categories: PromptCategory[];
+}
+
+export interface PathDisplayRule {
+  id: string;
+  source_pattern: string;
+  display_pattern: string;
+  created_at: number;
+  updated_at: number;
 }
 
 export interface PromptCategory {
   id: string;
   name: string;
+  translation_prompt?: string;
+  review_prompt?: string;
   archived?: boolean;
+}
+
+export interface JobEvent {
+  created_at?: string | number;
+  level?: string;
+  message?: string;
+  event_code?: string;
+}
+
+export interface JobDetailPayload {
+  job: PipelineJob;
+  events: JobEvent[];
+  transcript_revisions: Record<string, unknown>[];
+  translation_generations: Record<string, unknown>[];
+  subtitle_generations: Record<string, unknown>[];
+  subtitle_validation: Record<string, unknown> | null;
+  external_subtitles: string[];
 }
 
 export interface ListPayload<T> {
@@ -134,6 +183,23 @@ export interface ListPayload<T> {
   total: number;
   limit?: number;
   offset?: number;
+}
+
+export interface LibraryProgressSegment {
+  state: "done" | "running" | "waiting" | "attention" | "unprocessed";
+  percent: number;
+}
+
+export interface LibraryProgressItem {
+  name: string;
+  path: string;
+  image_path: string | null;
+  done: number;
+  total: number;
+  remaining: number;
+  active: number;
+  attention: number;
+  segments: LibraryProgressSegment[];
 }
 
 export class ApiError extends Error {
@@ -178,12 +244,14 @@ export const api = {
     offset?: number;
     state?: readonly string[];
     phase?: readonly string[];
+    reasonCode?: readonly string[];
   } = {}) => {
     const query = new URLSearchParams();
     if (params.limit != null) query.set("limit", String(params.limit));
     if (params.offset != null) query.set("offset", String(params.offset));
     for (const value of params.state ?? []) query.append("state", value);
     for (const value of params.phase ?? []) query.append("phase", value);
+    for (const value of params.reasonCode ?? []) query.append("reason_code", value);
     const suffix = query.toString();
     return request<ListPayload<PipelineJob>>(`/jobs${suffix ? `?${suffix}` : ""}`);
   },
@@ -201,6 +269,8 @@ export const api = {
     request<unknown>(`/jobs/${encodeURIComponent(jobId)}/retry`, { method: "POST" }),
   stopJob: (jobId: string) =>
     request<unknown>(`/jobs/${encodeURIComponent(jobId)}/stop`, { method: "POST" }),
+  pauseTranslation: (jobId: string) =>
+    request<unknown>(`/jobs/${encodeURIComponent(jobId)}/pause-translation`, { method: "POST" }),
   resumeTranslation: (jobId: string) =>
     request<unknown>(`/jobs/${encodeURIComponent(jobId)}/resume-translation`, {
       method: "POST",
@@ -208,17 +278,39 @@ export const api = {
   deleteJob: (jobId: string) =>
     request<unknown>(`/jobs/${encodeURIComponent(jobId)}`, { method: "DELETE" }),
 
-media: (params: { folder?: string; q?: string; actor?: string } = {}) => {
+  media: (params: {
+    folder?: string;
+    q?: string;
+    actor?: string;
+    folderSort?: string;
+    folderLimit?: number;
+  } = {}) => {
     const query = new URLSearchParams();
     if (params.folder) query.set("folder", params.folder);
     if (params.q) query.set("q", params.q);
     if (params.actor) query.set("actor", params.actor);
+    if (params.folderSort) query.set("folder_sort", params.folderSort);
+    if (params.folderLimit != null) query.set("folder_limit", String(params.folderLimit));
     const suffix = query.toString();
     return request<MediaListing>(`/media${suffix ? `?${suffix}` : ""}`);
   },
 
   promptCategories: () =>
     request<ListPayload<PromptCategory>>("/settings/prompt-categories"),
+  createPromptCategory: (body: {
+    name: string;
+    translation_prompt: string;
+    review_prompt: string;
+  }) => request<PromptCategory>("/settings/prompt-categories", { method: "POST", ...json(body) }),
+  updatePromptCategory: (
+    id: string,
+    body: { name: string; translation_prompt: string; review_prompt: string },
+  ) => request<PromptCategory>(`/settings/prompt-categories/${encodeURIComponent(id)}`, { method: "PUT", ...json(body) }),
+  setPromptCategoryArchived: (id: string, archived: boolean) =>
+    request<PromptCategory>(`/settings/prompt-categories/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      ...json({ archived }),
+    }),
 
   createJobs: (body: {
     source_rels: string[];
@@ -229,6 +321,8 @@ media: (params: { folder?: string; q?: string; actor?: string } = {}) => {
   }) => request<unknown>("/jobs", { method: "POST", ...json(body) }),
 
   settings: () => request<SettingsPayload>("/settings"),
+  libraryProgress: () =>
+    request<ListPayload<LibraryProgressItem>>("/dashboard/library-progress"),
   updateServers: (body: {
     stt_base_url: string;
     stt_token?: string | null;
@@ -237,11 +331,29 @@ media: (params: { folder?: string; q?: string; actor?: string } = {}) => {
     lm_model: string;
     translation_workers: number;
   }) => request<unknown>("/settings/servers", { method: "PUT", ...json(body) }),
+  createPathDisplayRule: (body: {
+    source_pattern: string;
+    display_pattern: string;
+  }) => request<PathDisplayRule>("/settings/path-display-rules", {
+    method: "POST",
+    ...json(body),
+  }),
+  updatePathDisplayRule: (
+    id: string,
+    body: { source_pattern: string; display_pattern: string },
+  ) => request<PathDisplayRule>(
+    `/settings/path-display-rules/${encodeURIComponent(id)}`,
+    { method: "PUT", ...json(body) },
+  ),
+  deletePathDisplayRule: (id: string) => request<unknown>(
+    `/settings/path-display-rules/${encodeURIComponent(id)}`,
+    { method: "DELETE" },
+  ),
 
-  job: (id: string) => request<PipelineJob>(`/jobs/${encodeURIComponent(id)}`),
+  job: (id: string) => request<JobDetailPayload>(`/jobs/${encodeURIComponent(id)}`),
 
   jobEvents: (id: string) =>
-    request<{ items: { created_at?: string; level?: string; message?: string; event?: string }[] }>(
+    request<{ items: JobEvent[] }>(
       `/jobs/${encodeURIComponent(id)}/events?limit=200`,
     ),
 
@@ -251,21 +363,30 @@ media: (params: { folder?: string; q?: string; actor?: string } = {}) => {
       `/api/v1/jobs/${encodeURIComponent(id)}/artifacts/${kind}`,
       { headers: { Accept: "application/json" } },
     );
-    if (!response.ok) return null;
+    if (response.status === 404) return null;
+    if (!response.ok) throw new ApiError(`산출물 응답 ${response.status}`, response.status);
     try {
       return (await response.json()) as unknown;
     } catch {
-      return null;
+      throw new ApiError("산출물 JSON을 읽지 못했습니다.", response.status);
     }
   },
 
   mediaFileUrl: (sourceRel: string) => `/api/v1/media/file?path=${encodeURIComponent(sourceRel)}`,
+  posterUrl: (posterPath: string) =>
+    `/api/v1/media/posters/${posterPath.split("/").map(encodeURIComponent).join("/")}`,
+  actorImageUrl: (actorPath: string) =>
+    `/api/v1/media/actors/${actorPath.split("/").map(encodeURIComponent).join("/")}`,
   subtitlesUrl: (id: string) => `/api/v1/jobs/${encodeURIComponent(id)}/subtitles.vtt`,
 
   comparisons: () =>
     request<ListPayload<{ id: string; source_rels: string[]; jobs: PipelineJob[]; updated_at: number }>>(
       "/comparisons",
     ),
+  comparison: (id: string) =>
+    request<{ id: string; jobs: PipelineJob[] }>(`/comparisons/${encodeURIComponent(id)}`),
+  retryComparison: (id: string) =>
+    request<{ updated: number }>(`/comparisons/${encodeURIComponent(id)}/retry`, { method: "POST" }),
 
   runtimes: () => request<ListPayload<RuntimeEndpoint>>("/runtimes"),
   createRuntime: (body: {
