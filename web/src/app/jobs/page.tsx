@@ -1,26 +1,47 @@
 "use client";
 
-import { useCallback, useMemo, useState } from "react";
-import { Badge, NeutralBadge } from "@/components/ui/Badge";
-import { Button } from "@/components/ui/Button";
-import { Card } from "@/components/ui/Card";
-import { Column, DataTable } from "@/components/ui/DataTable";
-import { FreshnessBadge } from "@/components/FreshnessBadge";
-import { api, type PipelineJob } from "@/lib/api";
+import { useCallback, useState } from "react";
+import { Icon } from "@/components/Icon";
+import { Freshness } from "@/components/Freshness";
+import { api } from "@/lib/api";
 import {
+  PHASE_LABEL,
   STATE_LABEL,
   STATE_ORDER,
   asJobState,
-  phaseLabel,
   reasonLabel,
+  type JobPhase,
+  type JobState,
 } from "@/lib/domain";
 import { clock, fileName, parentPath } from "@/lib/format";
 import { useLiveQuery } from "@/lib/useLiveQuery";
 
 const JOBS_INTERVAL_MS = 5000;
 
+const BADGE_CLASS: Record<JobState, string> = {
+  running: "b run dot",
+  waiting: "b wait dot",
+  paused: "b hold dot",
+  blocked: "b hold dot",
+  stopped: "b hold dot",
+  failed: "b bad dot",
+  done: "b ok dot",
+};
+
+const ROW_CLASS: Record<JobState, string> = {
+  running: "on-run",
+  waiting: "on-wait",
+  paused: "on-hold",
+  blocked: "on-hold",
+  stopped: "on-hold",
+  failed: "on-bad",
+  done: "on-ok",
+};
+
+const GRID = "36px 92px minmax(0, 1fr) 110px minmax(0, 220px) 100px";
+
 export default function JobsPage() {
-  const [filter, setFilter] = useState<readonly string[]>([]);
+  const [filter, setFilter] = useState<readonly JobState[]>([]);
   const [selected, setSelected] = useState<ReadonlySet<string>>(new Set());
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -30,8 +51,7 @@ export default function JobsPage() {
     [filter],
   );
   const { data, status, error, updatedAt, refresh } = useLiveQuery(fetcher, JOBS_INTERVAL_MS);
-
-  const jobs = useMemo(() => data?.items ?? [], [data]);
+  const jobs = data?.items ?? [];
 
   const toggle = (id: string) =>
     setSelected((current) => {
@@ -41,7 +61,7 @@ export default function JobsPage() {
       return next;
     });
 
-  const runAction = async (action: (ids: string[]) => Promise<unknown>) => {
+  const run = async (action: (ids: string[]) => Promise<unknown>) => {
     const ids = [...selected];
     if (!ids.length) return;
     setBusy(true);
@@ -49,7 +69,6 @@ export default function JobsPage() {
     try {
       await action(ids);
       setSelected(new Set());
-      // mutation 직후 폴링 주기를 기다리지 않고 바로 반영한다.
       await refresh();
     } catch (reason) {
       setActionError(reason instanceof Error ? reason.message : String(reason));
@@ -58,163 +77,142 @@ export default function JobsPage() {
     }
   };
 
-  const columns: readonly Column<PipelineJob>[] = [
-    {
-      key: "select",
-      header: "선택",
-      width: "44px",
-      cell: (job) => (
-        <input
-          type="checkbox"
-          checked={selected.has(job.id)}
-          onChange={() => toggle(job.id)}
-          aria-label={`${fileName(job.source_rel)} 선택`}
-          className="size-4 accent-[var(--color-accent)]"
-        />
-      ),
-    },
-    {
-      key: "source",
-      header: "파일",
-      width: "minmax(0,1fr)",
-      cell: (job) => (
-        <div className="grid min-w-0 gap-0.5">
-          <span className="truncate text-sm font-bold" title={job.source_rel}>
-            {fileName(job.source_rel)}
-          </span>
-          <span className="truncate text-xs text-[var(--color-muted)]">
-            {parentPath(job.source_rel) || "—"}
-          </span>
-        </div>
-      ),
-    },
-    {
-      key: "phase",
-      header: "단계",
-      width: "110px",
-      cell: (job) => <NeutralBadge>{phaseLabel(job.phase)}</NeutralBadge>,
-    },
-    {
-      key: "state",
-      header: "상태",
-      width: "124px",
-      cell: (job) => {
-        const state = asJobState(job.state);
-        return state ? (
-          <Badge tone={state}>{STATE_LABEL[state]}</Badge>
-        ) : (
-          <NeutralBadge>{job.state}</NeutralBadge>
-        );
-      },
-    },
-    {
-      key: "reason",
-      header: "사유",
-      width: "minmax(0,200px)",
-      hideOnNarrow: true,
-      cell: (job) => {
-        const reason = reasonLabel(job.reason_code) ?? job.error;
-        return (
-          <span className="block truncate text-xs text-[var(--color-muted)]" title={reason ?? ""}>
-            {reason ?? "—"}
-          </span>
-        );
-      },
-    },
-    {
-      key: "updated",
-      header: "갱신",
-      width: "92px",
-      align: "end",
-      cell: (job) => (
-        <span className="text-xs text-[var(--color-muted)] tnum">{clock(job.updated_at)}</span>
-      ),
-    },
-  ];
-
   return (
     <>
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <h1 className="m-0 text-lg font-bold">작업 목록</h1>
-        <FreshnessBadge status={status} updatedAt={updatedAt} error={error} />
-      </div>
+      <header className="topbar">
+        <h1>작업 목록</h1>
+        <span style={{ marginLeft: "auto" }}>
+          <Freshness status={status} updatedAt={updatedAt} error={error} />
+        </span>
+        <button type="button" className="btn sec sm" onClick={() => void refresh()}>
+          <Icon name="refresh" size={14} />
+          새로고침
+        </button>
+      </header>
 
-      <Card
-        title="필터"
-        actions={
-          filter.length ? (
-            <Button onClick={() => setFilter([])}>전체 해제</Button>
-          ) : undefined
-        }
-      >
-        <div className="flex flex-wrap gap-2">
-          {STATE_ORDER.map((state) => {
-            const active = filter.includes(state);
-            return (
-              <button
-                key={state}
-                type="button"
-                aria-pressed={active}
-                onClick={() =>
-                  setFilter((current) =>
-                    current.includes(state)
-                      ? current.filter((value) => value !== state)
-                      : [...current, state],
-                  )
-                }
-                className="rounded-[var(--radius-pill)] border border-[var(--color-line)] px-3 py-1.5 text-xs font-semibold aria-pressed:border-[var(--color-accent)] aria-pressed:bg-[color-mix(in_srgb,var(--color-accent)_14%,var(--color-surface))] aria-pressed:text-[var(--color-accent)]"
-              >
-                {STATE_LABEL[state]}
+      <div className="content">
+        <section className="card">
+          <div className="card-head">
+            <h2>필터</h2>
+            {filter.length ? (
+              <button type="button" className="btn sec sm" onClick={() => setFilter([])}>
+                전체 해제
               </button>
-            );
-          })}
-        </div>
-      </Card>
+            ) : null}
+          </div>
+          <div className="card-body">
+            <div className="rail">
+              {STATE_ORDER.map((state) => {
+                const on = filter.includes(state);
+                return (
+                  <button
+                    key={state}
+                    type="button"
+                    aria-pressed={on}
+                    className={on ? "chip on" : "chip"}
+                    style={{ paddingLeft: 9 }}
+                    onClick={() =>
+                      setFilter((current) =>
+                        current.includes(state)
+                          ? current.filter((value) => value !== state)
+                          : [...current, state],
+                      )
+                    }
+                  >
+                    {STATE_LABEL[state]}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        </section>
 
-      <Card
-        title="작업"
-        meta={`${jobs.length} / ${data?.total ?? 0}건${selected.size ? ` · ${selected.size}개 선택` : ""}`}
-        actions={
-          <>
-            <Button disabled={!selected.size || busy} onClick={() => runAction(api.retryJobs)}>
-              재시도
-            </Button>
-            <Button
-              disabled={!selected.size || busy}
-              onClick={() => runAction(api.pauseTranslations)}
-            >
-              번역 일시정지
-            </Button>
-            <Button
-              variant="danger"
-              disabled={!selected.size || busy}
-              onClick={() => runAction(api.stopJobs)}
-            >
-              정지
-            </Button>
-          </>
-        }
-        bodyClassName="p-0"
-      >
-        {actionError ? (
-          <p
-            role="alert"
-            className="m-0 border-b border-[var(--color-line)] px-4 py-2 text-sm"
-            style={{ color: "var(--color-st-failed)" }}
-          >
-            {actionError}
-          </p>
-        ) : null}
-        <DataTable
-          caption="작업 목록"
-          columns={columns}
-          rows={jobs}
-          rowKey={(job) => job.id}
-          rowTone={(job) => asJobState(job.state)}
-          selectedKeys={selected}
-          emptyText={status === "loading" ? "불러오는 중" : "조건에 맞는 작업 없음"}
-        />
-      </Card>
+        <section className="card">
+          <div className="card-head">
+            <h2>
+              작업
+              <span className="n" style={{ marginLeft: 7 }}>
+                {data?.total ?? 0}
+              </span>
+            </h2>
+            <span className="btns">
+              <button type="button" className="btn sec sm" disabled={!selected.size || busy} onClick={() => void run(api.retryJobs)}>
+                <Icon name="refresh" size={13} />
+                재시도
+              </button>
+              <button type="button" className="btn sec sm" disabled={!selected.size || busy} onClick={() => void run(api.pauseTranslations)}>
+                <Icon name="pause" size={13} />
+                번역 일시정지
+              </button>
+              <button type="button" className="btn dgr sm" disabled={!selected.size || busy} onClick={() => void run(api.stopJobs)}>
+                <Icon name="alert_triangle" size={13} />
+                정지
+              </button>
+            </span>
+          </div>
+          <div className="card-body flush">
+            {actionError ? (
+              <p role="alert" style={{ margin: 0, padding: "8px 12px", color: "var(--bad)", fontSize: ".82rem" }}>
+                {actionError}
+              </p>
+            ) : null}
+            <div className="tbl">
+              <div className="tr head" style={{ gridTemplateColumns: GRID }}>
+                <span />
+                <span>상태</span>
+                <span>작업</span>
+                <span>단계</span>
+                <span>사유</span>
+                <span className="r">갱신</span>
+              </div>
+              {jobs.length === 0 ? (
+                <div className="tr empty" style={{ gridTemplateColumns: "minmax(0, 1fr)" }}>
+                  {status === "loading" ? "불러오는 중" : "조건에 맞는 작업 없음"}
+                </div>
+              ) : (
+                jobs.map((job) => {
+                  const state = asJobState(job.state);
+                  const reason = reasonLabel(job.reason_code) ?? job.error ?? "—";
+                  const on = selected.has(job.id);
+                  return (
+                    <div
+                      key={job.id}
+                      className={`tr ${state ? ROW_CLASS[state] : ""}`}
+                      aria-selected={on}
+                      style={{ gridTemplateColumns: GRID }}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={on}
+                        onChange={() => toggle(job.id)}
+                        aria-label={`${fileName(job.source_rel)} 선택`}
+                      />
+                      <span className={state ? BADGE_CLASS[state] : "b"}>
+                        {state ? STATE_LABEL[state] : job.state}
+                      </span>
+                      <div className="t-name">
+                        <b>{fileName(job.source_rel)}</b>
+                        <span>{parentPath(job.source_rel)}</span>
+                      </div>
+                      <span className="b line">{PHASE_LABEL[job.phase as JobPhase] ?? job.phase}</span>
+                      <span
+                        className="m"
+                        title={reason}
+                        style={{ fontSize: ".76rem", color: "var(--muted)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+                      >
+                        {reason}
+                      </span>
+                      <span className="r m" style={{ fontSize: ".78rem", color: "var(--muted)" }}>
+                        {clock(job.updated_at)}
+                      </span>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          </div>
+        </section>
+      </div>
     </>
   );
 }
