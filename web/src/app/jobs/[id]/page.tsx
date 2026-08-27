@@ -319,9 +319,9 @@ export default function JobDetailPage({ params }: { params: Promise<{ id: string
           <div className="event-list">
             {(detail?.events ?? []).length ? detail?.events.slice(-100).reverse().map((event, index) => (
               <div className="event-row" key={`${event.created_at ?? "event"}-${index}`}>
-                <time className="code">{clock(event.created_at)}</time>
-                <span className={event.level === "error" ? "b bad" : event.level === "warning" ? "b hold" : "b line"}>{EVENT_LEVEL_LABEL[event.level ?? ""] ?? "기록"}</span>
-                <span title={event.message}>{eventText(event, runtimeNames)}</span>
+                <time className="code event-time">{clock(event.created_at)}</time>
+                <span className={`event-level ${event.level === "error" ? "b bad" : event.level === "warning" ? "b hold" : "b line"}`}>{EVENT_LEVEL_LABEL[event.level ?? ""] ?? "기록"}</span>
+                <span className="event-message" title={event.message}>{eventText(event, runtimeNames)}</span>
               </div>
             )) : <div className="empty-state compact"><strong>기록이 없습니다</strong></div>}
           </div>

@@ -114,6 +114,7 @@ export default function JobsPage() {
     () => jobs.filter((job) => selected.has(job.id)),
     [jobs, selected],
   );
+  const pageSelected = jobs.length > 0 && selectedJobs.length === jobs.length;
   const retryIds = selectedJobs
     .filter((job) => canRetryJob(asJobState(job.state)))
     .map((job) => job.id);
@@ -220,6 +221,16 @@ export default function JobsPage() {
               </span>
             </h2>
             <span className="btns">
+              <button
+                type="button"
+                className="btn sec sm mobile-page-select"
+                disabled={!jobs.length || busy}
+                aria-pressed={pageSelected}
+                onClick={() => setSelected(pageSelected ? new Set() : new Set(jobs.map((job) => job.id)))}
+              >
+                <Icon name="check" size={13} />
+                {pageSelected ? "페이지 선택 해제" : `현재 페이지 ${jobs.length}건 선택`}
+              </button>
               <span className="selection-summary" aria-live="polite">{selectedJobs.length ? `${selectedJobs.length}건 선택` : "작업을 선택하세요"}</span>
               <button type="button" className="btn sec sm" disabled={!retryIds.length || busy} onClick={() => void run(retryIds, api.retryJobs)}>
                 <Icon name="refresh" size={13} />
@@ -244,12 +255,12 @@ export default function JobsPage() {
                 {actionError}
               </p>
             ) : null}
-            <div className="tbl" role="table" aria-label="작업 목록">
+            <div className="tbl jobs-table" role="table" aria-label="작업 목록">
               <div className="tr head" role="row" style={{ gridTemplateColumns: GRID }}>
                 <span role="columnheader">
                   <input
                     type="checkbox"
-                    checked={jobs.length > 0 && selectedJobs.length === jobs.length}
+                    checked={pageSelected}
                     onChange={(event) => setSelected(event.target.checked ? new Set(jobs.map((job) => job.id)) : new Set())}
                     aria-label="현재 표시 작업 전체 선택"
                   />
@@ -277,38 +288,36 @@ export default function JobsPage() {
                   return (
                     <div
                       key={job.id}
-                      className={`tr ${state ? ROW_CLASS[state] : ""}`}
+                      className={`tr job-table-row ${state ? ROW_CLASS[state] : ""}`}
                       role="row"
                       aria-selected={on}
                       style={{ gridTemplateColumns: GRID }}
                     >
-                      <span role="cell"><input
+                      <span role="cell" className="job-select-cell"><input
                           type="checkbox"
                           checked={on}
                           onChange={() => toggle(job.id)}
                           aria-label={`${fileName(job.source_rel)} 선택`}
                         /></span>
-                      <span role="cell" className={state ? BADGE_CLASS[state] : "b"} data-label="상태" title={stateText}>
-                        {stateText}
-                      </span>
-                      <div role="cell" className="t-name" data-label="작업" title={job.source_rel}>
-                        <b><Link href={`/jobs/${encodeURIComponent(job.id)}`}>{fileName(job.source_rel)}</Link></b>
-                        <span>{parentPath(job.source_rel)}</span>
-                        {runtime ? <span title={`전사 서버: ${runtime}`}>전사 서버 · {runtime}</span> : null}
+                      <div role="cell" className="job-meta-cell job-state-cell" data-label="상태">
+                        <span className={state ? BADGE_CLASS[state] : "b"} title={stateText}>{stateText}</span>
                       </div>
-                      <span role="cell" className="b line" data-label="단계" title={phase}>{phase}</span>
-                      <span
-                        role="cell"
-                        className="m"
-                        data-label="사유"
-                        title={reason}
-                        style={{ fontSize: ".76rem", color: "var(--muted)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
-                      >
-                        {reason}
-                      </span>
-                      <span role="cell" className="r m" data-label="최근 변경" style={{ fontSize: ".78rem", color: "var(--muted)" }}>
-                        {clock(job.updated_at)}
-                      </span>
+                      <div role="cell" className="job-name-cell" data-label="작업">
+                        <div className="t-name" title={job.source_rel}>
+                          <b><Link href={`/jobs/${encodeURIComponent(job.id)}`}>{fileName(job.source_rel)}</Link></b>
+                          <span>{parentPath(job.source_rel)}</span>
+                          {runtime ? <span title={`전사 서버: ${runtime}`}>전사 서버 · {runtime}</span> : null}
+                        </div>
+                      </div>
+                      <div role="cell" className="job-meta-cell job-phase-cell" data-label="단계">
+                        <span className="b line" title={phase}>{phase}</span>
+                      </div>
+                      <div role="cell" className="job-meta-cell job-reason-cell" data-label="사유">
+                        <span className="m job-reason-value" title={reason}>{reason}</span>
+                      </div>
+                      <div role="cell" className="job-meta-cell job-updated-cell" data-label="최근 변경">
+                        <time className="m" dateTime={job.updated_at}>{clock(job.updated_at)}</time>
+                      </div>
                     </div>
                   );
                 })

@@ -163,6 +163,10 @@ a { color: var(--accent); text-decoration: none; }
 .t-name a { color: inherit; }
 .t-name a:hover { color: var(--accent); }
 .t-name > span { color: var(--muted); font-size: .74rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.job-name-cell, .job-meta-cell { min-width: 0; }
+.job-meta-cell > .b { justify-self: start; }
+.job-reason-value { display: block; overflow: hidden; color: var(--muted); font-size: .76rem; text-overflow: ellipsis; white-space: nowrap; }
+.job-updated-cell { justify-self: end; color: var(--muted); font-size: .78rem; text-align: right; }
 .r { text-align: right; }
 
 /* 그룹 헤더 (단계 묶음) */
@@ -417,6 +421,7 @@ button:disabled, .btn:disabled {
 .text-link { display: inline-flex; align-items: center; gap: 3px; color: var(--muted); font-size: .8rem; font-weight: 650; white-space: nowrap; }
 .text-link:hover { color: var(--accent); }
 .selection-summary { color: var(--muted); font-size: .78rem; white-space: nowrap; }
+.mobile-page-select { display: none; }
 
 .ctl { min-height: var(--h-ctl); height: auto; padding: 8px 11px; }
 .ctl:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-14); outline: none; }
@@ -619,6 +624,8 @@ progress::-moz-progress-bar { background: var(--accent-solid); border-radius: 99
 .event-row { display: grid; grid-template-columns: 100px 90px minmax(0, 1fr); align-items: center; gap: 12px; min-height: 46px; padding: 8px 14px; border-bottom: 1px solid var(--line); font-size: .8rem; }
 .event-row:last-child { border-bottom: 0; }
 .event-row time { color: var(--muted); font-size: .72rem; }
+.event-level { justify-self: start; }
+.event-message { min-width: 0; line-height: 1.55; overflow-wrap: anywhere; word-break: break-word; }
 
 /* 비교 */
 .comparison-grid { grid-template-columns: minmax(220px, 1fr) 210px !important; }
@@ -660,6 +667,7 @@ progress::-moz-progress-bar { background: var(--accent-solid); border-radius: 99
   .content { padding: 14px; gap: 14px; }
   .card-head { align-items: flex-start; flex-wrap: wrap; }
   .card-head > .btns { width: 100%; justify-content: flex-start; }
+  .mobile-page-select { display: inline-flex; }
   .search-panel, .progress-body { grid-template-columns: minmax(0, 1fr); }
   .breadcrumbs { justify-content: flex-start; }
   .file-toolbar > .btns { justify-content: flex-start; }
@@ -676,8 +684,53 @@ progress::-moz-progress-bar { background: var(--accent-solid); border-radius: 99
   .job-row > time { grid-column: 3; grid-row: 1; }
   .attention-row > .btns { grid-column: 2 / -1; }
   .completed-row > span:nth-child(3), .completed-row > strong { grid-column: 2; }
-  .tbl .tr:not(.head) > [data-label] { display: grid; grid-template-columns: 92px minmax(0, 1fr); align-items: start; gap: 8px; width: 100%; }
-  .tbl .tr:not(.head) > [data-label]::before { content: attr(data-label); color: var(--muted); font-size: .7rem; font-weight: 700; }
+  .tbl:not(.jobs-table) .tr:not(.head) > [data-label] { display: grid; grid-template-columns: 92px minmax(0, 1fr); align-items: start; gap: 8px; width: 100%; }
+  .tbl:not(.jobs-table) .tr:not(.head) > [data-label]::before { content: attr(data-label); color: var(--muted); font-size: .7rem; font-weight: 700; }
+  .jobs-table .job-table-row {
+    grid-template-columns: 22px minmax(0, 1fr) !important;
+    grid-template-areas:
+      "select name"
+      ". state"
+      ". phase"
+      ". reason"
+      ". updated";
+    gap: 8px 10px;
+    padding: 12px;
+    align-items: start;
+  }
+  .job-select-cell { grid-area: select; padding-top: 2px; }
+  .job-name-cell { grid-area: name; display: grid; gap: 3px; }
+  .job-state-cell { grid-area: state; }
+  .job-phase-cell { grid-area: phase; }
+  .job-reason-cell { grid-area: reason; }
+  .job-updated-cell { grid-area: updated; }
+  .job-name-cell::before, .job-meta-cell::before {
+    content: attr(data-label);
+    color: var(--muted);
+    font-size: .68rem;
+    font-weight: 700;
+    line-height: 1.4;
+  }
+  .job-meta-cell {
+    width: 100%;
+    display: grid;
+    grid-template-columns: 78px minmax(0, 1fr);
+    align-items: start;
+    gap: 8px;
+  }
+  .job-meta-cell > * { min-width: 0; }
+  .job-reason-value { white-space: normal; overflow-wrap: anywhere; }
+  .job-updated-cell { justify-self: stretch; text-align: left; }
+  .event-row {
+    grid-template-columns: auto minmax(0, 1fr);
+    grid-template-areas: "time level" "message message";
+    align-items: start;
+    gap: 6px 10px;
+    padding: 10px 12px;
+  }
+  .event-time { grid-area: time; }
+  .event-level { grid-area: level; }
+  .event-message { grid-area: message; }
   .comparison-grid { grid-template-columns: minmax(0, 1fr) !important; }
   .comparison-grid > .r { justify-self: stretch; }
 }
@@ -698,8 +751,8 @@ progress::-moz-progress-bar { background: var(--accent-solid); border-radius: 99
   .mt { font-size: .82rem; }
   .metric-grid { grid-template-columns: 1fr 1fr; }
   .cue-button { grid-template-columns: minmax(0, 1fr); gap: 4px; }
-  .event-row { grid-template-columns: 82px minmax(0, 1fr); }
-  .event-row > span:last-child { grid-column: 1 / -1; }
+  .jobs-table .job-table-row { padding: 11px 10px; }
+  .job-meta-cell { grid-template-columns: 72px minmax(0, 1fr); }
   .job-title { max-width: 100%; order: 3; width: 100%; }
   .path-rule-item { grid-template-columns: minmax(0, 1fr); }
   .path-rule-actions { justify-content: flex-start; }
