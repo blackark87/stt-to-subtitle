@@ -79,6 +79,11 @@ export type DependencyStatus = DependencyState | string;
 export interface DashboardPayload {
   state_counts: Record<string, number>;
   phase_counts: Record<string, number>;
+  completion_counts: {
+    audio: number;
+    transcription: number;
+    subtitle: number;
+  };
   recent_jobs: PipelineJob[];
   active_jobs: PipelineJob[];
   attention_jobs: PipelineJob[];
@@ -250,6 +255,7 @@ export const api = {
     offset?: number;
     state?: readonly string[];
     phase?: readonly string[];
+    operation?: readonly string[];
     reasonCode?: readonly string[];
   } = {}) => {
     const query = new URLSearchParams();
@@ -257,6 +263,7 @@ export const api = {
     if (params.offset != null) query.set("offset", String(params.offset));
     for (const value of params.state ?? []) query.append("state", value);
     for (const value of params.phase ?? []) query.append("phase", value);
+    for (const value of params.operation ?? []) query.append("operation", value);
     for (const value of params.reasonCode ?? []) query.append("reason_code", value);
     const suffix = query.toString();
     return request<ListPayload<PipelineJob>>(`/jobs${suffix ? `?${suffix}` : ""}`);

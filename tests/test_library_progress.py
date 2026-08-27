@@ -55,6 +55,41 @@ class LibraryProgressTests(unittest.TestCase):
 
         self.assertEqual(len(summarize_library_progress(entries, {}, limit=5)), 5)
 
+    def test_transcription_completion_is_not_subtitle_completion(self) -> None:
+        entries = [
+            {
+                "name": "작업 배우",
+                "path": "av/japan/actor",
+                "image_path": None,
+                "media": [
+                    {"path": "transcribed.mp4", "has_subtitle": False},
+                    {"path": "subtitled.mp4", "has_subtitle": False},
+                ],
+            }
+        ]
+        latest_jobs = {
+            "transcribed.mp4": SimpleNamespace(
+                state="done",
+                status="transcription_completed",
+            ),
+            "subtitled.mp4": SimpleNamespace(
+                state="done",
+                status="completed",
+            ),
+        }
+
+        summary = summarize_library_progress(entries, latest_jobs)[0]
+
+        self.assertEqual(summary["done"], 1)
+        self.assertEqual(summary["remaining"], 1)
+        self.assertEqual(
+            summary["segments"],
+            [
+                {"state": "done", "percent": 50.0},
+                {"state": "unprocessed", "percent": 50.0},
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

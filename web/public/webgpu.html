@@ -107,7 +107,8 @@
       <a class="b hold dot" href="/jobs?state=blocked">중단 <span data-count="blocked">0</span></a>
       <a class="b hold dot" href="/jobs?state=stopped">정지 <span data-count="stopped">0</span></a>
       <a class="b bad dot" href="/jobs?state=failed">실패 <span data-count="failed">0</span></a>
-      <a class="b ok dot" href="/jobs?state=done">완료 <span data-count="completed">0</span></a>
+      <a class="b ok dot" href="/jobs?state=done&amp;operation=transcribe">전사 완료 <span data-count="transcription-completed">0</span></a>
+      <a class="b ok dot" href="/jobs?state=done&amp;operation=translate&amp;operation=full">자막 완료 <span data-count="subtitle-completed">0</span></a>
     </span>
     <span id="data-status" class="b hold dot" style="margin-left: auto">데이터 확인 중</span>
     <span id="renderer-status" class="b hold dot">렌더러 확인 중</span>
@@ -125,7 +126,7 @@
     <label class="layer"><input type="checkbox" data-layer="blocked" checked><span class="sw" style="background: var(--hold)"></span>중단</label>
     <label class="layer"><input type="checkbox" data-layer="stopped" checked><span class="sw" style="background: var(--muted)"></span>정지</label>
     <label class="layer"><input type="checkbox" data-layer="failed" checked><span class="sw" style="background: var(--bad)"></span>실패</label>
-    <label class="layer"><input type="checkbox" data-layer="done" checked><span class="sw" style="background: var(--ok)"></span>완료</label>
+    <label class="layer"><input type="checkbox" data-layer="done" checked><span class="sw" style="background: var(--ok)"></span>자막 완료</label>
   </aside>
 
   <div class="side">

@@ -19,7 +19,7 @@
     transcription: "전사",
     translation: "번역",
     render: "렌더",
-    complete: "완료",
+    complete: "작업 종료",
   };
   const STATE_LABEL = {
     running: "진행 중",
@@ -42,6 +42,15 @@
     transcription_merge: "전사 결과 병합",
     subtitle_normalization: "자막 구간 구성",
   };
+  const COMPLETION_LABEL = {
+    audio_completed: "음원 추출 완료",
+    transcription_completed: "전사 완료",
+    completed: "자막 완료",
+  };
+
+  const statusLabel = (job) => job.state === "done"
+    ? COMPLETION_LABEL[job.status] || "작업 완료"
+    : STATE_LABEL[job.state] || job.state;
 
   const percent = (job) => {
     if (job.phase === "transcription") {
@@ -61,8 +70,8 @@
     phase: PHASE_LABEL[job.phase] || job.phase,
     stage: PHASE_LABEL[job.phase] || job.phase,
     state: job.state,
-    status: STATE_LABEL[job.state] || job.state,
-    status_label: STATE_LABEL[job.state] || job.state,
+    status: statusLabel(job),
+    status_label: statusLabel(job),
     reason_code: job.reason_code,
     error: job.error || "",
     detail: [
@@ -71,7 +80,7 @@
         ? TRANSCRIPTION_STAGE_LABEL[job.transcription_stage] || job.transcription_stage
         : null,
       job.stt_runtime_id ? `전사 서버 ${runtimeNames.get(job.stt_runtime_id) || job.stt_runtime_id}` : null,
-      STATE_LABEL[job.state] || job.state,
+      statusLabel(job),
     ].filter(Boolean).join(" · "),
     percent: percent(job),
     href: `/jobs/${encodeURIComponent(job.id)}`,
@@ -91,8 +100,9 @@
   const build = (payload, mediaPayload = null, runtimesPayload = null) => {
     const activeJobs = payload.active_jobs || payload.recent_jobs || [];
     const recentCompleted = payload.recent_completed
-      || (payload.recent_jobs || []).filter((job) => job.state === "done");
+      || (payload.recent_jobs || []).filter((job) => job.status === "completed");
     const counts = payload.state_counts || {};
+    const completionCounts = payload.completion_counts || {};
     const stateSamples = payload.state_samples || {};
     const runtimeNames = new Map(
       (runtimesPayload?.items || []).map((runtime) => [runtime.id, runtime.name]),
@@ -126,7 +136,7 @@
 
     return {
       rendering: renderingJob ? {
-        endpoint: "완료",
+        endpoint: "자막 완료",
         source_rel: renderingJob.source_rel,
         display_label: "렌더 중",
         detail: "자막 파일을 생성하고 있습니다.",
@@ -189,7 +199,7 @@
       })),
       stopped_rest: Math.max(0, (counts.stopped || stopped.length) - LIMIT),
       completed: completed.slice(0, LIMIT),
-      completed_total: counts.done || completed.length,
+      completed_total: completionCounts.subtitle ?? completed.length,
       media_tree: mediaFolders.slice(0, MEDIA_LIMIT).map((folder) => ({
         path: folder.path,
         label: folder.display_name || folder.name || folder.path,
@@ -206,9 +216,15 @@
   const value = (number, unit = "") => Number.isFinite(number) ? `${Math.round(number)}${unit}` : "—";
   const paint = (payload) => {
     const counts = payload.state_counts || {};
+    const completionCounts = payload.completion_counts || {};
     for (const node of document.querySelectorAll("[data-count]")) {
       const key = node.dataset.count;
-      node.textContent = String(key === "completed" ? (counts.done || 0) : (counts[key] || 0));
+      const value = key === "transcription-completed"
+        ? completionCounts.transcription
+        : key === "subtitle-completed"
+          ? completionCounts.subtitle
+          : counts[key];
+      node.textContent = String(value || 0);
     }
 
     const snapshot = payload.gpu;
@@ -265,7 +281,7 @@
   };
 
   window.__SCENE_DATA_READY__ = load().catch((reason) => {
-    window.__SCENE_DATA__ = build({ active_jobs: [], recent_completed: [], state_counts: {}, gpu: null });
+    window.__SCENE_DATA__ = build({ active_jobs: [], recent_completed: [], state_counts: {}, completion_counts: {}, gpu: null });
     const state = document.getElementById("data-status");
     if (state) {
       state.textContent = "Backend 연결 실패";

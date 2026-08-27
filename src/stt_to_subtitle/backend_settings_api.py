@@ -58,6 +58,11 @@ def dashboard(request: Request) -> dict[str, Any]:
         JobState.STOPPED,
         JobState.FAILED,
     )
+    completion_statuses = {
+        "audio": "audio_completed",
+        "transcription": "transcription_completed",
+        "subtitle": "completed",
+    }
     return {
         "state_counts": {
             state.value: service.store.count_jobs(
@@ -72,6 +77,13 @@ def dashboard(request: Request) -> dict[str, Any]:
                 include_comparison_transcriptions=False,
             )
             for phase in JobPhase
+        },
+        "completion_counts": {
+            name: service.store.count_jobs(
+                statuses={completion_status},
+                include_comparison_transcriptions=False,
+            )
+            for name, completion_status in completion_statuses.items()
         },
         "recent_jobs": jobs_payload(
             service.store.list_jobs(
@@ -88,7 +100,7 @@ def dashboard(request: Request) -> dict[str, Any]:
         ),
         "recent_completed": jobs_payload(
             service.store.list_jobs(
-                states={JobState.DONE.value},
+                statuses={completion_statuses["subtitle"]},
                 limit=10,
                 include_comparison_transcriptions=False,
             )

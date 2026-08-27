@@ -6,7 +6,6 @@ import { Icon } from "@/components/Icon";
 import { Freshness } from "@/components/Freshness";
 import { api } from "@/lib/api";
 import {
-  STATE_LABEL,
   asJobState,
   canPauseTranslation,
   canResumeTranslation,
@@ -17,7 +16,7 @@ import {
   type JobState,
 } from "@/lib/domain";
 import { clock, fileName, parentPath, percent } from "@/lib/format";
-import { EVENT_LEVEL_LABEL, eventText, jobProgressLabel } from "@/lib/jobPresentation";
+import { EVENT_LEVEL_LABEL, eventText, jobProgressLabel, jobStateLabel } from "@/lib/jobPresentation";
 import { useLiveQuery } from "@/lib/useLiveQuery";
 
 const INTERVAL_MS = 5000;
@@ -82,6 +81,7 @@ export default function JobDetailPage({ params }: { params: Promise<{ id: string
   const assignedRuntime = job?.stt_runtime_id
     ? runtimeNames.get(job.stt_runtime_id) ?? job.stt_runtime_id
     : null;
+  const stateText = job ? jobStateLabel(job) : null;
 
   const artifactVersion = `${id}:${job?.updated_at ?? "pending"}`;
   const [artifactResult, setArtifactResult] = useState<ArtifactResult | null>(null);
@@ -185,7 +185,7 @@ export default function JobDetailPage({ params }: { params: Promise<{ id: string
           <h1>{job ? fileName(job.source_rel) : "작업 상세"}</h1>
           <p>{job ? parentPath(job.source_rel) : "작업 정보를 불러오는 중입니다."}</p>
         </div>
-        {state ? <span className={BADGE_CLASS[state]}>{STATE_LABEL[state]}</span> : null}
+        {state && stateText ? <span className={BADGE_CLASS[state]}>{stateText}</span> : null}
         <span className="topbar-spacer" />
         <Freshness status={status} updatedAt={updatedAt} error={error} refreshing={refreshing} />
       </header>
@@ -229,7 +229,7 @@ export default function JobDetailPage({ params }: { params: Promise<{ id: string
             <div>
               <span className="eyebrow">현재 작업 진행</span>
               <strong>{job ? jobProgressLabel(job) : "확인 중"}</strong>
-              {job ? <span className="muted">작업 종류: {operationLabel(job.operation)} · 상태: {state ? STATE_LABEL[state] : job.state}</span> : null}
+              {job ? <span className="muted">작업 종류: {operationLabel(job.operation)} · 상태: {stateText}</span> : null}
               {assignedRuntime ? <span className="muted">전사 서버: {assignedRuntime} <span className="code">({job?.stt_runtime_id})</span></span> : null}
               {job?.reason_code ? <span className="reason-text" title={reasonLabel(job.reason_code) ?? undefined}>{reasonLabel(job.reason_code)}</span> : null}
             </div>

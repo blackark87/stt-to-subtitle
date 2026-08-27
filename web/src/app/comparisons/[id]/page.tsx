@@ -5,8 +5,9 @@ import { use, useCallback, useEffect, useMemo, useState, type CSSProperties } fr
 import { Freshness } from "@/components/Freshness";
 import { Icon } from "@/components/Icon";
 import { api, type PipelineJob } from "@/lib/api";
-import { STATE_LABEL, asJobState, canRetryJob } from "@/lib/domain";
+import { asJobState, canRetryJob } from "@/lib/domain";
 import { fileName } from "@/lib/format";
+import { jobStateLabel } from "@/lib/jobPresentation";
 import { useLiveQuery } from "@/lib/useLiveQuery";
 
 const INTERVAL_MS = 10000;
@@ -101,11 +102,10 @@ export default function ComparisonDetailPage({ params }: { params: Promise<{ id:
           </div>
           <div className="comparison-summary">
             {jobs.map((job) => {
-              const jobState = asJobState(job.state);
               return (
                 <Link href={`/jobs/${encodeURIComponent(job.id)}`} className="comparison-engine" key={job.id}>
                   <span className="eyebrow">{engine(job)}</span>
-                  <strong>{jobState ? STATE_LABEL[jobState] : job.state}</strong>
+                  <strong>{jobStateLabel(job)}</strong>
                   <span>{transcripts[job.id]?.length ?? 0}개 구간</span>
                 </Link>
               );

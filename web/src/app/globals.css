@@ -482,7 +482,7 @@ progress::-moz-progress-bar { background: var(--accent-solid); border-radius: 99
 
 /* 대시보드 */
 .dashboard-content { gap: 16px; }
-.summary-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+.summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; }
 .summary-card {
   min-width: 0;
   display: grid;
@@ -500,6 +500,7 @@ progress::-moz-progress-bar { background: var(--accent-solid); border-radius: 99
 .summary-card:hover { border-color: var(--accent-line); box-shadow: 0 0 0 3px var(--accent-08); }
 .summary-card.running > strong { color: var(--accent); }
 .summary-card.waiting > strong { color: var(--warn); }
+.summary-card.hold > strong { color: var(--hold); }
 .summary-card.attention { border-color: var(--bad-line); background: var(--bad-14); }
 .summary-card.attention > strong { color: var(--bad); }
 .summary-card.complete > strong { color: var(--ok); }
@@ -524,7 +525,7 @@ progress::-moz-progress-bar { background: var(--accent-solid); border-radius: 99
 .job-state-line { align-self: stretch; border-radius: 0 4px 4px 0; background: var(--line-strong); }
 .job-state-line.running { background: var(--accent-solid); }
 .job-state-line.failed { background: var(--bad); }
-.job-state-line.stopped { background: var(--hold); }
+.job-state-line.paused, .job-state-line.blocked, .job-state-line.stopped { background: var(--hold); }
 .job-state-line.complete { background: var(--ok); }
 .job-progress { display: grid; grid-template-columns: 1fr 38px; align-items: center; gap: 7px; font-size: .75rem; text-align: right; }
 .job-row > time { color: var(--muted); font-size: .76rem; text-align: right; }

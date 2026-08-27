@@ -1547,7 +1547,7 @@ function setDetail(u) {
                 paused: "b hold dot", blocked: "b hold dot", stopped: "b hold dot",
                 failed: "b bad dot", idle: "b hold dot",
                 start: "b ok dot", dir: "b" }[u.kind] || "b";
-  const name = { job: "진행 중", queue: "대기", done: "완료",
+  const name = { job: "진행 중", queue: "대기", done: "자막 완료",
                  paused: u.status || "일시 정지", blocked: u.status || "중단",
                  stopped: "정지", failed: u.status || "실패",
                  idle: "유휴", start: "시작 지점", dir: "디렉터리" }[u.kind];

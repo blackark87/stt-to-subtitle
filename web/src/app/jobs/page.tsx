@@ -8,6 +8,8 @@ import { Freshness } from "@/components/Freshness";
 import { api } from "@/lib/api";
 import {
   JOB_PHASES,
+  JOB_OPERATIONS,
+  OPERATION_LABEL,
   PHASE_LABEL,
   STATE_LABEL,
   STATE_ORDER,
@@ -17,10 +19,11 @@ import {
   canStopJob,
   reasonLabel,
   type JobPhase,
+  type JobOperation,
   type JobState,
 } from "@/lib/domain";
 import { clock, fileName, parentPath } from "@/lib/format";
-import { jobProgressLabel } from "@/lib/jobPresentation";
+import { jobStateLabel } from "@/lib/jobPresentation";
 import { useLiveQuery } from "@/lib/useLiveQuery";
 
 const JOBS_INTERVAL_MS = 5000;
@@ -58,6 +61,10 @@ export default function JobsPage() {
     searchParams.getAll("phase").filter((value): value is JobPhase => JOB_PHASES.includes(value as JobPhase)),
     [searchParams],
   );
+  const operationFilter = useMemo(() =>
+    searchParams.getAll("operation").filter((value): value is JobOperation => JOB_OPERATIONS.includes(value as JobOperation)),
+    [searchParams],
+  );
   const [selected, setSelected] = useState<ReadonlySet<string>>(new Set());
   const [busy, setBusy] = useState(false);
   const [limit, setLimit] = useState(20);
@@ -68,8 +75,9 @@ export default function JobsPage() {
       limit,
       state: stateFilter.length ? stateFilter : undefined,
       phase: phaseFilter.length ? phaseFilter : undefined,
+      operation: operationFilter.length ? operationFilter : undefined,
     }),
-    [limit, phaseFilter, stateFilter],
+    [limit, operationFilter, phaseFilter, stateFilter],
   );
   const { data, status, error, updatedAt, refreshing, refresh } = useLiveQuery(fetcher, JOBS_INTERVAL_MS);
   const runtimes = useLiveQuery(useCallback(() => api.runtimes(), []), 60000);
@@ -79,7 +87,7 @@ export default function JobsPage() {
     [runtimes.data?.items],
   );
 
-  const setFilter = (key: "state" | "phase", next: readonly string[]) => {
+  const setFilter = (key: "state" | "phase" | "operation", next: readonly string[]) => {
     const params = new URLSearchParams(searchParams.toString());
     params.delete(key);
     next.forEach((value) => params.append(key, value));
@@ -92,6 +100,7 @@ export default function JobsPage() {
     const params = new URLSearchParams(searchParams.toString());
     params.delete("state");
     params.delete("phase");
+    params.delete("operation");
     params.delete("reason_code");
     const suffix = params.toString();
     router.replace(suffix ? `/jobs?${suffix}` : "/jobs", { scroll: false });
@@ -99,7 +108,7 @@ export default function JobsPage() {
     setLimit(20);
   };
 
-  const activeFilterCount = stateFilter.length + phaseFilter.length;
+  const activeFilterCount = stateFilter.length + phaseFilter.length + operationFilter.length;
 
   const selectedJobs = useMemo(
     () => jobs.filter((job) => selected.has(job.id)),
@@ -163,6 +172,18 @@ export default function JobsPage() {
           <div className="card-body">
             <div className="job-filter-stack">
               <div className="job-filter-row">
+                <strong>작업 종류</strong>
+                <div className="rail">
+                  {JOB_OPERATIONS.map((operation) => {
+                    const on = operationFilter.includes(operation);
+                    return <button key={operation} type="button" aria-pressed={on} className={on ? "chip on" : "chip"} onClick={() => {
+                      setSelected(new Set());
+                      setFilter("operation", on ? operationFilter.filter((value) => value !== operation) : [...operationFilter, operation]);
+                    }}>{OPERATION_LABEL[operation]}</button>;
+                  })}
+                </div>
+              </div>
+              <div className="job-filter-row">
                 <strong>처리 단계</strong>
                 <div className="rail">
                   {JOB_PHASES.map((phase) => {
@@ -182,7 +203,7 @@ export default function JobsPage() {
                     return <button key={state} type="button" aria-pressed={on} className={on ? "chip on" : "chip"} onClick={() => {
                       setSelected(new Set());
                       setFilter("state", on ? stateFilter.filter((value) => value !== state) : [...stateFilter, state]);
-                    }}>{STATE_LABEL[state]}</button>;
+                    }}>{state === "done" ? "종료된 작업" : STATE_LABEL[state]}</button>;
                   })}
                 </div>
               </div>
@@ -252,11 +273,7 @@ export default function JobsPage() {
                     ? runtimeNames.get(job.stt_runtime_id) ?? job.stt_runtime_id
                     : null;
                   const phase = PHASE_LABEL[job.phase as JobPhase] ?? job.phase;
-                  const stateText = state === "done"
-                    ? jobProgressLabel(job)
-                    : state
-                      ? STATE_LABEL[state]
-                      : job.state;
+                  const stateText = jobStateLabel(job);
                   return (
                     <div
                       key={job.id}

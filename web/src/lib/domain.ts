@@ -95,7 +95,7 @@ export const PHASE_LABEL: Record<JobPhase, string> = {
   transcription: "전사",
   translation: "번역",
   render: "자막 생성",
-  complete: "완료",
+  complete: "작업 종료",
 };
 
 export const OPERATION_LABEL: Record<JobOperation, string> = {

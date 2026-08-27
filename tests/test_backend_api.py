@@ -104,6 +104,10 @@ class BackendAPIBoundaryTests(unittest.TestCase):
         self.assertEqual(dashboard.json()["attention_jobs"], [])
         self.assertEqual(dashboard.json()["recent_completed"], [])
         self.assertEqual(
+            dashboard.json()["completion_counts"],
+            {"audio": 0, "transcription": 0, "subtitle": 0},
+        )
+        self.assertEqual(
             dashboard.json()["state_samples"],
             {
                 "waiting": [],
@@ -160,6 +164,54 @@ class BackendAPIBoundaryTests(unittest.TestCase):
         self.assertEqual(
             len(dashboard.json()["state_samples"]["stopped"]),
             3,
+        )
+
+    def test_dashboard_separates_terminal_operation_counts(self) -> None:
+        from fastapi.testclient import TestClient
+
+        from stt_to_subtitle.backend_api import create_backend_app
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            settings = BackendSettings(
+                state_dir=root / "state",
+                media_root=media_root,
+                stt_base_url="http://runtime:8100",
+                stt_token="",
+                lm_base_url="",
+                lm_token="",
+                lm_model="",
+            )
+            with TestClient(create_backend_app(settings)) as client:
+                service = client.app.state.orchestrator
+                completed_jobs = (
+                    ("audio", "extract", "audio_completed"),
+                    ("transcription", "transcribe", "transcription_completed"),
+                    ("subtitle", "full", "completed"),
+                )
+                for job_id, operation, completion_status in completed_jobs:
+                    job = service.store.create(
+                        job_id=job_id,
+                        source_rel=f"{job_id}.mkv",
+                        force_overwrite=False,
+                        options={},
+                        operation=operation,
+                    )
+                    service.store.update(job.id, status=completion_status)
+                dashboard = client.get("/api/v1/dashboard")
+
+        payload = dashboard.json()
+        self.assertEqual(dashboard.status_code, 200)
+        self.assertEqual(payload["state_counts"]["done"], 3)
+        self.assertEqual(
+            payload["completion_counts"],
+            {"audio": 1, "transcription": 1, "subtitle": 1},
+        )
+        self.assertEqual(
+            [job["id"] for job in payload["recent_completed"]],
+            ["subtitle"],
         )
 
     def test_manages_external_runtime_without_exposing_its_token(self) -> None:

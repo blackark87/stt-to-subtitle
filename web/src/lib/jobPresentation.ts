@@ -40,9 +40,15 @@ function stateName(value: unknown): string {
     translated: "자막 생성 대기",
     transcription_completed: "전사 완료",
     audio_completed: "음원 추출 완료",
-    completed: "완료",
+    completed: "자막 완료",
   };
   return legacy[raw] ?? "저장된 중간 지점";
+}
+
+export function jobStateLabel(job: PipelineJob): string {
+  if (job.state === "done") return operationCompletionLabel(job.operation);
+  const state = asJobState(job.state);
+  return state ? STATE_LABEL[state] : job.state;
 }
 
 function runtimeName(
@@ -80,7 +86,7 @@ function genericMessage(message: string): string {
 }
 
 export function jobProgressLabel(job: PipelineJob): string {
-  if (job.state === "done") return operationCompletionLabel(job.operation);
+  if (job.state === "done") return jobStateLabel(job);
   const phase = phaseName(job.phase);
   if (job.phase !== "transcription") return phase;
   const stage = transcriptionStageLabel(job.transcription_stage);

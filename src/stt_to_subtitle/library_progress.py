@@ -31,7 +31,8 @@ def summarize_library_progress(
             source = str(media.get("path", ""))
             job = latest_jobs.get(source)
             state = str(getattr(job, "state", "")) if job is not None else ""
-            if bool(media.get("has_subtitle")) or state == "done":
+            status = str(getattr(job, "status", "")) if job is not None else ""
+            if bool(media.get("has_subtitle")) or status == "completed":
                 counts["done"] += 1
             elif state in ATTENTION_STATES:
                 counts["attention"] += 1

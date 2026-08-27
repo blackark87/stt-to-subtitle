@@ -20,8 +20,16 @@ import { clock, elapsed, fileName, parentPath, percent } from "@/lib/format";
 import { useLiveQuery } from "@/lib/useLiveQuery";
 
 const DASHBOARD_INTERVAL_MS = 5000;
-const ATTENTION: JobState[] = ["blocked", "failed", "paused", "stopped"];
 const PIPELINE_PHASES = JOB_PHASES.filter((phase) => phase !== "complete");
+const INTERRUPTED_STATES: readonly {
+  state: Extract<JobState, "paused" | "blocked" | "stopped" | "failed">;
+  description: string;
+}[] = [
+  { state: "paused", description: "재개를 기다리는 번역 작업" },
+  { state: "blocked", description: "외부 조건으로 중단된 작업" },
+  { state: "stopped", description: "사용자가 정지한 작업" },
+  { state: "failed", description: "오류로 실패한 작업" },
+];
 
 const BADGE_CLASS: Record<JobState, string> = {
   running: "b run dot",
@@ -42,7 +50,7 @@ const LIBRARY_SEGMENT_CLASS: Record<LibraryProgressSegment["state"], string> = {
 };
 
 const LIBRARY_SEGMENT_LABEL: Record<LibraryProgressSegment["state"], string> = {
-  done: "완료",
+  done: "자막 완료",
   running: "진행 중",
   waiting: "대기",
   attention: "확인 필요",
@@ -133,12 +141,13 @@ export default function DashboardPage() {
   const active = data?.active_jobs ?? data?.recent_jobs ?? [];
   const running = active.filter((job) => job.state === "running");
   const waiting = active.filter((job) => job.state === "waiting");
-  const attention = data?.attention_jobs
-    ?? active.filter((job) => ATTENTION.includes(job.state as JobState));
-  const completed = data?.recent_completed ?? (data?.recent_jobs ?? []).filter((job) => job.state === "done");
+  const completed = data?.recent_completed ?? (data?.recent_jobs ?? []).filter((job) => job.status === "completed");
   const counts = data?.state_counts ?? {};
-  const attentionTotal = ATTENTION.reduce((sum, state) => sum + (counts[state] ?? 0), 0);
-  const visibleAttention = attention.slice(0, 10);
+  const completionCounts = data?.completion_counts ?? {
+    audio: 0,
+    transcription: 0,
+    subtitle: 0,
+  };
   const visibleCompleted = completed.slice(0, 10);
   const gpu = data?.gpu ?? null;
   const runtimeNames = useMemo(
@@ -195,11 +204,22 @@ export default function DashboardPage() {
           <Link href="/jobs?state=waiting" className="summary-card waiting">
             <span>대기</span><strong>{counts.waiting ?? 0}</strong><small>처리를 기다리는 작업</small>
           </Link>
-          <Link href="/jobs?state=blocked&state=failed&state=paused&state=stopped" className={attentionTotal ? "summary-card attention" : "summary-card"}>
-            <span>확인 필요</span><strong>{attentionTotal}</strong><small>중단·실패·일시 정지</small>
+          {INTERRUPTED_STATES.map(({ state: interruptedState, description }) => (
+            <Link
+              href={`/jobs?state=${interruptedState}`}
+              className={interruptedState === "failed" ? "summary-card attention" : "summary-card hold"}
+              key={interruptedState}
+            >
+              <span>{STATE_LABEL[interruptedState]}</span>
+              <strong>{counts[interruptedState] ?? 0}</strong>
+              <small>{description}</small>
+            </Link>
+          ))}
+          <Link href="/jobs?state=done&operation=transcribe" className="summary-card complete">
+            <span>전사 완료</span><strong>{completionCounts.transcription}</strong><small>전사만 완료된 작업</small>
           </Link>
-          <Link href="/jobs?state=done" className="summary-card complete">
-            <span>완료</span><strong>{counts.done ?? 0}</strong><small>누적 완료 작업</small>
+          <Link href="/jobs?state=done&operation=translate&operation=full" className="summary-card complete">
+            <span>자막 완료</span><strong>{completionCounts.subtitle}</strong><small>번역·자막 생성 완료</small>
           </Link>
         </section>
 
@@ -262,43 +282,55 @@ export default function DashboardPage() {
               </div>
             </section>
 
-            <section className="card attention-card" aria-labelledby="attention-title">
-                <div className="card-head">
-                  <div><h2 id="attention-title">확인 필요</h2><span className="sub" title={`최근 ${visibleAttention.length}건 · 전체 ${attentionTotal}건`}>최근 {visibleAttention.length}건 · 전체 {attentionTotal}건</span></div>
-                  <Link href="/jobs?state=blocked&state=failed&state=paused&state=stopped" className="text-link">전체 보기<Icon name="chevron_right" size={13} /></Link>
-                </div>
-                <div className="card-body flush">
-                  {visibleAttention.length === 0 ? (
-                    <div className="empty-state compact"><strong>확인이 필요한 작업이 없습니다</strong></div>
-                  ) : <div className="job-list">
-                    {visibleAttention.map((job) => {
-                      const jobState = asJobState(job.state);
-                      const reason = reasonLabel(job.reason_code) ?? job.error ?? "원인 정보 없음";
-                      return (
-                        <div className="job-row attention-row" key={job.id}>
-                          <span className={`job-state-line ${jobState === "failed" ? "failed" : "stopped"}`} />
-                          <span className="t-name" title={job.source_rel}><b><Link href={`/jobs/${encodeURIComponent(job.id)}`}>{fileName(job.source_rel)}</Link></b><span>{PHASE_LABEL[job.phase as JobPhase] ?? job.phase} · {clock(job.updated_at)}</span></span>
-                          <span className={jobState ? BADGE_CLASS[jobState] : "b"}>{jobState ? STATE_LABEL[jobState] : job.state}</span>
-                          <span className="reason-text" title={reason}>{reason}</span>
-                          <span className="btns">
-                            {canResumeTranslation(jobState) ? <button type="button" className="btn sec sm" disabled={actingId != null} onClick={() => void act(job.id, () => api.resumeTranslation(job.id))}><Icon name="play" size={13} />재개</button> : null}
-                            {canRetryJob(jobState) ? <button type="button" className="btn sec sm" disabled={actingId != null} onClick={() => void act(job.id, () => api.retryJob(job.id))}><Icon name="refresh" size={13} />재시도</button> : null}
-                            {canRetryJob(jobState) ? <button type="button" className="btn dgr sm" disabled={actingId != null} onClick={() => {
-                              if (!window.confirm(`${fileName(job.source_rel)} 기록을 삭제할까요?`)) return;
-                              void act(job.id, () => api.deleteJob(job.id));
-                            }}><Icon name="trash" size={13} />삭제</button> : null}
-                          </span>
-                        </div>
-                      );
-                    })}
-                  </div>}
-                </div>
-              </section>
+            {INTERRUPTED_STATES.map(({ state: interruptedState, description }) => {
+              const interruptedJobs = data?.state_samples?.[interruptedState]
+                ?? active.filter((job) => job.state === interruptedState).slice(0, 3);
+              const interruptedTotal = counts[interruptedState] ?? 0;
+              return (
+                <section className="card attention-card" aria-labelledby={`${interruptedState}-title`} key={interruptedState}>
+                  <div className="card-head">
+                    <div>
+                      <h2 id={`${interruptedState}-title`}>{STATE_LABEL[interruptedState]}</h2>
+                      <span className="sub" title={`${description} · 최근 ${interruptedJobs.length}건 · 전체 ${interruptedTotal}건`}>
+                        {description} · 최근 {interruptedJobs.length}건 · 전체 {interruptedTotal}건
+                      </span>
+                    </div>
+                    <Link href={`/jobs?state=${interruptedState}`} className="text-link">전체 보기<Icon name="chevron_right" size={13} /></Link>
+                  </div>
+                  <div className="card-body flush">
+                    {interruptedJobs.length === 0 ? (
+                      <div className="empty-state compact"><strong>{STATE_LABEL[interruptedState]} 작업이 없습니다</strong></div>
+                    ) : <div className="job-list">
+                      {interruptedJobs.map((job) => {
+                        const jobState = asJobState(job.state);
+                        const reason = reasonLabel(job.reason_code) ?? job.error ?? "상세 사유 없음";
+                        return (
+                          <div className="job-row attention-row" key={job.id}>
+                            <span className={`job-state-line ${interruptedState}`} />
+                            <span className="t-name" title={job.source_rel}><b><Link href={`/jobs/${encodeURIComponent(job.id)}`}>{fileName(job.source_rel)}</Link></b><span>{PHASE_LABEL[job.phase as JobPhase] ?? job.phase} · {clock(job.updated_at)}</span></span>
+                            <span className={jobState ? BADGE_CLASS[jobState] : "b"}>{jobState ? STATE_LABEL[jobState] : job.state}</span>
+                            <span className="reason-text" title={reason}>{reason}</span>
+                            <span className="btns">
+                              {canResumeTranslation(jobState) ? <button type="button" className="btn sec sm" disabled={actingId != null} onClick={() => void act(job.id, () => api.resumeTranslation(job.id))}><Icon name="play" size={13} />재개</button> : null}
+                              {canRetryJob(jobState) ? <button type="button" className="btn sec sm" disabled={actingId != null} onClick={() => void act(job.id, () => api.retryJob(job.id))}><Icon name="refresh" size={13} />재시도</button> : null}
+                              {canRetryJob(jobState) ? <button type="button" className="btn dgr sm" disabled={actingId != null} onClick={() => {
+                                if (!window.confirm(`${fileName(job.source_rel)} 기록을 삭제할까요?`)) return;
+                                void act(job.id, () => api.deleteJob(job.id));
+                              }}><Icon name="trash" size={13} />삭제</button> : null}
+                            </span>
+                          </div>
+                        );
+                      })}
+                    </div>}
+                  </div>
+                </section>
+              );
+            })}
 
             <section className="card" aria-labelledby="completed-title">
-              <div className="card-head"><div><h2 id="completed-title">최근 완료</h2><span className="sub" title={`최근 ${visibleCompleted.length}건 · 전체 ${counts.done ?? 0}건`}>최근 {visibleCompleted.length}건 · 전체 {counts.done ?? 0}건</span></div><Link href="/jobs?state=done" className="text-link">전체 보기<Icon name="chevron_right" size={13} /></Link></div>
+              <div className="card-head"><div><h2 id="completed-title">최근 자막 완료</h2><span className="sub" title={`최근 ${visibleCompleted.length}건 · 전체 ${completionCounts.subtitle}건`}>최근 {visibleCompleted.length}건 · 전체 {completionCounts.subtitle}건</span></div><Link href="/jobs?state=done&operation=translate&operation=full" className="text-link">전체 보기<Icon name="chevron_right" size={13} /></Link></div>
               <div className="card-body flush">
-                {completed.length === 0 ? <div className="empty-state compact"><strong>완료된 작업이 없습니다</strong></div> : (
+                {completed.length === 0 ? <div className="empty-state compact"><strong>자막이 완료된 작업이 없습니다</strong></div> : (
                   <div className="job-list">
                     {visibleCompleted.map((job) => (
                       <Link href={`/jobs/${encodeURIComponent(job.id)}`} className="job-row completed-row" key={job.id}>
@@ -386,7 +418,7 @@ export default function DashboardPage() {
                           ) : <span aria-hidden>{item.name.slice(0, 1)}</span>}
                         </span>
                         <span className="library-progress-copy">
-                          <span><strong title={item.name}>{item.name}</strong><small>{item.done} / {item.total} 완료</small></span>
+                          <span><strong title={item.name}>{item.name}</strong><small>{item.done} / {item.total} 자막 완료</small></span>
                           <span className="segbar" aria-label={`${item.name} 작업 진행 현황`}>
                             {item.segments.map((segment) => (
                               <i
