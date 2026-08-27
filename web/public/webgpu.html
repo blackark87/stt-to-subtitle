@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="ko" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script>
+  (() => {
+    const mobile3dMedia = window.matchMedia(
+      "(max-width: 820px), (hover: none) and (pointer: coarse)",
+    );
+    const switchTo2d = (event) => {
+      if (event.matches) window.location.replace("/?view=2d");
+    };
+    switchTo2d(mobile3dMedia);
+    if (typeof mobile3dMedia.addEventListener === "function") {
+      mobile3dMedia.addEventListener("change", switchTo2d);
+    } else {
+      mobile3dMedia.addListener(switchTo2d);
+    }
+  })();
+</script>
+<noscript><meta http-equiv="refresh" content="0;url=/?view=2d"></noscript>
+<title>3D 대시보드</title>
+<link rel="stylesheet" href="/webgpu.css">
+<style>
+  html, body { height: 100%; overflow: hidden; }
+
+  @media (max-width: 820px), (hover: none) and (pointer: coarse) {
+    html { visibility: hidden; }
+  }
+
+  /* 레퍼런스와 같은 구성 — 캔버스는 alpha:true 로 투명하고 하늘은 그 뒤 CSS 그라디언트다.
+     씬에 fog·background 를 두지 않으므로 원경이 탁해지지 않는다. */
+  #sky { position: fixed; inset: 0; z-index: 0;
+         background: linear-gradient(#8e9db8 0%, #b9c5d8 38%, #dbe3ee 72%, #e8edf4 100%); }
+  #scene { position: fixed; inset: 0; display: block; z-index: 1; cursor: grab;
+           touch-action: none; user-select: none; }
+  #scene.is-hovering { cursor: pointer; }
+  #scene.is-dragging { cursor: grabbing; }
+  #pins  { position: fixed; inset: 0; z-index: 2; pointer-events: none; overflow: hidden; }
+  .hud   { z-index: 3; }
+
+  /* 라벨은 three 스프라이트가 아니라 DOM 이다 — 한글이 캔버스 텍스처보다 훨씬 또렷하고
+     기기 폰트를 그대로 쓴다. 매 프레임 월드 좌표를 투영해 위치만 갱신한다. */
+  .pin { position: absolute; left: 0; top: 0; transform-origin: 50% 100%;
+         display: inline-flex; align-items: center; gap: 6px; white-space: nowrap;
+         padding: 4px 9px; border-radius: 999px;
+         font-size: .72rem; font-weight: 700; line-height: 1.25; color: #eaeef7;
+         background: rgba(12, 16, 25, .86); border: 1px solid rgba(255,255,255,.16);
+         box-shadow: 0 4px 14px rgba(0,0,0,.38);
+         transition: opacity .16s linear; }
+  .pin i { width: 7px; height: 7px; border-radius: 50%; flex: none; }
+  .pin .n { color: var(--muted); font-weight: 650; }
+  .pin.sm { font-size: .66rem; padding: 3px 8px; }
+  .pin[hidden] { display: none; }
+  .pin.off { opacity: 0; }
+  body.lbl-far .pin.sm { opacity: 0; }
+
+  .hud { position: fixed; inset: 0; pointer-events: none; display: grid;
+         grid-template-columns: 1fr 348px; grid-template-rows: auto 1fr auto; gap: 16px; padding: 16px; }
+  .hud > * { pointer-events: auto; }
+  .glass {
+    border: 1px solid color-mix(in srgb, var(--line) 70%, transparent);
+    border-radius: var(--r-lg);
+    background: color-mix(in srgb, var(--card) 72%, transparent);
+    backdrop-filter: blur(14px) saturate(1.2);
+    box-shadow: 0 10px 40px rgba(0,0,0,.45);
+  }
+
+  .topbar-hud { grid-column: 1 / -1; display: flex; align-items: center; gap: 12px; padding: 0 14px; min-height: 50px; }
+  .topbar-hud h1 { margin: 0; font-size: 1rem; font-weight: 750; }
+
+  .side { grid-column: 2; grid-row: 2 / 4; display: grid; gap: 12px; align-content: start;
+          overflow: auto; max-height: calc(100vh - 84px); scrollbar-width: thin; }
+
+  .foot { grid-column: 1; grid-row: 3; display: flex; align-items: center; gap: 10px;
+          padding: 0 12px; min-height: 42px; width: max-content; }
+
+  .layers { grid-column: 1; grid-row: 2; align-self: start; width: max-content; padding: 10px 12px; display: grid; gap: 8px; }
+  .layer { display: flex; align-items: center; gap: 9px; font-size: .82rem; font-weight: 650; cursor: pointer; }
+  .layer input { accent-color: var(--accent); width: 15px; height: 15px; }
+  .layer .sw { width: 10px; height: 10px; border-radius: 3px; }
+
+  #detail[hidden] { display: none; }
+  .phase-path { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: stretch; gap: 5px; min-width: 0; }
+  .endpoint-state { display: inline-flex; align-items: center; gap: 5px; min-width: 88px; border: 1px dashed var(--line); border-radius: var(--r-sm); padding: 5px 7px; color: var(--muted); font-size: .68rem; font-weight: 700; white-space: nowrap; }
+  .endpoint-state.done { border-style: solid; border-color: var(--ok-line); color: var(--ok); }
+  .endpoint-state.run { border-style: solid; border-color: var(--accent-line); background: var(--accent-subtle); color: var(--accent); }
+  .endpoint-state.fail { border-style: solid; border-color: var(--bad-line); color: var(--bad); }
+  .endpoint-state.hold { border-style: solid; border-color: var(--hold-line); color: var(--hold); }
+  @media (max-width: 820px) {
+    .hud { grid-template-columns: 1fr; gap: 8px; padding: 8px; }
+    .topbar-hud { flex-wrap: wrap; padding: 8px 10px; }
+    .topbar-hud .btns { order: 3; width: 100%; }
+    .side { grid-column: 1; grid-row: 2 / 4; width: min(330px, calc(100vw - 16px)); justify-self: end;
+            max-height: calc(100vh - 112px); }
+    .layers { grid-column: 1; grid-row: 2; }
+    .foot { display: none; }
+  }
+</style>
+</head>
+<body>
+<div id="sky"></div>
+<canvas id="scene"></canvas>
+<div id="pins"></div>
+
+<div class="hud">
+  <header class="glass topbar-hud">
+    <h1>대시보드</h1>
+    <span class="btns" style="gap: 5px; flex-wrap: wrap">
+      <span class="b run dot">진행 중 <span data-count="running">0</span></span>
+      <span class="b wait dot">대기 <span data-count="waiting">0</span></span>
+      <span class="b hold dot">일시 정지 <span data-count="paused">0</span></span>
+      <span class="b hold dot">중단 <span data-count="blocked">0</span></span>
+      <span class="b hold dot">정지 <span data-count="stopped">0</span></span>
+      <span class="b bad dot">실패 <span data-count="failed">0</span></span>
+      <span class="b ok dot">완료 <span data-count="completed">0</span></span>
+    </span>
+    <span id="backend" class="b hold dot" style="margin-left: auto">확인 중</span>
+    <a class="btn sec sm" href="/media">미디어 선택</a>
+    <button type="button" class="btn sec sm" id="refresh">새로고침</button>
+    <a class="btn sec sm" href="/?view=2d">2D 대시보드</a>
+  </header>
+
+  <aside class="glass layers">
+    <label class="layer"><input type="checkbox" data-layer="media" checked><span class="sw" style="background: #c9a98a"></span>미디어</label>
+    <label class="layer"><input type="checkbox" data-layer="stations" checked><span class="sw" style="background: var(--accent)"></span>파이프라인</label>
+    <label class="layer"><input type="checkbox" data-layer="queue" checked><span class="sw" style="background: var(--warn-strong)"></span>대기 큐</label>
+    <label class="layer"><input type="checkbox" data-layer="gpu" checked><span class="sw" style="background: #7dd3fc"></span>GPU</label>
+    <label class="layer"><input type="checkbox" data-layer="paused" checked><span class="sw" style="background: var(--hold)"></span>일시 정지</label>
+    <label class="layer"><input type="checkbox" data-layer="blocked" checked><span class="sw" style="background: var(--hold)"></span>중단</label>
+    <label class="layer"><input type="checkbox" data-layer="stopped" checked><span class="sw" style="background: var(--muted)"></span>정지</label>
+    <label class="layer"><input type="checkbox" data-layer="failed" checked><span class="sw" style="background: var(--bad)"></span>실패</label>
+    <label class="layer"><input type="checkbox" data-layer="done" checked><span class="sw" style="background: var(--ok)"></span>완료</label>
+  </aside>
+
+  <div class="side">
+    <section class="glass" id="detail" hidden>
+      <div class="card-head"><h2>선택</h2><span id="detail-badge" class="b"></span></div>
+      <div class="card-body" id="detail-body"></div>
+    </section>
+
+    
+      <section class="glass" id="phase-states">
+        <div class="card-head"><h2>진행 중 작업</h2></div>
+        <div class="card-body" style="display: grid; gap: 8px">
+          
+            <div class="pn inset" style="display: grid; gap: 7px">
+              <span style="display: flex; justify-content: space-between; gap: 8px">
+                <b class="t-name"></b>
+                <span class="sub"> · %</span>
+              </span>
+              <div class="phase-path">
+                <ol class="stages" style="grid-template-columns: repeat(, minmax(0, 1fr))" aria-label="처리 단계">
+                  
+                    
+                    <li class="st ">
+                      <span class="st-i" aria-hidden="true">✓●!Ⅱ·</span>
+                      <strong class="st-l"></strong>
+                      <span class="st-c"></span>
+                      <span class="bar"><i style="width: %"></i></span>
+                    </li>
+                  
+                </ol>
+                
+                  
+                  <span class="endpoint-state " title="작업 종료점">✓●· </span>
+                
+              </div>
+            </div>
+          
+          <span class="sub">외 건</span>
+        </div>
+      </section>
+    
+
+    <section class="glass">
+      <div class="card-head"><h2>GPU </h2><span class="sub code"></span></div>
+      
+        <div class="card-body">
+          <div class="pn inset" style="padding: 11px">
+            <span class="pn-l">사용률</span>
+            <span class="pn-v" style="font-size: 1.5rem"><small>%</small>—</span>
+            <div class="bar" style="margin-top: 7px"><i style="width: %"></i></div>
+          </div>
+          <div class="pn inset" style="padding: 11px; margin-top: 8px">
+            <span class="pn-l">메모리</span>
+            <span class="pn-v" style="font-size: 1.5rem"><small>%</small>—</span>
+            <span class="pn-d"> /  GiB</span>
+            <div class="bar" style="margin-top: 7px"><i style="width: %"></i></div>
+          </div>
+          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 8px">
+            <div class="pn inset"><span class="pn-l">온도</span><span class="pn-v" style="font-size: 1.1rem"><small>°C</small>—</span></div>
+            <div class="pn inset"><span class="pn-l">전력</span><span class="pn-v" style="font-size: 1.1rem"><small>W</small>—</span></div>
+          </div>
+        </div>
+      
+    </section>
+  </div>
+
+  <footer class="glass foot">
+    <button type="button" class="btn sec sm" id="reset">시점 초기화</button>
+  </footer>
+</div>
+
+<noscript><p class="glass" style="position: fixed; z-index: 5; left: 50%; top: 50%; transform: translate(-50%, -50%); padding: 16px">3D 대시보드에는 JavaScript가 필요합니다.</p></noscript>
+
+<script type="importmap">
+{ "imports": { "three": "/vendor/three.webgpu.min.js" } }
+</script>
+
+<script src="/webgpu-data.js"></script>
+<script type="module" src="/webgpu-scene.js"></script>
+</body>
+</html>

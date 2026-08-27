@@ -43,6 +43,6 @@ export function proxy(request: NextRequest) {
 export const config = {
   matcher: [
     // 정적 자산과 API 프록시, 헬스체크는 제외한다.
-    { source: "/((?!_next/static|_next/image|favicon.ico|healthz|api/).*)" },
+    { source: "/((?!_next/static|_next/image|favicon.ico|healthz|vendor/|webgpu|api/).*)" },
   ],
 };
