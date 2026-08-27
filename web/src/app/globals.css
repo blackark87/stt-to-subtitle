@@ -255,3 +255,47 @@ a { color: var(--accent); text-decoration: none; }
 .fresh.bad i { background: var(--bad); }
 /* 링크 초기화 (Next Link 가 a 를 그대로 낸다) */
 a.brand, .primary-nav a, .t-name a { text-decoration: none; }
+
+/* ===== 좁은 폭 대응 =====
+   시안은 1440px 고정 아트보드라 폭 기준 규칙이 없다. 그대로 옮기면
+   고정 열 합(예: 92+250+168)이 뷰포트를 넘는 순간 minmax(0,1fr) 인
+   작업 열이 0 으로 눌려 내용이 사라지고, 오른쪽 동작 열이 잘린다.
+   페이지의 인라인 grid-template-columns 를 이겨야 하므로 !important 를 쓴다. */
+
+/* 표는 카드 안에서 가로로 스크롤한다. 레이아웃 밖으로 밀어내지 않는다. */
+.card-body.flush { overflow-x: auto; }
+
+@media (max-width: 1100px) {
+  /* 단계 스트립은 자기 줄을 차지한다. */
+  .tr.tall { grid-template-columns: minmax(0, 1fr) 88px 116px !important; }
+  .tr.tall > .stages { grid-column: 1 / -1; grid-row: 2; }
+}
+
+@media (max-width: 860px) {
+  .app-shell { grid-template-columns: 1fr; }
+  .sidebar {
+    flex-direction: row;
+    align-items: center;
+    gap: 10px;
+    overflow-x: auto;
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+    padding: 8px 12px;
+  }
+  .sidebar .primary-nav { display: flex; gap: 4px; }
+  .sidebar-foot { margin-top: 0; margin-left: auto; }
+  .topbar { height: auto; flex-wrap: wrap; padding: 10px 14px; }
+  .content { padding: 14px; }
+
+  /* 모든 표를 셀 단위로 쌓는다. 머리글은 숨기고 셀마다 라벨을 보여준다. */
+  .tbl .tr { grid-template-columns: minmax(0, 1fr) !important; gap: 4px; }
+  .tbl .tr.head { display: none; }
+  .tbl .tr > .r { justify-self: start; text-align: left; }
+  .tr > .btns { justify-content: flex-start !important; }
+  .stages { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+@media (max-width: 620px) {
+  .stages { grid-template-columns: minmax(0, 1fr); }
+  .board { grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); }
+}
