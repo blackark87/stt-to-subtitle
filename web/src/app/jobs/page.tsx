@@ -20,6 +20,7 @@ import {
   type JobState,
 } from "@/lib/domain";
 import { clock, fileName, parentPath } from "@/lib/format";
+import { jobProgressLabel } from "@/lib/jobPresentation";
 import { useLiveQuery } from "@/lib/useLiveQuery";
 
 const JOBS_INTERVAL_MS = 5000;
@@ -141,9 +142,8 @@ export default function JobsPage() {
     <>
       <header className="topbar">
         <h1>작업 목록</h1>
-        <span style={{ marginLeft: "auto" }}>
-          <Freshness status={status} updatedAt={updatedAt} error={error} refreshing={refreshing} />
-        </span>
+        <span className="topbar-spacer" />
+        <Freshness status={status} updatedAt={updatedAt} error={error} refreshing={refreshing} />
         <button type="button" className="btn sec sm" disabled={refreshing} onClick={() => void refresh()}>
           <Icon name="refresh" size={14} />
           새로고침
@@ -192,15 +192,12 @@ export default function JobsPage() {
 
         <section className="card">
           <div className="card-head">
-            <div>
-              <h2>
-                작업
-                <span className="n" style={{ marginLeft: 7 }}>
-                  {data?.total ?? 0}
-                </span>
-              </h2>
-              <span className="sub" title={`20건 단위 · 현재 ${jobs.length}건 표시`}>20건 단위 · 현재 {jobs.length}건 표시</span>
-            </div>
+            <h2>
+              작업
+              <span className="n" style={{ marginLeft: 7 }}>
+                {data?.total ?? 0}
+              </span>
+            </h2>
             <span className="btns">
               <span className="selection-summary" aria-live="polite">{selectedJobs.length ? `${selectedJobs.length}건 선택` : "작업을 선택하세요"}</span>
               <button type="button" className="btn sec sm" disabled={!retryIds.length || busy} onClick={() => void run(retryIds, api.retryJobs)}>
@@ -240,7 +237,7 @@ export default function JobsPage() {
                 <span role="columnheader">작업</span>
                 <span role="columnheader">단계</span>
                 <span role="columnheader">사유</span>
-                <span role="columnheader" className="r">갱신</span>
+                <span role="columnheader" className="r">최근 변경</span>
               </div>
               {jobs.length === 0 ? (
                 <div className="tr empty" role="row" style={{ gridTemplateColumns: "minmax(0, 1fr)" }}>
@@ -255,9 +252,11 @@ export default function JobsPage() {
                     ? runtimeNames.get(job.stt_runtime_id) ?? job.stt_runtime_id
                     : null;
                   const phase = PHASE_LABEL[job.phase as JobPhase] ?? job.phase;
-                  const displayedPhase = job.phase === "transcription" && runtime
-                    ? `${phase} · ${runtime}`
-                    : phase;
+                  const stateText = state === "done"
+                    ? jobProgressLabel(job)
+                    : state
+                      ? STATE_LABEL[state]
+                      : job.state;
                   return (
                     <div
                       key={job.id}
@@ -272,14 +271,15 @@ export default function JobsPage() {
                           onChange={() => toggle(job.id)}
                           aria-label={`${fileName(job.source_rel)} 선택`}
                         /></span>
-                      <span role="cell" className={state ? BADGE_CLASS[state] : "b"} data-label="상태">
-                        {state ? STATE_LABEL[state] : job.state}
+                      <span role="cell" className={state ? BADGE_CLASS[state] : "b"} data-label="상태" title={stateText}>
+                        {stateText}
                       </span>
                       <div role="cell" className="t-name" data-label="작업" title={job.source_rel}>
                         <b><Link href={`/jobs/${encodeURIComponent(job.id)}`}>{fileName(job.source_rel)}</Link></b>
                         <span>{parentPath(job.source_rel)}</span>
+                        {runtime ? <span title={`전사 서버: ${runtime}`}>전사 서버 · {runtime}</span> : null}
                       </div>
-                      <span role="cell" className="b line" data-label="단계" title={displayedPhase}>{displayedPhase}</span>
+                      <span role="cell" className="b line" data-label="단계" title={phase}>{phase}</span>
                       <span
                         role="cell"
                         className="m"
@@ -289,7 +289,7 @@ export default function JobsPage() {
                       >
                         {reason}
                       </span>
-                      <span role="cell" className="r m" data-label="갱신" style={{ fontSize: ".78rem", color: "var(--muted)" }}>
+                      <span role="cell" className="r m" data-label="최근 변경" style={{ fontSize: ".78rem", color: "var(--muted)" }}>
                         {clock(job.updated_at)}
                       </span>
                     </div>
