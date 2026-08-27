@@ -47,6 +47,14 @@ export function AppShell({ children }: { children: ReactNode }) {
             );
           })}
         </nav>
+
+        {/* 3D 대시보드 전환. Next 라우터를 타지 않는 정적 페이지라 <a> 를 쓴다. */}
+        <div className="sidebar-foot">
+          <a className="btn sec sm" href="/webgpu.html" style={{ width: "100%", justifyContent: "flex-start" }}>
+            <Icon name="compare" size={15} />
+            3D 대시보드
+          </a>
+        </div>
       </aside>
 
       <div className="frame">{children}</div>

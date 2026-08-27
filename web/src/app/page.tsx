@@ -309,7 +309,15 @@ export default function DashboardPage() {
                           </span>
                           <div className="t-name">
                             <b>{fileName(job.source_rel)}</b>
-                            <span className="m">{parentPath(job.source_rel)}</span>
+                            {/* 어느 단계에서 멈췄는지가 이 줄의 존재 이유다.
+                                blocked_stage 가 있으면 그것을, 없으면 현재 phase 를 쓴다. */}
+                            <span className="m">
+                              {(job.blocked_stage
+                                ? (PHASE_LABEL[job.blocked_stage as JobPhase] ?? job.blocked_stage)
+                                : (PHASE_LABEL[job.phase as JobPhase] ?? job.phase))}
+                              {" 단계에서 멈춤 · "}
+                              {clock(job.updated_at)}
+                            </span>
                           </div>
                           <span
                             className="m"

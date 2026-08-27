@@ -30,6 +30,8 @@ WORKDIR /app
 # standalone 출력만 옮긴다. node_modules 전체를 싣지 않는다.
 COPY --from=builder --chown=${APP_UID}:${APP_GID} /build/.next/standalone ./
 COPY --from=builder --chown=${APP_UID}:${APP_GID} /build/.next/static ./.next/static
+# standalone 출력에는 public/ 이 포함되지 않는다. 3D 대시보드 자산이 여기 있다.
+COPY --from=builder --chown=${APP_UID}:${APP_GID} /build/public ./public
 
 USER ${APP_UID}:${APP_GID}
 EXPOSE 8080
