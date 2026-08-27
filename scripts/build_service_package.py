@@ -15,7 +15,9 @@ ENTRYPOINTS = {
 }
 EXTRA_ROOTS = {
     "backend": {"migration_check"},
-    "runtime": set(),
+    # Workers launched via ``python -m`` are not visible to the static import
+    # closure rooted at runtime_api, so they must be staged explicitly.
+    "runtime": {"speaker_worker"},
 }
 FORBIDDEN_MODULES = {
     "backend": {

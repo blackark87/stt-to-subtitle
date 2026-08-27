@@ -40,6 +40,8 @@ COPY --from=service-source /service/stt_to_subtitle /opt/stt/stt_to_subtitle
 
 RUN /opt/venvs/whisperjav/bin/python -c \
         "from stt_to_subtitle.vendor.whisperjav.runner import run_ensemble" \
+    && /opt/venvs/whisperx/bin/python -c \
+        "from stt_to_subtitle import speaker_worker" \
     && ! /opt/venvs/whisperjav/bin/python -c "import whisperjav" 2>/dev/null
 
 USER app

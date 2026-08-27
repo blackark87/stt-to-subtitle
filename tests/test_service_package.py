@@ -47,6 +47,8 @@ class ServicePackageBoundaryTests(unittest.TestCase):
             )
 
             self.assertIn("runtime_api", selected)
+            self.assertIn("speaker_worker", selected)
+            self.assertTrue((destination / "speaker_worker.py").is_file())
             for module in (
                 "web_app",
                 "backend_api",
