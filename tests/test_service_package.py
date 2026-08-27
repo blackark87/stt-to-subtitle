@@ -25,7 +25,7 @@ class ServicePackageBoundaryTests(unittest.TestCase):
             self.assertIn("backend_api", selected)
             for module in (
                 "web_app",
-                "stt_api",
+                "runtime_api",
                 "kotoba",
                 "hybrid_stt",
                 "whisperx_worker",
@@ -46,7 +46,7 @@ class ServicePackageBoundaryTests(unittest.TestCase):
                 destination,
             )
 
-            self.assertIn("stt_api", selected)
+            self.assertIn("runtime_api", selected)
             for module in (
                 "web_app",
                 "backend_api",

@@ -2,7 +2,7 @@
 set -eu
 
 runtime_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-env_file=${STT_API_ENV:-"$runtime_dir/.env"}
+env_file=${STT_RUNTIME_ENV:-${STT_API_ENV:-"$runtime_dir/.env"}}
 
 if [ ! -f "$env_file" ]; then
     echo "Environment file was not found: $env_file" >&2
@@ -15,4 +15,4 @@ set -a
 set +a
 
 export PYTHONPATH="$runtime_dir/src${PYTHONPATH:+:$PYTHONPATH}"
-exec "$runtime_dir/scripts/run-stt-api.sh"
+exec "$runtime_dir/scripts/run-stt-runtime.sh"

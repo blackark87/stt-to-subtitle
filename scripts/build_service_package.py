@@ -11,7 +11,7 @@ import shutil
 
 ENTRYPOINTS = {
     "backend": "backend_api",
-    "runtime": "stt_api",
+    "runtime": "runtime_api",
 }
 EXTRA_ROOTS = {
     "backend": {"migration_check"},
@@ -20,7 +20,7 @@ EXTRA_ROOTS = {
 FORBIDDEN_MODULES = {
     "backend": {
         "web_app",
-        "stt_api",
+        "runtime_api",
         "kotoba",
         "hybrid_stt",
         "whisperx_worker",

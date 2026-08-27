@@ -8,19 +8,19 @@
 
 이번 작업은 다음 세 가지 목표를 기준으로 진행했다.
 
-1. 실제 지원 장치 범위와 맞지 않던 `macos` 계열 이름을 역할 중심의 중립적인 STT 이름으로 변경한다.
+1. 실제 지원 장치 범위와 맞지 않던 `macos` 계열 이름을 역할 중심의 전사 Runtime 이름으로 변경한다.
 2. 한 화면에 섞여 있던 대시보드와 미디어 파일 목록을 분리하고, 주요 기능 사이의 이동 구조를 명확하게 만든다.
 3. NVIDIA GPU 사용량을 확인할 수 있는 Prometheus/Grafana 구성을 메인 애플리케이션과 독립된 사이드 프로젝트로 제공한다.
 
 ## 2. 결과 요약
 
-- 호스트 STT API, 실행 스크립트, 환경 파일, 런타임 생성기, 테스트에서 `macos` 이름을 제거했다.
+- 호스트 전사 Runtime, 실행 스크립트, 환경 파일, 런타임 생성기, 테스트에서 `macos` 이름을 제거했다.
 - `/`, `/media`, `/jobs`, `/settings`의 책임을 분리하고 반응형 사이드 메뉴를 적용했다.
 - 메인 대시보드는 작업 현황, 서비스 연결 상태, 최근 작업만 보여주는 개요 화면으로 단순화했다.
 - 미디어 탐색과 새 작업 생성은 `/media`로 이동했다.
 - GPU 관측 스택을 `gpu-observability/` 아래 독립 Compose 프로젝트로 추가했다.
 - 메인 웹 앱은 Prometheus의 DCGM 메트릭을 읽어 GPU 상태를 STT 대시보드 안에 직접 표시한다.
-- STT API와 웹 오케스트레이터 사이의 5초 상태 폴링을 제거하고, STT 저장소 변경 Hook → 작업별 SSE → 웹 저장소 변경 Hook → 브라우저 SSE로 이어지는 이벤트 경로를 적용했다.
+- 전사 Runtime과 웹 오케스트레이터 사이의 5초 상태 폴링을 제거하고, Runtime 저장소 변경 Hook → 작업별 SSE → 웹 저장소 변경 Hook → 브라우저 SSE로 이어지는 이벤트 경로를 적용했다.
 - 작업 목록은 전체 파이프라인과 전사·번역 청크 진행률을 단계 그래프와 진행 바로 표시한다.
 
 전체 진행률은 작업에 포함된 파이프라인 단계를 같은 비중으로 계산한 단계 진척도이며 예상 남은 시간은 아니다. 전사 전체 청크는 FFmpeg가 생성한 WAV 헤더의 재생 시간과 모델 청크 길이로 먼저 추정하고, 실제 생성 수가 추정치를 넘으면 자동으로 보정한다.
@@ -32,31 +32,31 @@
 
 | 기존 이름 | 변경한 이름 |
 | --- | --- |
-| `src/stt_to_subtitle/macos_api.py` | `src/stt_to_subtitle/stt_api.py` |
-| `stt-macos-api` | `stt-api` |
-| `scripts/run-macos-stt.sh` | `scripts/run-stt-api.sh` |
+| `src/stt_to_subtitle/macos_api.py` | `src/stt_to_subtitle/runtime_api.py` |
+| `stt-macos-api` | `stt-runtime` |
+| `scripts/run-macos-stt.sh` | `scripts/run-stt-runtime.sh` |
 | `scripts/create_macos_runtime.py` | `scripts/create_stt_runtime.py` |
 | `scripts/macos-runtime/` | `scripts/stt-runtime/` |
 | `.env.macos.example` | `.env.stt.example` |
-| `tests/test_macos_api.py` | `tests/test_stt_api.py` |
+| `tests/test_macos_api.py` | `tests/test_runtime_api.py` |
 | `tests/test_create_macos_runtime.py` | `tests/test_create_stt_runtime.py` |
 | `MacOSAPISettings` | `STTAPISettings` |
 
 Python 콘솔 엔트리 포인트는 다음과 같다.
 
 ```toml
-stt-api = "stt_to_subtitle.stt_api:main"
+stt-runtime = "stt_to_subtitle.runtime_api:main"
 ```
 
-ASGI 모듈 경로도 `stt_to_subtitle.stt_api:app`으로 변경했다.
+ASGI 모듈 경로도 `stt_to_subtitle.runtime_api:app`으로 변경했다.
 
 ### 3.2 환경변수와 로컬 경로 변경
 
 | 기존 이름 또는 경로 | 변경한 이름 또는 경로 |
 | --- | --- |
-| `MACOS_STT_PYTHON` | `STT_API_PYTHON` |
+| `MACOS_STT_PYTHON` | `STT_RUNTIME_PYTHON` |
 | `MACOS_STT_BOOTSTRAP_PYTHON` | `STT_BOOTSTRAP_PYTHON` |
-| `MACOS_STT_ENV` | `STT_API_ENV` |
+| `MACOS_STT_ENV` | `STT_RUNTIME_ENV` |
 | `.venv-macos` | `.venv-stt` |
 | `var/macos-cache` | `var/model-cache` |
 | `var/macos-stt` | `var/stt` |

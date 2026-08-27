@@ -1,6 +1,6 @@
-# STT API Runtime
+# 전사 Runtime
 
-이 폴더는 Git 작업 트리 밖에서 전사 API를 실행하기 위한 독립 실행 환경입니다. 애플리케이션 소스, Python 가상환경, 환경 변수, 모델 캐시와 작업 DB가 모두 이 폴더 안에 유지됩니다. 기본 예시는 Apple Silicon의 MPS를 사용하지만 `STT_DEVICE` 설정에 따라 지원되는 다른 장치에서도 같은 API를 실행할 수 있습니다.
+이 폴더는 Git 작업 트리 밖에서 전사 Runtime을 실행하기 위한 독립 실행 환경입니다. 애플리케이션 소스, Python 가상환경, 환경 변수, 모델 캐시와 작업 DB가 모두 이 폴더 안에 유지됩니다. 기본 예시는 Apple Silicon의 MPS를 사용하지만 `STT_DEVICE` 설정에 따라 지원되는 다른 장치에서도 같은 Runtime API를 실행할 수 있습니다.
 
 ## 최초 설치
 

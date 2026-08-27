@@ -370,9 +370,9 @@ STT의 `jobs.sqlite3`와 `results/`는 `STT_STATE_PATH`에 유지하고,
 기존 `/var/lib/stt/jobs` 및 `/var/lib/stt/incoming` 경로는 새 비중첩 작업
 경로로 자동 변환됩니다. 데이터베이스 스키마와 파일명은 변경하지 않습니다.
 
-## 호스트 STT API (Apple Silicon MPS 예시)
+## 호스트 전사 Runtime (Apple Silicon MPS 예시)
 
-Apple Silicon에서는 전사 API를 호스트 프로세스로 실행할 수 있습니다.
+Apple Silicon에서는 전사 Runtime을 호스트 프로세스로 실행할 수 있습니다.
 이 경로는 CUDA Compose 배포와 별개이며 Metal/MPS를 사용하는 경우에만
 필요합니다.
 
@@ -380,7 +380,7 @@ Apple Silicon에서는 전사 API를 호스트 프로세스로 실행할 수 있
 brew install python@3.11 ffmpeg libsndfile portaudio
 cp .env.stt.example .env.stt
 # .env.stt의 HF_TOKEN을 설정
-./scripts/run-stt-api.sh
+./scripts/run-stt-runtime.sh
 ```
 
 독립 실행 폴더가 필요하면 다음 도구를 사용합니다.

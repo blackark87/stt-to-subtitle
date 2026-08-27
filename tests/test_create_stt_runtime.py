@@ -26,7 +26,7 @@ class CreateSTTRuntimeTests(unittest.TestCase):
             self.assertTrue((target / "requirements-api.txt").is_file())
             self.assertTrue((target / "requirements-kotoba.txt").is_file())
             self.assertTrue(
-                (target / "src" / "stt_to_subtitle" / "stt_api.py").is_file()
+                (target / "src" / "stt_to_subtitle" / "runtime_api.py").is_file()
             )
             self.assertFalse((target / ".env").exists())
             self.assertFalse((target / ".venv-stt").exists())

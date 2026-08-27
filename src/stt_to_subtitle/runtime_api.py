@@ -687,12 +687,12 @@ class TranscriptionService:
         self._active_job_id: str | None = None
         self._worker = threading.Thread(
             target=self._worker_loop,
-            name="stt-api-worker",
+            name="stt-runtime-worker",
             daemon=True,
         )
         self._idle_reaper = threading.Thread(
             target=self._idle_reaper_loop,
-            name="stt-api-idle-reaper",
+            name="stt-runtime-idle-reaper",
             daemon=True,
         )
         self._started_at = time.time()
@@ -2453,7 +2453,7 @@ def main() -> None:
         os.environ.get("LOG_LEVEL", "INFO").upper(),
     )
     uvicorn.run(
-        "stt_to_subtitle.stt_api:app",
+        "stt_to_subtitle.runtime_api:app",
         host=os.environ.get("STT_HOST", "0.0.0.0"),
         port=int(os.environ.get("STT_PORT", "8100")),
         workers=1,

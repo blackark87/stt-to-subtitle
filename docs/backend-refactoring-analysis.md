@@ -1,7 +1,7 @@
 # STT-to-Subtitle 백엔드 리팩터링 분석 보고서
 
 - 작성일: 2026-08-26
-- 분석 범위: 웹 오케스트레이터, STT API, 작업 저장소, 외부 서비스 연동, 산출물 처리, 2D/3D 대시보드용 상태 집계
+- 분석 범위: 웹 오케스트레이터, 전사 Runtime API, 작업 저장소, 외부 서비스 연동, 산출물 처리, 2D/3D 대시보드용 상태 집계
 - 기준 버전: 현재 작업 트리의 `4.0.0`
 
 ### 구현 진행 상태
@@ -65,7 +65,7 @@ flowchart LR
     U[사용자 / 브라우저] --> W[Web 오케스트레이터]
     W --> J[(Web SQLite JobStore)]
     W --> F[FFmpeg 오디오 추출]
-    W --> S[STT API]
+    W --> S[전사 Runtime API]
     S --> SJ[(STT SQLite Store)]
     S --> G[Kotoba / WhisperX GPU Worker]
     W --> L[OpenAI 호환 번역 API]
@@ -82,7 +82,7 @@ flowchart LR
 | 파이프라인 실행 | [`orchestrator.py`](../src/stt_to_subtitle/orchestrator.py) | 단계 실행, 스케줄링, 정지, 복구, 이벤트 기록이 한 클래스에 집중 |
 | 웹 작업 저장 | [`job_store.py`](../src/stt_to_subtitle/job_store.py) | SQLite 기반 영속화는 적절하나 상태·마이그레이션 계약이 약함 |
 | 외부 API | [`service_clients.py`](../src/stt_to_subtitle/service_clients.py) | 요청 재시도와 SSE 재연결을 지원하나 장애 종류 분류와 회로 차단이 없음 |
-| STT 서비스 | [`stt_api.py`](../src/stt_to_subtitle/stt_api.py), [`transcription_store.py`](../src/stt_to_subtitle/transcription_store.py) | 전사 요청 멱등성·독립 큐·취소·구조화 실패 코드를 제공. backend별 재시도 가능성 세분화는 남음 |
+| 전사 Runtime | [`runtime_api.py`](../src/stt_to_subtitle/runtime_api.py), [`transcription_store.py`](../src/stt_to_subtitle/transcription_store.py) | 전사 요청 멱등성·독립 큐·취소·구조화 실패 코드를 제공. backend별 재시도 가능성 세분화는 남음 |
 | 산출물 | [`audio.py`](../src/stt_to_subtitle/audio.py), [`subtitle.py`](../src/stt_to_subtitle/subtitle.py), [`files.py`](../src/stt_to_subtitle/files.py) | JSON은 원자 저장. WAV 및 SRT/ASS 묶음의 장애 복구 보장은 보강 필요 |
 
 현재 SQLite와 단일 웹 스케줄러는 현 규모에서 유지할 수 있다. 상태 모델을 정리하기 전에 메시지 브로커나 분산 데이터베이스를 도입하면 복잡도만 늘어난다.

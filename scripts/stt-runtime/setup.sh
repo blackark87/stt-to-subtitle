@@ -36,5 +36,5 @@ if [ ! -f "$runtime_dir/.env" ]; then
     echo "Created $runtime_dir/.env"
 fi
 
-echo "STT API runtime is installed in $runtime_dir"
+echo "Transcription Runtime is installed in $runtime_dir"
 echo "Set HF_TOKEN in $runtime_dir/.env, then run ./run.sh"

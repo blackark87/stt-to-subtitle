@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export a self-contained STT API runtime outside the Git worktree."""
+"""Export a self-contained transcription Runtime outside the Git worktree."""
 
 from __future__ import annotations
 
@@ -20,8 +20,8 @@ def _copy_runtime_files(repository_root: Path, target: Path) -> None:
             target / "requirements-kotoba.txt"
         ),
         repository_root / ".env.stt.example": target / ".env.example",
-        repository_root / "scripts" / "run-stt-api.sh": (
-            target / "scripts" / "run-stt-api.sh"
+        repository_root / "scripts" / "run-stt-runtime.sh": (
+            target / "scripts" / "run-stt-runtime.sh"
         ),
         repository_root / "scripts" / "stt-runtime" / "setup.sh": (
             target / "setup.sh"
@@ -89,7 +89,7 @@ def create_runtime(
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Copy the STT API application into a runtime directory "
+            "Copy the transcription Runtime into a directory "
             "outside the Git worktree."
         )
     )
@@ -114,7 +114,7 @@ def main() -> None:
         parser.error(str(error))
 
     action = "Updated" if arguments.update else "Created"
-    print(f"{action} STT API runtime: {target}")
+    print(f"{action} transcription Runtime: {target}")
     print(f"Next: cd {target} && ./setup.sh")
 
 

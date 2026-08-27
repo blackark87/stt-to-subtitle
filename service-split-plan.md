@@ -20,8 +20,8 @@ Uvicorn으로 유지한다. Flask + Gunicorn으로 변경할 운영상 이점이
 
 - `stt-web`은 FastAPI + Jinja2 화면 서버이면서 오케스트레이터, JobStore,
   FFmpeg 추출, 번역 호출, 자막 렌더링까지 수행한다.
-- `stt-backend`라는 컨테이너는 `stt_api.py`를 실행하며 실제 역할은 GPU 전사
-  런타임이다.
+- `stt-backend`라는 컨테이너는 당시 전사 Runtime API를 실행하며 실제 역할은
+  GPU 전사 런타임이다.
 - Compose의 `stt-runtime`은 실행 서비스가 아니라 ML 기반 이미지를 만드는
   `build` 프로필이다.
 - 현재 브라우저 화면은 서버가 렌더링한 Jinja2 HTML과 HTML fragment에

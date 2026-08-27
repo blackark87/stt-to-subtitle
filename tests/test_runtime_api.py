@@ -14,7 +14,7 @@ import wave
 from fastapi.testclient import TestClient
 
 from stt_to_subtitle import __version__
-from stt_to_subtitle.stt_api import (
+from stt_to_subtitle.runtime_api import (
     InvalidTranscriptionOutput,
     STTAPISettings,
     TranscriptionChangeHook,
@@ -70,7 +70,7 @@ class STTAPIHelpersTests(unittest.TestCase):
 
             with patch.object(service, "_get_pipeline", return_value=Mock()):
                 with patch(
-                    "stt_to_subtitle.stt_api.run_pipeline",
+                    "stt_to_subtitle.runtime_api.run_pipeline",
                     side_effect=InvalidTranscriptionOutput(
                         "segments must be a list"
                     ),
@@ -118,7 +118,7 @@ class STTAPIHelpersTests(unittest.TestCase):
 
             with patch.object(service, "_get_pipeline", return_value=Mock()):
                 with patch(
-                    "stt_to_subtitle.stt_api.run_pipeline",
+                    "stt_to_subtitle.runtime_api.run_pipeline",
                     side_effect=RuntimeError("CUDA out of memory"),
                 ):
                     service._run_job("oom")
@@ -631,7 +631,7 @@ class STTAPIHelpersTests(unittest.TestCase):
 
             with patch.object(service, "_release_pipeline") as release:
                 with patch(
-                    "stt_to_subtitle.stt_api.TranscriptionService."
+                    "stt_to_subtitle.runtime_api.TranscriptionService."
                     "_run_worker_process",
                     side_effect=fake_run,
                 ) as run:
@@ -656,7 +656,7 @@ class STTAPIHelpersTests(unittest.TestCase):
 
             with patch.object(service, "_release_pipeline") as release:
                 with patch(
-                    "stt_to_subtitle.stt_api.TranscriptionService."
+                    "stt_to_subtitle.runtime_api.TranscriptionService."
                     "_run_worker_process",
                     side_effect=fake_run,
                 ) as run:
@@ -733,7 +733,7 @@ class STTAPIHelpersTests(unittest.TestCase):
 
             with patch.object(service, "_release_pipeline") as release:
                 with patch(
-                    "stt_to_subtitle.stt_api.TranscriptionService."
+                    "stt_to_subtitle.runtime_api.TranscriptionService."
                     "_run_worker_process",
                     side_effect=fake_run,
                 ):
@@ -788,7 +788,7 @@ class STTAPIHelpersTests(unittest.TestCase):
             stage_progress = []
 
             with patch(
-                "stt_to_subtitle.stt_api.subprocess.Popen",
+                "stt_to_subtitle.runtime_api.subprocess.Popen",
                 return_value=process,
             ):
                 completed = service._run_worker_process(
@@ -878,7 +878,7 @@ class STTAPIHelpersTests(unittest.TestCase):
                     return_value=primary_result,
                 ) as run_whisperx:
                     with patch(
-                        "stt_to_subtitle.stt_api.run_pipeline",
+                        "stt_to_subtitle.runtime_api.run_pipeline",
                         return_value=fallback_result,
                     ) as run_kotoba:
                         service._run_job("hybrid-job")
@@ -1001,7 +1001,7 @@ class STTAPIHelpersTests(unittest.TestCase):
                     return_value=primary_result,
                 ):
                     with patch(
-                        "stt_to_subtitle.stt_api.run_pipeline",
+                        "stt_to_subtitle.runtime_api.run_pipeline",
                         return_value=window_result,
                     ) as run_kotoba:
                         service._run_job("window-job")
@@ -1083,7 +1083,7 @@ class STTAPIHelpersTests(unittest.TestCase):
                     return_value=primary_result,
                 ):
                     with patch(
-                        "stt_to_subtitle.stt_api.run_pipeline",
+                        "stt_to_subtitle.runtime_api.run_pipeline",
                     ) as run_kotoba:
                         service._run_job("clean-hybrid-job")
 
@@ -1260,7 +1260,7 @@ class STTAPIHelpersTests(unittest.TestCase):
 
             with patch.object(service, "_get_pipeline", return_value=Mock()):
                 with patch(
-                    "stt_to_subtitle.stt_api.run_pipeline",
+                    "stt_to_subtitle.runtime_api.run_pipeline",
                     return_value=result,
                 ):
                     service._run_job("job-id")

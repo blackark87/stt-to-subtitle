@@ -190,7 +190,7 @@ class ReleaseConfigurationTests(unittest.TestCase):
             backend_dockerfile,
         )
         self.assertIn(
-            'ENTRYPOINT ["python", "-m", "stt_to_subtitle.stt_api"]',
+            'ENTRYPOINT ["python", "-m", "stt_to_subtitle.runtime_api"]',
             runtime_dockerfile,
         )
         self.assertIn("build_service_package.py", backend_dockerfile)
@@ -198,7 +198,7 @@ class ReleaseConfigurationTests(unittest.TestCase):
         self.assertEqual(compose.count("cap_drop:"), 3)
         self.assertIn("condition: service_healthy", compose)
 
-    def test_standalone_runtime_compose_publishes_only_the_stt_api(self) -> None:
+    def test_standalone_runtime_compose_publishes_only_the_runtime_api(self) -> None:
         compose = (ROOT / "compose.runtime.yaml").read_text(encoding="utf-8")
         example = (ROOT / ".env.runtime.example").read_text(encoding="utf-8")
 
