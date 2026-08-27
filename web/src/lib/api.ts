@@ -75,6 +75,60 @@ export interface DashboardPayload {
   gpu: GpuSnapshot | null;
 }
 
+export interface MediaFolder {
+  path: string;
+  name: string;
+  has_subtitle?: boolean;
+}
+
+export interface MediaFile {
+  path: string;
+  name: string;
+  size: number;
+  duration_seconds: number | null;
+  has_subtitle: boolean;
+  has_external_subtitle: boolean;
+  external_subtitle_formats: string[];
+  has_nfo: boolean;
+  title: string;
+  poster_path: string | null;
+  actors: string[];
+}
+
+export interface MediaListing {
+  current_folder: string;
+  parent_folder: string | null;
+  breadcrumbs: { name: string; path: string }[];
+  folders: MediaFolder[];
+  files: MediaFile[];
+}
+
+export interface ServerSettings {
+  configured: boolean;
+  transcription_configured: boolean;
+  translation_configured: boolean;
+  stt_base_url: string;
+  stt_token_configured: boolean;
+  stt_gate_state: string;
+  stt_gate_message: string | null;
+  lm_base_url: string;
+  lm_model: string;
+  lm_token_configured: boolean;
+  translation_workers: number;
+}
+
+export interface SettingsPayload {
+  servers: ServerSettings;
+  runtimes: RuntimeEndpoint[];
+  prompt_categories: PromptCategory[];
+}
+
+export interface PromptCategory {
+  id: string;
+  name: string;
+  archived?: boolean;
+}
+
 export interface ListPayload<T> {
   items: T[];
   total: number;
@@ -153,6 +207,41 @@ export const api = {
     }),
   deleteJob: (jobId: string) =>
     request<unknown>(`/jobs/${encodeURIComponent(jobId)}`, { method: "DELETE" }),
+
+media: (params: { folder?: string; q?: string; actor?: string } = {}) => {
+    const query = new URLSearchParams();
+    if (params.folder) query.set("folder", params.folder);
+    if (params.q) query.set("q", params.q);
+    if (params.actor) query.set("actor", params.actor);
+    const suffix = query.toString();
+    return request<MediaListing>(`/media${suffix ? `?${suffix}` : ""}`);
+  },
+
+  promptCategories: () =>
+    request<ListPayload<PromptCategory>>("/settings/prompt-categories"),
+
+  createJobs: (body: {
+    source_rels: string[];
+    folder_rels?: string[];
+    operation?: string;
+    prompt_category_id?: string | null;
+    force_overwrite?: boolean;
+  }) => request<unknown>("/jobs", { method: "POST", ...json(body) }),
+
+  settings: () => request<SettingsPayload>("/settings"),
+  updateServers: (body: {
+    stt_base_url: string;
+    stt_token?: string | null;
+    lm_base_url: string;
+    lm_token?: string | null;
+    lm_model: string;
+    translation_workers: number;
+  }) => request<unknown>("/settings/servers", { method: "PUT", ...json(body) }),
+
+  comparisons: () =>
+    request<ListPayload<{ id: string; source_rels: string[]; jobs: PipelineJob[]; updated_at: number }>>(
+      "/comparisons",
+    ),
 
   runtimes: () => request<ListPayload<RuntimeEndpoint>>("/runtimes"),
   createRuntime: (body: {
