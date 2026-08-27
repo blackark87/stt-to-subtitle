@@ -1,19 +1,17 @@
 # syntax=docker/dockerfile:1
 
 ARG PYTHON_IMAGE=python:3.11.15-slim-bookworm@sha256:b18992999dbe963a45a8a4da40ac2b1975be1a776d939d098c647482bcad5cba
-ARG STT_RUNTIME_IMAGE=stt-to-subtitle-stt-runtime:py311-cuda-v2
+ARG STT_RUNTIME_BASE_IMAGE=stt-to-subtitle-runtime-base:py311-cuda-v4
 
-FROM ${PYTHON_IMAGE} AS app-builder
-
-ENV PIP_DISABLE_PIP_VERSION_CHECK=1
+FROM ${PYTHON_IMAGE} AS service-source
 
 WORKDIR /build
-COPY pyproject.toml README.md ./
 COPY src ./src
-RUN --mount=type=cache,id=stt-app-pip,target=/root/.cache/pip \
-    python -m pip wheel --no-deps --wheel-dir /wheel .
+COPY scripts/build_service_package.py ./scripts/build_service_package.py
+RUN python scripts/build_service_package.py \
+    runtime src/stt_to_subtitle /service/stt_to_subtitle
 
-FROM ${STT_RUNTIME_IMAGE} AS runtime
+FROM ${STT_RUNTIME_BASE_IMAGE} AS runtime
 
 ARG APP_UID=1000
 ARG APP_GID=1000
@@ -22,6 +20,7 @@ ENV PYTHONUNBUFFERED=1 \
     HOME=/tmp \
     PYTHONDONTWRITEBYTECODE=1 \
     PATH=/opt/venvs/kotoba/bin:$PATH \
+    PYTHONPATH=/opt/stt \
     HF_HOME=/var/cache/stt/huggingface \
     PYANNOTE_CACHE=/var/cache/stt/pyannote \
     TORCH_HOME=/var/cache/stt/torch \
@@ -34,20 +33,11 @@ ENV PYTHONUNBUFFERED=1 \
 
 RUN groupadd --gid "${APP_GID}" app \
     && useradd --uid "${APP_UID}" --gid "${APP_GID}" --no-create-home app \
-    && mkdir -p /var/cache/stt /var/lib/stt \
-    && chown -R app:app /var/cache/stt /var/lib/stt
+    && mkdir -p /var/cache/stt /var/lib/stt /var/lib/stt-work \
+    && chown -R app:app /var/cache/stt /var/lib/stt /var/lib/stt-work
 
-COPY --from=app-builder /wheel /tmp/stt-wheel
-RUN /opt/venvs/kotoba/bin/python -m pip install --no-cache-dir --no-deps \
-        /tmp/stt-wheel/*.whl \
-    && /opt/venvs/whisperx/bin/python -m pip install --no-cache-dir --no-deps \
-        /tmp/stt-wheel/*.whl \
-    && /opt/venvs/whisperjav/bin/python -m pip install --no-cache-dir --no-deps \
-        /tmp/stt-wheel/*.whl \
-    && rm -rf /tmp/stt-wheel
+COPY --from=service-source /service/stt_to_subtitle /opt/stt/stt_to_subtitle
 
-# The vendored ensemble must be importable, and the upstream package must be
-# gone — otherwise the worker could silently keep using the old install.
 RUN /opt/venvs/whisperjav/bin/python -c \
         "from stt_to_subtitle.vendor.whisperjav.runner import run_ensemble" \
     && ! /opt/venvs/whisperjav/bin/python -c "import whisperjav" 2>/dev/null
@@ -59,4 +49,4 @@ EXPOSE 8100
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
     CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8100/readyz', timeout=3)"]
 
-ENTRYPOINT ["stt-api"]
+ENTRYPOINT ["python", "-m", "stt_to_subtitle.stt_api"]

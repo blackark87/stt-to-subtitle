@@ -154,6 +154,18 @@ class PromptCategory:
 
 
 @dataclass(frozen=True)
+class RuntimeEndpoint:
+    id: str
+    name: str
+    base_url: str
+    token: str
+    enabled: bool
+    capacity: int
+    created_at: float
+    updated_at: float
+
+
+@dataclass(frozen=True)
 class PipelineJob:
     id: str
     source_rel: str
@@ -169,6 +181,7 @@ class PipelineJob:
     audio_sha256: str | None
     audio_revision_id: str | None
     stt_job_id: str | None
+    stt_runtime_id: str | None
     transcript_path: str | None
     transcript_revision_id: str | None
     translation_path: str | None
@@ -284,6 +297,7 @@ class JobStore:
         "audio_sha256",
         "audio_revision_id",
         "stt_job_id",
+        "stt_runtime_id",
         "transcript_path",
         "transcript_revision_id",
         "translation_path",
@@ -568,6 +582,7 @@ class JobStore:
                     audio_sha256 TEXT,
                     audio_revision_id TEXT,
                     stt_job_id TEXT,
+                    stt_runtime_id TEXT,
                     transcript_path TEXT,
                     transcript_revision_id TEXT,
                     translation_path TEXT,
@@ -632,6 +647,19 @@ class JobStore:
                     lm_model TEXT NOT NULL,
                     translation_workers INTEGER NOT NULL DEFAULT 1,
                     updated_at REAL NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS runtime_endpoints (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    base_url TEXT NOT NULL UNIQUE,
+                    token TEXT NOT NULL DEFAULT '',
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    capacity INTEGER NOT NULL DEFAULT 1,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    CHECK (enabled IN (0, 1)),
+                    CHECK (capacity BETWEEN 1 AND 8)
                 );
 
                 CREATE TABLE IF NOT EXISTS dependency_states (
@@ -1233,7 +1261,31 @@ class JobStore:
                     "transcript_segment_counts_v1",
                     self._migrate_transcript_segment_counts,
                 ),
+                Migration(
+                    53,
+                    "runtime_pool_v1",
+                    self._migrate_runtime_pool,
+                ),
             ),
+        )
+
+    @staticmethod
+    def _migrate_runtime_pool(connection: sqlite3.Connection) -> None:
+        columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(jobs)").fetchall()
+        }
+        if "stt_runtime_id" not in columns:
+            connection.execute(
+                "ALTER TABLE jobs ADD COLUMN stt_runtime_id TEXT"
+            )
+        connection.execute(
+            "UPDATE jobs SET stt_runtime_id = 'builtin' "
+            "WHERE stt_job_id IS NOT NULL AND stt_runtime_id IS NULL"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS jobs_stt_runtime_idx "
+            "ON jobs(stt_runtime_id, status)"
         )
 
     @staticmethod
@@ -2298,6 +2350,156 @@ class JobStore:
         if result.rowcount != 1:
             raise ValueError("경로 표시 규칙을 찾을 수 없습니다.")
 
+    @staticmethod
+    def _runtime_endpoint_from_row(
+        row: sqlite3.Row | None,
+    ) -> RuntimeEndpoint | None:
+        if row is None:
+            return None
+        return RuntimeEndpoint(
+            id=str(row["id"]),
+            name=str(row["name"]),
+            base_url=str(row["base_url"]),
+            token=str(row["token"]),
+            enabled=bool(row["enabled"]),
+            capacity=int(row["capacity"]),
+            created_at=float(row["created_at"]),
+            updated_at=float(row["updated_at"]),
+        )
+
+    def list_runtime_endpoints(self) -> list[RuntimeEndpoint]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM runtime_endpoints ORDER BY created_at, id"
+            ).fetchall()
+        return [
+            endpoint
+            for row in rows
+            if (endpoint := self._runtime_endpoint_from_row(row)) is not None
+        ]
+
+    def get_runtime_endpoint(self, runtime_id: str) -> RuntimeEndpoint | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM runtime_endpoints WHERE id = ?",
+                (runtime_id,),
+            ).fetchone()
+        return self._runtime_endpoint_from_row(row)
+
+    def create_runtime_endpoint(
+        self,
+        *,
+        name: str,
+        base_url: str,
+        token: str,
+        enabled: bool,
+        capacity: int,
+    ) -> RuntimeEndpoint:
+        runtime_id = uuid4().hex
+        now = time.time()
+        try:
+            with self._connect() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO runtime_endpoints (
+                        id, name, base_url, token, enabled, capacity,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        runtime_id,
+                        name,
+                        base_url,
+                        token,
+                        int(enabled),
+                        capacity,
+                        now,
+                        now,
+                    ),
+                )
+        except sqlite3.IntegrityError as error:
+            raise ValueError("같은 주소의 Runtime이 이미 등록되어 있습니다.") from error
+        created = self.get_runtime_endpoint(runtime_id)
+        if created is None:
+            raise RuntimeError("created Runtime endpoint could not be read")
+        return created
+
+    def update_runtime_endpoint(
+        self,
+        runtime_id: str,
+        *,
+        name: str,
+        base_url: str,
+        token: str,
+        enabled: bool,
+        capacity: int,
+    ) -> RuntimeEndpoint:
+        try:
+            with self._connect() as connection:
+                result = connection.execute(
+                    """
+                    UPDATE runtime_endpoints
+                    SET name = ?, base_url = ?, token = ?, enabled = ?,
+                        capacity = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        name,
+                        base_url,
+                        token,
+                        int(enabled),
+                        capacity,
+                        time.time(),
+                        runtime_id,
+                    ),
+                )
+        except sqlite3.IntegrityError as error:
+            raise ValueError("같은 주소의 Runtime이 이미 등록되어 있습니다.") from error
+        if result.rowcount != 1:
+            raise ValueError("Runtime을 찾을 수 없습니다.")
+        updated = self.get_runtime_endpoint(runtime_id)
+        if updated is None:
+            raise RuntimeError("updated Runtime endpoint could not be read")
+        return updated
+
+    def delete_runtime_endpoint(self, runtime_id: str) -> None:
+        with self._connect() as connection:
+            result = connection.execute(
+                "DELETE FROM runtime_endpoints WHERE id = ?",
+                (runtime_id,),
+            )
+        if result.rowcount != 1:
+            raise ValueError("Runtime을 찾을 수 없습니다.")
+
+    def transcription_runtime_counts(self) -> dict[str, int]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT COALESCE(stt_runtime_id, 'builtin') AS runtime_id,
+                       COUNT(*) AS job_count
+                FROM jobs
+                WHERE status = 'transcription_running'
+                GROUP BY COALESCE(stt_runtime_id, 'builtin')
+                """
+            ).fetchall()
+        return {
+            str(row["runtime_id"]): int(row["job_count"])
+            for row in rows
+        }
+
+    def runtime_has_active_transcriptions(self, runtime_id: str) -> bool:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT 1 FROM jobs
+                WHERE status = 'transcription_running'
+                  AND COALESCE(stt_runtime_id, 'builtin') = ?
+                LIMIT 1
+                """,
+                (runtime_id,),
+            ).fetchone()
+        return row is not None
+
     def get_remote_server_settings(self) -> dict[str, Any] | None:
         with self._connect() as connection:
             row = connection.execute(
@@ -2490,6 +2692,9 @@ class JobStore:
                 else None
             ),
             stt_job_id=str(row["stt_job_id"]) if row["stt_job_id"] else None,
+            stt_runtime_id=(
+                str(row["stt_runtime_id"]) if row["stt_runtime_id"] else None
+            ),
             transcript_path=(
                 str(row["transcript_path"]) if row["transcript_path"] else None
             ),
@@ -2875,6 +3080,7 @@ class JobStore:
         *,
         lease_owner: str = "legacy-dispatcher",
         lease_seconds: float = 60.0,
+        stt_runtime_id: str | None = None,
     ) -> int | None:
         if not lease_owner.strip():
             raise ValueError("lease owner is required")
@@ -2894,27 +3100,32 @@ class JobStore:
         )
         with self._connect() as connection:
             now = time.time()
+            runtime_assignment = (
+                ", stt_runtime_id = ?" if stt_runtime_id is not None else ""
+            )
+            parameters: list[Any] = [
+                running_status,
+                projected.phase.value,
+                projected.state.value,
+                lease_owner,
+                now + lease_seconds,
+                now,
+                now,
+            ]
+            if stt_runtime_id is not None:
+                parameters.append(stt_runtime_id)
+            parameters.extend((job_id, waiting_status, now))
             result = connection.execute(
                 "UPDATE jobs SET status = ?, phase = ?, state = ?, "
                 "reason_code = NULL, blocked_stage = NULL, error = NULL, "
                 "lease_owner = ?, lease_expires_at = ?, "
                 "lease_token = lease_token + 1, "
-                "status_updated_at = ?, updated_at = ? "
+                "status_updated_at = ?, updated_at = ?"
+                f"{runtime_assignment} "
                 "WHERE id = ? AND status = ? AND job_stop_requested = 0 "
                 "AND (lease_expires_at IS NULL OR lease_expires_at <= ?)"
                 f"{translation_condition}",
-                (
-                    running_status,
-                    projected.phase.value,
-                    projected.state.value,
-                    lease_owner,
-                    now + lease_seconds,
-                    now,
-                    now,
-                    job_id,
-                    waiting_status,
-                    now,
-                ),
+                parameters,
             )
             claimed = connection.execute(
                 "SELECT lease_token FROM jobs "

@@ -251,11 +251,14 @@ class STTAPIClient(RetryingJSONClient):
         token: str,
         *,
         attempts: int = 3,
+        connect_timeout: float = 10.0,
+        read_timeout: float = 300.0,
         request_observer: RequestObserver | None = None,
     ) -> None:
         super().__init__(
             token=token,
-            read_timeout=300.0,
+            connect_timeout=connect_timeout,
+            read_timeout=read_timeout,
             attempts=attempts,
             service_name="stt",
             request_observer=request_observer,

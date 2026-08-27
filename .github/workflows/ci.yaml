@@ -29,7 +29,7 @@ jobs:
           cache-dependency-path: |
             requirements-test.txt
             requirements-api.txt
-            requirements-web.txt
+            requirements-backend.txt
 
       - name: Install test dependencies
         run: |

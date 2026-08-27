@@ -11,6 +11,7 @@ import math
 from pathlib import Path
 import sqlite3
 import threading
+import time
 from typing import Any, Callable, Mapping, Sequence
 from uuid import uuid4
 import wave
@@ -32,20 +33,33 @@ from .files import (
     sha256_file,
     write_json_atomic,
 )
-from .hybrid_stt import HybridRescueOptions
-from .kotoba import DEFAULT_CHUNK_LENGTH_SECONDS, TranscriptionOptions
+from .stt_options import (
+    DEFAULT_ANIME_MAX_GROUP_SECONDS,
+    DEFAULT_CHUNK_LENGTH_SECONDS,
+    DEFAULT_QWEN_MAX_GROUP_SECONDS,
+    DEFAULT_SUBTITLE_SEGMENTATION,
+    HybridRescueOptions,
+    TranscriptionOptions,
+    WHISPERX_MAX_BATCH_SIZE,
+    WHISPERX_MAX_CHUNK_LENGTH_SECONDS,
+    WHISPERX_MIN_BATCH_SIZE,
+    WhisperJAVOptions,
+    WhisperXSegmentationOptions,
+)
 from .path_display import PathDisplayRule
-from .web_config import (
+from .backend_config import (
     MediaLibrary,
+    BackendSettings,
     RemoteServerSettings,
     SubtitleValidatorSettings,
-    WebSettings,
+    normalize_server_url,
     probe_media_duration,
 )
 from .job_store import (
     JobStore,
     PipelineJob,
     PromptCategory,
+    RuntimeEndpoint,
     RETRYABLE_STATUSES,
     SUCCESS_STATUSES,
     WorkerLeaseLost,
@@ -66,18 +80,6 @@ from .subtitle_validation import build_subtitle_validator_payload
 from .translation_prompt import (
     KOREAN_JAV_SYSTEM_PROMPT,
     KOREAN_TRANSLATION_REVIEW_PROMPT,
-)
-from .whisperx_worker import (
-    DEFAULT_SUBTITLE_SEGMENTATION,
-    WHISPERX_MAX_BATCH_SIZE,
-    WHISPERX_MAX_CHUNK_LENGTH_SECONDS,
-    WHISPERX_MIN_BATCH_SIZE,
-    WhisperXSegmentationOptions,
-)
-from .whisperjav_worker import (
-    DEFAULT_ANIME_MAX_GROUP_SECONDS,
-    DEFAULT_QWEN_MAX_GROUP_SECONDS,
-    WhisperJAVOptions,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -111,6 +113,12 @@ EVENT_PHASE_BY_STAGE = {
 JOB_LEASE_SECONDS = 60.0
 JOB_LEASE_HEARTBEAT_SECONDS = 15.0
 JOB_SHUTDOWN_GRACE_SECONDS = 5.0
+BUILTIN_RUNTIME_ID = "builtin"
+MAX_RUNTIME_ENDPOINTS = 32
+LEGACY_BUILTIN_RUNTIME_URLS = {
+    "http://stt:8100",
+    "http://stt-backend:8100",
+}
 
 
 def _canonical_payload_hash(value: Any) -> str:
@@ -269,7 +277,7 @@ def _operation_is_completed(
 class SubtitleOrchestrator:
     """Advance persisted jobs while keeping each remote resource independent."""
 
-    def __init__(self, settings: WebSettings) -> None:
+    def __init__(self, settings: BackendSettings) -> None:
         settings.validate()
         self.settings = settings
         self.settings.state_dir.mkdir(parents=True, exist_ok=True)
@@ -293,6 +301,19 @@ class SubtitleOrchestrator:
                 rebased_paths,
             )
         saved_servers = self.store.get_remote_server_settings()
+        if (
+            saved_servers is not None
+            and str(saved_servers["stt_base_url"])
+            in LEGACY_BUILTIN_RUNTIME_URLS
+            and settings.stt_base_url.strip()
+            and str(saved_servers["stt_base_url"])
+            != settings.stt_base_url.strip().rstrip("/")
+        ):
+            saved_servers = {
+                **saved_servers,
+                "stt_base_url": settings.stt_base_url.strip().rstrip("/"),
+            }
+            self.store.save_remote_server_settings(**saved_servers)
         initial_servers = (
             RemoteServerSettings(**saved_servers)
             if saved_servers is not None
@@ -313,11 +334,15 @@ class SubtitleOrchestrator:
             RemoteServerSettings,
         ] = (None, None, initial_servers)
         self._stt_gate_lock = threading.RLock()
+        self._runtime_lock = threading.RLock()
+        self._runtime_clients: dict[str, STTAPIClient] = {}
+        self._runtime_health: dict[str, dict[str, Any]] = {}
+        self._runtime_dispatch_cursor = 0
         self._translation_circuit_lock = threading.RLock()
         self._subtitle_publication_lock = threading.RLock()
         self._stage_futures_lock = threading.RLock()
         self._stage_futures: set[Future[Any]] = set()
-        self._worker_id = f"web-{uuid4().hex}"
+        self._worker_id = f"backend-{uuid4().hex}"
         saved_translation_state = self.store.get_dependency_state(
             "translation_lm"
         )
@@ -330,7 +355,7 @@ class SubtitleOrchestrator:
             "lost"
             if saved_translation_state_name == "lost"
             else "ready"
-            if initial_servers.is_complete
+            if initial_servers.translation_is_complete
             else "offline"
         )
         if saved_translation_state_name != self._translation_circuit_state:
@@ -343,7 +368,7 @@ class SubtitleOrchestrator:
             str(saved_stt_gate["state"])
             if saved_stt_gate is not None
             else "ready"
-            if initial_servers.is_complete
+            if initial_servers.stt_is_complete
             else "unknown"
         )
         self._stt_gate_message = (
@@ -352,11 +377,19 @@ class SubtitleOrchestrator:
             and self._stt_gate_state in {"lost", "unknown"}
             else "사용 가능"
         )
-        if initial_servers.is_complete:
+        if initial_servers.stt_is_complete:
+            self._runtime_health[BUILTIN_RUNTIME_ID] = {
+                "status": self._stt_gate_state,
+                "message": self._stt_gate_message,
+                "readiness": None,
+                "checked_at": None,
+            }
+        if initial_servers.stt_is_complete:
             try:
                 self._set_remote_servers(initial_servers, persist=False)
             except ValueError as error:
                 LOGGER.warning("remote server settings are invalid: %s", error)
+        self._load_external_runtimes()
         self._stop_event = threading.Event()
         self._scheduler = threading.Thread(
             target=self._scheduler_loop,
@@ -375,8 +408,12 @@ class SubtitleOrchestrator:
             thread_name_prefix="pipeline-render",
         )
         self._stt_executor = ThreadPoolExecutor(
-            max_workers=1,
+            max_workers=MAX_RUNTIME_ENDPOINTS,
             thread_name_prefix="pipeline-stt",
+        )
+        self._runtime_probe_executor = ThreadPoolExecutor(
+            max_workers=4,
+            thread_name_prefix="runtime-probe",
         )
         self._translation_executor = ThreadPoolExecutor(
             # translation_workers belongs to parallel batches within one
@@ -400,7 +437,19 @@ class SubtitleOrchestrator:
 
     @property
     def remote_servers_configured(self) -> bool:
-        return self.stt_client is not None and self.lm_client is not None
+        return (
+            self.transcription_server_configured
+            and self.lm_client is not None
+        )
+
+    @property
+    def transcription_server_configured(self) -> bool:
+        with self._runtime_lock:
+            return bool(self._runtime_clients)
+
+    @property
+    def translation_server_configured(self) -> bool:
+        return self.lm_client is not None
 
     def remote_servers_view(self) -> dict[str, Any]:
         servers = self.remote_servers
@@ -415,9 +464,394 @@ class SubtitleOrchestrator:
             "lm_model": servers.lm_model,
             "translation_workers": servers.translation_workers,
             "configured": self.remote_servers_configured,
+            "transcription_configured": self.transcription_server_configured,
+            "translation_configured": self.translation_server_configured,
             "stt_gate_state": stt_gate_state,
             "stt_gate_message": stt_gate_message,
         }
+
+    @staticmethod
+    def _validate_runtime_values(
+        *,
+        name: str,
+        base_url: str,
+        capacity: int,
+    ) -> tuple[str, str, int]:
+        normalized_name = name.strip()
+        if not normalized_name or len(normalized_name) > 80:
+            raise ValueError("Runtime 이름은 1~80자여야 합니다.")
+        if not 1 <= capacity <= 8:
+            raise ValueError("Runtime 동시 작업 수는 1~8이어야 합니다.")
+        normalized_url = normalize_server_url(base_url, "RUNTIME_BASE_URL")
+        return normalized_name, normalized_url, capacity
+
+    def _load_external_runtimes(self) -> None:
+        with self._runtime_lock:
+            for endpoint in self.store.list_runtime_endpoints():
+                if endpoint.enabled:
+                    self._runtime_clients[endpoint.id] = STTAPIClient(
+                        endpoint.base_url,
+                        endpoint.token,
+                        request_observer=self.record_external_request,
+                    )
+                    self._runtime_health.setdefault(
+                        endpoint.id,
+                        {
+                            "status": "unknown",
+                            "message": None,
+                            "readiness": None,
+                            "checked_at": None,
+                        },
+                    )
+                else:
+                    self._runtime_health[endpoint.id] = {
+                        "status": "disabled",
+                        "message": None,
+                        "readiness": None,
+                        "checked_at": None,
+                    }
+
+    def _runtime_definitions(self) -> list[dict[str, Any]]:
+        definitions: list[dict[str, Any]] = []
+        servers = self.remote_servers
+        if servers.stt_is_complete:
+            definitions.append(
+                {
+                    "id": BUILTIN_RUNTIME_ID,
+                    "name": "기본 Runtime",
+                    "base_url": servers.stt_base_url,
+                    "token": servers.stt_token,
+                    "enabled": True,
+                    "capacity": 1,
+                    "builtin": True,
+                }
+            )
+        definitions.extend(
+            {
+                "id": endpoint.id,
+                "name": endpoint.name,
+                "base_url": endpoint.base_url,
+                "token": endpoint.token,
+                "enabled": endpoint.enabled,
+                "capacity": endpoint.capacity,
+                "builtin": False,
+            }
+            for endpoint in self.store.list_runtime_endpoints()
+        )
+        return definitions
+
+    def _runtime_definition(self, runtime_id: str) -> dict[str, Any]:
+        for definition in self._runtime_definitions():
+            if definition["id"] == runtime_id:
+                return definition
+        raise ValueError("Runtime을 찾을 수 없습니다.")
+
+    def _runtime_client(self, runtime_id: str) -> STTAPIClient | None:
+        with self._runtime_lock:
+            return self._runtime_clients.get(runtime_id)
+
+    def _stt_client_for_job(self, job: PipelineJob) -> STTAPIClient | None:
+        return self._runtime_client(job.stt_runtime_id or BUILTIN_RUNTIME_ID)
+
+    def _refresh_stt_gate_from_pool(
+        self,
+        *,
+        reason_code: str | None = None,
+        message: str | None = None,
+    ) -> None:
+        definitions = [
+            definition
+            for definition in self._runtime_definitions()
+            if definition["enabled"]
+        ]
+        with self._runtime_lock:
+            statuses = [
+                str(self._runtime_health.get(definition["id"], {}).get(
+                    "status", "unknown"
+                ))
+                for definition in definitions
+            ]
+        if any(status == "ready" for status in statuses):
+            self._set_stt_gate("ready", "사용 가능")
+        elif any(status == "checking" for status in statuses):
+            self._set_stt_gate("checking", "연결 확인 중", persist=False)
+        elif any(status == "unavailable" for status in statuses):
+            self._set_stt_gate(
+                "lost",
+                message or "사용 가능한 Runtime이 없습니다.",
+                reason_code=reason_code or JobReason.STT_UNAVAILABLE.value,
+            )
+        elif definitions:
+            self._set_stt_gate("unknown", "연결 확인이 필요합니다.")
+        else:
+            self._set_stt_gate("offline", "Runtime이 등록되지 않았습니다.")
+
+    def _set_runtime_health(
+        self,
+        runtime_id: str,
+        status: str,
+        *,
+        message: str | None = None,
+        readiness: Mapping[str, Any] | None = None,
+        reason_code: str | None = None,
+    ) -> None:
+        with self._runtime_lock:
+            self._runtime_health[runtime_id] = {
+                "status": status,
+                "message": message,
+                "readiness": dict(readiness) if readiness is not None else None,
+                "checked_at": time.time(),
+            }
+        self._refresh_stt_gate_from_pool(
+            reason_code=reason_code,
+            message=message,
+        )
+
+    def runtime_endpoints_view(self) -> list[dict[str, Any]]:
+        counts = self.store.transcription_runtime_counts()
+        with self._runtime_lock:
+            health = {
+                runtime_id: dict(value)
+                for runtime_id, value in self._runtime_health.items()
+            }
+        views: list[dict[str, Any]] = []
+        for definition in self._runtime_definitions():
+            runtime_id = str(definition["id"])
+            current = health.get(runtime_id, {"status": "unknown"})
+            readiness = current.get("readiness")
+            running = counts.get(runtime_id, 0)
+            capacity = int(definition["capacity"])
+            views.append(
+                {
+                    "id": runtime_id,
+                    "name": definition["name"],
+                    "base_url": definition["base_url"],
+                    "token_configured": bool(definition["token"]),
+                    "enabled": bool(definition["enabled"]),
+                    "capacity": capacity,
+                    "builtin": bool(definition["builtin"]),
+                    "status": current.get("status", "unknown"),
+                    "message": current.get("message"),
+                    "checked_at": current.get("checked_at"),
+                    "running_jobs": running,
+                    "available_slots": max(0, capacity - running),
+                    "identity": (
+                        readiness.get("runtime")
+                        if isinstance(readiness, Mapping)
+                        else None
+                    ),
+                    "queue": (
+                        readiness.get("queue")
+                        if isinstance(readiness, Mapping)
+                        else None
+                    ),
+                    "backends": (
+                        readiness.get("backends")
+                        if isinstance(readiness, Mapping)
+                        else None
+                    ),
+                }
+            )
+        return views
+
+    def create_runtime_endpoint(
+        self,
+        *,
+        name: str,
+        base_url: str,
+        token: str,
+        enabled: bool,
+        capacity: int,
+    ) -> dict[str, Any]:
+        name, base_url, capacity = self._validate_runtime_values(
+            name=name,
+            base_url=base_url,
+            capacity=capacity,
+        )
+        with self._runtime_lock:
+            if (
+                len(self.store.list_runtime_endpoints())
+                >= MAX_RUNTIME_ENDPOINTS - 1
+            ):
+                raise ValueError("등록 가능한 외부 Runtime 수를 초과했습니다.")
+            if base_url == self.remote_servers.stt_base_url:
+                raise ValueError("기본 Runtime과 같은 주소는 등록할 수 없습니다.")
+            endpoint = self.store.create_runtime_endpoint(
+                name=name,
+                base_url=base_url,
+                token=token,
+                enabled=enabled,
+                capacity=capacity,
+            )
+            self._install_runtime_endpoint(endpoint)
+        if enabled:
+            self.probe_runtime_endpoint(endpoint.id)
+        return self._runtime_view(endpoint.id)
+
+    def _install_runtime_endpoint(self, endpoint: RuntimeEndpoint) -> None:
+        with self._runtime_lock:
+            if endpoint.enabled:
+                self._runtime_clients[endpoint.id] = STTAPIClient(
+                    endpoint.base_url,
+                    endpoint.token,
+                    request_observer=self.record_external_request,
+                )
+                self._runtime_health[endpoint.id] = {
+                    "status": "unknown",
+                    "message": None,
+                    "readiness": None,
+                    "checked_at": None,
+                }
+            else:
+                self._runtime_clients.pop(endpoint.id, None)
+                self._runtime_health[endpoint.id] = {
+                    "status": "disabled",
+                    "message": None,
+                    "readiness": None,
+                    "checked_at": time.time(),
+                }
+        self._refresh_stt_gate_from_pool()
+
+    def update_runtime_endpoint(
+        self,
+        runtime_id: str,
+        *,
+        name: str,
+        base_url: str,
+        token: str | None,
+        clear_token: bool,
+        enabled: bool,
+        capacity: int,
+    ) -> dict[str, Any]:
+        if runtime_id == BUILTIN_RUNTIME_ID:
+            raise ValueError("기본 Runtime은 서버 설정에서 변경하세요.")
+        name, base_url, capacity = self._validate_runtime_values(
+            name=name,
+            base_url=base_url,
+            capacity=capacity,
+        )
+        with self._runtime_lock:
+            current = self.store.get_runtime_endpoint(runtime_id)
+            if current is None:
+                raise ValueError("Runtime을 찾을 수 없습니다.")
+            if self.store.runtime_has_active_transcriptions(runtime_id) and (
+                not enabled or base_url != current.base_url
+            ):
+                raise ValueError(
+                    "진행 중인 작업이 있는 Runtime 설정은 변경할 수 없습니다."
+                )
+            if base_url == self.remote_servers.stt_base_url:
+                raise ValueError("기본 Runtime과 같은 주소는 등록할 수 없습니다.")
+            updated = self.store.update_runtime_endpoint(
+                runtime_id,
+                name=name,
+                base_url=base_url,
+                token=(
+                    ""
+                    if clear_token
+                    else current.token
+                    if token is None
+                    else token
+                ),
+                enabled=enabled,
+                capacity=capacity,
+            )
+            self._install_runtime_endpoint(updated)
+        if enabled:
+            self.probe_runtime_endpoint(runtime_id)
+        return self._runtime_view(runtime_id)
+
+    def delete_runtime_endpoint(self, runtime_id: str) -> None:
+        if runtime_id == BUILTIN_RUNTIME_ID:
+            raise ValueError("기본 Runtime은 삭제할 수 없습니다.")
+        with self._runtime_lock:
+            if self.store.runtime_has_active_transcriptions(runtime_id):
+                raise ValueError(
+                    "진행 중인 작업이 있는 Runtime은 삭제할 수 없습니다."
+                )
+            self.store.delete_runtime_endpoint(runtime_id)
+            self._runtime_clients.pop(runtime_id, None)
+            self._runtime_health.pop(runtime_id, None)
+        self._refresh_stt_gate_from_pool()
+
+    def _runtime_view(self, runtime_id: str) -> dict[str, Any]:
+        return next(
+            view
+            for view in self.runtime_endpoints_view()
+            if view["id"] == runtime_id
+        )
+
+    def probe_runtime_endpoint(self, runtime_id: str) -> dict[str, Any]:
+        definition = self._runtime_definition(runtime_id)
+        if not definition["enabled"]:
+            raise ValueError("비활성화된 Runtime은 확인할 수 없습니다.")
+        self._set_runtime_health(runtime_id, "checking")
+        client = self._runtime_client(runtime_id)
+        if client is None:
+            raise ValueError("Runtime 연결 설정이 없습니다.")
+        probe_client = (
+            client
+            if runtime_id == BUILTIN_RUNTIME_ID
+            else STTAPIClient(
+                str(definition["base_url"]),
+                str(definition["token"]),
+                attempts=1,
+                connect_timeout=3.0,
+                read_timeout=5.0,
+                request_observer=self.record_external_request,
+            )
+        )
+        try:
+            readiness = probe_client.check_readiness()
+        except ExternalServiceError as error:
+            self._record_dependency_readiness("stt", "unavailable")
+            self._set_runtime_health(
+                runtime_id,
+                "unavailable",
+                message=self._sanitize_error(str(error)),
+            )
+        else:
+            self._record_dependency_readiness("stt", "ready")
+            self._record_stt_queue_snapshot(readiness, runtime_id=runtime_id)
+            identity = readiness.get("runtime")
+            observed_id = (
+                str(identity.get("id", "")).strip()
+                if isinstance(identity, Mapping)
+                else ""
+            )
+            with self._runtime_lock:
+                duplicate_id = next(
+                    (
+                        other_id
+                        for other_id, current in self._runtime_health.items()
+                        if other_id != runtime_id
+                        and current.get("status") == "ready"
+                        and isinstance(current.get("readiness"), Mapping)
+                        and isinstance(
+                            current["readiness"].get("runtime"), Mapping
+                        )
+                        and str(
+                            current["readiness"]["runtime"].get("id", "")
+                        ).strip()
+                        == observed_id
+                        and observed_id
+                    ),
+                    None,
+                )
+            if duplicate_id is not None:
+                self._set_runtime_health(
+                    runtime_id,
+                    "unavailable",
+                    message="같은 Runtime ID가 이미 등록되어 있습니다.",
+                    readiness=readiness,
+                )
+            else:
+                self._set_runtime_health(
+                    runtime_id,
+                    "ready",
+                    readiness=readiness,
+                )
+        return self._runtime_view(runtime_id)
 
     def subtitle_validator_view(self) -> dict[str, Any]:
         settings = self._subtitle_validator
@@ -580,7 +1014,12 @@ class SubtitleOrchestrator:
             labels=labels,
         )
 
-    def _record_stt_queue_snapshot(self, readiness: Mapping[str, Any]) -> None:
+    def _record_stt_queue_snapshot(
+        self,
+        readiness: Mapping[str, Any],
+        *,
+        runtime_id: str = BUILTIN_RUNTIME_ID,
+    ) -> None:
         queue = readiness.get("queue")
         if not isinstance(queue, Mapping):
             return
@@ -590,7 +1029,14 @@ class SubtitleOrchestrator:
                 self._record_measurement(
                     "remote_stt.queue.jobs",
                     value,
-                    labels={"state": state},
+                    labels={
+                        "state": state,
+                        **(
+                            {"runtime_id": runtime_id}
+                            if runtime_id != BUILTIN_RUNTIME_ID
+                            else {}
+                        ),
+                    },
                 )
 
     def _record_artifact_audit(self, audit: Mapping[str, object]) -> None:
@@ -682,24 +1128,28 @@ class SubtitleOrchestrator:
             )
 
     def activate_transcription_stt(self) -> int:
-        """Open the STT gate after one explicit readiness check."""
-        if self.stt_client is None:
+        """Open the STT pool after explicit readiness checks."""
+        enabled = [
+            definition
+            for definition in self._runtime_definitions()
+            if definition["enabled"]
+        ]
+        if not enabled:
             raise ValueError("전사 서버 설정을 먼저 저장하세요.")
-        self._set_stt_gate("checking", "연결 확인 중", persist=False)
-        try:
-            readiness = self.stt_client.check_readiness()
-            self._record_stt_queue_snapshot(readiness)
-        except ExternalServiceError as error:
-            self._record_dependency_readiness("stt", "unavailable")
-            message = self._sanitize_error(str(error))
-            self._set_stt_gate(
-                "lost",
-                message,
-                reason_code=JobReason.STT_UNAVAILABLE.value,
+        views = [
+            self.probe_runtime_endpoint(str(definition["id"]))
+            for definition in enabled
+        ]
+        if not any(view["status"] == "ready" for view in views):
+            message = next(
+                (
+                    str(view["message"])
+                    for view in views
+                    if view.get("message")
+                ),
+                "사용 가능한 Runtime이 없습니다.",
             )
-            raise
-        self._record_dependency_readiness("stt", "ready")
-        self._set_stt_gate("ready", "사용 가능")
+            raise ExternalServiceError(message)
 
         retried = 0
         for job_id in self.store.ids_with_status("blocked"):
@@ -912,19 +1362,28 @@ class SubtitleOrchestrator:
             previous.lm_token,
             previous.lm_model,
         )
+        if any(
+            endpoint.base_url == normalized.stt_base_url
+            for endpoint in self.store.list_runtime_endpoints()
+        ):
+            raise ValueError("외부 Runtime과 같은 주소를 기본값으로 설정할 수 없습니다.")
         stt_client = STTAPIClient(
             normalized.stt_base_url,
             normalized.stt_token,
             request_observer=self.record_external_request,
         )
-        lm_client = OpenAICompatibleClient(
-            normalized.lm_base_url,
-            normalized.lm_token,
-            normalized.lm_model,
-            max_segments=self.settings.translation_batch_segments,
-            max_characters=self.settings.translation_batch_characters,
-            request_limiter=self._translation_request_limiter,
-            request_observer=self.record_external_request,
+        lm_client = (
+            OpenAICompatibleClient(
+                normalized.lm_base_url,
+                normalized.lm_token,
+                normalized.lm_model,
+                max_segments=self.settings.translation_batch_segments,
+                max_characters=self.settings.translation_batch_characters,
+                request_limiter=self._translation_request_limiter,
+                request_observer=self.record_external_request,
+            )
+            if normalized.translation_is_complete
+            else None
         )
         if persist:
             self.store.save_remote_server_settings(
@@ -939,11 +1398,17 @@ class SubtitleOrchestrator:
             normalized.translation_workers
         )
         self._remote_runtime = (stt_client, lm_client, normalized)
+        with self._runtime_lock:
+            self._runtime_clients[BUILTIN_RUNTIME_ID] = stt_client
+            if persist:
+                self._runtime_health[BUILTIN_RUNTIME_ID] = {
+                    "status": "unknown",
+                    "message": None,
+                    "readiness": None,
+                    "checked_at": None,
+                }
         if persist:
-            self._set_stt_gate(
-                "unknown",
-                "연결 확인이 필요합니다.",
-            )
+            self._refresh_stt_gate_from_pool()
         if persist and translation_settings_changed:
             self._set_translation_circuit("ready")
         return normalized
@@ -982,6 +1447,16 @@ class SubtitleOrchestrator:
                 translation_recovery["generation_count"],
                 translation_recovery["batch_count"],
             )
+        for view in self.runtime_endpoints_view():
+            if (
+                not view["builtin"]
+                and view["enabled"]
+                and view["status"] == "unknown"
+            ):
+                self._runtime_probe_executor.submit(
+                    self.probe_runtime_endpoint,
+                    str(view["id"]),
+                )
         self._scheduler.start()
 
     def _reconcile_interrupted_jobs(self) -> int:
@@ -1015,7 +1490,12 @@ class SubtitleOrchestrator:
                         event_code="recovery.stop_confirmation",
                         from_state=job.state,
                         phase="transcription",
-                        payload={"remote_job_id": job.stt_job_id},
+                        payload={
+                            "remote_job_id": job.stt_job_id,
+                            "runtime_id": (
+                                job.stt_runtime_id or BUILTIN_RUNTIME_ID
+                            ),
+                        },
                     )
                     self._submit_stage(
                         self._stt_executor,
@@ -1047,7 +1527,10 @@ class SubtitleOrchestrator:
                     event_code="transcription.reconnected",
                     from_state=job.state,
                     phase="transcription",
-                    payload={"remote_job_id": job.stt_job_id},
+                    payload={
+                        "remote_job_id": job.stt_job_id,
+                        "runtime_id": job.stt_runtime_id or BUILTIN_RUNTIME_ID,
+                    },
                 )
                 self._submit_stage(
                     self._stt_executor,
@@ -1112,11 +1595,12 @@ class SubtitleOrchestrator:
         return recovered
 
     def _cancel_interrupted_transcription(self, job: PipelineJob) -> None:
-        if self.stt_client is None or not job.stt_job_id:
+        stt_client = self._stt_client_for_job(job)
+        if stt_client is None or not job.stt_job_id:
             raise ExternalServiceError(
                 "transcription server is not configured for cancellation"
             )
-        self.stt_client.cancel_job_and_wait(job.stt_job_id)
+        stt_client.cancel_job_and_wait(job.stt_job_id)
         raise OperationStopped("remote transcription cancellation confirmed")
 
     def _restart_checkpoint_status(
@@ -1178,6 +1662,7 @@ class SubtitleOrchestrator:
             self._audio_executor,
             self._render_executor,
             self._stt_executor,
+            self._runtime_probe_executor,
             self._translation_executor,
         ):
             executor.shutdown(wait=False, cancel_futures=True)
@@ -1273,10 +1758,14 @@ class SubtitleOrchestrator:
     ) -> list[PipelineJob]:
         if operation not in SUPPORTED_OPERATIONS:
             raise ValueError("unsupported job operation")
-        if operation != "extract" and not self.remote_servers_configured:
-            raise ValueError(
-                "먼저 서버 설정에서 전사 서버와 번역 서버를 저장하세요."
-            )
+        if operation in {"transcribe", "full"} and not (
+            self.transcription_server_configured
+        ):
+            raise ValueError("전사 서버 설정이 필요합니다.")
+        if operation in TRANSLATION_OPERATIONS and not (
+            self.translation_server_configured
+        ):
+            raise ValueError("번역 서버 설정이 필요합니다.")
         unique_source_rels = list(dict.fromkeys(source_rels))
         if not unique_source_rels:
             raise ValueError("작업할 미디어 파일을 하나 이상 선택하세요.")
@@ -1384,6 +1873,7 @@ class SubtitleOrchestrator:
                         else None
                     ),
                     stt_job_id=None,
+                    stt_runtime_id=None,
                     transcript_path=None,
                     transcript_revision_id=None,
                     translation_path=None,
@@ -1517,10 +2007,8 @@ class SubtitleOrchestrator:
         parent_comparison_id: str | None = None,
     ) -> tuple[str, list[PipelineJob]]:
         """Queue one transcription-only job per engine and source."""
-        if not self.remote_servers_configured:
-            raise ValueError(
-                "먼저 서버 설정에서 전사 서버와 번역 서버를 저장하세요."
-            )
+        if not self.transcription_server_configured:
+            raise ValueError("전사 서버 설정이 필요합니다.")
         unique_source_rels = list(dict.fromkeys(source_rels))
         if not unique_source_rels:
             raise ValueError("비교할 미디어 파일을 하나 이상 선택하세요.")
@@ -1658,10 +2146,8 @@ class SubtitleOrchestrator:
         prompt_category_id: str,
     ) -> list[PipelineJob]:
         """Move selected, latest completed transcripts into translation."""
-        if not self.remote_servers_configured:
-            raise ValueError(
-                "먼저 서버 설정에서 전사 서버와 번역 서버를 저장하세요."
-            )
+        if not self.translation_server_configured:
+            raise ValueError("번역 서버 설정이 필요합니다.")
         selected_ids = list(
             dict.fromkeys(job_id.strip() for job_id in job_ids if job_id.strip())
         )
@@ -1776,10 +2262,8 @@ class SubtitleOrchestrator:
         prompt_category_id: str,
     ) -> list[PipelineJob]:
         """Create translation jobs from selected comparison transcripts."""
-        if not self.remote_servers_configured:
-            raise ValueError(
-                "먼저 서버 설정에서 전사 서버와 번역 서버를 저장하세요."
-            )
+        if not self.translation_server_configured:
+            raise ValueError("번역 서버 설정이 필요합니다.")
         normalized_comparison_id = comparison_id.strip()
         selected_ids = list(
             dict.fromkeys(
@@ -2254,6 +2738,7 @@ class SubtitleOrchestrator:
             # A manual retry must submit the persisted WAV again. Retaining a
             # terminal remote ID would only replay its previous failed status.
             retry_fields["stt_job_id"] = None
+            retry_fields["stt_runtime_id"] = None
         if (
             target_status == "audio_ready"
             and job.audio_path
@@ -2538,10 +3023,14 @@ class SubtitleOrchestrator:
             raise ValueError("only successful jobs can be reprocessed")
         if operation not in SUPPORTED_OPERATIONS:
             raise ValueError("unsupported job operation")
-        if operation != "extract" and not self.remote_servers_configured:
-            raise ValueError(
-                "먼저 서버 설정에서 전사 서버와 번역 서버를 저장하세요."
-            )
+        if operation in {"transcribe", "full"} and not (
+            self.transcription_server_configured
+        ):
+            raise ValueError("전사 서버 설정이 필요합니다.")
+        if operation in TRANSLATION_OPERATIONS and not (
+            self.translation_server_configured
+        ):
+            raise ValueError("번역 서버 설정이 필요합니다.")
         return self.create_job(
             original.source_rel,
             force_overwrite=True,
@@ -2670,10 +3159,11 @@ class SubtitleOrchestrator:
                     if (
                         job.status == "transcription_running"
                         and job.stt_job_id
-                        and self.stt_client is not None
                     ):
+                        stt_client = self._stt_client_for_job(job)
                         try:
-                            self.stt_client.cancel_job(job.stt_job_id)
+                            if stt_client is not None:
+                                stt_client.cancel_job(job.stt_job_id)
                         except ExternalServiceError as error:
                             message = self._sanitize_error(str(error))
                             self.store.add_event(
@@ -2930,18 +3420,54 @@ class SubtitleOrchestrator:
                 self._extract,
             ):
                 break
-        if (
-            self.stt_gate_state == "ready"
-            and not self.store.ids_with_status("transcription_running")
-        ):
-            self._dispatch_one(
-                "audio_ready",
-                "transcription_running",
-                "transcription",
-                self._stt_executor,
-                self._transcribe,
-            )
+        if self.stt_gate_state == "ready":
+            self._dispatch_transcriptions()
         self._dispatch_translations()
+
+    def _dispatch_transcriptions(self) -> int:
+        with self._runtime_lock:
+            counts = self.store.transcription_runtime_counts()
+            health = {
+                runtime_id: str(value.get("status", "unknown"))
+                for runtime_id, value in self._runtime_health.items()
+            }
+            slots: list[str] = []
+            for definition in self._runtime_definitions():
+                runtime_id = str(definition["id"])
+                if (
+                    not definition["enabled"]
+                    or health.get(runtime_id) != "ready"
+                ):
+                    continue
+                available = max(
+                    0,
+                    int(definition["capacity"])
+                    - counts.get(runtime_id, 0),
+                )
+                slots.extend([runtime_id] * available)
+            if slots:
+                start = self._runtime_dispatch_cursor % len(slots)
+                slots = slots[start:] + slots[:start]
+                slots = slots[
+                    : max(0, MAX_RUNTIME_ENDPOINTS - sum(counts.values()))
+                ]
+            dispatched = 0
+            for runtime_id in slots:
+                if not self._dispatch_one(
+                    "audio_ready",
+                    "transcription_running",
+                    "transcription",
+                    self._stt_executor,
+                    self._transcribe,
+                    stt_runtime_id=runtime_id,
+                ):
+                    break
+                dispatched += 1
+            if slots:
+                self._runtime_dispatch_cursor = (
+                    self._runtime_dispatch_cursor + dispatched
+                ) % len(slots)
+        return dispatched
 
     def _dispatch_translations(self) -> int:
         if self.translation_circuit_state != "ready":
@@ -2965,6 +3491,8 @@ class SubtitleOrchestrator:
         stage: str,
         executor: ThreadPoolExecutor,
         operation: Callable[[PipelineJob], None],
+        *,
+        stt_runtime_id: str | None = None,
     ) -> bool:
         waiting_ids = self.store.dispatchable_ids_with_status(waiting)
         for job_id in waiting_ids:
@@ -2974,6 +3502,7 @@ class SubtitleOrchestrator:
                 running,
                 lease_owner=self._worker_id,
                 lease_seconds=JOB_LEASE_SECONDS,
+                stt_runtime_id=stt_runtime_id,
             )
             if lease_token is None:
                 continue
@@ -2988,6 +3517,11 @@ class SubtitleOrchestrator:
                 payload={
                     "waiting_status": waiting,
                     "running_status": running,
+                    **(
+                        {"runtime_id": stt_runtime_id}
+                        if stt_runtime_id is not None
+                        else {}
+                    ),
                 },
             )
             self._submit_stage(
@@ -3102,9 +3636,10 @@ class SubtitleOrchestrator:
                 )
                 return
             if error.failure_code == "auth_required":
-                self._set_stt_gate(
-                    "lost",
-                    message,
+                self._set_runtime_health(
+                    job.stt_runtime_id or BUILTIN_RUNTIME_ID,
+                    "unavailable",
+                    message=message,
                     reason_code=JobReason.AUTH_REQUIRED.value,
                 )
             outcome = "blocked" if blocked else "failed"
@@ -3148,10 +3683,10 @@ class SubtitleOrchestrator:
                 )
                 return
             if stage == "transcription":
-                self._set_stt_gate(
-                    "lost",
-                    message,
-                    reason_code=JobReason.STT_UNAVAILABLE.value,
+                self._set_runtime_health(
+                    job.stt_runtime_id or BUILTIN_RUNTIME_ID,
+                    "unavailable",
+                    message=message,
                 )
             if stage == "translation":
                 self._set_translation_circuit(
@@ -3404,9 +3939,10 @@ class SubtitleOrchestrator:
         )
 
     def _transcribe(self, job: PipelineJob) -> None:
-        stt_client = self.stt_client
+        runtime_id = job.stt_runtime_id or BUILTIN_RUNTIME_ID
+        stt_client = self._runtime_client(runtime_id)
         if stt_client is None:
-            raise ExternalServiceError("transcription server is not configured")
+            raise ExternalServiceError("assigned Runtime is not configured")
         if not job.audio_path or not Path(job.audio_path).is_file():
             raise RuntimeError("extracted WAV is unavailable")
         options = {
@@ -3495,7 +4031,10 @@ class SubtitleOrchestrator:
                 event_code="transcription.remote_accepted",
                 from_state=JobState.RUNNING.value,
                 phase="transcription",
-                payload={"remote_job_id": remote_job_id},
+                payload={
+                    "remote_job_id": remote_job_id,
+                    "runtime_id": runtime_id,
+                },
             )
 
         def update_transcription_progress(progress: Mapping[str, Any]) -> None:

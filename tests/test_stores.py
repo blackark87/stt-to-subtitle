@@ -808,8 +808,8 @@ class JobStoreTests(unittest.TestCase):
             self.assertEqual(
                 snapshot["database"]["migrations"],
                 {
-                    "applied_count": 8,
-                    "latest_sequence": 52,
+                    "applied_count": 9,
+                    "latest_sequence": 53,
                     "unsequenced_count": 0,
                 },
             )
@@ -1398,6 +1398,45 @@ class JobStoreTests(unittest.TestCase):
                     "lm_model": "model",
                     "translation_workers": 1,
                 },
+            )
+
+    def test_persists_runtime_pool_and_atomic_job_assignment(self) -> None:
+        with TemporaryDirectory() as directory:
+            database_path = Path(directory) / "jobs.sqlite3"
+            store = JobStore(database_path)
+            endpoint = store.create_runtime_endpoint(
+                name="GPU Runtime 02",
+                base_url="http://runtime-02.test:8100",
+                token="runtime-token",
+                enabled=True,
+                capacity=2,
+            )
+            job = store.create(
+                job_id="runtime-assignment",
+                source_rel="movie.mkv",
+                force_overwrite=False,
+                options={},
+                status="audio_ready",
+            )
+
+            lease_token = store.claim_for_dispatch(
+                job.id,
+                "audio_ready",
+                "transcription_running",
+                stt_runtime_id=endpoint.id,
+            )
+
+            reloaded = JobStore(database_path)
+            assigned = reloaded.get(job.id)
+            self.assertEqual(lease_token, 1)
+            self.assertEqual(assigned.stt_runtime_id, endpoint.id)
+            self.assertEqual(
+                reloaded.transcription_runtime_counts(),
+                {endpoint.id: 1},
+            )
+            self.assertEqual(
+                reloaded.list_runtime_endpoints()[0].token,
+                "runtime-token",
             )
 
     def test_persists_dependency_gate_state_without_credentials(self) -> None:

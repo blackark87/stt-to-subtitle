@@ -17,62 +17,17 @@ from .stt_quality import (
     short_span_diagnostics,
 )
 from .stt_trace import StageArtifactRecorder
+from .stt_options import (
+    DEFAULT_CHUNK_LENGTH_SECONDS,
+    DEFAULT_NOISE_FILTER_TRIGGER_LEVEL,
+    TranscriptionOptions,
+)
 
 MODEL_ID = "kotoba-tech/kotoba-whisper-v2.2"
 MODEL_REVISION = "9d33482a0eb9b57f1ad80708e8ac5538246d8355"
 DEVICE_PATTERN = re.compile(r"^(?:cpu|mps|cuda(?::\d+)?)$")
 TIMESTAMP_POSTPROCESSOR = "stt-to-subtitle/kotoba-speaker-span-v1"
-DEFAULT_CHUNK_LENGTH_SECONDS = 60
-DEFAULT_NOISE_FILTER_TRIGGER_LEVEL = 7.0
 LOGGER = logging.getLogger(__name__)
-
-
-@dataclass(frozen=True)
-class TranscriptionOptions:
-    batch_size: int = 1
-    chunk_length_seconds: int = DEFAULT_CHUNK_LENGTH_SECONDS
-    num_speakers: int | None = None
-    min_speakers: int | None = None
-    max_speakers: int | None = None
-    add_punctuation: bool = False
-    noise_filter: bool = True
-    noise_filter_trigger_level: float = DEFAULT_NOISE_FILTER_TRIGGER_LEVEL
-    short_span_policy: str = "observe"
-    threads: int | None = None
-
-    def validate(self) -> None:
-        if self.batch_size < 1:
-            raise ValueError("batch_size must be at least 1")
-        if self.chunk_length_seconds < 1:
-            raise ValueError("chunk_length_seconds must be at least 1")
-        if self.noise_filter_trigger_level <= 0:
-            raise ValueError("noise_filter_trigger_level must be positive")
-        if self.threads is not None and self.threads < 1:
-            raise ValueError("threads must be at least 1")
-        if self.short_span_policy != "observe":
-            raise ValueError(
-                "short_span_policy currently supports only non-destructive "
-                "'observe' mode"
-            )
-        speaker_values = (
-            self.num_speakers,
-            self.min_speakers,
-            self.max_speakers,
-        )
-        if any(value is not None and value < 1 for value in speaker_values):
-            raise ValueError("speaker counts must be at least 1")
-        if self.num_speakers is not None and (
-            self.min_speakers is not None or self.max_speakers is not None
-        ):
-            raise ValueError(
-                "num_speakers cannot be combined with min_speakers or max_speakers"
-            )
-        if (
-            self.min_speakers is not None
-            and self.max_speakers is not None
-            and self.min_speakers > self.max_speakers
-        ):
-            raise ValueError("min_speakers cannot exceed max_speakers")
 
 
 class SpeechPipeline(Protocol):

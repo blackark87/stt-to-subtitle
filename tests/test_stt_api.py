@@ -1372,6 +1372,8 @@ class STTAPIRouteTests(unittest.TestCase):
                 state_dir=Path(directory),
                 api_token="api-token",
                 hf_token="hf-token",
+                runtime_id="runtime-node-02",
+                runtime_name="GPU Runtime 02",
             )
             with TestClient(create_app(settings)) as client:
                 health = client.get("/healthz")
@@ -1379,6 +1381,14 @@ class STTAPIRouteTests(unittest.TestCase):
 
             self.assertEqual(health.status_code, 200)
             self.assertEqual(health.json()["status"], "ok")
+            self.assertEqual(
+                health.json()["runtime"],
+                {
+                    "id": "runtime-node-02",
+                    "name": "GPU Runtime 02",
+                    "version": __version__,
+                },
+            )
             self.assertEqual(
                 health.json()["queue"],
                 {

@@ -3,35 +3,38 @@
 영상에서 일본어 음성을 전사하고 OpenAI 호환 번역 서버로 한국어를 생성한 뒤,
 화자별 SRT·ASS 자막을 저장하는 로컬 웹 애플리케이션입니다.
 
-NVIDIA GPU 배포에서는 웹 오케스트레이터와 CUDA 전사 API를 하나의 Docker
-Compose 프로젝트로 빌드하고 실행합니다. 애플리케이션 이미지를 외부
+NVIDIA GPU 배포에서는 정적 웹, Backend API와 CUDA 전사 Runtime을 하나의
+Docker Compose 프로젝트로 빌드하고 실행합니다. 애플리케이션 이미지를 외부
 레지스트리에서 받거나 게시하지 않습니다.
 
 ## 구성
 
 ```text
-브라우저 ──▶ Traefik(HTTPS) ──▶ web:8080
-                                  │
+브라우저 ──▶ Traefik(HTTPS) ──▶ web:8080 (Nginx, 정적 HTML/CSS/JS)
+                                  │ HTTP /api
+                                  ▼
+                                backend:8080 (FastAPI + Uvicorn)
                                   ├─ FFmpeg 오디오 추출
                                   ├─ 작업·번역·자막 렌더링
-                                  │
-                                  ├──▶ stt:8100
-                                  │      Kotoba + Pyannote
-                                  │      WhisperX + Pyannote
-                                  │      WhisperJAV + Qwen alignment + Pyannote
-                                  │
-                                  └──▶ 외부 OpenAI 호환 번역 API
+                                  ├──▶ Runtime 풀 (HTTP + 진행 상태 SSE)
+                                  │      ├─ runtime:8100 (기본)
+                                  │      └─ 외부 GPU Runtime 1..N
+                                  └──▶ 외부 번역·검증 Provider
 ```
 
-Compose 프로젝트에는 두 컨테이너가 있습니다.
+Compose 프로젝트에는 세 실행 컨테이너가 있습니다.
 
-- `web`: 미디어 탐색, 작업 상태, FFmpeg 추출, 번역, SRT·ASS 렌더링
-- `stt`: WhisperJAV, Kotoba, WhisperX, 하이브리드 전사를 제공하는 CUDA
+- `web`: Nginx로 최소 정적 화면과 자산을 제공하고 `/api`만 프록시
+- `backend`: 작업 API, 상태 저장, FFmpeg 추출, 번역, SRT·ASS 렌더링
+- `runtime`: WhisperJAV, Kotoba, WhisperX, 하이브리드 전사를 제공하는 CUDA
   FastAPI 서버
 
-두 서비스는 Compose 내부 네트워크의 `http://stt:8100`으로 연결됩니다.
-전사 API와 웹 포트는 호스트에 직접 게시하지 않습니다. 웹 서비스만 기존
+Backend와 Runtime은 Compose 내부 네트워크의 `http://runtime:8100`으로
+연결됩니다. Backend와 Runtime 포트는 호스트에 직접 게시하지 않습니다. Web만 기존
 Traefik 외부 네트워크에 연결되고 HTTPS 라우터를 통해 제공됩니다.
+기본 Runtime을 포함한 All-in-One 구성이 기본값이며, 외부 호스트의 Runtime은
+Web UI에서 주소를 추가해 같은 전사 작업 풀로 확장할 수 있습니다. 번역 LLM
+서버는 Runtime 풀에 포함되지 않고 Backend가 별도로 호출합니다.
 
 Kotoba, WhisperX, WhisperJAV는 요구하는 PyTorch·모델 의존성이 다르므로
 STT 이미지 안에서도 각각 `/opt/venvs/kotoba`, `/opt/venvs/whisperx`,
@@ -95,15 +98,15 @@ test -w /data/models/stt-to-subtitle
 ```
 
 고정 STT 실행 환경 이미지는 Python, CUDA 라이브러리와 서로 격리된 Kotoba,
-WhisperX, WhisperJAV 환경을 포함합니다. 애플리케이션 `stt` 이미지는 이 기반
-이미지 위에 애플리케이션 wheel만 설치합니다. 모델 가중치는 두 이미지에
+WhisperX, WhisperJAV 환경을 포함합니다. 애플리케이션 `runtime` 이미지는 이 기반
+이미지 위에 Runtime 의존 모듈만 추가합니다. 모델 가중치는 두 이미지에
 포함하지 않습니다. 기반 런타임 이미지를 준비하려면 다음 명령을 사용합니다.
 
 ```bash
-./scripts/compose.sh --env-file .env.compose --profile build build stt-runtime
+./scripts/compose.sh --env-file .env.compose --profile build build runtime-base
 ```
 
-이후 애플리케이션 이미지를 빌드하고 두 서비스를 함께 실행합니다.
+이후 애플리케이션 이미지를 빌드하고 세 서비스를 함께 실행합니다.
 
 ```bash
 ./scripts/compose.sh --env-file .env.compose config
@@ -112,14 +115,14 @@ WhisperX, WhisperJAV 환경을 포함합니다. 애플리케이션 `stt` 이미�
 ./scripts/compose.sh --env-file .env.compose ps
 ```
 
-`scripts/compose.sh`는 현재 실행 계정의 UID/GID를 두 컨테이너에 주입하며
+`scripts/compose.sh`는 현재 실행 계정의 UID/GID를 Runtime에 주입하며
 root 실행은 거부합니다. 따라서 `.env.compose`에 UID/GID를 설정할 필요가
 없고, 마운트 경로를 소유한 일반 사용자로 실행해야 합니다.
 
-`stt-runtime` 이미지는 세 ML 환경을 모두 설치하므로 최초 빌드 시간이 길고
+`runtime-base` 이미지는 세 ML 환경을 모두 설치하므로 최초 빌드 시간이 길고
 이미지가 클 수 있습니다. 일반 `build`는 이 고정 이미지를 재사용하고
 애플리케이션 코드만 설치합니다. 요구사항 파일이나 Python/CUDA 기반 환경을
-변경할 때만 `STT_RUNTIME_IMAGE` 태그를 올리고 `stt-runtime`을 다시
+변경할 때만 `STT_RUNTIME_BASE_IMAGE` 태그를 올리고 `runtime-base`를 다시
 빌드합니다. 모델 가중치는 이미지에 포함하지 않으며 최초 전사 요청 때
 `${MODEL_CACHE_PATH}`로 내려받습니다.
 `STT_RUNTIME_CACHE_PATH`는 외부에서 준비한 BuildKit 로컬 캐시를 읽는 경로이며,
@@ -129,31 +132,49 @@ Compose 빌드 자체는 이 캐시를 갱신하지 않습니다.
 
 ```bash
 curl https://stt.example.com/healthz
-./scripts/compose.sh --env-file .env.compose exec stt \
+./scripts/compose.sh --env-file .env.compose exec runtime \
   python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8100/readyz').read().decode())"
 ```
 
-브라우저에서 `https://TRAEFIK_HOST`를 열고 **서버 설정**에서 번역
-서버를 확인합니다. Compose의 전사 API 주소는 내부 서비스
-`http://stt:8100`으로 고정되므로 환경 파일에서 설정하지 않습니다. 설정은
-웹 상태 디렉터리의 `jobs.sqlite3`에 저장되며 컨테이너를 다시 만들어도
+브라우저에서 `https://TRAEFIK_HOST`를 열면 최소 정적 화면에서 상태와 최근
+작업을 확인할 수 있습니다. 상세 UI는 후속 프런트엔드 마이그레이션 범위입니다.
+Compose의 전사 API 주소는 내부 서비스 `http://runtime:8100`으로 고정되므로
+환경 파일에서 설정하지 않습니다. 설정은 Backend 상태 디렉터리의
+`jobs.sqlite3`에 저장되며 컨테이너를 다시 만들어도
 유지됩니다. 번역 작업은 전사가 완료되어 번역 대기 상태가 되었을 때만 외부
 서버를 호출하며, 별도의 시작 동작이나 주기적인 상태 확인은 수행하지 않습니다.
 연결 실패 시 해당 작업을 중단하고 뒤의 대기 작업은 보존합니다. 번역 PC와
 모델을 준비한 뒤 작업 목록에서 번역 작업만 선택해 재시도할 수 있습니다.
 
-웹 화면은 역할별로 분리됩니다. `/`는 상태 요약과 최근 작업만 보여 주는
-대시보드이고, `/media`는 파일 탐색과 신규 작업 등록, `/jobs`는 상태별 작업
-목록입니다. 대시보드의 2D/3D 전환 상태는 브라우저 쿠키에 저장됩니다. 3D 모드는
-같은 작업·GPU 데이터를 아이소메트릭 파이프라인으로 표시하며, WebGPU가 지원되지
-않으면 WebGL2로 폴백합니다. 모든 화면에서 사이드 메뉴로 각 영역을 직접 이동할
-수 있습니다.
+현재 정적 화면은 서비스 분리를 검증하기 위한 최소 UI입니다. 기존 Jinja2
+화면의 시각 설계와 기능을 그대로 이식하지 않으며, 후속 프런트엔드 작업은
+`service-split-plan.md`의 API 계약을 기준으로 진행합니다.
 
-전사 상태는 고정 간격으로 조회하지 않습니다. STT 저장소 변경 Hook이 작업별
-SSE 스트림으로 상태를 보내고, 웹 오케스트레이터의 변경 Hook이 다시 브라우저
-SSE에 전달합니다. 번역도 배치 저장 시 같은 경로로 즉시 반영됩니다. 오디오
-추출이 끝나면 WAV 헤더의 재생 시간과 모델 청크 길이로 전체 전사 청크를 먼저
-추정하며, 실제 생성 청크가 추정치를 넘으면 진행률의 전체 수를 자동 보정합니다.
+## 외부 Runtime 추가
+
+외부 GPU 호스트에서는 Runtime 전용 Compose만 실행합니다.
+
+```bash
+cp .env.runtime.example .env.runtime
+mkdir -p /var/lib/stt-to-subtitle/runtime-state \
+  /data/work/stt-to-subtitle/runtime-incoming \
+  /data/models/stt-to-subtitle
+./scripts/compose.sh -f compose.runtime.yaml --env-file .env.runtime \
+  --profile build build runtime-base
+./scripts/compose.sh -f compose.runtime.yaml --env-file .env.runtime build runtime
+./scripts/compose.sh -f compose.runtime.yaml --env-file .env.runtime up -d runtime
+```
+
+방화벽에서는 Backend 호스트가 접근할 Runtime 포트만 허용합니다. Web UI의
+**전사 Runtime**에서 `http://runtime-host:8100` 주소와 동일한 API 토큰을
+등록하면 준비 상태 확인 후 새 전사 작업부터 사용됩니다. 진행 중인 작업은
+접수한 Runtime에 고정되며 Backend 재시작 후에도 같은 원격 작업에 재연결합니다.
+Runtime 비활성화와 삭제는 해당 Runtime의 진행 작업이 없을 때만 허용됩니다.
+
+Backend는 Runtime의 작업별 SSE 스트림으로 장시간 전사 진행 상태를 받습니다.
+최소 정적 화면은 `/api/v1/jobs`를 10초마다 조회합니다. 오디오 추출이 끝나면 WAV
+헤더의 재생 시간과 모델 청크 길이로 전체 전사 청크를 먼저 추정하며, 실제 생성
+청크가 추정치를 넘으면 진행률의 전체 수를 자동 보정합니다.
 
 ## 환경 설정
 
@@ -162,31 +183,21 @@ SSE에 전달합니다. 번역도 배치 저장 시 같은 경로로 즉시 반�
 | 변수 | 기본값 | 용도 |
 | --- | --- | --- |
 | `MEDIA_PATH` | `./media` | 입력 영상과 생성 자막 |
-| `WEB_STATE_PATH` | `/var/lib/homelab/stt-to-subtitle/web-state` | 작업 DB와 영속 상태 |
-| `WEB_WORK_PATH` | `/data/work/stt-to-subtitle/web-jobs` | 작업 WAV와 재생성 가능한 JSON 체크포인트 |
-| `WEB_PUID` | `1026` | 웹 컨테이너 프로세스 UID |
-| `WEB_PGID` | `100` | 웹 컨테이너 프로세스 GID |
+| `BACKEND_STATE_PATH` | `/var/lib/homelab/stt-to-subtitle/web-state` | 작업 DB와 영속 상태 |
+| `BACKEND_WORK_PATH` | `/data/work/stt-to-subtitle/web-jobs` | 작업 WAV와 재생성 가능한 JSON 체크포인트 |
+| `BACKEND_PUID` | `1026` | Backend 프로세스 UID |
+| `BACKEND_PGID` | `100` | Backend 프로세스 GID |
 | `TRAEFIK_HOST` | 필수 | 웹 HTTPS 라우터의 DNS 호스트명 |
 | `TRAEFIK_NETWORK` | `proxy` | Traefik이 연결된 외부 Docker 네트워크 |
 | `TRAEFIK_ENTRYPOINT` | `websecure` | Traefik HTTPS entrypoint |
 | `TRAEFIK_CERT_RESOLVER` | `letsencrypt` | Traefik 인증서 resolver |
-| `WEB_FORWARDED_ALLOW_IPS` | `*` | 호스트에 직접 게시되지 않은 웹 컨테이너에서 신뢰할 프록시 주소 |
-| `WEB_ADMIN_PASSWORD` | 빈 값 | 웹 로그인 비밀번호 |
-| `WEB_SESSION_SECRET` | 빈 값 | 로그인 사용 시 필요한 32자 이상 세션 키 |
-| `WEB_SECURE_COOKIE` | `true` | HTTPS에서만 세션 쿠키 전송 |
-| `WEB_AUDIO_WORKERS` | `1` | 동시에 실행할 오디오 추출 작업 수, 자막 렌더는 별도 실행기에서 병행 |
+| `BACKEND_FORWARDED_ALLOW_IPS` | `*` | Nginx를 통해 전달되는 proxy header의 신뢰 범위 |
+| `BACKEND_AUDIO_WORKERS` | `1` | 동시에 실행할 오디오 추출 작업 수, 자막 렌더는 별도 실행기에서 병행 |
 | `GPU_PROMETHEUS_URL` | 빈 값 | STT 대시보드가 직접 조회할 Prometheus URL |
 | `GPU_PROMETHEUS_TOKEN` | 빈 값 | 외부 Prometheus 프록시가 요구할 때만 사용하는 Bearer 토큰 |
 | `GPU_METRICS_REFRESH_SECONDS` | `10` | STT 화면의 GPU 메트릭 갱신 및 서버 캐시 간격 |
 | `GPU_METRICS_TIMEOUT_SECONDS` | `3` | Prometheus 조회 제한 시간 |
 | `GPU_MONITORING_NETWORK` | `gpu-monitoring` | 두 Compose 프로젝트가 공유하는 내부 Docker 네트워크 |
-
-`WEB_ADMIN_PASSWORD`를 설정하면 `WEB_SESSION_SECRET`도 반드시 32자
-이상으로 설정해야 합니다. 다음과 같이 생성할 수 있습니다.
-
-```bash
-python3 -c 'import secrets; print(secrets.token_urlsafe(48))'
-```
 
 ### CUDA 전사
 
@@ -195,6 +206,10 @@ python3 -c 'import secrets; print(secrets.token_urlsafe(48))'
 | `STT_STATE_PATH` | `/var/lib/homelab/stt-to-subtitle/stt-state` | 전사 작업 DB와 결과 |
 | `STT_WORK_PATH` | `/data/work/stt-to-subtitle/stt-incoming` | 전사용 입력 WAV 작업 공간 |
 | `MODEL_CACHE_PATH` | `/data/models/stt-to-subtitle` | Hugging Face·PyTorch·WhisperX·WhisperJAV 캐시 |
+| `STT_RUNTIME_BASE_IMAGE` | `stt-to-subtitle-runtime-base:py311-cuda-v4` | Runtime이 재사용하는 고정 ML 기반 이미지 |
+| `STT_RUNTIME_ID` | `builtin` | Runtime이 상태 API에 보고하는 고유 식별자 |
+| `STT_RUNTIME_NAME` | `기본 Runtime` | Runtime 표시 이름 |
+| `STT_API_TOKEN` | 빈 값 | Backend와 Runtime이 공유하는 선택적 Bearer 토큰 |
 | `STT_RUNTIME_CACHE_PATH` | `/data/cache/buildkit/stt-runtime-py311-cuda-v4-20260825` | 외부에서 준비한 고비용 런타임 빌드 캐시 |
 | `STT_DEVICE` | `cuda` | `cuda` 또는 `cuda:<index>` |
 | `STT_DIARIZATION_DEVICE` | `cuda` | 화자 분리 장치, VRAM 절약 시 `cpu` |
@@ -225,9 +240,9 @@ python3 -c 'import secrets; print(secrets.token_urlsafe(48))'
 ## GPU 관측 사이드 프로젝트
 
 `gpu-observability/`는 메인 Compose와 분리된 독립 프로젝트입니다. NVIDIA
-DCGM Exporter, Prometheus와 Grafana를 함께 실행합니다. STT 웹은 Grafana로
-이동하지 않고 Prometheus의 현재 GPU 사용률, 메모리, 온도와 전력을 직접
-조회해 메인 대시보드에 표시합니다.
+DCGM Exporter, Prometheus와 Grafana를 함께 실행합니다. Backend는 Grafana로
+이동하지 않고 Prometheus의 현재 GPU 사용률, 메모리, 온도와 전력을 조회해
+API로 제공합니다.
 
 관측 스택을 먼저 실행해 `gpu-monitoring` 네트워크를 만든 뒤, 메인 프로젝트에
 전용 Compose 오버레이를 함께 적용합니다.
@@ -236,7 +251,7 @@ DCGM Exporter, Prometheus와 Grafana를 함께 실행합니다. STT 웹은 Grafa
 docker compose \
   -f compose.yaml \
   -f compose.gpu-monitoring.yaml \
-  up -d --build web
+  up -d --build web backend
 ```
 
 이 구성에서는 기본 `GPU_PROMETHEUS_URL`이 `http://prometheus:9090`입니다.
@@ -339,14 +354,17 @@ SQLite에 저장합니다. 부분 JSON은 DB 결과에서 다시 만들 수 있�
 마운트 용도는 다음과 같습니다.
 
 - `${MEDIA_PATH}:/media:rw`: 영상 조회 및 원본 옆 자막 저장
-- `${WEB_STATE_PATH}:/var/lib/stt:rw`: 작업 DB와 영속 상태
-- `${WEB_WORK_PATH}:/var/lib/stt-work:rw`: 작업 WAV와 재생성 가능한 체크포인트
+- `${BACKEND_STATE_PATH}:/var/lib/stt:rw`: 작업 DB와 영속 상태
+- `${BACKEND_WORK_PATH}:/var/lib/stt-work:rw`: 작업 WAV와 재생성 가능한 체크포인트
 - `${STT_STATE_PATH}:/var/lib/stt:rw`: STT 작업 DB와 결과
 - `${STT_WORK_PATH}:/var/lib/stt-work:rw`: 전사용 입력 WAV 작업 공간
 - `${MODEL_CACHE_PATH}:/var/cache/stt:rw`: 모델 캐시
 
 기존 배포를 이전할 때는 서비스를 먼저 중지합니다. 웹 `jobs.sqlite3`는
-`WEB_STATE_PATH`로, 기존 웹 `jobs/`의 내용은 `WEB_WORK_PATH`로 옮깁니다.
+`BACKEND_STATE_PATH`로, 기존 웹 `jobs/`의 내용은
+`BACKEND_WORK_PATH`로 옮깁니다. 기존 배포의 `WEB_STATE_PATH`,
+`WEB_WORK_PATH`, `WEB_PUID`, `WEB_PGID`, `WEB_AUDIO_WORKERS`는 Compose
+이전 별칭으로만 계속 인식합니다.
 STT의 `jobs.sqlite3`와 `results/`는 `STT_STATE_PATH`에 유지하고,
 `incoming/`의 내용은 `STT_WORK_PATH`로 옮깁니다. 첫 시작 시 DB에 저장된
 기존 `/var/lib/stt/jobs` 및 `/var/lib/stt/incoming` 경로는 새 비중첩 작업
@@ -383,19 +401,19 @@ cd /path/to/runtime
 ./scripts/compose.sh --env-file .env.compose up -d
 ```
 
-소스 변경만으로는 `stt-runtime`을 다시 빌드하지 않습니다. ML 요구사항이나
-기반 런타임을 변경한 경우에만 새 `STT_RUNTIME_IMAGE` 태그를 지정하고 다음을
+소스 변경만으로는 `runtime-base`를 다시 빌드하지 않습니다. ML 요구사항이나
+기반 런타임을 변경한 경우에만 새 `STT_RUNTIME_BASE_IMAGE` 태그를 지정하고 다음을
 실행합니다.
 
 ```bash
-./scripts/compose.sh --env-file .env.compose --profile build build stt-runtime
+./scripts/compose.sh --env-file .env.compose --profile build build runtime-base
 ```
 
 자주 사용하는 명령은 다음과 같습니다.
 
 ```bash
-./scripts/compose.sh --env-file .env.compose logs --tail=200 web stt
-./scripts/compose.sh --env-file .env.compose restart web stt
+./scripts/compose.sh --env-file .env.compose logs --tail=200 web backend runtime
+./scripts/compose.sh --env-file .env.compose restart web backend runtime
 ./scripts/compose.sh --env-file .env.compose down
 ```
 
@@ -409,11 +427,12 @@ cd /path/to/runtime
 stt-check-migrations /path/to/jobs.sqlite3
 ```
 
-Compose 운영 DB는 웹 entrypoint를 덮어써 같은 UID/GID와 볼륨에서 검사합니다.
-`--entrypoint`를 생략하면 `stt-web`이 잘못 전달된 명령 인자를 거부합니다.
+Compose 운영 DB는 Backend entrypoint를 덮어써 같은 UID/GID와 볼륨에서
+검사합니다.
 
 ```bash
-docker compose run --rm --entrypoint stt-check-migrations web \
+docker compose run --rm --entrypoint python backend \
+  -m stt_to_subtitle.migration_check \
   /var/lib/stt/jobs.sqlite3
 ```
 
@@ -423,13 +442,11 @@ checkpoint가 끝난 WAL 없는 DB는 immutable read-only로 열어 원본 디�
 중단합니다.
 
 운영 스냅샷은 `/api/operations/metrics` JSON과
-`/api/operations/metrics/prometheus` Prometheus text로 제공합니다. 웹 인증을
-켠 구성에서는 두 경로에도 인증이 필요합니다.
+`/api/operations/metrics/prometheus` Prometheus text로 제공합니다.
 
-웹 로그인을 사용하지 않는 구성은 신뢰할 수 있는 사설망 또는 VPN에서만
-실행하십시오. 인터넷에 직접 노출할 때는 HTTPS reverse proxy,
-`WEB_ADMIN_PASSWORD`, `WEB_SESSION_SECRET`, `WEB_SECURE_COOKIE=true`를
-설정합니다. STT 포트는 호스트에 게시하지 않습니다.
+애플리케이션 인증은 두지 않으므로 신뢰할 수 있는 내부망에서만 실행합니다.
+Web만 HTTPS reverse proxy에 연결하고 Backend와 Runtime 포트는 호스트에
+게시하지 않습니다.
 
 ## 개발 검증
 

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
 import gc
 from importlib.metadata import version
 import json
@@ -16,6 +15,13 @@ from typing import Any, Mapping, Sequence
 from .files import write_json_atomic
 from .stt_quality import repetition_diagnostics
 from .stt_trace import StageArtifactRecorder
+from .stt_options import (
+    DEFAULT_SUBTITLE_SEGMENTATION,
+    WHISPERX_MAX_BATCH_SIZE,
+    WHISPERX_MAX_CHUNK_LENGTH_SECONDS,
+    WHISPERX_MIN_BATCH_SIZE,
+    WhisperXSegmentationOptions,
+)
 from .transcription_progress import (
     StageProgressCallback,
     report_stage_progress,
@@ -26,17 +32,7 @@ WHISPERX_PACKAGE_VERSION = "3.8.6"
 DEFAULT_WHISPERX_MODEL = "large-v3"
 DEFAULT_WHISPERX_LANGUAGE = "ja"
 DEFAULT_WHISPERX_COMPUTE_TYPE = "float16"
-WHISPERX_MAX_CHUNK_LENGTH_SECONDS = 30
-WHISPERX_MIN_BATCH_SIZE = 1
-WHISPERX_MAX_BATCH_SIZE = 64
 WHISPERX_TIMESTAMP_POSTPROCESSOR = "whisperx-forced-alignment"
-DEFAULT_SUBTITLE_SEGMENTATION = {
-    "split_on_speaker_change": True,
-    "max_gap_sec": 0.8,
-    "max_duration_sec": 8.0,
-    "max_chars": 36,
-    "prefer_punctuation_boundary": True,
-}
 
 
 def _log(message: str) -> None:
@@ -47,73 +43,6 @@ def _log(message: str) -> None:
     """
 
     print(f"[whisperx_worker] {message}", file=sys.stderr, flush=True)
-
-
-@dataclass(frozen=True)
-class WhisperXSegmentationOptions:
-    """Configurable word-level subtitle boundaries."""
-
-    split_on_speaker_change: bool = True
-    max_gap_sec: float | None = None
-    max_duration_sec: float | None = None
-    max_chars: int | None = None
-    prefer_punctuation_boundary: bool = True
-
-    @classmethod
-    def from_options(
-        cls,
-        options: Mapping[str, Any],
-        *,
-        defaults: Mapping[str, Any] | None = None,
-    ) -> WhisperXSegmentationOptions:
-        raw = options.get("subtitle_segmentation", {})
-        if not isinstance(raw, Mapping):
-            raise ValueError("subtitle_segmentation must be a JSON object")
-        if defaults is not None:
-            raw = {**defaults, **raw}
-        allowed = {
-            "split_on_speaker_change",
-            "max_gap_sec",
-            "max_duration_sec",
-            "max_chars",
-            "prefer_punctuation_boundary",
-        }
-        unknown = set(raw) - allowed
-        if unknown:
-            raise ValueError(
-                f"unsupported subtitle_segmentation options: {sorted(unknown)}"
-            )
-
-        def optional_float(name: str) -> float | None:
-            value = raw.get(name)
-            if value is None:
-                return None
-            converted = float(value)
-            if converted <= 0:
-                raise ValueError(f"{name} must be positive or null")
-            return converted
-
-        max_chars_value = raw.get("max_chars")
-        max_chars = int(max_chars_value) if max_chars_value is not None else None
-        if max_chars is not None and max_chars < 1:
-            raise ValueError("max_chars must be positive or null")
-        for name in (
-            "split_on_speaker_change",
-            "prefer_punctuation_boundary",
-        ):
-            if name in raw and not isinstance(raw[name], bool):
-                raise ValueError(f"{name} must be a JSON boolean")
-        return cls(
-            split_on_speaker_change=raw.get(
-                "split_on_speaker_change", True
-            ),
-            max_gap_sec=optional_float("max_gap_sec"),
-            max_duration_sec=optional_float("max_duration_sec"),
-            max_chars=max_chars,
-            prefer_punctuation_boundary=raw.get(
-                "prefer_punctuation_boundary", True
-            ),
-        )
 
 
 class _WholeSegmentSentenceTokenizer:

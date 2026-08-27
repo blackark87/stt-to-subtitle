@@ -9,37 +9,49 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class ReleaseConfigurationTests(unittest.TestCase):
-    def test_compose_builds_web_and_stt_images_locally(self) -> None:
+    def test_compose_builds_isolated_web_backend_and_runtime_images(self) -> None:
         compose = (ROOT / "compose.yaml").read_text(encoding="utf-8")
         workflow = (ROOT / ".github/workflows/ci.yaml").read_text(
             encoding="utf-8"
         )
 
         self.assertIn("dockerfile: Dockerfile.web", compose)
-        self.assertIn("dockerfile: Dockerfile", compose)
+        self.assertIn("dockerfile: Dockerfile.backend", compose)
+        self.assertIn("dockerfile: Dockerfile.runtime", compose)
         self.assertIn("dockerfile: Dockerfile.stt-runtime", compose)
-        self.assertEqual(compose.count("context: ${WORKSPACE:-.}"), 3)
-        self.assertIn("STT_RUNTIME_IMAGE:", compose)
-        self.assertIn("stt-to-subtitle-stt-runtime:py311-cuda-v4", compose)
-        stt_dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
-        runtime_dockerfile = (ROOT / "Dockerfile.stt-runtime").read_text(
+        self.assertEqual(compose.count("context: ${WORKSPACE:-.}"), 4)
+        self.assertIn("STT_RUNTIME_BASE_IMAGE:", compose)
+        self.assertIn("stt-to-subtitle-runtime-base:py311-cuda-v4", compose)
+        backend_dockerfile = (ROOT / "Dockerfile.backend").read_text(
             encoding="utf-8"
         )
-        self.assertIn("FROM ${STT_RUNTIME_IMAGE} AS runtime", stt_dockerfile)
-        self.assertNotIn("AS whisperjav-builder", stt_dockerfile)
+        runtime_dockerfile = (ROOT / "Dockerfile.runtime").read_text(
+            encoding="utf-8"
+        )
+        runtime_base_dockerfile = (ROOT / "Dockerfile.stt-runtime").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            "FROM ${STT_RUNTIME_BASE_IMAGE} AS runtime",
+            runtime_dockerfile,
+        )
+        self.assertNotIn("AS whisperjav-builder", runtime_dockerfile)
         self.assertIn(
             "FROM ${PYTHON_IMAGE} AS whisperjav-builder",
-            runtime_dockerfile,
+            runtime_base_dockerfile,
         )
         self.assertIn(
             "COPY --from=whisperjav-builder /opt/venvs/whisperjav",
-            runtime_dockerfile,
+            runtime_base_dockerfile,
         )
         # WhisperJAV is vendored, so the image installs pinned dependencies
         # instead of cloning the upstream project.
-        self.assertIn("requirements-whisperjav.txt", runtime_dockerfile)
-        self.assertNotIn("github.com/meizhong986/WhisperJAV", runtime_dockerfile)
-        self.assertNotIn("--extra qwen", runtime_dockerfile)
+        self.assertIn("requirements-whisperjav.txt", runtime_base_dockerfile)
+        self.assertNotIn(
+            "github.com/meizhong986/WhisperJAV",
+            runtime_base_dockerfile,
+        )
+        self.assertNotIn("--extra qwen", runtime_base_dockerfile)
         whisperjav_requirements = (
             ROOT / "requirements-whisperjav.txt"
         ).read_text(encoding="utf-8")
@@ -47,34 +59,33 @@ class ReleaseConfigurationTests(unittest.TestCase):
         self.assertIn("onnxruntime-gpu==1.23.2", whisperjav_requirements)
         for excluded in ("faster-whisper", "ctranslate2", "auditok"):
             self.assertNotIn(f"\n{excluded}==", whisperjav_requirements)
-        self.assertIn("libc++1", runtime_dockerfile)
-        self.assertIn("libc++abi1", runtime_dockerfile)
-        self.assertIn("from ten_vad import TenVad", runtime_dockerfile)
-        self.assertIn(
-            "/opt/venvs/whisperjav/bin/python -m pip",
-            stt_dockerfile,
-        )
+        self.assertIn("libc++1", runtime_base_dockerfile)
+        self.assertIn("libc++abi1", runtime_base_dockerfile)
+        self.assertIn("from ten_vad import TenVad", runtime_base_dockerfile)
+        self.assertIn("PYTHONPATH=/opt/stt", runtime_dockerfile)
         self.assertIn(
             "WHISPERJAV_PYTHON=/opt/venvs/whisperjav/bin/python",
-            stt_dockerfile,
+            runtime_dockerfile,
         )
-        self.assertNotIn("requirements-kotoba.txt", stt_dockerfile)
-        self.assertIn("requirements-kotoba.txt", runtime_dockerfile)
-        self.assertIn("requirements-whisperx-cuda.txt", runtime_dockerfile)
+        self.assertNotIn("requirements-kotoba.txt", runtime_dockerfile)
+        self.assertIn("requirements-kotoba.txt", runtime_base_dockerfile)
+        self.assertIn(
+            "requirements-whisperx-cuda.txt",
+            runtime_base_dockerfile,
+        )
         self.assertIn(
             "nvidia-npp-cu12==12.3.3.100",
             (ROOT / "requirements-whisperx-cuda.in").read_text(
                 encoding="utf-8"
             ),
         )
-        self.assertIn("nvidia/npp/lib", runtime_dockerfile)
-        self.assertIn("STT_BASE_URL: http://stt:8100", compose)
-        self.assertIn("container_name: stt-web", compose)
-        self.assertIn("container_name: stt-backend", compose)
+        self.assertIn("nvidia/npp/lib", runtime_base_dockerfile)
+        self.assertIn("STT_BASE_URL: http://runtime:8100", compose)
+        self.assertNotIn("container_name:", compose)
         self.assertIn(
-            "WEB_STATE_DIR: /var/lib/stt", compose
+            "BACKEND_STATE_DIR: /var/lib/stt", compose
         )
-        self.assertIn("WEB_WORK_DIR: /var/lib/stt-work", compose)
+        self.assertIn("BACKEND_WORK_DIR: /var/lib/stt-work", compose)
         self.assertIn(
             "STT_STATE_DIR: /var/lib/stt", compose
         )
@@ -85,19 +96,20 @@ class ReleaseConfigurationTests(unittest.TestCase):
         self.assertEqual(compose.count("create_host_path: false"), 6)
         self.assertIn("target: /var/cache/stt", compose)
         self.assertNotIn("${STT_BASE_URL", compose)
-        self.assertNotIn("STT_API_TOKEN:", compose)
-        self.assertIn("${WEB_PUID:-1026}:${WEB_PGID:-100}", compose)
+        self.assertEqual(compose.count("\n      STT_API_TOKEN:"), 2)
+        self.assertIn("${BACKEND_PUID:-${WEB_PUID:-1026}}", compose)
+        self.assertIn("${BACKEND_PGID:-${WEB_PGID:-100}}", compose)
         self.assertIn("${PUID:-1000}:${PGID:-1000}", compose)
         self.assertNotIn("${WEB_PORT", compose)
         self.assertIn('traefik.enable: "true"', compose)
         self.assertIn("${TRAEFIK_HOST:?TRAEFIK_HOST must be set}", compose)
         self.assertIn(
-            "WEB_SECURE_COOKIE: ${WEB_SECURE_COOKIE:-true}", compose
-        )
-        self.assertIn(
-            "WEB_FORWARDED_ALLOW_IPS: \"${WEB_FORWARDED_ALLOW_IPS:-*}\"",
+            "BACKEND_FORWARDED_ALLOW_IPS: "
+            '"${BACKEND_FORWARDED_ALLOW_IPS:-*}"',
             compose,
         )
+        self.assertNotIn("WEB_ADMIN_PASSWORD:", compose)
+        self.assertNotIn("WEB_SESSION_SECRET:", compose)
         self.assertIn(
             "traefik.http.services.stt-to-subtitle."
             'loadbalancer.server.port: "8080"',
@@ -109,6 +121,71 @@ class ReleaseConfigurationTests(unittest.TestCase):
         registry_name = "gh" + "cr.io"
         self.assertNotIn(registry_name, compose.lower())
         self.assertNotIn(registry_name, workflow.lower())
+
+        web_dockerfile = (ROOT / "Dockerfile.web").read_text(
+            encoding="utf-8"
+        )
+        nginx_config = (ROOT / "deploy/nginx/nginx.conf").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("FROM ${NGINX_IMAGE}", web_dockerfile)
+        self.assertNotIn("python", web_dockerfile.lower())
+        self.assertNotIn("ffmpeg", web_dockerfile.lower())
+        self.assertNotIn("jinja", web_dockerfile.lower())
+        self.assertIn("@sha256:", web_dockerfile)
+        self.assertIn("USER 101:101", web_dockerfile)
+        self.assertIn("location /api/v1/", nginx_config)
+        self.assertIn('return 404 \'{"detail":"API version not found"}\'', nginx_config)
+        self.assertNotIn("/api/events", nginx_config)
+        self.assertNotIn("text/event-stream", nginx_config)
+        self.assertIn("requirements-backend.txt", backend_dockerfile)
+        self.assertNotIn("requirements-web.txt", backend_dockerfile)
+        self.assertFalse((ROOT / "requirements-web.txt").exists())
+        backend_requirements = (ROOT / "requirements-backend.txt").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("jinja2", backend_requirements.lower())
+        self.assertNotIn("itsdangerous", backend_requirements.lower())
+        backend_source = (
+            ROOT / "src" / "stt_to_subtitle" / "backend_api.py"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn("web_app", backend_source)
+        self.assertFalse(
+            (ROOT / "src" / "stt_to_subtitle" / "web_app.py").exists()
+        )
+        self.assertFalse(
+            (ROOT / "src" / "stt_to_subtitle" / "templates").exists()
+        )
+        self.assertFalse(
+            (ROOT / "src" / "stt_to_subtitle" / "static").exists()
+        )
+        self.assertIn(
+            'ENTRYPOINT ["python", "-m", "stt_to_subtitle.backend_api"]',
+            backend_dockerfile,
+        )
+        self.assertIn(
+            'ENTRYPOINT ["python", "-m", "stt_to_subtitle.stt_api"]',
+            runtime_dockerfile,
+        )
+        self.assertIn("build_service_package.py", backend_dockerfile)
+        self.assertIn("build_service_package.py", runtime_dockerfile)
+        self.assertEqual(compose.count("cap_drop:"), 3)
+        self.assertIn("condition: service_healthy", compose)
+
+    def test_standalone_runtime_compose_publishes_only_the_stt_api(self) -> None:
+        compose = (ROOT / "compose.runtime.yaml").read_text(encoding="utf-8")
+        example = (ROOT / ".env.runtime.example").read_text(encoding="utf-8")
+
+        self.assertIn("dockerfile: Dockerfile.runtime", compose)
+        self.assertIn("dockerfile: Dockerfile.stt-runtime", compose)
+        self.assertIn("STT_RUNTIME_BIND_ADDRESS", compose)
+        self.assertIn("STT_RUNTIME_ID", compose)
+        self.assertIn("STT_RUNTIME_NAME", compose)
+        self.assertIn("STT_API_TOKEN", compose)
+        self.assertNotIn("OPENAI_COMPATIBLE", compose)
+        self.assertNotIn("Dockerfile.web", compose)
+        self.assertNotIn("Dockerfile.backend", compose)
+        self.assertIn("STT_RUNTIME_ID=runtime-node-01", example)
 
     def test_compose_launcher_uses_the_calling_non_root_account(self) -> None:
         launcher = (ROOT / "scripts/compose.sh").read_text(encoding="utf-8")

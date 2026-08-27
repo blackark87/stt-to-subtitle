@@ -4,13 +4,12 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
 from functools import lru_cache
 from math import isfinite
 from typing import Any
 
 from .stt_quality import normalize_transcript, repetition_diagnostics
-from .whisperx_worker import WHISPERX_MAX_CHUNK_LENGTH_SECONDS
+from .stt_options import HybridRescueOptions, RESCUE_SCOPES
 
 HYBRID_POLICY_VERSION = "hybrid-rescue-v1"
 MIN_SPEAKER_MAPPING_CONFIDENCE = 0.5
@@ -18,7 +17,6 @@ MIN_SPEAKER_MAPPING_CONFIDENCE = 0.5
 # padded rescue spans. Window scope diarizes each span in isolation, so
 # speaker labels are local to the window. Keep "full" as an explicit
 # compatibility option, but prefer the faster window-scoped rescue.
-RESCUE_SCOPES = {"full", "windows"}
 FATAL_ISSUE_CODES = {
     "INVALID_WORD_TIMESTAMP",
     "LONG_WORD_ALIGNMENT",
@@ -26,104 +24,6 @@ FATAL_ISSUE_CODES = {
     "REPEATED_TRANSCRIPT",
     "REPLACEMENT_CHARACTER",
 }
-
-
-@dataclass(frozen=True)
-class HybridRescueOptions:
-    """Per-request thresholds and backend chunk lengths for hybrid STT."""
-
-    window_padding_sec: float = 5.0
-    max_word_duration_sec: float = 8.0
-    short_segment_duration_sec: float = 0.2
-    short_segment_cluster_window_sec: float = 5.0
-    short_segment_cluster_count: int = 3
-    speaker_debounce_sec: float = 0.1
-    kotoba_chunk_length_seconds: int = 15
-    whisperx_chunk_length_seconds: int = 30
-    rescue_scope: str = "windows"
-
-    @classmethod
-    def from_options(cls, options: Mapping[str, Any]) -> HybridRescueOptions:
-        raw = options.get("hybrid_rescue", {})
-        if not isinstance(raw, Mapping):
-            raise ValueError("hybrid_rescue must be a JSON object")
-        allowed = {
-            "window_padding_sec",
-            "max_word_duration_sec",
-            "short_segment_duration_sec",
-            "short_segment_cluster_window_sec",
-            "short_segment_cluster_count",
-            "speaker_debounce_sec",
-            "kotoba_chunk_length_seconds",
-            "whisperx_chunk_length_seconds",
-            "rescue_scope",
-        }
-        unknown = set(raw) - allowed
-        if unknown:
-            raise ValueError(
-                f"unsupported hybrid_rescue options: {sorted(unknown)}"
-            )
-
-        def positive_float(name: str, default: float) -> float:
-            value = float(raw.get(name, default))
-            if not isfinite(value) or value <= 0:
-                raise ValueError(f"{name} must be positive")
-            return value
-
-        def positive_int(name: str, default: int, *, minimum: int = 1) -> int:
-            value = int(raw.get(name, default))
-            if value < minimum:
-                raise ValueError(f"{name} must be at least {minimum}")
-            return value
-
-        defaults = cls()
-        options = cls(
-            window_padding_sec=positive_float(
-                "window_padding_sec", defaults.window_padding_sec
-            ),
-            max_word_duration_sec=positive_float(
-                "max_word_duration_sec", defaults.max_word_duration_sec
-            ),
-            short_segment_duration_sec=positive_float(
-                "short_segment_duration_sec",
-                defaults.short_segment_duration_sec,
-            ),
-            short_segment_cluster_window_sec=positive_float(
-                "short_segment_cluster_window_sec",
-                defaults.short_segment_cluster_window_sec,
-            ),
-            short_segment_cluster_count=positive_int(
-                "short_segment_cluster_count",
-                defaults.short_segment_cluster_count,
-                minimum=2,
-            ),
-            speaker_debounce_sec=positive_float(
-                "speaker_debounce_sec", defaults.speaker_debounce_sec
-            ),
-            kotoba_chunk_length_seconds=positive_int(
-                "kotoba_chunk_length_seconds",
-                defaults.kotoba_chunk_length_seconds,
-            ),
-            whisperx_chunk_length_seconds=positive_int(
-                "whisperx_chunk_length_seconds",
-                defaults.whisperx_chunk_length_seconds,
-            ),
-            rescue_scope=str(raw.get("rescue_scope", defaults.rescue_scope)),
-        )
-        if options.rescue_scope not in RESCUE_SCOPES:
-            raise ValueError(
-                "rescue_scope must be one of "
-                f"{sorted(RESCUE_SCOPES)}"
-            )
-        if (
-            options.whisperx_chunk_length_seconds
-            > WHISPERX_MAX_CHUNK_LENGTH_SECONDS
-        ):
-            raise ValueError(
-                "whisperx_chunk_length_seconds must be at most "
-                f"{WHISPERX_MAX_CHUNK_LENGTH_SECONDS}"
-            )
-        return options
 
 
 def _timestamp(value: Any) -> float | None:

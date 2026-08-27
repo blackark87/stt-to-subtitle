@@ -169,6 +169,8 @@ class STTAPISettings:
     state_dir: Path
     api_token: str
     hf_token: str
+    runtime_id: str = "runtime"
+    runtime_name: str = "STT Runtime"
     device: str = "mps"
     diarization_device: str = "cpu"
     batch_size: int = 1
@@ -198,6 +200,10 @@ class STTAPISettings:
             ).expanduser(),
             api_token=os.environ.get("STT_API_TOKEN", ""),
             hf_token=os.environ.get("HF_TOKEN", ""),
+            runtime_id=os.environ.get("STT_RUNTIME_ID", "runtime").strip(),
+            runtime_name=os.environ.get(
+                "STT_RUNTIME_NAME", "STT Runtime"
+            ).strip(),
             work_dir=(
                 Path(os.environ["STT_WORK_DIR"]).expanduser()
                 if os.environ.get("STT_WORK_DIR", "").strip()
@@ -282,6 +288,12 @@ class STTAPISettings:
     def validate(self) -> None:
         if not self.hf_token.strip():
             raise ValueError("HF_TOKEN is required")
+        if not self.runtime_id or len(self.runtime_id) > 80:
+            raise ValueError("STT_RUNTIME_ID must be between 1 and 80 characters")
+        if not self.runtime_name or len(self.runtime_name) > 80:
+            raise ValueError(
+                "STT_RUNTIME_NAME must be between 1 and 80 characters"
+            )
         validate_device(self.device, setting="STT_DEVICE")
         validate_device(
             self.diarization_device,
@@ -811,6 +823,11 @@ class TranscriptionService:
         queue_snapshot = self.queue_snapshot()
         return {
             "status": "ok",
+            "runtime": {
+                "id": self.settings.runtime_id,
+                "name": self.settings.runtime_name,
+                "version": __version__,
+            },
             "uptime_seconds": round(time.time() - self._started_at, 3),
             "queued_jobs": queue_snapshot["queued"],
             "queue": queue_snapshot,
@@ -827,6 +844,11 @@ class TranscriptionService:
 
     def readiness(self) -> tuple[bool, dict[str, Any]]:
         detail: dict[str, Any] = {
+            "runtime": {
+                "id": self.settings.runtime_id,
+                "name": self.settings.runtime_name,
+                "version": __version__,
+            },
             "device": self.settings.device,
             "diarization_device": self.settings.diarization_device,
             "hf_token_configured": bool(self.settings.hf_token.strip()),

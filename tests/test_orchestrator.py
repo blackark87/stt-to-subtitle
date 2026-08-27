@@ -7,10 +7,10 @@ import time
 import unittest
 from unittest.mock import ANY, Mock, patch
 
-from stt_to_subtitle.web_config import (
+from stt_to_subtitle.backend_config import (
+    BackendSettings,
     RemoteServerSettings,
     SubtitleValidatorSettings,
-    WebSettings,
 )
 from stt_to_subtitle.orchestrator import (
     SubtitleOrchestrator,
@@ -68,12 +68,10 @@ class SubtitleOrchestratorTests(unittest.TestCase):
             )
 
             orchestrator = SubtitleOrchestrator(
-                WebSettings(
+                BackendSettings(
                     state_dir=state_dir,
                     work_dir=work_dir,
                     media_root=media_root,
-                    admin_password="",
-                    session_secret="",
                     stt_base_url="",
                     stt_token="",
                     lm_base_url="",
@@ -130,11 +128,9 @@ class SubtitleOrchestratorTests(unittest.TestCase):
         media_root: Path,
     ) -> SubtitleOrchestrator:
         return SubtitleOrchestrator(
-            WebSettings(
+            BackendSettings(
                 state_dir=root / "state",
                 media_root=media_root,
-                admin_password="admin-password",
-                session_secret="a" * 32,
                 stt_base_url="http://stt.test",
                 stt_token="stt-token",
                 lm_base_url="http://lm.test/v1",
@@ -150,11 +146,9 @@ class SubtitleOrchestratorTests(unittest.TestCase):
             media_root.mkdir()
             (media_root / "movie.mkv").write_bytes(b"media")
             orchestrator = SubtitleOrchestrator(
-                WebSettings(
+                BackendSettings(
                     state_dir=root / "state",
                     media_root=media_root,
-                    admin_password="",
-                    session_secret="",
                     stt_base_url="http://stt.test",
                     stt_token="",
                     lm_base_url="http://lm.test/v1",
@@ -189,11 +183,9 @@ class SubtitleOrchestratorTests(unittest.TestCase):
             media_root = root / "media"
             media_root.mkdir()
             (media_root / "movie.mkv").write_bytes(b"media")
-            settings = WebSettings(
+            settings = BackendSettings(
                 state_dir=root / "state",
                 media_root=media_root,
-                admin_password="",
-                session_secret="",
                 stt_base_url="http://stt.test",
                 stt_token="",
                 lm_base_url="http://lm.test/v1",
@@ -453,11 +445,9 @@ class SubtitleOrchestratorTests(unittest.TestCase):
             media_root.mkdir()
             (media_root / "movie.mkv").write_bytes(b"not-read-in-this-test")
             orchestrator = SubtitleOrchestrator(
-                WebSettings(
+                BackendSettings(
                     state_dir=root / "state",
                     media_root=media_root,
-                    admin_password="admin-password",
-                    session_secret="a" * 32,
                     stt_base_url="http://stt.test",
                     stt_token="stt-token",
                     lm_base_url="http://lm.test/v1",
@@ -646,6 +636,138 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                 self.assertEqual(reloaded.lm_client.model, "new-model")
             finally:
                 reloaded.stop()
+
+    def test_migrates_legacy_all_in_one_runtime_service_url(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            store = JobStore(root / "state" / "jobs.sqlite3")
+            store.save_remote_server_settings(
+                stt_base_url="http://stt:8100",
+                stt_token="",
+                lm_base_url="http://lm.test/v1",
+                lm_token="lm-token",
+                lm_model="model",
+            )
+
+            orchestrator = SubtitleOrchestrator(
+                BackendSettings(
+                    state_dir=root / "state",
+                    media_root=media_root,
+                    stt_base_url="http://runtime:8100",
+                    stt_token="",
+                    lm_base_url="",
+                    lm_token="",
+                    lm_model="",
+                )
+            )
+            try:
+                self.assertEqual(
+                    orchestrator.stt_client.base_url,
+                    "http://runtime:8100",
+                )
+                self.assertEqual(
+                    orchestrator.store.get_remote_server_settings()[
+                        "stt_base_url"
+                    ],
+                    "http://runtime:8100",
+                )
+                self.assertEqual(orchestrator.lm_client.model, "model")
+            finally:
+                orchestrator.stop()
+
+    def test_dispatches_transcriptions_across_builtin_and_external_runtimes(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            orchestrator = self.make_orchestrator(root, media_root)
+            try:
+                endpoint = orchestrator.store.create_runtime_endpoint(
+                    name="GPU Runtime 02",
+                    base_url="http://runtime-02.test:8100",
+                    token="token-02",
+                    enabled=True,
+                    capacity=1,
+                )
+                orchestrator._install_runtime_endpoint(endpoint)
+                orchestrator._set_runtime_health(
+                    endpoint.id,
+                    "ready",
+                    readiness={"status": "ready", "queue": {}},
+                )
+                jobs = [
+                    orchestrator.store.create(
+                        job_id=f"pooled-{index}",
+                        source_rel=f"movie-{index}.mkv",
+                        force_overwrite=False,
+                        options={},
+                        status="audio_ready",
+                    )
+                    for index in range(2)
+                ]
+                orchestrator._stt_executor.submit = Mock()
+
+                dispatched = orchestrator._dispatch_transcriptions()
+                assignments = {
+                    orchestrator.store.get(job.id).stt_runtime_id
+                    for job in jobs
+                }
+
+                self.assertEqual(dispatched, 2)
+                self.assertEqual(
+                    assignments,
+                    {"builtin", endpoint.id},
+                )
+                self.assertEqual(
+                    orchestrator._stt_executor.submit.call_count,
+                    2,
+                )
+            finally:
+                orchestrator.stop()
+
+    def test_cancels_transcription_on_its_assigned_runtime(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            orchestrator = self.make_orchestrator(root, media_root)
+            try:
+                endpoint = orchestrator.store.create_runtime_endpoint(
+                    name="GPU Runtime 02",
+                    base_url="http://runtime-02.test:8100",
+                    token="token-02",
+                    enabled=True,
+                    capacity=1,
+                )
+                external_client = Mock()
+                orchestrator._runtime_clients[endpoint.id] = external_client
+                orchestrator.stt_client.cancel_job = Mock()
+                job = orchestrator.store.create(
+                    job_id="external-running",
+                    source_rel="movie.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                orchestrator.store.update(
+                    job.id,
+                    status="transcription_running",
+                    stt_job_id="remote-job-02",
+                    stt_runtime_id=endpoint.id,
+                )
+
+                stopped = orchestrator.stop_jobs([job.id])
+
+                self.assertEqual(stopped, 1)
+                external_client.cancel_job.assert_called_once_with(
+                    "remote-job-02"
+                )
+                orchestrator.stt_client.cancel_job.assert_not_called()
+            finally:
+                orchestrator.stop()
 
     def test_translation_workers_are_reserved_for_one_file_at_a_time(
         self,
@@ -889,11 +1011,9 @@ class SubtitleOrchestratorTests(unittest.TestCase):
             media_root.mkdir()
             (media_root / "movie.mkv").write_bytes(b"media")
             orchestrator = SubtitleOrchestrator(
-                WebSettings(
+                BackendSettings(
                     state_dir=root / "state",
                     media_root=media_root,
-                    admin_password="",
-                    session_secret="",
                     stt_base_url="",
                     stt_token="",
                     lm_base_url="",
@@ -2713,11 +2833,9 @@ class SubtitleOrchestratorTests(unittest.TestCase):
             source = media_root / "movie.mkv"
             source.write_bytes(b"not-read-in-this-test")
             orchestrator = SubtitleOrchestrator(
-                WebSettings(
+                BackendSettings(
                     state_dir=root / "state",
                     media_root=media_root,
-                    admin_password="admin-password",
-                    session_secret="a" * 32,
                     stt_base_url="http://stt.test",
                     stt_token="stt-token",
                     lm_base_url="http://lm.test/v1",
@@ -3703,11 +3821,9 @@ class SchedulerDispatchTests(unittest.TestCase):
         audio_workers: int = 1,
     ) -> SubtitleOrchestrator:
         orchestrator = SubtitleOrchestrator(
-            WebSettings(
+            BackendSettings(
                 state_dir=root / "state",
                 media_root=media_root,
-                admin_password="admin-password",
-                session_secret="a" * 32,
                 stt_base_url="http://stt.test",
                 stt_token="stt-token",
                 lm_base_url="http://lm.test/v1",

@@ -1327,20 +1327,24 @@ tags
 !/.dockerignore
 !/AGENTS.md
 !/Dockerfile
+!/Dockerfile.backend
+!/Dockerfile.runtime
 !/Dockerfile.stt-runtime
 !/Dockerfile.web
 !/compose.yaml
+!/compose.runtime.yaml
 !/compose.gpu-monitoring.yaml
 !/Makefile
 !/pyproject.toml
 !/requirements-api.txt
+!/requirements-backend.txt
 !/requirements-kotoba.txt
-!/requirements-web.txt
 !/requirements-whisperjav.txt
 !/requirements-whisperx-cuda.in
 !/requirements-whisperx-cuda.txt
 !/requirements-test.txt
 !/.env.compose.example
+!/.env.runtime.example
 !/.env.stt.example
 !/.github/
 !/.github/**
@@ -1352,6 +1356,11 @@ tags
 !/tests/**
 !/gpu-observability/
 !/gpu-observability/**
+!/deploy/
+!/deploy/**
+!/web/
+!/web/**
+!/service-split-plan.md
 
 # Local media, transcripts, and model data
 /media/

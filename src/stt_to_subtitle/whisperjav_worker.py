@@ -20,6 +20,14 @@ from typing import Any, Mapping, Sequence
 import wave
 
 from .files import write_json_atomic
+from .stt_options import (
+    DEFAULT_ANIME_MAX_GROUP_SECONDS,
+    DEFAULT_QWEN_MAX_GROUP_SECONDS,
+    MAX_MAX_GROUP_SECONDS,
+    MIN_MAX_GROUP_SECONDS,
+    WHISPERJAV_RECIPE,
+    WhisperJAVOptions,
+)
 from .transcription_progress import (
     StageProgressCallback,
     report_stage_progress,
@@ -28,7 +36,6 @@ from .transcription_progress import (
 from .vendor.whisperjav import presets
 from .vendor.whisperjav.runner import Cue, run_ensemble
 
-WHISPERJAV_RECIPE = "whisperjav-domain-ensemble-v1"
 # Upstream commit the vendored tree was copied from (see
 # vendor/whisperjav/VENDOR.md). Reported as the recipe revision.
 WHISPERJAV_COMMIT = "a69a43244e14612ebd3a1eb417bdd0de6d494d0f"
@@ -40,69 +47,9 @@ ALIGNER_MODEL_ID = "Qwen/Qwen3-ForcedAligner-0.6B"
 ALIGNER_MODEL_REVISION = "c7cbfc2048c462b0d63a45797104fc9db3ad62b7"
 WHISPERSEG_MODEL_REVISION = "6ac29e2cbf2f4f8e9b639861766a8639dd666e9c"
 TEN_VAD_VERSION = "1.0.6.8"
-DEFAULT_ANIME_MAX_GROUP_SECONDS = 2.0
-DEFAULT_QWEN_MAX_GROUP_SECONDS = 3.0
-MIN_MAX_GROUP_SECONDS = 0.5
-MAX_MAX_GROUP_SECONDS = 30.0
 # WhisperFeatureExtractor uses a 200-sample reflection pad before STFT.
 # Reflection padding requires the input dimension to be greater than the pad.
 MIN_FORCED_ALIGNMENT_SAMPLES = 201
-
-
-@dataclass(frozen=True)
-class WhisperJAVOptions:
-    """Validated controls exposed by the stable WhisperJAV recipe."""
-
-    recipe: str = WHISPERJAV_RECIPE
-    anime_max_group_duration_seconds: float = (
-        DEFAULT_ANIME_MAX_GROUP_SECONDS
-    )
-    qwen_max_group_duration_seconds: float = DEFAULT_QWEN_MAX_GROUP_SECONDS
-
-    @classmethod
-    def from_options(cls, options: Mapping[str, Any]) -> WhisperJAVOptions:
-        raw = options.get("whisperjav", {})
-        if not isinstance(raw, Mapping):
-            raise ValueError("whisperjav must be a JSON object")
-        allowed = {
-            "recipe",
-            "anime_max_group_duration_seconds",
-            "qwen_max_group_duration_seconds",
-        }
-        unknown = set(raw) - allowed
-        if unknown:
-            raise ValueError(
-                f"unsupported whisperjav options: {sorted(unknown)}"
-            )
-        recipe = str(raw.get("recipe", WHISPERJAV_RECIPE)).strip()
-        if recipe != WHISPERJAV_RECIPE:
-            raise ValueError(
-                f"whisperjav recipe must be '{WHISPERJAV_RECIPE}'"
-            )
-
-        def group_seconds(name: str, default: float) -> float:
-            try:
-                value = float(raw.get(name, default))
-            except (TypeError, ValueError) as error:
-                raise ValueError(f"{name} must be a number") from error
-            if not MIN_MAX_GROUP_SECONDS <= value <= MAX_MAX_GROUP_SECONDS:
-                raise ValueError(
-                    f"{name} must be between {MIN_MAX_GROUP_SECONDS} and "
-                    f"{MAX_MAX_GROUP_SECONDS}"
-                )
-            return value
-
-        return cls(
-            recipe=recipe,
-            anime_max_group_duration_seconds=group_seconds(
-                "anime_max_group_duration_seconds",
-                DEFAULT_ANIME_MAX_GROUP_SECONDS,
-            ),
-            qwen_max_group_duration_seconds=group_seconds(
-                "qwen_max_group_duration_seconds",
-                DEFAULT_QWEN_MAX_GROUP_SECONDS,
-            ),
-        )
 
 
 @dataclass(frozen=True)

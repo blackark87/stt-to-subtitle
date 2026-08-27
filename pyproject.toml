@@ -12,19 +12,15 @@ dependencies = []
 
 [project.scripts]
 stt-transcribe = "stt_to_subtitle.cli:main"
+stt-backend = "stt_to_subtitle.backend_api:main"
+stt-runtime = "stt_to_subtitle.stt_api:main"
+# Compatibility alias for exported host runtimes and existing operators.
 stt-api = "stt_to_subtitle.stt_api:main"
-stt-web = "stt_to_subtitle.web_app:main"
 stt-check-migrations = "stt_to_subtitle.migration_check:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
-stt_to_subtitle = [
-    "templates/*.html",
-    "static/*.css",
-    "static/*.js",
-    "static/vendor/*.js",
-]
 "stt_to_subtitle.vendor.whisperjav" = ["LICENSE", "NOTICES", "VENDOR.md"]
 "stt_to_subtitle.vendor.whisperjav.data.hallucination_filters" = ["*.json"]

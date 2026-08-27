@@ -1,11 +1,11 @@
 name: stt-to-subtitle
 
 services:
-  stt-runtime:
+  runtime-base:
     profiles:
       - build
     platform: linux/amd64
-    image: ${STT_RUNTIME_IMAGE:-stt-to-subtitle-stt-runtime:py311-cuda-v4}
+    image: ${STT_RUNTIME_BASE_IMAGE:-${STT_RUNTIME_IMAGE:-stt-to-subtitle-runtime-base:py311-cuda-v4}}
     build:
       context: ${WORKSPACE:-.}
       dockerfile: Dockerfile.stt-runtime
@@ -13,19 +13,20 @@ services:
         - type=local,src=${STT_RUNTIME_CACHE_PATH:-/data/cache/buildkit/stt-runtime-py311-cuda-v4-20260825}
 
   web:
-    container_name: stt-web
     platform: linux/amd64
     build:
       context: ${WORKSPACE:-.}
       dockerfile: Dockerfile.web
-    user: "${WEB_PUID:-1026}:${WEB_PGID:-100}"
+    user: "101:101"
     init: true
     restart: unless-stopped
     read_only: true
     security_opt:
       - no-new-privileges:true
+    cap_drop:
+      - ALL
     depends_on:
-      stt:
+      backend:
         condition: service_healthy
         restart: true
     expose:
@@ -39,15 +40,38 @@ services:
       traefik.http.routers.stt-to-subtitle.tls.certresolver: ${TRAEFIK_CERT_RESOLVER:-letsencrypt}
       traefik.http.routers.stt-to-subtitle.service: stt-to-subtitle
       traefik.http.services.stt-to-subtitle.loadbalancer.server.port: "8080"
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    networks:
+      - app
+      - traefik
+
+  backend:
+    platform: linux/amd64
+    build:
+      context: ${WORKSPACE:-.}
+      dockerfile: Dockerfile.backend
+    user: "${BACKEND_PUID:-${WEB_PUID:-1026}}:${BACKEND_PGID:-${WEB_PGID:-100}}"
+    init: true
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    depends_on:
+      runtime:
+        condition: service_healthy
+        restart: true
+    expose:
+      - "8080"
     environment:
       MEDIA_ROOT: /media
-      WEB_STATE_DIR: /var/lib/stt
-      WEB_WORK_DIR: /var/lib/stt-work
-      WEB_ADMIN_PASSWORD: ${WEB_ADMIN_PASSWORD:-}
-      WEB_SESSION_SECRET: ${WEB_SESSION_SECRET:-}
-      WEB_SECURE_COOKIE: ${WEB_SECURE_COOKIE:-true}
-      WEB_FORWARDED_ALLOW_IPS: "${WEB_FORWARDED_ALLOW_IPS:-*}"
-      STT_BASE_URL: http://stt:8100
+      BACKEND_STATE_DIR: /var/lib/stt
+      BACKEND_WORK_DIR: /var/lib/stt-work
+      BACKEND_FORWARDED_ALLOW_IPS: "${BACKEND_FORWARDED_ALLOW_IPS:-*}"
+      STT_BASE_URL: http://runtime:8100
+      STT_API_TOKEN: ${STT_API_TOKEN:-}
       OPENAI_COMPATIBLE_BASE_URL: ${OPENAI_COMPATIBLE_BASE_URL:-}
       OPENAI_COMPATIBLE_TOKEN: ${OPENAI_COMPATIBLE_TOKEN:-}
       OPENAI_COMPATIBLE_MODEL: ${OPENAI_COMPATIBLE_MODEL:-}
@@ -57,7 +81,7 @@ services:
       GPU_METRICS_TIMEOUT_SECONDS: ${GPU_METRICS_TIMEOUT_SECONDS:-3}
       TRANSLATION_BATCH_SEGMENTS: ${TRANSLATION_BATCH_SEGMENTS:-30}
       TRANSLATION_BATCH_CHARACTERS: ${TRANSLATION_BATCH_CHARACTERS:-6000}
-      WEB_AUDIO_WORKERS: ${WEB_AUDIO_WORKERS:-1}
+      BACKEND_AUDIO_WORKERS: ${BACKEND_AUDIO_WORKERS:-${WEB_AUDIO_WORKERS:-1}}
     volumes:
       - type: bind
         source: ${MEDIA_PATH:-./media}
@@ -65,39 +89,45 @@ services:
         bind:
           create_host_path: false
       - type: bind
-        source: ${WEB_STATE_PATH:-/var/lib/homelab/stt-to-subtitle/web-state}
+        source: ${BACKEND_STATE_PATH:-${WEB_STATE_PATH:-/var/lib/homelab/stt-to-subtitle/web-state}}
         target: /var/lib/stt
         bind:
           create_host_path: false
       - type: bind
-        source: ${WEB_WORK_PATH:-/data/work/stt-to-subtitle/web-jobs}
+        source: ${BACKEND_WORK_PATH:-${WEB_WORK_PATH:-/data/work/stt-to-subtitle/web-jobs}}
         target: /var/lib/stt-work
         bind:
           create_host_path: false
     tmpfs:
       - /tmp:size=256m,mode=1777
     networks:
-      - default
-      - traefik
+      - app
+      - runtime
 
-  stt:
-    container_name: stt-backend
+  runtime:
     platform: linux/amd64
     build:
       context: ${WORKSPACE:-.}
-      dockerfile: Dockerfile
+      dockerfile: Dockerfile.runtime
       args:
-        STT_RUNTIME_IMAGE: ${STT_RUNTIME_IMAGE:-stt-to-subtitle-stt-runtime:py311-cuda-v4}
+        STT_RUNTIME_BASE_IMAGE: ${STT_RUNTIME_BASE_IMAGE:-${STT_RUNTIME_IMAGE:-stt-to-subtitle-runtime-base:py311-cuda-v4}}
     user: "${PUID:-1000}:${PGID:-1000}"
     init: true
     restart: unless-stopped
     read_only: true
     security_opt:
       - no-new-privileges:true
+    cap_drop:
+      - ALL
+    expose:
+      - "8100"
     environment:
       HF_TOKEN: ${HF_TOKEN:?HF_TOKEN must be set}
       STT_HOST: 0.0.0.0
       STT_PORT: 8100
+      STT_RUNTIME_ID: ${STT_RUNTIME_ID:-builtin}
+      STT_RUNTIME_NAME: ${STT_RUNTIME_NAME:-기본 Runtime}
+      STT_API_TOKEN: ${STT_API_TOKEN:-}
       STT_STATE_DIR: /var/lib/stt
       STT_WORK_DIR: /var/lib/stt-work
       STT_DEVICE: ${STT_DEVICE:-cuda}
@@ -146,8 +176,12 @@ services:
               count: all
               capabilities:
                 - gpu
+    networks:
+      - runtime
 
 networks:
+  app:
+  runtime:
   traefik:
     name: ${TRAEFIK_NETWORK:-proxy}
     external: true
