@@ -1,0 +1,131 @@
+@import "tailwindcss";
+
+/* ---------------------------------------------------------------------------
+   디자인 토큰.
+   상태 7종의 값은 CIEDE2000 색차와 WCAG 상대휘도로 검증했다.
+   21쌍 전부 ΔE2000 >= 15 (라이트 최소 19.8 / 다크 19.5),
+   배지 배경 대비 전부 AA 4.5:1 이상 (실측 4.67 ~ 7.94:1).
+   값을 바꾸면 반드시 다시 계산할 것. 기준은 docs/design-scheme-audit.md.
+--------------------------------------------------------------------------- */
+@theme {
+  --color-bg: #f5f6fa;
+  --color-surface: #ffffff;
+  --color-sunken: #eef0f6;
+  --color-band: #f2f4f9;
+  --color-text: #12141c;
+  --color-muted: #5b6472;
+  --color-line: #e3e6ef;
+  --color-line-strong: #c9cedc;
+  --color-accent: #1d4ed8;
+  --color-accent-ink: #ffffff;
+
+  --color-st-running: #1d4ed8;
+  --color-st-waiting: #854d0e;
+  --color-st-paused: #a21caf;
+  --color-st-blocked: #0e7490;
+  --color-st-stopped: #52525b;
+  --color-st-failed: #b91c1c;
+  --color-st-done: #166534;
+
+  /* 배지 배경 = 상태색 10% 틴트 (라이트) */
+  --state-tint: 10%;
+
+  --radius-card: 12px;
+  --radius-control: 8px;
+  --radius-pill: 999px;
+
+  --font-sans: Pretendard, "Apple SD Gothic Neo", ui-sans-serif, system-ui,
+    -apple-system, "Segoe UI", "Malgun Gothic", "Noto Sans KR", Roboto, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+@layer base {
+  :root {
+    color-scheme: light dark;
+  }
+
+  /* 다크는 두 경로 모두 정의한다 — 시스템 기본과 [data-theme] 강제. */
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --color-bg: #0b0e14;
+      --color-surface: #12151d;
+      --color-sunken: #171a23;
+      --color-band: #10131a;
+      --color-text: #e7e9ee;
+      --color-muted: #8b93a7;
+      --color-line: #232733;
+      --color-line-strong: #2f3542;
+      --color-accent: #93a4ff;
+      --color-accent-ink: #0b0e14;
+
+      --color-st-running: #93a4ff;
+      --color-st-waiting: #e0b341;
+      --color-st-paused: #e879f9;
+      --color-st-blocked: #38bdf8;
+      --color-st-stopped: #a1a1aa;
+      --color-st-failed: #f87171;
+      --color-st-done: #4ade80;
+
+      --state-tint: 14%;
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --color-bg: #0b0e14;
+    --color-surface: #12151d;
+    --color-sunken: #171a23;
+    --color-band: #10131a;
+    --color-text: #e7e9ee;
+    --color-muted: #8b93a7;
+    --color-line: #232733;
+    --color-line-strong: #2f3542;
+    --color-accent: #93a4ff;
+    --color-accent-ink: #0b0e14;
+
+    --color-st-running: #93a4ff;
+    --color-st-waiting: #e0b341;
+    --color-st-paused: #e879f9;
+    --color-st-blocked: #38bdf8;
+    --color-st-stopped: #a1a1aa;
+    --color-st-failed: #f87171;
+    --color-st-done: #4ade80;
+
+    --state-tint: 14%;
+  }
+
+  html,
+  body {
+    min-height: 100%;
+  }
+
+  body {
+    background: var(--color-bg);
+    color: var(--color-text);
+    font-family: var(--font-sans);
+    line-height: 1.5;
+  }
+
+  /* N8 — cursor:pointer 인데 포커스 표시가 없던 결함. 전역으로 보장한다. */
+  :focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 2px;
+    border-radius: 4px;
+  }
+
+  ::selection {
+    background: color-mix(in srgb, var(--color-accent) 26%, transparent);
+  }
+}
+
+@layer utilities {
+  .tnum {
+    font-variant-numeric: tabular-nums;
+  }
+  /* 한글이 섞이는 자리에 고정폭을 쓰면 한 문자열 안에서 서체가 갈린다.
+     고정폭은 ASCII 전용 자리에만 쓴다. */
+  .code {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -0.01em;
+  }
+}

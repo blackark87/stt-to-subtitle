@@ -125,19 +125,44 @@ class ReleaseConfigurationTests(unittest.TestCase):
         web_dockerfile = (ROOT / "Dockerfile.web").read_text(
             encoding="utf-8"
         )
-        nginx_config = (ROOT / "deploy/nginx/nginx.conf").read_text(
+        next_config = (ROOT / "web" / "next.config.ts").read_text(
             encoding="utf-8"
         )
-        self.assertIn("FROM ${NGINX_IMAGE}", web_dockerfile)
+        next_proxy = (ROOT / "web" / "src" / "proxy.ts").read_text(
+            encoding="utf-8"
+        )
+        api_proxy_route = (
+            ROOT / "web" / "src" / "app" / "api" / "v1" / "[...path]" / "route.ts"
+        ).read_text(encoding="utf-8")
+
+        def without_comments(source: str) -> str:
+            """주석은 설명이지 설정이 아니다. 단정은 실제 코드에 대해서만 한다."""
+            return "\n".join(
+                line
+                for line in source.splitlines()
+                if not line.lstrip().startswith(("//", "*", "/*"))
+            )
+
+        next_config_code = without_comments(next_config)
+        next_proxy_code = without_comments(next_proxy)
+        # web 은 Next.js 정적/서버 렌더만 담당한다. 파이썬·미디어 처리는 없다.
+        self.assertIn("FROM ${NODE_IMAGE}", web_dockerfile)
         self.assertNotIn("python", web_dockerfile.lower())
         self.assertNotIn("ffmpeg", web_dockerfile.lower())
         self.assertNotIn("jinja", web_dockerfile.lower())
-        self.assertIn("@sha256:", web_dockerfile)
-        self.assertIn("USER 101:101", web_dockerfile)
-        self.assertIn("location /api/v1/", nginx_config)
-        self.assertIn('return 404 \'{"detail":"API version not found"}\'', nginx_config)
-        self.assertNotIn("/api/events", nginx_config)
-        self.assertNotIn("text/event-stream", nginx_config)
+        self.assertNotIn("nginx", web_dockerfile.lower())
+        self.assertIn("standalone", web_dockerfile)
+        # /api/v1 만 backend 로 넘긴다. web 이 API 를 자체 구현하지 않는다.
+        # rewrites 는 쓰지 않는다 — next.config 값은 빌드 시점에 구워져서
+        # 컨테이너 런타임의 BACKEND_ORIGIN 이 무시된다.
+        self.assertNotIn("rewrites", next_config_code)
+        self.assertNotIn("BACKEND_ORIGIN", next_config_code)
+        self.assertIn("process.env.BACKEND_ORIGIN", api_proxy_route)
+        # nginx 가 붙이던 보안 헤더는 Next proxy 로 옮겼다.
+        self.assertIn("Content-Security-Policy", next_proxy)
+        self.assertIn("X-Content-Type-Options", next_proxy)
+        self.assertNotIn("unsafe-inline", next_proxy_code)
+        self.assertFalse((ROOT / "deploy" / "nginx").exists())
         self.assertIn("requirements-backend.txt", backend_dockerfile)
         self.assertNotIn("requirements-web.txt", backend_dockerfile)
         self.assertFalse((ROOT / "requirements-web.txt").exists())
@@ -201,12 +226,12 @@ class ReleaseConfigurationTests(unittest.TestCase):
         self.assertTrue((ROOT / "requirements-kotoba.txt").is_file())
         self.assertFalse((ROOT / "requirements-cuda.txt").exists())
 
-    def test_project_and_package_versions_are_4_0_0(self) -> None:
+    def test_project_and_package_versions_are_4_1_0(self) -> None:
         project = tomllib.loads(
             (ROOT / "pyproject.toml").read_text(encoding="utf-8")
         )
-        self.assertEqual(project["project"]["version"], "4.0.0")
-        self.assertEqual(__version__, "4.0.0")
+        self.assertEqual(project["project"]["version"], "4.1.0")
+        self.assertEqual(__version__, "4.1.0")
 
 
 if __name__ == "__main__":

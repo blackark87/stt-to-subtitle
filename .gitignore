@@ -1376,3 +1376,14 @@ tags
 
 # 대시보드 개편 초안 (design/) — 루트의 "ignore everything" 규칙에서 예외 처리
 !design/**
+
+# stt-web (Next.js) 빌드 산출물·의존성.
+# 위쪽 !/web/** 가 루트의 "ignore everything"을 뚫고 web/ 전체를 되살리므로
+# node_modules 와 .next 를 여기서 다시 제외한다. 없으면 커밋에 딸려 들어간다.
+/web/node_modules/
+/web/.next/
+/web/next-env.d.ts
+/web/tsconfig.tsbuildinfo
+
+# 2026-08-25 세션 캔버스 시안 복원본. 로컬 참조용이며 저장소에 올리지 않는다.
+/design/mockup/
