@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { Freshness } from "@/components/Freshness";
 import { Icon } from "@/components/Icon";
 import { api, type GpuDevice, type LibraryProgressSegment, type PipelineJob } from "@/lib/api";
@@ -126,6 +126,7 @@ export default function DashboardPage() {
   const fetcher = useCallback(() => api.dashboard(), []);
   const { data, status, error, updatedAt, refreshing, refresh } = useLiveQuery(fetcher, DASHBOARD_INTERVAL_MS);
   const libraryProgress = useLiveQuery(useCallback(() => api.libraryProgress(), []), 60000);
+  const runtimes = useLiveQuery(useCallback(() => api.runtimes(), []), 60000);
   const [actingId, setActingId] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
 
@@ -140,6 +141,13 @@ export default function DashboardPage() {
   const visibleAttention = attention.slice(0, 10);
   const visibleCompleted = completed.slice(0, 10);
   const gpu = data?.gpu ?? null;
+  const runtimeNames = useMemo(
+    () => new Map((runtimes.data?.items ?? []).map((runtime) => [runtime.id, runtime.name])),
+    [runtimes.data?.items],
+  );
+  const runtimeLabel = (job: PipelineJob): string | null => job.stt_runtime_id
+    ? runtimeNames.get(job.stt_runtime_id) ?? job.stt_runtime_id
+    : null;
 
   const act = async (id: string, task: () => Promise<unknown>) => {
     setActingId(id);
@@ -217,6 +225,7 @@ export default function DashboardPage() {
                     <>
                       <Link className="pipeline-job" title={primary.source_rel} href={`/jobs/${encodeURIComponent(primary.id)}`}>{fileName(primary.source_rel)}</Link>
                       <span className="muted truncate" title={parentPath(primary.source_rel)}>{parentPath(primary.source_rel)}</span>
+                      {phase === "transcription" && runtimeLabel(primary) ? <span className="muted truncate" title={`전사 서버 ${runtimeLabel(primary)}`}>전사 서버 · {runtimeLabel(primary)}</span> : null}
                       <div className="progress-line">
                         <progress max={100} value={pct ?? undefined} aria-label={`${PHASE_LABEL[phase]} 진행률`} />
                         <span>{pct == null ? "—" : `${pct}%`}</span>
@@ -242,7 +251,7 @@ export default function DashboardPage() {
                         <Link href={`/jobs/${encodeURIComponent(job.id)}`} className="job-row" key={job.id}>
                           <span className="job-state-line running" />
                           <span className="t-name" title={job.source_rel}><b>{fileName(job.source_rel)}</b><span>{parentPath(job.source_rel)}</span></span>
-                          <span className="b line">{PHASE_LABEL[job.phase as JobPhase] ?? job.phase}</span>
+                          <span className="b line">{PHASE_LABEL[job.phase as JobPhase] ?? job.phase}{job.phase === "transcription" && runtimeLabel(job) ? ` · ${runtimeLabel(job)}` : ""}</span>
                           <span className="job-progress"><progress max={100} value={pct ?? undefined} aria-label="작업 진행률" /><b>{pct == null ? "—" : `${pct}%`}</b></span>
                           <time className="m">{clock(job.updated_at)}</time>
                         </Link>

@@ -103,10 +103,63 @@ class BackendAPIBoundaryTests(unittest.TestCase):
         self.assertEqual(dashboard.json()["active_jobs"], [])
         self.assertEqual(dashboard.json()["attention_jobs"], [])
         self.assertEqual(dashboard.json()["recent_completed"], [])
+        self.assertEqual(
+            dashboard.json()["state_samples"],
+            {
+                "waiting": [],
+                "paused": [],
+                "blocked": [],
+                "stopped": [],
+                "failed": [],
+            },
+        )
         self.assertEqual(settings_response.status_code, 200)
         self.assertNotIn(
             "stt_token",
             settings_response.json()["servers"],
+        )
+
+    def test_dashboard_returns_recent_samples_for_each_large_state(self) -> None:
+        from fastapi.testclient import TestClient
+
+        from stt_to_subtitle.backend_api import create_backend_app
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            settings = BackendSettings(
+                state_dir=root / "state",
+                media_root=media_root,
+                stt_base_url="http://runtime:8100",
+                stt_token="",
+                lm_base_url="",
+                lm_token="",
+                lm_model="",
+            )
+            with TestClient(create_backend_app(settings)) as client:
+                service = client.app.state.orchestrator
+                for index in range(5):
+                    job = service.store.create(
+                        job_id=f"stopped-{index}",
+                        source_rel=f"movie-{index}.mkv",
+                        force_overwrite=False,
+                        options={},
+                    )
+                    service.store.update(
+                        job.id,
+                        status="blocked",
+                        state="stopped",
+                        reason_code="user_stop",
+                        blocked_stage="extraction",
+                    )
+                dashboard = client.get("/api/v1/dashboard")
+
+        self.assertEqual(dashboard.status_code, 200)
+        self.assertEqual(dashboard.json()["state_counts"]["stopped"], 5)
+        self.assertEqual(
+            len(dashboard.json()["state_samples"]["stopped"]),
+            3,
         )
 
     def test_manages_external_runtime_without_exposing_its_token(self) -> None:

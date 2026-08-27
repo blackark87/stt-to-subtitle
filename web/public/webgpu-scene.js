@@ -623,14 +623,14 @@ if (PRIMARY_ZONE) {
   }
   avWing.traverse((o) => { if (o.isMesh) o.userData.pickRoot = avWing; });
   avWing.userData = {
-    kind: "dir", title: PRIMARY_ZONE.path,
+    kind: "dir", title: PRIMARY_ZONE.label || PRIMARY_ZONE.path,
     detail: [PRIMARY_ZONE.dirs != null ? `하위 폴더 ${PRIMARY_ZONE.dirs}개` : null,
              PRIMARY_ZONE.files != null ? `낱개 파일 ${PRIMARY_ZONE.files}개` : null]
              .filter(Boolean).join(" · "),
     href: mediaHref(PRIMARY_ZONE.path),
   };
   pickable.push(avWing);
-  pin(`${dot(CSS.media)}<span class="n">${h(PRIMARY_ZONE.path)}</span>`,
+  pin(`${dot(CSS.media)}<span class="n">${h(PRIMARY_ZONE.label || PRIMARY_ZONE.path)}</span>`,
       { x: (AV_X0 + AV_X1) / 2, y: DECK_Y, z: AISLE_Z0 - 0.9 }, 2.4, "", "media");
 }
 
@@ -652,14 +652,14 @@ OTHER_ZONES.forEach((zone, i) => {
   }
   g.traverse((o) => { if (o.isMesh) o.userData.pickRoot = g; });
   g.userData = {
-    kind: "dir", title: zone.path,
+    kind: "dir", title: zone.label || zone.path,
     detail: [zone.dirs != null ? `하위 폴더 ${zone.dirs}개` : null,
              zone.files != null ? `낱개 파일 ${zone.files}개` : null]
              .filter(Boolean).join(" · "),
     href: mediaHref(zone.path),
   };
   pickable.push(g);
-  pin(`${dot(mixed ? CSS.warn : CSS.mute)}<span class="n">${h(zone.path)}</span>`,
+  pin(`${dot(mixed ? CSS.warn : CSS.mute)}<span class="n">${h(zone.label || zone.path)}</span>`,
       { x, y: DECK_Y, z: z0 - 0.5 }, 1.9, "sm", "media");
 });
 if (DATA.media_tree_rest) {
@@ -1220,8 +1220,10 @@ function statusCargo(job, kind, tint, group, x, y, z, color) {
     kind,
     title: job.source_rel.split("/").pop(),
     status: job.status_label,
-    detail: kind === "failed" ? (job.error || "") : "",
+    detail: kind === "failed" ? (job.error || job.detail || "") : (job.detail || ""),
     href: job.href,
+    list_href: job.list_href,
+    state_total: job.state_total,
   };
   group.add(cargo);
   pickable.push(cargo);
@@ -1273,8 +1275,10 @@ function statusBay({ cx, cz, routeZ, group, jobs, rest, label, kind, layer, rug,
     kind,
     title: job.source_rel.split("/").pop(),
     status: job.status_label,
-    detail: kind === "failed" ? (job.error || "") : "",
+    detail: kind === "failed" ? (job.error || job.detail || "") : (job.detail || ""),
     href: job.href,
+    list_href: job.list_href,
+    state_total: job.state_total,
   };
   const handler = person(0x758294);
   handler.position.set(0, 0, -0.82);
@@ -1555,7 +1559,10 @@ function setDetail(u) {
     ${u.endpoint ? `<div class="kv"><span>종료점</span><span>${h(u.endpoint)}</span></div>` : ""}
     ${u.percent !== undefined ? `<div class="kv"><span>진행</span><span>${u.percent}%</span></div>` : ""}
     ${u.detail ? `<p class="muted" style="margin: 10px 0 0; font-size: .8rem; line-height: 1.5">${h(u.detail)}</p>` : ""}
-    ${u.href ? `<a class="btn sec sm" style="margin-top: 12px" href="${h(u.href)}">작업 상세</a>` : ""}`;
+    ${(u.href || u.list_href) ? `<span class="btns" style="margin-top: 12px">
+      ${u.href ? `<a class="btn sec sm" href="${h(u.href)}">작업 상세</a>` : ""}
+      ${u.list_href ? `<a class="btn sec sm" href="${h(u.list_href)}">전체 ${h(u.state_total ?? "")}건 보기</a>` : ""}
+    </span>` : ""}`;
 }
 
 document.querySelectorAll("[data-layer]").forEach((cb) => {

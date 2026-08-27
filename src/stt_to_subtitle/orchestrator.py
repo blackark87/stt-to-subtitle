@@ -4039,6 +4039,8 @@ class SubtitleOrchestrator:
 
         def update_transcription_progress(progress: Mapping[str, Any]) -> None:
             fields: dict[str, Any] = {}
+            current = self.store.get(job.id)
+            stage_changed = False
             if "created" in progress and "completed" in progress:
                 fields.update(
                     chunks_created=int(progress["created"]),
@@ -4048,13 +4050,36 @@ class SubtitleOrchestrator:
                     ),
                 )
             if "stage" in progress:
+                stage = str(progress["stage"])
+                stage_index = int(progress["stage_index"])
+                stage_total = int(progress["stage_total"])
                 fields.update(
-                    transcription_stage=str(progress["stage"]),
-                    transcription_stage_index=int(progress["stage_index"]),
-                    transcription_stage_total=int(progress["stage_total"]),
+                    transcription_stage=stage,
+                    transcription_stage_index=stage_index,
+                    transcription_stage_total=stage_total,
                 )
+                stage_changed = current is None or (
+                    current.transcription_stage,
+                    current.transcription_stage_index,
+                    current.transcription_stage_total,
+                ) != (stage, stage_index, stage_total)
             if fields:
                 self._require_stage_update(job, **fields)
+            if stage_changed:
+                self.store.add_event(
+                    job.id,
+                    "info",
+                    f"transcription stage changed to {stage}",
+                    event_code="transcription.stage_changed",
+                    from_state=JobState.RUNNING.value,
+                    phase="transcription",
+                    payload={
+                        "stage": stage,
+                        "stage_index": stage_index,
+                        "stage_total": stage_total,
+                        "runtime_id": runtime_id,
+                    },
+                )
 
         payload = stt_client.transcribe(
             Path(job.audio_path),

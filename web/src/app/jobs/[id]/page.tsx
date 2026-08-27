@@ -6,18 +6,18 @@ import { Icon } from "@/components/Icon";
 import { Freshness } from "@/components/Freshness";
 import { api } from "@/lib/api";
 import {
-  PHASE_LABEL,
   STATE_LABEL,
   asJobState,
   canPauseTranslation,
   canResumeTranslation,
   canRetryJob,
   canStopJob,
+  operationLabel,
   reasonLabel,
-  type JobPhase,
   type JobState,
 } from "@/lib/domain";
 import { clock, fileName, parentPath, percent } from "@/lib/format";
+import { EVENT_LEVEL_LABEL, eventText, jobProgressLabel } from "@/lib/jobPresentation";
 import { useLiveQuery } from "@/lib/useLiveQuery";
 
 const INTERVAL_MS = 5000;
@@ -72,8 +72,16 @@ export default function JobDetailPage({ params }: { params: Promise<{ id: string
   const { id } = use(params);
   const fetcher = useCallback(() => api.job(id), [id]);
   const { data: detail, status, error, updatedAt, refreshing, refresh } = useLiveQuery(fetcher, INTERVAL_MS);
+  const runtimes = useLiveQuery(useCallback(() => api.runtimes(), []), 60000);
   const job = detail?.job ?? null;
   const state = job ? asJobState(job.state) : null;
+  const runtimeNames = useMemo(
+    () => new Map((runtimes.data?.items ?? []).map((runtime) => [runtime.id, runtime.name])),
+    [runtimes.data?.items],
+  );
+  const assignedRuntime = job?.stt_runtime_id
+    ? runtimeNames.get(job.stt_runtime_id) ?? job.stt_runtime_id
+    : null;
 
   const artifactVersion = `${id}:${job?.updated_at ?? "pending"}`;
   const [artifactResult, setArtifactResult] = useState<ArtifactResult | null>(null);
@@ -189,7 +197,7 @@ export default function JobDetailPage({ params }: { params: Promise<{ id: string
           <div className="card-head">
             <div>
               <h2 id="job-progress-title">작업 진행</h2>
-              <span className="sub" title={job ? (PHASE_LABEL[job.phase as JobPhase] ?? job.phase) : "불러오는 중"}>{job ? (PHASE_LABEL[job.phase as JobPhase] ?? job.phase) : "불러오는 중"}</span>
+              <span className="sub" title={job ? jobProgressLabel(job) : "불러오는 중"}>{job ? jobProgressLabel(job) : "불러오는 중"}</span>
             </div>
             <div className="btns">
               {state && canRetryJob(state) ? (
@@ -219,8 +227,10 @@ export default function JobDetailPage({ params }: { params: Promise<{ id: string
           </div>
           <div className="card-body progress-body">
             <div>
-              <span className="eyebrow">현재 상태</span>
-              <strong>{state ? STATE_LABEL[state] : "확인 중"}</strong>
+              <span className="eyebrow">현재 작업 진행</span>
+              <strong>{job ? jobProgressLabel(job) : "확인 중"}</strong>
+              {job ? <span className="muted">작업 종류: {operationLabel(job.operation)} · 상태: {state ? STATE_LABEL[state] : job.state}</span> : null}
+              {assignedRuntime ? <span className="muted">전사 서버: {assignedRuntime} <span className="code">({job?.stt_runtime_id})</span></span> : null}
               {job?.reason_code ? <span className="reason-text" title={reasonLabel(job.reason_code) ?? undefined}>{reasonLabel(job.reason_code)}</span> : null}
             </div>
             <div className="progress-measure">
@@ -265,7 +275,12 @@ export default function JobDetailPage({ params }: { params: Promise<{ id: string
 
           <section className="card cue-card">
             <div className="card-head">
-              <div><h2>자막</h2><span className="sub" title={`${translated} / ${segments.length}개 번역`}>{translated} / {segments.length}개 번역</span></div>
+              <div>
+                <h2>{job?.operation === "transcribe" ? "전사 구간" : "자막"}</h2>
+                <span className="sub" title={job?.operation === "transcribe" ? `${segments.length}개 전사 구간` : `${translated} / ${segments.length}개 번역`}>
+                  {job?.operation === "transcribe" ? `${segments.length}개 전사 구간` : `${translated} / ${segments.length}개 번역`}
+                </span>
+              </div>
             </div>
             <div className="cue-scroll">
               {artifactError ? <p className="notice error" role="alert">{artifactError}</p> : null}
@@ -283,7 +298,7 @@ export default function JobDetailPage({ params }: { params: Promise<{ id: string
                         <button type="button" className={on ? "cue-button is-current" : "cue-button"} onClick={() => seek(segment)}>
                           <span className="code cue-time">{timecode(segment.start)}</span>
                           <span className="cue-copy">
-                            <strong>{segment.ko || "번역 대기"}</strong>
+                            {segment.ko ? <strong>{segment.ko}</strong> : job?.operation === "transcribe" ? null : <span>아직 번역되지 않음</span>}
                             <span lang="ja">{segment.ja}</span>
                           </span>
                         </button>
@@ -305,8 +320,8 @@ export default function JobDetailPage({ params }: { params: Promise<{ id: string
             {(detail?.events ?? []).length ? detail?.events.slice(-100).reverse().map((event, index) => (
               <div className="event-row" key={`${event.created_at ?? "event"}-${index}`}>
                 <time className="code">{clock(event.created_at)}</time>
-                <span className={event.level === "error" ? "b bad" : "b line"}>{event.level ?? "기록"}</span>
-                <span>{event.message ?? event.event_code ?? "—"}</span>
+                <span className={event.level === "error" ? "b bad" : event.level === "warning" ? "b hold" : "b line"}>{EVENT_LEVEL_LABEL[event.level ?? ""] ?? "기록"}</span>
+                <span title={event.message}>{eventText(event, runtimeNames)}</span>
               </div>
             )) : <div className="empty-state compact"><strong>기록이 없습니다</strong></div>}
           </div>

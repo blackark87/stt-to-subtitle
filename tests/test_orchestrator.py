@@ -2897,9 +2897,10 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                     side_effect=transcribe_with_progress
                 )
                 orchestrator._transcribe(orchestrator.store.get(job.id))
+                progress_events = orchestrator.store.events(job.id)
                 progress_messages = [
                     event["message"]
-                    for event in orchestrator.store.events(job.id)
+                    for event in progress_events
                 ]
 
                 translation_client = Mock()
@@ -2928,6 +2929,21 @@ class SubtitleOrchestratorTests(unittest.TestCase):
             self.assertIn(
                 "noise filter removed 2 non-speech diarization span(s)",
                 progress_messages,
+            )
+            stage_events = [
+                event
+                for event in progress_events
+                if event["event_code"] == "transcription.stage_changed"
+            ]
+            self.assertEqual(len(stage_events), 1)
+            self.assertEqual(
+                stage_events[0]["payload"],
+                {
+                    "runtime_id": "builtin",
+                    "stage": "primary_transcription",
+                    "stage_index": 1,
+                    "stage_total": 7,
+                },
             )
             sent_options = (
                 orchestrator.stt_client.transcribe.call_args.kwargs["options"]

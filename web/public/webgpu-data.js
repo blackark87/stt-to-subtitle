@@ -13,6 +13,7 @@
   });
 
   const LIMIT = 3;
+  const MEDIA_LIMIT = 9;
   const PHASE_LABEL = {
     extraction: "추출",
     transcription: "전사",
@@ -29,6 +30,18 @@
     failed: "실패",
     done: "완료",
   };
+  const TRANSCRIPTION_STAGE_LABEL = {
+    model_loading: "모델 준비",
+    scene_detection: "장면 분석",
+    primary_transcription: "1차 전사",
+    secondary_transcription: "2차 전사",
+    forced_alignment: "강제 정렬",
+    speaker_diarization: "화자 분리",
+    quality_analysis: "문제 구간 분석",
+    rescue_transcription: "문제 구간 재전사",
+    transcription_merge: "전사 결과 병합",
+    subtitle_normalization: "자막 구간 구성",
+  };
 
   const percent = (job) => {
     if (job.phase === "transcription") {
@@ -41,17 +54,25 @@
     return job.state === "done" ? 100 : null;
   };
 
-  const view = (job) => ({
+  const view = (job, runtimeNames) => ({
     id: job.id,
     source_rel: job.source_rel,
     title: String(job.source_rel || "").split("/").pop() || job.source_rel,
     phase: PHASE_LABEL[job.phase] || job.phase,
+    stage: PHASE_LABEL[job.phase] || job.phase,
     state: job.state,
     status: STATE_LABEL[job.state] || job.state,
     status_label: STATE_LABEL[job.state] || job.state,
     reason_code: job.reason_code,
     error: job.error || "",
-    detail: `${PHASE_LABEL[job.phase] || job.phase} · ${STATE_LABEL[job.state] || job.state}`,
+    detail: [
+      PHASE_LABEL[job.phase] || job.phase,
+      job.phase === "transcription" && job.transcription_stage
+        ? TRANSCRIPTION_STAGE_LABEL[job.transcription_stage] || job.transcription_stage
+        : null,
+      job.stt_runtime_id ? `전사 서버 ${runtimeNames.get(job.stt_runtime_id) || job.stt_runtime_id}` : null,
+      STATE_LABEL[job.state] || job.state,
+    ].filter(Boolean).join(" · "),
     percent: percent(job),
     href: `/jobs/${encodeURIComponent(job.id)}`,
   });
@@ -67,20 +88,30 @@
     power_watts: null,
   });
 
-  const build = (payload) => {
+  const build = (payload, mediaPayload = null, runtimesPayload = null) => {
     const activeJobs = payload.active_jobs || payload.recent_jobs || [];
     const recentCompleted = payload.recent_completed
       || (payload.recent_jobs || []).filter((job) => job.state === "done");
     const counts = payload.state_counts || {};
+    const stateSamples = payload.state_samples || {};
+    const runtimeNames = new Map(
+      (runtimesPayload?.items || []).map((runtime) => [runtime.id, runtime.name]),
+    );
     const active = activeJobs.map((job) => ({ ...job }));
-    const pick = (states) => active.filter((job) => states.includes(job.state)).map(view);
+    const pick = (states) => states.flatMap((state) => {
+      const source = Array.isArray(stateSamples[state])
+        ? stateSamples[state]
+        : active.filter((job) => job.state === state);
+      return source.map((job) => view(job, runtimeNames));
+    });
     const runningRaw = active.filter((job) => job.state === "running");
     const queue = pick(["waiting"]);
     const blocked = pick(["blocked"]);
     const failed = pick(["failed"]);
     const paused = pick(["paused"]);
     const stopped = pick(["stopped"]);
-    const completed = recentCompleted.map(view);
+    const completed = recentCompleted.map((job) => view(job, runtimeNames));
+    const mediaFolders = mediaPayload?.folders || [];
     const gpuSnapshot = payload.gpu || null;
     const gpuDevice = gpuSnapshot?.devices?.[0] || null;
     const gpu = gpuDevice
@@ -112,26 +143,62 @@
         return {
           stage: label,
           job: job?.source_rel || null,
-          detail: job ? `${PHASE_LABEL[job.phase]} · ${STATE_LABEL[job.state]}` : "",
+          detail: job ? [
+            PHASE_LABEL[job.phase],
+            phase === "transcription" && job.transcription_stage
+              ? TRANSCRIPTION_STAGE_LABEL[job.transcription_stage] || job.transcription_stage
+              : null,
+            phase === "transcription" && job.stt_runtime_id
+              ? `전사 서버 ${runtimeNames.get(job.stt_runtime_id) || job.stt_runtime_id}`
+              : null,
+            STATE_LABEL[job.state],
+          ].filter(Boolean).join(" · ") : "",
           percent: job ? percent(job) : null,
           count: phaseJobs.length,
           href: job ? `/jobs/${encodeURIComponent(job.id)}` : null,
         };
       }),
-      queue: queue.slice(0, LIMIT),
+      queue: queue.slice(0, LIMIT).map((job) => ({
+        ...job,
+        list_href: "/jobs?state=waiting",
+        state_total: counts.waiting || queue.length,
+      })),
       queue_rest: Math.max(0, (counts.waiting || queue.length) - LIMIT),
-      blocked: blocked.slice(0, LIMIT),
+      blocked: blocked.slice(0, LIMIT).map((job) => ({
+        ...job,
+        list_href: "/jobs?state=blocked",
+        state_total: counts.blocked || blocked.length,
+      })),
       blocked_rest: Math.max(0, (counts.blocked || blocked.length) - LIMIT),
-      failed: failed.slice(0, LIMIT),
+      failed: failed.slice(0, LIMIT).map((job) => ({
+        ...job,
+        list_href: "/jobs?state=failed",
+        state_total: counts.failed || failed.length,
+      })),
       failed_rest: Math.max(0, (counts.failed || failed.length) - LIMIT),
-      paused: paused.slice(0, LIMIT),
+      paused: paused.slice(0, LIMIT).map((job) => ({
+        ...job,
+        list_href: "/jobs?state=paused",
+        state_total: counts.paused || paused.length,
+      })),
       paused_rest: Math.max(0, (counts.paused || paused.length) - LIMIT),
-      stopped: stopped.slice(0, LIMIT),
+      stopped: stopped.slice(0, LIMIT).map((job) => ({
+        ...job,
+        list_href: "/jobs?state=stopped",
+        state_total: counts.stopped || stopped.length,
+      })),
       stopped_rest: Math.max(0, (counts.stopped || stopped.length) - LIMIT),
       completed: completed.slice(0, LIMIT),
       completed_total: counts.done || completed.length,
-      media_tree: [],
-      media_tree_rest: 0,
+      media_tree: mediaFolders.slice(0, MEDIA_LIMIT).map((folder) => ({
+        path: folder.path,
+        label: folder.display_name || folder.name || folder.path,
+        shape: "directory",
+      })),
+      media_tree_rest: Math.max(
+        0,
+        (mediaPayload?.folder_total || mediaFolders.length) - MEDIA_LIMIT,
+      ),
       state_counts: counts,
     };
   };
@@ -181,10 +248,19 @@
   };
 
   const load = async () => {
-    const response = await fetch("/api/v1/dashboard", { headers: { Accept: "application/json" } });
+    const headers = { Accept: "application/json" };
+    const response = await fetch("/api/v1/dashboard", { headers });
     if (!response.ok) throw new Error(`dashboard ${response.status}`);
-    const payload = await response.json();
-    window.__SCENE_DATA__ = build(payload);
+    const [payload, mediaPayload, runtimesPayload] = await Promise.all([
+      response.json(),
+      fetch(`/api/v1/media?folder_limit=${MEDIA_LIMIT}`, { headers })
+        .then((result) => result.ok ? result.json() : null)
+        .catch(() => null),
+      fetch("/api/v1/runtimes", { headers })
+        .then((result) => result.ok ? result.json() : null)
+        .catch(() => null),
+    ]);
+    window.__SCENE_DATA__ = build(payload, mediaPayload, runtimesPayload);
     paint(payload);
   };
 

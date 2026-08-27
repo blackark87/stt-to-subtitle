@@ -27,6 +27,14 @@ export const JOB_PHASES = [
 ] as const;
 export type JobPhase = (typeof JOB_PHASES)[number];
 
+export const JOB_OPERATIONS = [
+  "extract",
+  "transcribe",
+  "translate",
+  "full",
+] as const;
+export type JobOperation = (typeof JOB_OPERATIONS)[number];
+
 export const JOB_REASONS = [
   "user_stop",
   "lm_unavailable",
@@ -88,6 +96,33 @@ export const PHASE_LABEL: Record<JobPhase, string> = {
   translation: "번역",
   render: "자막 생성",
   complete: "완료",
+};
+
+export const OPERATION_LABEL: Record<JobOperation, string> = {
+  extract: "음원 추출",
+  transcribe: "전사",
+  translate: "번역·자막 생성",
+  full: "전체 자막 생성",
+};
+
+export const OPERATION_COMPLETION_LABEL: Record<JobOperation, string> = {
+  extract: "음원 추출 완료",
+  transcribe: "전사 완료",
+  translate: "번역·자막 생성 완료",
+  full: "자막 생성 완료",
+};
+
+export const TRANSCRIPTION_STAGE_LABEL: Record<string, string> = {
+  model_loading: "모델 준비",
+  scene_detection: "장면 분석",
+  primary_transcription: "1차 전사",
+  secondary_transcription: "2차 전사",
+  forced_alignment: "강제 정렬",
+  speaker_diarization: "화자 분리",
+  quality_analysis: "문제 구간 분석",
+  rescue_transcription: "문제 구간 재전사",
+  transcription_merge: "전사 결과 병합",
+  subtitle_normalization: "자막 구간 구성",
 };
 
 export const REASON_LABEL: Record<JobReason, string> = {
@@ -160,6 +195,23 @@ export function stateLabel(value: string): string {
 export function phaseLabel(value: string): string {
   const phase = asJobPhase(value);
   return phase ? PHASE_LABEL[phase] : value;
+}
+
+export function operationLabel(value: string): string {
+  return (JOB_OPERATIONS as readonly string[]).includes(value)
+    ? OPERATION_LABEL[value as JobOperation]
+    : value;
+}
+
+export function operationCompletionLabel(value: string): string {
+  return (JOB_OPERATIONS as readonly string[]).includes(value)
+    ? OPERATION_COMPLETION_LABEL[value as JobOperation]
+    : "작업 완료";
+}
+
+export function transcriptionStageLabel(value: string | null): string | null {
+  if (!value) return null;
+  return TRANSCRIPTION_STAGE_LABEL[value] ?? value;
 }
 
 export function reasonLabel(value: string | null): string | null {

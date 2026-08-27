@@ -51,6 +51,13 @@ def dashboard(request: Request) -> dict[str, Any]:
         JobState.PAUSED.value,
         JobState.STOPPED.value,
     }
+    sampled_states = (
+        JobState.WAITING,
+        JobState.PAUSED,
+        JobState.BLOCKED,
+        JobState.STOPPED,
+        JobState.FAILED,
+    )
     return {
         "state_counts": {
             state.value: service.store.count_jobs(
@@ -86,6 +93,16 @@ def dashboard(request: Request) -> dict[str, Any]:
                 include_comparison_transcriptions=False,
             )
         ),
+        "state_samples": {
+            state.value: jobs_payload(
+                service.store.list_jobs(
+                    states={state.value},
+                    limit=3,
+                    include_comparison_transcriptions=False,
+                )
+            )
+            for state in sampled_states
+        },
         "attention_jobs": jobs_payload(
             service.store.list_jobs(
                 states=attention_states,

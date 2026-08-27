@@ -83,6 +83,7 @@ export interface DashboardPayload {
   active_jobs: PipelineJob[];
   attention_jobs: PipelineJob[];
   recent_completed: PipelineJob[];
+  state_samples?: Record<string, PipelineJob[]>;
   dependencies: { transcription: DependencyStatus; translation: DependencyStatus };
   gpu: GpuSnapshot | null;
 }
@@ -166,6 +167,11 @@ export interface JobEvent {
   level?: string;
   message?: string;
   event_code?: string;
+  from_state?: string | null;
+  to_state?: string | null;
+  phase?: string | null;
+  attempt?: number | null;
+  payload?: Record<string, unknown>;
 }
 
 export interface JobDetailPayload {

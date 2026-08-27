@@ -59,7 +59,7 @@ export default function JobsPage() {
   );
   const [selected, setSelected] = useState<ReadonlySet<string>>(new Set());
   const [busy, setBusy] = useState(false);
-  const [limit, setLimit] = useState(200);
+  const [limit, setLimit] = useState(20);
   const [actionError, setActionError] = useState<string | null>(null);
 
   const fetcher = useCallback(
@@ -71,7 +71,12 @@ export default function JobsPage() {
     [limit, phaseFilter, stateFilter],
   );
   const { data, status, error, updatedAt, refreshing, refresh } = useLiveQuery(fetcher, JOBS_INTERVAL_MS);
+  const runtimes = useLiveQuery(useCallback(() => api.runtimes(), []), 60000);
   const jobs = useMemo(() => data?.items ?? [], [data?.items]);
+  const runtimeNames = useMemo(
+    () => new Map((runtimes.data?.items ?? []).map((runtime) => [runtime.id, runtime.name])),
+    [runtimes.data?.items],
+  );
 
   const setFilter = (key: "state" | "phase", next: readonly string[]) => {
     const params = new URLSearchParams(searchParams.toString());
@@ -79,6 +84,7 @@ export default function JobsPage() {
     next.forEach((value) => params.append(key, value));
     const suffix = params.toString();
     router.replace(suffix ? `/jobs?${suffix}` : "/jobs", { scroll: false });
+    setLimit(20);
   };
 
   const clearFilters = () => {
@@ -89,6 +95,7 @@ export default function JobsPage() {
     const suffix = params.toString();
     router.replace(suffix ? `/jobs?${suffix}` : "/jobs", { scroll: false });
     setSelected(new Set());
+    setLimit(20);
   };
 
   const activeFilterCount = stateFilter.length + phaseFilter.length;
@@ -185,12 +192,15 @@ export default function JobsPage() {
 
         <section className="card">
           <div className="card-head">
-            <h2>
-              작업
-              <span className="n" style={{ marginLeft: 7 }}>
-                {data?.total ?? 0}
-              </span>
-            </h2>
+            <div>
+              <h2>
+                작업
+                <span className="n" style={{ marginLeft: 7 }}>
+                  {data?.total ?? 0}
+                </span>
+              </h2>
+              <span className="sub" title={`20건 단위 · 현재 ${jobs.length}건 표시`}>20건 단위 · 현재 {jobs.length}건 표시</span>
+            </div>
             <span className="btns">
               <span className="selection-summary" aria-live="polite">{selectedJobs.length ? `${selectedJobs.length}건 선택` : "작업을 선택하세요"}</span>
               <button type="button" className="btn sec sm" disabled={!retryIds.length || busy} onClick={() => void run(retryIds, api.retryJobs)}>
@@ -241,6 +251,13 @@ export default function JobsPage() {
                   const state = asJobState(job.state);
                   const reason = reasonLabel(job.reason_code) ?? job.error ?? "—";
                   const on = selected.has(job.id);
+                  const runtime = job.stt_runtime_id
+                    ? runtimeNames.get(job.stt_runtime_id) ?? job.stt_runtime_id
+                    : null;
+                  const phase = PHASE_LABEL[job.phase as JobPhase] ?? job.phase;
+                  const displayedPhase = job.phase === "transcription" && runtime
+                    ? `${phase} · ${runtime}`
+                    : phase;
                   return (
                     <div
                       key={job.id}
@@ -262,7 +279,7 @@ export default function JobsPage() {
                         <b><Link href={`/jobs/${encodeURIComponent(job.id)}`}>{fileName(job.source_rel)}</Link></b>
                         <span>{parentPath(job.source_rel)}</span>
                       </div>
-                      <span role="cell" className="b line" data-label="단계">{PHASE_LABEL[job.phase as JobPhase] ?? job.phase}</span>
+                      <span role="cell" className="b line" data-label="단계" title={displayedPhase}>{displayedPhase}</span>
                       <span
                         role="cell"
                         className="m"
@@ -282,7 +299,7 @@ export default function JobsPage() {
             </div>
             {(data?.total ?? 0) > jobs.length ? (
               <div className="load-more">
-                <button type="button" className="btn sec" onClick={() => setLimit((value) => value + 200)}>
+                <button type="button" className="btn sec" onClick={() => setLimit((value) => value + 20)}>
                   더 보기 · {jobs.length} / {data?.total ?? 0}
                 </button>
               </div>

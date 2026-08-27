@@ -101,13 +101,13 @@
   <header class="glass topbar-hud">
     <h1>대시보드</h1>
     <span class="btns" style="gap: 5px; flex-wrap: wrap">
-      <span class="b run dot">진행 중 <span data-count="running">0</span></span>
-      <span class="b wait dot">대기 <span data-count="waiting">0</span></span>
-      <span class="b hold dot">일시 정지 <span data-count="paused">0</span></span>
-      <span class="b hold dot">중단 <span data-count="blocked">0</span></span>
-      <span class="b hold dot">정지 <span data-count="stopped">0</span></span>
-      <span class="b bad dot">실패 <span data-count="failed">0</span></span>
-      <span class="b ok dot">완료 <span data-count="completed">0</span></span>
+      <a class="b run dot" href="/jobs?state=running">진행 중 <span data-count="running">0</span></a>
+      <a class="b wait dot" href="/jobs?state=waiting">대기 <span data-count="waiting">0</span></a>
+      <a class="b hold dot" href="/jobs?state=paused">일시 정지 <span data-count="paused">0</span></a>
+      <a class="b hold dot" href="/jobs?state=blocked">중단 <span data-count="blocked">0</span></a>
+      <a class="b hold dot" href="/jobs?state=stopped">정지 <span data-count="stopped">0</span></a>
+      <a class="b bad dot" href="/jobs?state=failed">실패 <span data-count="failed">0</span></a>
+      <a class="b ok dot" href="/jobs?state=done">완료 <span data-count="completed">0</span></a>
     </span>
     <span id="data-status" class="b hold dot" style="margin-left: auto">데이터 확인 중</span>
     <span id="renderer-status" class="b hold dot">렌더러 확인 중</span>
