@@ -349,10 +349,6 @@ class BackendTranslationRouting:
 
     def _probe(self, stage: str, server: TranslationServer) -> TranslationServer:
         key = (stage, server.id)
-        if not server.enabled:
-            with self._lock:
-                self._health[key] = {"status": "disabled", "message": None}
-            return server
         if not server.base_url:
             raise ExternalServiceError("번역 서버 주소가 설정되지 않았습니다.")
         try:

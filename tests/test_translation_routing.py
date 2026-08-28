@@ -270,6 +270,28 @@ class BackendTranslationRoutingTests(unittest.TestCase):
                 {"model", "messages"},
             )
 
+    def test_explicit_probe_checks_a_disabled_server(self) -> None:
+        with TemporaryDirectory() as directory, patch(
+            "stt_to_subtitle.translation_routing.requests.get",
+            return_value=model_response("disabled-server-model"),
+        ) as request:
+            routing = self.routing(Path(directory))
+
+            result = routing.probe_server("review", "builtin")
+
+            request.assert_called_once_with(
+                "http://builtin.test/v1/models",
+                headers={
+                    "Accept": "application/json",
+                    "Authorization": "Bearer builtin-secret",
+                    "Content-Type": "application/json",
+                },
+                timeout=(10.0, 30.0),
+            )
+            self.assertFalse(result["enabled"])
+            self.assertEqual(result["status"], "disabled")
+            self.assertEqual(result["models"], ["disabled-server-model"])
+
     def test_draft_and_review_use_their_own_server_groups(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
