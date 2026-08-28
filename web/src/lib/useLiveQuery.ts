@@ -45,9 +45,9 @@ export function useLiveQuery<T>(
   const mounted = useRef(true);
   const requestVersion = useRef(0);
 
-  const run = useCallback(async () => {
+  const run = useCallback(async (silent = false) => {
     const version = ++requestVersion.current;
-    setRefreshing(true);
+    if (!silent) setRefreshing(true);
     try {
       const next = await fetcher();
       if (!mounted.current || version !== requestVersion.current) return;
@@ -61,7 +61,7 @@ export function useLiveQuery<T>(
       setError(reason instanceof Error ? reason.message : String(reason));
       setStatus("error");
     } finally {
-      if (mounted.current && version === requestVersion.current) {
+      if (!silent && mounted.current && version === requestVersion.current) {
         setRefreshing(false);
       }
     }
@@ -69,16 +69,19 @@ export function useLiveQuery<T>(
 
   useEffect(() => {
     mounted.current = true;
+    // 타이머·탭 복귀로 인한 자동 갱신은 silent 로 돈다: refreshing 을 켜지 않아
+    // "새로고침" 버튼이 흐려지거나 Freshness 문구가 "갱신 중"으로 바뀌는 걸
+    // 5초마다 반복해서 보여주지 않는다. 사용자가 직접 누른 새로고침만 시각
+    // 피드백을 준다.
     const tick = () => {
-      // 탭이 숨겨져 있으면 요청하지 않는다. 보이면 즉시 한 번 따라잡는다.
-      if (document.visibilityState === "visible") void run();
+      if (document.visibilityState === "visible") void run(true);
     };
 
     queueMicrotask(() => void run());
     const timer = window.setInterval(tick, intervalMs);
 
     const onVisibility = () => {
-      if (document.visibilityState === "visible") void run();
+      if (document.visibilityState === "visible") void run(true);
     };
     document.addEventListener("visibilitychange", onVisibility);
 
@@ -90,5 +93,5 @@ export function useLiveQuery<T>(
     };
   }, [run, intervalMs]);
 
-  return { data, status, error, updatedAt, refreshing, refresh: run };
+  return { data, status, error, updatedAt, refreshing, refresh: () => run() };
 }
