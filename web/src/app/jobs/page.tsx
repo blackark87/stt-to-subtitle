@@ -270,20 +270,19 @@ export default function JobsPage() {
                 {pageSelected ? "페이지 선택 해제" : `현재 페이지 ${jobs.length}건 선택`}
               </button>
               <span className="selection-summary" aria-live="polite">{selectedJobs.length ? `${selectedJobs.length}건 선택` : "작업을 선택하세요"}</span>
-              <label className="compact-field job-translation-prompt">
-                <span>번역 프롬프트</span>
-                <select
-                  className="ctl sm"
-                  value={translationPromptId}
-                  disabled={busy || prompts.status === "loading"}
-                  onChange={(event) => setTranslationPromptId(event.target.value)}
-                >
-                  <option value="">{prompts.status === "loading" ? "불러오는 중" : "프롬프트 선택"}</option>
-                  {activePrompts.map((prompt) => (
-                    <option key={prompt.id} value={prompt.id}>{prompt.name}</option>
-                  ))}
-                </select>
-              </label>
+              <select
+                className="ctl sm job-translation-prompt"
+                aria-label="번역 프롬프트"
+                title="번역 프롬프트"
+                value={translationPromptId}
+                disabled={busy || prompts.status === "loading"}
+                onChange={(event) => setTranslationPromptId(event.target.value)}
+              >
+                <option value="">{prompts.status === "loading" ? "불러오는 중" : "프롬프트 선택"}</option>
+                {activePrompts.map((prompt) => (
+                  <option key={prompt.id} value={prompt.id}>{prompt.name}</option>
+                ))}
+              </select>
               <button
                 type="button"
                 className="btn sm"
