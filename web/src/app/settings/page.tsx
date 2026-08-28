@@ -342,7 +342,7 @@ export default function SettingsPage() {
                         {runtime.running_jobs} / {runtime.capacity}
                       </span>
                       <span role="cell" data-label="배치" className="runtime-batch-cell m">
-                        K {runtime.kotoba_batch_size ?? "자동"} · W {runtime.whisperx_batch_size ?? "자동"}
+                        Kotoba 배치 {runtime.kotoba_batch_size ?? "기본값"} · WhisperX 배치 {runtime.whisperx_batch_size ?? "기본값"}
                       </span>
                       <span role="cell" data-label="관리" className="btns runtime-actions">
                         <button type="button" className="btn sec sm" disabled={busy} onClick={() => void guard(() => api.probeRuntime(runtime.id))}>
@@ -511,33 +511,35 @@ export default function SettingsPage() {
           ) : null}
         </section>
 
-        <section className="card">
-          <div className="card-head"><div><h2>초벌 번역</h2><span className="sub m">가용 서버 중 여유 슬롯을 사용하며, 일괄 작업은 우선 서버를 먼저 사용합니다.</span></div></div>
-          <div className="card-body translation-model-list">
-            {translationEndpoints.map((endpoint) => {
-              const models = Array.from(new Set([endpoint.draft_model, ...endpoint.models].filter(Boolean)));
-              return <div className="translation-model-row" key={`draft-${endpoint.id}`}>
-                <div className="runtime-title"><strong>{endpoint.name}</strong>{endpoint.builtin ? <span className="b line">기본</span> : null}</div>
-                <label className="f"><span className="lb">모델 선택</span><select className="ctl" value={endpoint.draft_model} disabled={busy || !endpoint.enabled} onChange={(event) => void updateTranslationRouting(endpoint, { draft_model: event.target.value })}><option value="">사용 안 함</option>{models.map((model) => <option value={model} key={model}>{model}</option>)}</select></label>
-                <label className="translation-toggle"><input type="checkbox" checked={endpoint.batch_preferred} disabled={busy || !endpoint.enabled} onChange={(event) => void updateTranslationRouting(endpoint, { batch_preferred: event.target.checked })} /><span>일괄 처리 우선</span></label>
-              </div>;
-            })}
-          </div>
-        </section>
+        <div className="translation-stage-settings" aria-label="번역 단계 설정">
+          <section className="card">
+            <div className="card-head"><div><h2>초벌 번역</h2><span className="sub m">가용 서버 중 여유 슬롯을 사용하며, 일괄 작업은 우선 서버를 먼저 사용합니다.</span></div></div>
+            <div className="card-body translation-model-list">
+              {translationEndpoints.map((endpoint) => {
+                const models = Array.from(new Set([endpoint.draft_model, ...endpoint.models].filter(Boolean)));
+                return <div className="translation-model-row" key={`draft-${endpoint.id}`}>
+                  <div className="runtime-title"><strong>{endpoint.name}</strong>{endpoint.builtin ? <span className="b line">기본</span> : null}</div>
+                  <label className="f"><span className="lb">모델 선택</span><select className="ctl" value={endpoint.draft_model} disabled={busy || !endpoint.enabled} onChange={(event) => void updateTranslationRouting(endpoint, { draft_model: event.target.value })}><option value="">사용 안 함</option>{models.map((model) => <option value={model} key={model}>{model}</option>)}</select></label>
+                  <label className="translation-toggle"><input type="checkbox" checked={endpoint.batch_preferred} disabled={busy || !endpoint.enabled} onChange={(event) => void updateTranslationRouting(endpoint, { batch_preferred: event.target.checked })} /><span>일괄 처리 우선</span></label>
+                </div>;
+              })}
+            </div>
+          </section>
 
-        <section className="card">
-          <div className="card-head"><div><h2>검증 번역</h2><span className="sub m">서버별 사용 여부를 명시적으로 켠 경우에만 검증 모델을 호출합니다.</span></div></div>
-          <div className="card-body translation-model-list">
-            {translationEndpoints.map((endpoint) => {
-              const models = Array.from(new Set([endpoint.review_model, ...endpoint.models].filter(Boolean)));
-              return <div className="translation-model-row" key={`review-${endpoint.id}`}>
-                <div className="runtime-title"><strong>{endpoint.name}</strong>{endpoint.builtin ? <span className="b line">기본</span> : null}</div>
-                <label className="f"><span className="lb">모델 선택</span><select className="ctl" value={endpoint.review_model} disabled={busy || !endpoint.enabled} onChange={(event) => void updateTranslationRouting(endpoint, { review_model: event.target.value })}><option value="">선택 안 함</option>{models.map((model) => <option value={model} key={model}>{model}</option>)}</select></label>
-                <label className="translation-toggle"><input type="checkbox" checked={endpoint.review_enabled} disabled={busy || !endpoint.enabled} onChange={(event) => void updateTranslationRouting(endpoint, { review_enabled: event.target.checked })} /><span>검증 서버 사용</span></label>
-              </div>;
-            })}
-          </div>
-        </section>
+          <section className="card">
+            <div className="card-head"><div><h2>검증 번역</h2><span className="sub m">서버별 사용 여부를 명시적으로 켠 경우에만 검증 모델을 호출합니다.</span></div></div>
+            <div className="card-body translation-model-list">
+              {translationEndpoints.map((endpoint) => {
+                const models = Array.from(new Set([endpoint.review_model, ...endpoint.models].filter(Boolean)));
+                return <div className="translation-model-row" key={`review-${endpoint.id}`}>
+                  <div className="runtime-title"><strong>{endpoint.name}</strong>{endpoint.builtin ? <span className="b line">기본</span> : null}</div>
+                  <label className="f"><span className="lb">모델 선택</span><select className="ctl" value={endpoint.review_model} disabled={busy || !endpoint.enabled} onChange={(event) => void updateTranslationRouting(endpoint, { review_model: event.target.value })}><option value="">선택 안 함</option>{models.map((model) => <option value={model} key={model}>{model}</option>)}</select></label>
+                  <label className="translation-toggle"><input type="checkbox" checked={endpoint.review_enabled} disabled={busy || !endpoint.enabled} onChange={(event) => void updateTranslationRouting(endpoint, { review_enabled: event.target.checked })} /><span>검증 서버 사용</span></label>
+                </div>;
+              })}
+            </div>
+          </section>
+        </div>
 
         <section className="card">
           <div className="card-head">
