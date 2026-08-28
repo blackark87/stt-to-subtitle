@@ -167,17 +167,13 @@ export interface ServerSettings {
   stt_token_configured: boolean;
   stt_gate_state: string;
   stt_gate_message: string | null;
-  lm_base_url: string;
-  lm_model: string;
-  lm_token_configured: boolean;
-  translation_workers: number;
 }
 
 export interface SettingsPayload {
   servers: ServerSettings;
   runtimes: RuntimeEndpoint[];
   translation_groups: TranslationGroup[];
-  translation_router_error: string | null;
+  translation_groups_error: string | null;
   path_display_rules: PathDisplayRule[];
   prompt_categories: PromptCategory[];
 }
@@ -426,10 +422,6 @@ export const api = {
   updateServers: (body: {
     stt_base_url: string;
     stt_token?: string | null;
-    lm_base_url: string;
-    lm_token?: string | null;
-    lm_model: string;
-    translation_workers: number;
   }) => request<unknown>("/settings/servers", { method: "PUT", ...json(body) }),
   updateTranslationGroupModel: (
     stage: TranslationStage,

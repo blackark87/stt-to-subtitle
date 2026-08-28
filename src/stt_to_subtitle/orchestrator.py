@@ -71,10 +71,8 @@ from .service_clients import (
     OpenAICompatibleClient,
     OperationStopped,
     RemoteTranscriptionFailed,
-    RequestConcurrencyLimiter,
     STTAPIClient,
     SubtitleValidationClient,
-    TranslationRouterAdminClient,
     TranslationPaused,
 )
 from .subtitle import write_styled_subtitles_atomic
@@ -82,6 +80,10 @@ from .subtitle_validation import build_subtitle_validator_payload
 from .translation_prompt import (
     KOREAN_JAV_SYSTEM_PROMPT,
     KOREAN_TRANSLATION_REVIEW_PROMPT,
+)
+from .translation_routing import (
+    BackendTranslationRouting,
+    TranslationRoutingDefaults,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -323,28 +325,39 @@ class SubtitleOrchestrator:
             if saved_servers is not None
             else settings.remote_servers()
         )
-        if settings.translation_service_base_url.strip():
-            service_servers = settings.remote_servers()
-            initial_servers = replace(
-                initial_servers,
-                lm_base_url=service_servers.lm_base_url,
-                lm_token=service_servers.lm_token,
-                lm_model=service_servers.lm_model,
-            )
         saved_validator = self.store.get_subtitle_validator_settings()
         self._subtitle_validator = (
             SubtitleValidatorSettings(**saved_validator)
             if saved_validator is not None
             else SubtitleValidatorSettings()
         )
-        self._translation_request_limiter = RequestConcurrencyLimiter(
-            initial_servers.translation_workers
+        self._translation_routing = BackendTranslationRouting(
+            TranslationRoutingDefaults(
+                state_dir=settings.translation_dir,
+                builtin_name=settings.translation_builtin_name,
+                builtin_base_url=settings.translation_builtin_base_url,
+                builtin_token=settings.translation_builtin_token,
+                builtin_capacity=settings.translation_builtin_capacity,
+                draft_enabled=settings.translation_builtin_draft_enabled,
+                review_enabled=settings.translation_builtin_review_enabled,
+                draft_model=settings.translation_builtin_draft_model,
+                review_model=settings.translation_builtin_review_model,
+                draft_batch_preferred=(
+                    settings.translation_builtin_draft_batch_preferred
+                ),
+                review_batch_preferred=(
+                    settings.translation_builtin_review_batch_preferred
+                ),
+                connect_timeout_seconds=(
+                    settings.translation_connect_timeout_seconds
+                ),
+                read_timeout_seconds=settings.translation_read_timeout_seconds,
+            )
         )
         self._remote_runtime: tuple[
             STTAPIClient | None,
-            OpenAICompatibleClient | None,
             RemoteServerSettings,
-        ] = (None, None, initial_servers)
+        ] = (None, initial_servers)
         self._stt_gate_lock = threading.RLock()
         self._runtime_lock = threading.RLock()
         self._runtime_clients: dict[str, STTAPIClient] = {}
@@ -367,7 +380,7 @@ class SubtitleOrchestrator:
             "lost"
             if saved_translation_state_name == "lost"
             else "ready"
-            if initial_servers.translation_is_complete
+            if self._translation_routing.is_configured()
             else "offline"
         )
         if saved_translation_state_name != self._translation_circuit_state:
@@ -428,9 +441,8 @@ class SubtitleOrchestrator:
             thread_name_prefix="runtime-probe",
         )
         self._translation_executor = ThreadPoolExecutor(
-            # translation_workers belongs to parallel batches within one
-            # file. Keep files serial so one file owns those workers until
-            # its translation is complete.
+            # Keep translation files serial. Parallel batch requests inside
+            # one file are bounded by the selected translation group.
             max_workers=1,
             thread_name_prefix="pipeline-translation",
         )
@@ -440,19 +452,12 @@ class SubtitleOrchestrator:
         return self._remote_runtime[0]
 
     @property
-    def lm_client(self) -> OpenAICompatibleClient | None:
+    def remote_servers(self) -> RemoteServerSettings:
         return self._remote_runtime[1]
 
     @property
-    def remote_servers(self) -> RemoteServerSettings:
-        return self._remote_runtime[2]
-
-    @property
     def remote_servers_configured(self) -> bool:
-        return (
-            self.transcription_server_configured
-            and self.lm_client is not None
-        )
+        return self.transcription_server_configured
 
     @property
     def transcription_server_configured(self) -> bool:
@@ -461,7 +466,7 @@ class SubtitleOrchestrator:
 
     @property
     def translation_server_configured(self) -> bool:
-        return self.lm_client is not None
+        return self._translation_routing.is_configured()
 
     def remote_servers_view(self) -> dict[str, Any]:
         servers = self.remote_servers
@@ -471,10 +476,6 @@ class SubtitleOrchestrator:
         return {
             "stt_base_url": servers.stt_base_url,
             "stt_token_configured": bool(servers.stt_token),
-            "lm_base_url": servers.lm_base_url,
-            "lm_token_configured": bool(servers.lm_token),
-            "lm_model": servers.lm_model,
-            "translation_workers": servers.translation_workers,
             "configured": self.remote_servers_configured,
             "transcription_configured": self.transcription_server_configured,
             "translation_configured": self.translation_server_configured,
@@ -482,32 +483,24 @@ class SubtitleOrchestrator:
             "stt_gate_message": stt_gate_message,
         }
 
-    def _translation_router_admin(self) -> TranslationRouterAdminClient:
-        if not self.settings.translation_service_base_url.strip():
-            raise ValueError("독립 번역 라우터가 설정되지 않았습니다.")
-        servers = self.remote_servers
-        return TranslationRouterAdminClient(
-            servers.lm_base_url,
-            servers.lm_token,
-            request_observer=self.record_external_request,
-        )
-
     def translation_groups_view(self) -> list[dict[str, Any]]:
-        return self._translation_router_admin().list_groups()
+        return self._translation_routing.groups()
 
     def update_translation_group_model(
         self,
         stage: str,
         model: str,
     ) -> dict[str, Any]:
-        return self._translation_router_admin().update_group_model(stage, model)
+        return self._translation_routing.update_model(stage, model)
 
     def create_translation_endpoint(
         self,
         stage: str,
         payload: Mapping[str, Any],
     ) -> dict[str, Any]:
-        return self._translation_router_admin().create_endpoint(stage, payload)
+        result = self._translation_routing.create_server(stage, payload)
+        self._refresh_translation_circuit_from_routing()
+        return result
 
     def update_translation_endpoint(
         self,
@@ -515,24 +508,24 @@ class SubtitleOrchestrator:
         endpoint_id: str,
         payload: Mapping[str, Any],
     ) -> dict[str, Any]:
-        return self._translation_router_admin().update_endpoint(
+        result = self._translation_routing.update_server(
             stage,
             endpoint_id,
             payload,
         )
+        self._refresh_translation_circuit_from_routing()
+        return result
 
     def delete_translation_endpoint(self, stage: str, endpoint_id: str) -> None:
-        self._translation_router_admin().delete_endpoint(stage, endpoint_id)
+        self._translation_routing.delete_server(stage, endpoint_id)
+        self._refresh_translation_circuit_from_routing()
 
     def probe_translation_endpoint(
         self,
         stage: str,
         endpoint_id: str,
     ) -> dict[str, Any]:
-        return self._translation_router_admin().probe_endpoint(
-            stage,
-            endpoint_id,
-        )
+        return self._translation_routing.probe_server(stage, endpoint_id)
 
     def update_translation_endpoint_routing(
         self,
@@ -540,10 +533,17 @@ class SubtitleOrchestrator:
         endpoint_id: str,
         payload: Mapping[str, Any],
     ) -> dict[str, Any]:
-        return self._translation_router_admin().update_routing(
+        result = self._translation_routing.update_routing(
             stage,
             endpoint_id,
             payload,
+        )
+        self._refresh_translation_circuit_from_routing()
+        return result
+
+    def _refresh_translation_circuit_from_routing(self) -> None:
+        self._set_translation_circuit(
+            "ready" if self._translation_routing.is_configured() else "offline"
         )
 
     @staticmethod
@@ -1514,14 +1514,6 @@ class SubtitleOrchestrator:
         self,
         settings: RemoteServerSettings,
     ) -> RemoteServerSettings:
-        if self.settings.translation_service_base_url.strip():
-            service_servers = self.settings.remote_servers()
-            settings = replace(
-                settings,
-                lm_base_url=service_servers.lm_base_url,
-                lm_token=service_servers.lm_token,
-                lm_model=service_servers.lm_model,
-            )
         return self._set_remote_servers(settings, persist=True)
 
     def _set_remote_servers(
@@ -1531,16 +1523,6 @@ class SubtitleOrchestrator:
         persist: bool,
     ) -> RemoteServerSettings:
         normalized = settings.normalized()
-        previous = self.remote_servers
-        translation_settings_changed = (
-            normalized.lm_base_url,
-            normalized.lm_token,
-            normalized.lm_model,
-        ) != (
-            previous.lm_base_url,
-            previous.lm_token,
-            previous.lm_model,
-        )
         if any(
             endpoint.base_url == normalized.stt_base_url
             for endpoint in self.store.list_runtime_endpoints()
@@ -1551,32 +1533,12 @@ class SubtitleOrchestrator:
             normalized.stt_token,
             request_observer=self.record_external_request,
         )
-        lm_client = (
-            OpenAICompatibleClient(
-                normalized.lm_base_url,
-                normalized.lm_token,
-                normalized.lm_model,
-                max_segments=self.settings.translation_batch_segments,
-                max_characters=self.settings.translation_batch_characters,
-                request_limiter=self._translation_request_limiter,
-                request_observer=self.record_external_request,
-            )
-            if normalized.translation_is_complete
-            else None
-        )
         if persist:
             self.store.save_remote_server_settings(
                 stt_base_url=normalized.stt_base_url,
                 stt_token=normalized.stt_token,
-                lm_base_url=normalized.lm_base_url,
-                lm_token=normalized.lm_token,
-                lm_model=normalized.lm_model,
-                translation_workers=normalized.translation_workers,
             )
-        self._translation_request_limiter.set_limit(
-            normalized.translation_workers
-        )
-        self._remote_runtime = (stt_client, lm_client, normalized)
+        self._remote_runtime = (stt_client, normalized)
         with self._runtime_lock:
             self._runtime_clients[BUILTIN_RUNTIME_ID] = stt_client
             if persist:
@@ -1588,8 +1550,6 @@ class SubtitleOrchestrator:
                 }
         if persist:
             self._refresh_stt_gate_from_pool()
-        if persist and translation_settings_changed:
-            self._set_translation_circuit("ready")
         return normalized
 
     def start(self) -> None:
@@ -3097,7 +3057,6 @@ class SubtitleOrchestrator:
             current_transcript_payload,
             current_segments,
             current_prompt_snapshot,
-            self.remote_servers,
         )
         self._capture_legacy_subtitle_generation(
             job,
@@ -3137,7 +3096,6 @@ class SubtitleOrchestrator:
             selected_job,
             transcript_payload,
             updated_prompt_snapshot,
-            self.remote_servers,
             origin="restart",
             force_new=True,
         )
@@ -3490,7 +3448,6 @@ class SubtitleOrchestrator:
                 transcript_payload,
                 segments,
                 prompt_snapshot,
-                self.remote_servers,
             )
             self._capture_legacy_subtitle_generation(
                 job,
@@ -3504,7 +3461,6 @@ class SubtitleOrchestrator:
                 job,
                 transcript_payload,
                 prompt_snapshot,
-                self.remote_servers,
                 origin="manual",
                 force_new=True,
                 model="manual",
@@ -4543,19 +4499,27 @@ class SubtitleOrchestrator:
 
     def _make_translation_client(
         self,
-        servers: RemoteServerSettings,
         *,
         request_observer: Callable[[Mapping[str, Any]], None] | None = None,
     ) -> OpenAICompatibleClient:
         return OpenAICompatibleClient(
-            servers.lm_base_url,
-            servers.lm_token,
-            servers.lm_model,
+            "",
+            "",
+            "",
             max_segments=self.settings.translation_batch_segments,
             max_characters=self.settings.translation_batch_characters,
-            request_limiter=self._translation_request_limiter,
             request_observer=(
                 request_observer or self.record_external_request
+            ),
+            completion_request=lambda stage, mode, payload: (
+                self._translation_routing.request_completion(
+                    stage,
+                    mode,
+                    payload,
+                    request_observer=(
+                        request_observer or self.record_external_request
+                    ),
+                )
             ),
         )
 
@@ -4564,7 +4528,6 @@ class SubtitleOrchestrator:
         job: PipelineJob,
         transcript_payload: Mapping[str, Any],
         prompt_snapshot: Mapping[str, Any],
-        servers: RemoteServerSettings,
         *,
         model: str | None = None,
         endpoint_key: str | None = None,
@@ -4576,8 +4539,18 @@ class SubtitleOrchestrator:
             raise ValueError("transcript job_id is unavailable")
         transcript_hash = sha256_file(Path(job.transcript_path))
         prompt_hash = _canonical_payload_hash(dict(prompt_snapshot))
-        selected_model = (model or servers.lm_model).strip()
-        selected_endpoint = (endpoint_key or servers.lm_base_url).rstrip("/")
+        execution_mode = str(
+            job.options.get(TRANSLATION_EXECUTION_MODE_OPTION, "live")
+        ).strip()
+        if execution_mode not in {"live", "batch"}:
+            execution_mode = "live"
+        selected_model = (
+            model or self._translation_routing.model_contract()
+        ).strip()
+        selected_endpoint = (
+            endpoint_key
+            or self._translation_routing.endpoint_contract(execution_mode)
+        ).rstrip("/")
         config_hash = _canonical_payload_hash(
             {
                 "schema_version": TRANSLATION_SCHEMA_VERSION,
@@ -4610,7 +4583,6 @@ class SubtitleOrchestrator:
         job: PipelineJob,
         transcript_payload: Mapping[str, Any],
         prompt_snapshot: Mapping[str, Any],
-        servers: RemoteServerSettings,
         *,
         origin: str,
         force_new: bool = False,
@@ -4622,7 +4594,6 @@ class SubtitleOrchestrator:
             job,
             transcript_payload,
             prompt_snapshot,
-            servers,
             model=model,
             endpoint_key=endpoint_key,
         )
@@ -4780,7 +4751,6 @@ class SubtitleOrchestrator:
         transcript_payload: Mapping[str, Any],
         segments: Sequence[Mapping[str, Any]],
         prompt_snapshot: Mapping[str, Any],
-        servers: RemoteServerSettings,
     ) -> dict[str, Any] | None:
         if not job.translation_path:
             return None
@@ -4808,13 +4778,13 @@ class SubtitleOrchestrator:
                 generation = saved_generation
         if generation is None:
             payload_model = (
-                str(payload.get("model", "")).strip() or servers.lm_model
+                str(payload.get("model", "")).strip()
+                or self._translation_routing.model_contract()
             )
             generation = self._create_translation_generation(
                 job,
                 transcript_payload,
                 prompt_snapshot,
-                servers,
                 origin="legacy",
                 model=payload_model,
             )
@@ -4841,9 +4811,7 @@ class SubtitleOrchestrator:
         return generation
 
     def _translate(self, job: PipelineJob) -> None:
-        remote_runtime = self._remote_runtime
-        servers = remote_runtime[2]
-        if remote_runtime[1] is None:
+        if not self.translation_server_configured:
             raise ExternalServiceError("translation server is not configured")
         media_duration: float | None = None
         if job.audio_revision_id:
@@ -4956,7 +4924,6 @@ class SubtitleOrchestrator:
                     )
 
         lm_client = self._make_translation_client(
-            servers,
             request_observer=observe_translation_request,
         )
         prompt_snapshot = job.options.get(TRANSLATION_PROMPT_OPTION)
@@ -5019,7 +4986,6 @@ class SubtitleOrchestrator:
             job,
             transcript_payload,
             prompt_snapshot,
-            servers,
             origin="automatic",
         )
         expected_id_list = [str(segment["id"]) for segment in segments]
@@ -5212,7 +5178,9 @@ class SubtitleOrchestrator:
                 on_progress=update_translation_progress,
                 should_pause=should_pause,
                 on_review_warning=review_warning,
-                max_workers=servers.translation_workers,
+                max_workers=self._translation_routing.worker_limit(
+                    execution_mode
+                ),
                 execution_mode=execution_mode,
             )
             self._raise_if_job_stop_requested(job.id)
@@ -5947,11 +5915,9 @@ class SubtitleOrchestrator:
         sanitized = message
         for secret in {
             self.settings.stt_token,
-            self.settings.lm_token,
-            self.settings.translation_service_token,
             self.remote_servers.stt_token,
-            self.remote_servers.lm_token,
             self._subtitle_validator.token,
+            *self._translation_routing.tokens(),
         }:
             if secret:
                 sanitized = sanitized.replace(secret, "[redacted]")

@@ -1330,7 +1330,6 @@ tags
 !/Dockerfile.backend
 !/Dockerfile.runtime
 !/Dockerfile.stt-runtime
-!/Dockerfile.translation
 !/Dockerfile.web
 !/compose.yaml
 !/compose.runtime.yaml

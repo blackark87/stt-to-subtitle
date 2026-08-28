@@ -779,31 +779,35 @@ class MediaLibraryTests(unittest.TestCase):
 
 
 class BackendSettingsTests(unittest.TestCase):
-    def test_reads_openai_compatible_environment_settings(self) -> None:
+    def test_reads_backend_owned_translation_group_settings(self) -> None:
         with patch.dict(
             os.environ,
             {
-                "OPENAI_COMPATIBLE_BASE_URL": "http://translation.test/v1",
-                "OPENAI_COMPATIBLE_TOKEN": "token",
-                "OPENAI_COMPATIBLE_MODEL": "model",
+                "TRANSLATION_BUILTIN_NAME": "로컬 LLM",
+                "TRANSLATION_BUILTIN_BASE_URL": "http://translation.test/v1",
+                "TRANSLATION_BUILTIN_TOKEN": "token",
+                "TRANSLATION_BUILTIN_DRAFT_MODEL": "draft-model",
+                "TRANSLATION_BUILTIN_REVIEW_MODEL": "review-model",
             },
             clear=True,
         ):
             settings = BackendSettings.from_env()
 
+        self.assertEqual(settings.translation_builtin_name, "로컬 LLM")
         self.assertEqual(
-            settings.lm_base_url,
+            settings.translation_builtin_base_url,
             "http://translation.test/v1",
         )
-        self.assertEqual(settings.lm_token, "token")
-        self.assertEqual(settings.lm_model, "model")
+        self.assertEqual(settings.translation_builtin_token, "token")
+        self.assertEqual(settings.translation_builtin_draft_model, "draft-model")
+        self.assertEqual(settings.translation_builtin_review_model, "review-model")
         self.assertEqual(
             settings.state_dir,
             Path("/var/lib/stt"),
         )
         self.assertEqual(settings.jobs_dir, Path("/var/lib/stt/jobs"))
 
-    def test_translation_service_overrides_legacy_direct_lm_connection(self) -> None:
+    def test_ignores_legacy_combined_translation_settings(self) -> None:
         with patch.dict(
             os.environ,
             {
@@ -817,27 +821,9 @@ class BackendSettingsTests(unittest.TestCase):
             clear=True,
         ):
             settings = BackendSettings.from_env()
-            settings.validate()
-            servers = settings.remote_servers()
 
-        self.assertEqual(servers.lm_base_url, "http://router.test/v1")
-        self.assertEqual(servers.lm_token, "router-token")
-        self.assertEqual(servers.lm_model, "translation-router")
-
-    def test_rejects_partial_translation_service_connection(self) -> None:
-        settings = BackendSettings(
-            state_dir=Path("/state"),
-            media_root=Path("/media"),
-            stt_base_url="",
-            stt_token="",
-            lm_base_url="",
-            lm_token="",
-            lm_model="",
-            translation_service_base_url="http://router.test/v1",
-        )
-
-        with self.assertRaisesRegex(ValueError, "TRANSLATION_SERVICE_MODEL"):
-            settings.validate()
+        self.assertEqual(settings.translation_builtin_base_url, "")
+        self.assertEqual(settings.translation_builtin_token, "")
 
     def test_reads_backend_storage_directories(self) -> None:
         with patch.dict(
@@ -849,22 +835,6 @@ class BackendSettingsTests(unittest.TestCase):
 
         self.assertEqual(settings.state_dir, Path("/state"))
         self.assertEqual(settings.jobs_dir, Path("/work"))
-
-    def test_keeps_legacy_lm_studio_environment_fallback(self) -> None:
-        with patch.dict(
-            os.environ,
-            {
-                "LM_STUDIO_BASE_URL": "http://legacy.test/v1",
-                "LM_STUDIO_TOKEN": "legacy-token",
-                "LM_STUDIO_MODEL": "legacy-model",
-            },
-            clear=True,
-        ):
-            settings = BackendSettings.from_env()
-
-        self.assertEqual(settings.lm_base_url, "http://legacy.test/v1")
-        self.assertEqual(settings.lm_token, "legacy-token")
-        self.assertEqual(settings.lm_model, "legacy-model")
 
     def test_reads_and_validates_gpu_prometheus_settings(self) -> None:
         with patch.dict(
@@ -894,9 +864,6 @@ class BackendSettingsTests(unittest.TestCase):
             media_root=Path("/media"),
             stt_base_url="",
             stt_token="",
-            lm_base_url="",
-            lm_token="",
-            lm_model="",
             gpu_prometheus_url="javascript:alert(1)",
         )
 
@@ -909,9 +876,6 @@ class BackendSettingsTests(unittest.TestCase):
             media_root=Path("/media"),
             stt_base_url="",
             stt_token="",
-            lm_base_url="",
-            lm_token="",
-            lm_model="",
         )
 
         settings.validate()
@@ -922,9 +886,6 @@ class BackendSettingsTests(unittest.TestCase):
             media_root=Path("/media"),
             stt_base_url="http://stt.test",
             stt_token="",
-            lm_base_url="http://lm.test/v1",
-            lm_token="",
-            lm_model="model",
         )
 
         settings.validate()
@@ -933,56 +894,44 @@ class BackendSettingsTests(unittest.TestCase):
         settings = RemoteServerSettings(
             stt_base_url=" http://stt.test/ ",
             stt_token="stt-token",
-            lm_base_url="http://lm.test/v1/",
-            lm_token="lm-token",
-            lm_model=" model ",
         )
 
         normalized = settings.normalized()
 
         self.assertEqual(normalized.stt_base_url, "http://stt.test")
-        self.assertEqual(normalized.lm_base_url, "http://lm.test/v1")
-        self.assertEqual(normalized.lm_model, "model")
 
     def test_rejects_invalid_remote_server_url(self) -> None:
         settings = RemoteServerSettings(
             stt_base_url="file:///tmp/stt",
             stt_token="",
-            lm_base_url="http://lm.test/v1",
-            lm_token="",
-            lm_model="model",
         )
 
         with self.assertRaisesRegex(ValueError, "STT_BASE_URL"):
             settings.normalized()
 
-    def test_allows_transcription_without_translation_server(self) -> None:
+    def test_remote_server_settings_only_describe_transcription(self) -> None:
         settings = RemoteServerSettings(
             stt_base_url="http://runtime:8100",
             stt_token="",
-            lm_base_url="",
-            lm_token="",
-            lm_model="",
         )
 
         normalized = settings.normalized()
 
         self.assertTrue(normalized.stt_is_complete)
-        self.assertFalse(normalized.translation_is_complete)
-        self.assertFalse(normalized.is_complete)
+        self.assertTrue(normalized.is_complete)
+        self.assertEqual(set(vars(normalized)), {"stt_base_url", "stt_token"})
 
-    def test_translation_worker_count_must_be_between_one_and_eight(self) -> None:
-        for workers in (0, 9):
-            settings = RemoteServerSettings(
-                stt_base_url="http://stt.test",
+    def test_translation_builtin_capacity_must_be_between_one_and_eight(self) -> None:
+        for capacity in (0, 9):
+            settings = BackendSettings(
+                state_dir=Path("/state"),
+                media_root=Path("/media"),
+                stt_base_url="",
                 stt_token="",
-                lm_base_url="http://lm.test/v1",
-                lm_token="",
-                lm_model="model",
-                translation_workers=workers,
+                translation_builtin_capacity=capacity,
             )
-            with self.assertRaisesRegex(ValueError, "between 1 and 8"):
-                settings.normalized()
+            with self.assertRaisesRegex(ValueError, "1..8"):
+                settings.validate()
 
     def test_normalizes_subtitle_validator_settings(self) -> None:
         settings = SubtitleValidatorSettings(

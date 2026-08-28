@@ -659,14 +659,10 @@ class JobStore:
                     CHECK (attempt IS NULL OR attempt >= 1)
                 );
 
-                CREATE TABLE IF NOT EXISTS remote_server_settings (
+                CREATE TABLE IF NOT EXISTS builtin_runtime_settings (
                     id INTEGER PRIMARY KEY CHECK (id = 1),
                     stt_base_url TEXT NOT NULL,
                     stt_token TEXT NOT NULL,
-                    lm_base_url TEXT NOT NULL,
-                    lm_token TEXT NOT NULL,
-                    lm_model TEXT NOT NULL,
-                    translation_workers INTEGER NOT NULL DEFAULT 1,
                     updated_at REAL NOT NULL
                 );
 
@@ -1209,17 +1205,21 @@ class JobStore:
             "CREATE INDEX IF NOT EXISTS job_events_created_idx "
             "ON job_events(created_at, id)"
         )
-        server_columns = {
-            str(row["name"])
-            for row in connection.execute(
-                "PRAGMA table_info(remote_server_settings)"
-            ).fetchall()
-        }
-        if "translation_workers" not in server_columns:
+        legacy_server_table = connection.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'remote_server_settings'"
+        ).fetchone()
+        if legacy_server_table is not None:
             connection.execute(
-                "ALTER TABLE remote_server_settings ADD COLUMN "
-                "translation_workers INTEGER NOT NULL DEFAULT 1"
+                """
+                INSERT OR IGNORE INTO builtin_runtime_settings (
+                    id, stt_base_url, stt_token, updated_at
+                )
+                SELECT id, stt_base_url, stt_token, updated_at
+                FROM remote_server_settings
+                """
             )
+            connection.execute("DROP TABLE remote_server_settings")
 
     @staticmethod
     def _migrate_structured_job_state(
@@ -2637,9 +2637,8 @@ class JobStore:
         with self._connect() as connection:
             row = connection.execute(
                 """
-                SELECT stt_base_url, stt_token, lm_base_url, lm_token, lm_model,
-                       translation_workers
-                FROM remote_server_settings
+                SELECT stt_base_url, stt_token
+                FROM builtin_runtime_settings
                 WHERE id = 1
                 """
             ).fetchone()
@@ -2648,10 +2647,6 @@ class JobStore:
         return {
             "stt_base_url": str(row["stt_base_url"]),
             "stt_token": str(row["stt_token"]),
-            "lm_base_url": str(row["lm_base_url"]),
-            "lm_token": str(row["lm_token"]),
-            "lm_model": str(row["lm_model"]),
-            "translation_workers": int(row["translation_workers"]),
         }
 
     def get_dependency_state(self, dependency: str) -> dict[str, Any] | None:
@@ -2720,35 +2715,21 @@ class JobStore:
         *,
         stt_base_url: str,
         stt_token: str,
-        lm_base_url: str,
-        lm_token: str,
-        lm_model: str,
-        translation_workers: int = 1,
     ) -> None:
         with self._connect() as connection:
             connection.execute(
                 """
-                INSERT INTO remote_server_settings (
-                    id, stt_base_url, stt_token,
-                    lm_base_url, lm_token, lm_model,
-                    translation_workers, updated_at
-                ) VALUES (1, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO builtin_runtime_settings (
+                    id, stt_base_url, stt_token, updated_at
+                ) VALUES (1, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     stt_base_url = excluded.stt_base_url,
                     stt_token = excluded.stt_token,
-                    lm_base_url = excluded.lm_base_url,
-                    lm_token = excluded.lm_token,
-                    lm_model = excluded.lm_model,
-                    translation_workers = excluded.translation_workers,
                     updated_at = excluded.updated_at
                 """,
                 (
                     stt_base_url,
                     stt_token,
-                    lm_base_url,
-                    lm_token,
-                    lm_model,
-                    translation_workers,
                     time.time(),
                 ),
             )

@@ -12,14 +12,12 @@ import shutil
 ENTRYPOINTS = {
     "backend": "backend_api",
     "runtime": "runtime_api",
-    "translation": "translation_api",
 }
 EXTRA_ROOTS = {
     "backend": {"migration_check"},
     # Workers launched via ``python -m`` are not visible to the static import
     # closure rooted at runtime_api, so they must be staged explicitly.
     "runtime": {"speaker_worker"},
-    "translation": set(),
 }
 FORBIDDEN_MODULES = {
     "backend": {
@@ -41,23 +39,6 @@ FORBIDDEN_MODULES = {
         "backend_settings_api",
         "orchestrator",
         "job_store",
-    },
-    "translation": {
-        "web_app",
-        "backend_api",
-        "backend_common",
-        "backend_contracts",
-        "backend_jobs_api",
-        "backend_media_api",
-        "backend_settings_api",
-        "orchestrator",
-        "job_store",
-        "runtime_api",
-        "kotoba",
-        "hybrid_stt",
-        "whisperx_worker",
-        "whisperjav_worker",
-        "speaker_worker",
     },
 }
 

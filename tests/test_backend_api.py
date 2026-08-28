@@ -30,9 +30,6 @@ class BackendAPIBoundaryTests(unittest.TestCase):
                     media_root=media_root,
                     stt_base_url="http://runtime:8100",
                     stt_token="",
-                    lm_base_url="",
-                    lm_token="",
-                    lm_model="",
                 )
             )
 
@@ -92,9 +89,6 @@ class BackendAPIBoundaryTests(unittest.TestCase):
                 media_root=media_root,
                 stt_base_url="http://runtime:8100",
                 stt_token="",
-                lm_base_url="",
-                lm_token="",
-                lm_model="",
             )
             with TestClient(create_backend_app(settings)) as client:
                 health = client.get("/healthz")
@@ -147,9 +141,6 @@ class BackendAPIBoundaryTests(unittest.TestCase):
                 media_root=media_root,
                 stt_base_url="http://runtime:8100",
                 stt_token="",
-                lm_base_url="",
-                lm_token="",
-                lm_model="",
             )
             with TestClient(create_backend_app(settings)) as client:
                 service = client.app.state.orchestrator
@@ -190,9 +181,6 @@ class BackendAPIBoundaryTests(unittest.TestCase):
                 media_root=media_root,
                 stt_base_url="http://runtime:8100",
                 stt_token="",
-                lm_base_url="",
-                lm_token="",
-                lm_model="",
             )
             with TestClient(create_backend_app(settings)) as client:
                 service = client.app.state.orchestrator
@@ -238,9 +226,6 @@ class BackendAPIBoundaryTests(unittest.TestCase):
                 media_root=media_root,
                 stt_base_url="http://runtime:8100",
                 stt_token="",
-                lm_base_url="",
-                lm_token="",
-                lm_model="",
             )
             with TestClient(create_backend_app(settings)) as client:
                 created = client.post(
@@ -301,9 +286,6 @@ class BackendAPIBoundaryTests(unittest.TestCase):
                 media_root=media_root,
                 stt_base_url="http://runtime:8100",
                 stt_token="",
-                lm_base_url="",
-                lm_token="",
-                lm_model="",
             )
             with TestClient(create_backend_app(settings)) as client:
                 actor_listing = client.get(

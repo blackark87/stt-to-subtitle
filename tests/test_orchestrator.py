@@ -74,9 +74,6 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                     media_root=media_root,
                     stt_base_url="",
                     stt_token="",
-                    lm_base_url="",
-                    lm_token="",
-                    lm_model="",
                 )
             )
             try:
@@ -133,9 +130,7 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                 media_root=media_root,
                 stt_base_url="http://stt.test",
                 stt_token="stt-token",
-                lm_base_url="http://lm.test/v1",
-                lm_token="lm-token",
-                lm_model="model",
+                translation_builtin_base_url="http://translation.test/v1",
             )
         )
 
@@ -151,9 +146,7 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                     media_root=media_root,
                     stt_base_url="http://stt.test",
                     stt_token="",
-                    lm_base_url="http://lm.test/v1",
-                    lm_token="secret",
-                    lm_model="model",
+                    translation_builtin_base_url="http://translation.test/v1",
                 )
             )
             try:
@@ -188,9 +181,7 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                 media_root=media_root,
                 stt_base_url="http://stt.test",
                 stt_token="",
-                lm_base_url="http://lm.test/v1",
-                lm_token="secret",
-                lm_model="model",
+                translation_builtin_base_url="http://translation.test/v1",
             )
             first = SubtitleOrchestrator(settings)
             try:
@@ -247,9 +238,6 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                     RemoteServerSettings(
                         stt_base_url="http://new-stt.test",
                         stt_token="",
-                        lm_base_url="http://lm.test/v1",
-                        lm_token="secret",
-                        lm_model="model",
                     )
                 )
                 self.assertEqual(restarted.translation_circuit_state, "lost")
@@ -454,9 +442,7 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                     media_root=media_root,
                     stt_base_url="http://stt.test",
                     stt_token="stt-token",
-                    lm_base_url="http://lm.test/v1",
-                    lm_token="lm-token",
-                    lm_model="model",
+                    translation_builtin_base_url="http://translation.test/v1",
                 )
             )
             try:
@@ -610,9 +596,6 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                     RemoteServerSettings(
                         stt_base_url="http://new-stt.test/",
                         stt_token="new-stt-token",
-                        lm_base_url="http://new-lm.test/v1/",
-                        lm_token="new-lm-token",
-                        lm_model="new-model",
                     )
                 )
 
@@ -621,12 +604,7 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                     original.stt_client.base_url,
                     "http://new-stt.test",
                 )
-                self.assertEqual(
-                    original.lm_client.base_url,
-                    "http://new-lm.test/v1",
-                )
-                self.assertEqual(original.lm_client.model, "new-model")
-                self.assertEqual(saved.lm_model, "new-model")
+                self.assertEqual(saved.stt_base_url, "http://new-stt.test")
             finally:
                 original.stop()
 
@@ -637,7 +615,6 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                     "http://new-stt.test",
                 )
                 self.assertEqual(reloaded.stt_client.token, "new-stt-token")
-                self.assertEqual(reloaded.lm_client.model, "new-model")
             finally:
                 reloaded.stop()
 
@@ -650,9 +627,6 @@ class SubtitleOrchestratorTests(unittest.TestCase):
             store.save_remote_server_settings(
                 stt_base_url="http://stt:8100",
                 stt_token="",
-                lm_base_url="http://lm.test/v1",
-                lm_token="lm-token",
-                lm_model="model",
             )
 
             orchestrator = SubtitleOrchestrator(
@@ -661,9 +635,6 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                     media_root=media_root,
                     stt_base_url="http://runtime:8100",
                     stt_token="",
-                    lm_base_url="",
-                    lm_token="",
-                    lm_model="",
                 )
             )
             try:
@@ -677,7 +648,6 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                     ],
                     "http://runtime:8100",
                 )
-                self.assertEqual(orchestrator.lm_client.model, "model")
             finally:
                 orchestrator.stop()
 
@@ -893,7 +863,7 @@ class SubtitleOrchestratorTests(unittest.TestCase):
             finally:
                 orchestrator.stop()
 
-    def test_translation_workers_are_reserved_for_one_file_at_a_time(
+    def test_translation_executor_reserves_one_file_at_a_time(
         self,
     ) -> None:
         with TemporaryDirectory() as directory:
@@ -904,14 +874,18 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                 (media_root / f"movie-{index}.mkv").write_bytes(b"media")
             orchestrator = self.make_orchestrator(root, media_root)
             try:
+                orchestrator._translation_routing.stores["draft"].update(
+                    "builtin",
+                    name="기본 서버",
+                    base_url="http://translation.test/v1",
+                    token="",
+                    enabled=True,
+                    capacity=3,
+                )
                 orchestrator.update_remote_servers(
                     RemoteServerSettings(
                         stt_base_url="http://stt.test",
                         stt_token="",
-                        lm_base_url="http://lm.test/v1",
-                        lm_token="",
-                        lm_model="model",
-                        translation_workers=2,
                     )
                 )
                 jobs = orchestrator.create_jobs(
@@ -1140,9 +1114,6 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                     media_root=media_root,
                     stt_base_url="",
                     stt_token="",
-                    lm_base_url="",
-                    lm_token="",
-                    lm_model="",
                 )
             )
             try:
@@ -1640,7 +1611,7 @@ class SubtitleOrchestratorTests(unittest.TestCase):
             self.assertEqual(generation_batches[0]["state"], "completed")
             self.assertTrue(Path(generations[0]["artifact_path"]).is_file())
 
-    def test_translation_uses_configured_workers_for_one_file(self) -> None:
+    def test_translation_uses_group_capacity_for_one_file(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
             media_root = root / "media"
@@ -1648,14 +1619,18 @@ class SubtitleOrchestratorTests(unittest.TestCase):
             (media_root / "movie.mkv").write_bytes(b"media")
             orchestrator = self.make_orchestrator(root, media_root)
             try:
+                orchestrator._translation_routing.stores["draft"].update(
+                    "builtin",
+                    name="기본 서버",
+                    base_url="http://translation.test/v1",
+                    token="",
+                    enabled=True,
+                    capacity=3,
+                )
                 orchestrator.update_remote_servers(
                     RemoteServerSettings(
                         stt_base_url="http://stt.test",
                         stt_token="",
-                        lm_base_url="http://lm.test/v1",
-                        lm_token="",
-                        lm_model="model",
-                        translation_workers=3,
                     )
                 )
                 job = orchestrator.create_job(
@@ -1733,7 +1708,7 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                     side_effect=translate_with_metrics
                 )
 
-                def make_translation_client(_servers, *, request_observer):
+                def make_translation_client(*, request_observer):
                     observer_holder["observer"] = request_observer
                     return translation_client
 
@@ -2000,7 +1975,6 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                 running,
                 transcript_payload,
                 prompt_snapshot,
-                orchestrator.remote_servers,
                 origin="automatic",
             )
             orchestrator.store.save_translation_batch(
@@ -3101,9 +3075,10 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                     media_root=media_root,
                     stt_base_url="http://stt.test",
                     stt_token="stt-token",
-                    lm_base_url="http://lm.test/v1",
-                    lm_token="lm-token",
-                    lm_model="model",
+                    translation_builtin_base_url="http://lm.test/v1",
+                    translation_builtin_token="lm-token",
+                    translation_builtin_draft_model="model",
+                    translation_builtin_review_model="model",
                 )
             )
             try:
@@ -4117,9 +4092,10 @@ class SchedulerDispatchTests(unittest.TestCase):
                 media_root=media_root,
                 stt_base_url="http://stt.test",
                 stt_token="stt-token",
-                lm_base_url="http://lm.test/v1",
-                lm_token="lm-token",
-                lm_model="model",
+                translation_builtin_base_url="http://lm.test/v1",
+                translation_builtin_token="lm-token",
+                translation_builtin_draft_model="model",
+                translation_builtin_review_model="model",
                 audio_workers=audio_workers,
             )
         )

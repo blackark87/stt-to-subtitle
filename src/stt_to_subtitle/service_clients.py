@@ -903,133 +903,6 @@ def list_openai_compatible_models(
     return sorted(model_ids, key=str.casefold)
 
 
-class TranslationRouterAdminClient(RetryingJSONClient):
-    """Manage the dedicated translation endpoint registry."""
-
-    def __init__(
-        self,
-        base_url: str,
-        token: str,
-        *,
-        request_observer: RequestObserver | None = None,
-    ) -> None:
-        super().__init__(
-            token=token,
-            read_timeout=30.0,
-            attempts=1,
-            service_name="translation_router_admin",
-            request_observer=request_observer,
-        )
-        self.base_url = base_url.rstrip("/")
-
-    def _json_request(
-        self,
-        method: str,
-        path: str,
-        *,
-        payload: Mapping[str, Any] | None = None,
-        expected_statuses: set[int] = {200},
-    ) -> dict[str, Any]:
-        kwargs: dict[str, Any] = {"headers": self.headers}
-        if payload is not None:
-            kwargs["headers"] = {
-                **self.headers,
-                "Content-Type": "application/json",
-            }
-            kwargs["json"] = dict(payload)
-        response = self.request(
-            method,
-            f"{self.base_url}{path}",
-            metric_operation="endpoint_settings",
-            **kwargs,
-        )
-        if response.status_code not in expected_statuses:
-            raise ExternalServiceError(
-                "translation router settings request failed: "
-                f"HTTP {response.status_code}: {_safe_error(response)}"
-            )
-        if response.status_code == 204:
-            return {}
-        try:
-            result = response.json()
-        except (TypeError, ValueError, requests.JSONDecodeError) as error:
-            raise ExternalServiceError(
-                "translation router returned invalid settings JSON"
-            ) from error
-        if not isinstance(result, Mapping):
-            raise ExternalServiceError(
-                "translation router returned invalid settings JSON"
-            )
-        return dict(result)
-
-    def list_groups(self) -> list[dict[str, Any]]:
-        payload = self._json_request("GET", "/router/groups")
-        items = payload.get("items")
-        if not isinstance(items, list) or not all(
-            isinstance(item, Mapping) for item in items
-        ):
-            raise ExternalServiceError(
-                "translation router returned an invalid group list"
-            )
-        return [dict(item) for item in items]
-
-    def update_group_model(self, stage: str, model: str) -> dict[str, Any]:
-        return self._json_request(
-            "PUT",
-            f"/router/groups/{stage}/model",
-            payload={"model": model},
-        )
-
-    def create_endpoint(
-        self,
-        stage: str,
-        payload: Mapping[str, Any],
-    ) -> dict[str, Any]:
-        return self._json_request(
-            "POST",
-            f"/router/groups/{stage}/servers",
-            payload=payload,
-            expected_statuses={201},
-        )
-
-    def update_endpoint(
-        self,
-        stage: str,
-        endpoint_id: str,
-        payload: Mapping[str, Any],
-    ) -> dict[str, Any]:
-        return self._json_request(
-            "PUT",
-            f"/router/groups/{stage}/servers/{endpoint_id}",
-            payload=payload,
-        )
-
-    def delete_endpoint(self, stage: str, endpoint_id: str) -> None:
-        self._json_request(
-            "DELETE",
-            f"/router/groups/{stage}/servers/{endpoint_id}",
-            expected_statuses={204},
-        )
-
-    def probe_endpoint(self, stage: str, endpoint_id: str) -> dict[str, Any]:
-        return self._json_request(
-            "POST",
-            f"/router/groups/{stage}/servers/{endpoint_id}/probe",
-        )
-
-    def update_routing(
-        self,
-        stage: str,
-        endpoint_id: str,
-        payload: Mapping[str, Any],
-    ) -> dict[str, Any]:
-        return self._json_request(
-            "PUT",
-            f"/router/groups/{stage}/servers/{endpoint_id}/routing",
-            payload=payload,
-        )
-
-
 class SubtitleValidationClient(RetryingJSONClient):
     """Run one explicit structured subtitle review against a paid LLM."""
 
@@ -1289,6 +1162,9 @@ class OpenAICompatibleClient(RetryingJSONClient):
         attempts: int = 3,
         request_limiter: RequestConcurrencyLimiter | None = None,
         request_observer: RequestObserver | None = None,
+        completion_request: (
+            Callable[[str, str, Mapping[str, Any]], requests.Response] | None
+        ) = None,
     ) -> None:
         super().__init__(
             token=token,
@@ -1298,10 +1174,11 @@ class OpenAICompatibleClient(RetryingJSONClient):
             service_name="translation_lm",
             request_observer=request_observer,
         )
-        if not model.strip():
+        if not model.strip() and completion_request is None:
             raise ValueError("OpenAI-compatible model name is required")
         self.base_url = base_url.rstrip("/")
         self.model = model.strip()
+        self.completion_request = completion_request
         self.max_segments = max_segments
         self.max_characters = max_characters
         self.translation_execution_mode = "live"
@@ -1766,22 +1643,26 @@ class OpenAICompatibleClient(RetryingJSONClient):
                 },
             },
         }
-        response = self.request(
-            "POST",
-            f"{self.base_url}/chat/completions",
-            headers={
-                **self.headers,
-                "Content-Type": "application/json",
-                "X-Translation-Mode": self.translation_execution_mode,
-                "X-Translation-Pass": (
-                    "review" if "review" in schema_name else "draft"
+        stage = "review" if "review" in schema_name else "draft"
+        if self.completion_request is not None:
+            response = self.completion_request(
+                stage,
+                self.translation_execution_mode,
+                request_payload,
+            )
+        else:
+            response = self.request(
+                "POST",
+                f"{self.base_url}/chat/completions",
+                headers={
+                    **self.headers,
+                    "Content-Type": "application/json",
+                },
+                json=request_payload,
+                metric_operation=(
+                    "review" if stage == "review" else "translation"
                 ),
-            },
-            json=request_payload,
-            metric_operation=(
-                "review" if "review" in schema_name else "translation"
-            ),
-        )
+            )
         if response.status_code != 200:
             raise ExternalServiceError(
                 f"OpenAI-compatible {error_label} failed: "

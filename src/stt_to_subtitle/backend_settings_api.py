@@ -26,18 +26,16 @@ from .backend_contracts import (
     TranslationEndpointRoutingRequest,
     TranslationEndpointUpdateRequest,
     TranslationGroupModelRequest,
-    TranslationModelLookupRequest,
 )
 from .job_state import JobPhase, JobReason, JobState
 from .gpu_monitoring import gpu_snapshot_payload
 from .library_progress import summarize_library_progress
 from .operational_metrics import prometheus_exposition
 from .orchestrator import DEFAULT_ARTIFACT_CLEANUP_AGE_DAYS
-from .service_clients import ExternalServiceError, list_openai_compatible_models
+from .service_clients import ExternalServiceError
 from .backend_config import (
     RemoteServerSettings,
     SubtitleValidatorSettings,
-    normalize_server_url,
 )
 
 
@@ -167,19 +165,16 @@ def capabilities() -> dict[str, Any]:
 def settings(request: Request) -> dict[str, Any]:
     service = service_from_request(request)
     translation_groups: list[dict[str, Any]] = []
-    translation_router_error: str | None = None
-    if service.settings.translation_service_base_url.strip():
-        try:
-            translation_groups = service.translation_groups_view()
-        except (ExternalServiceError, ValueError) as error:
-            translation_router_error = service.sanitize_external_error(
-                str(error)
-            )
+    translation_groups_error: str | None = None
+    try:
+        translation_groups = service.translation_groups_view()
+    except (ExternalServiceError, ValueError) as error:
+        translation_groups_error = service.sanitize_external_error(str(error))
     return {
         "servers": service.remote_servers_view(),
         "runtimes": service.runtime_endpoints_view(),
         "translation_groups": translation_groups,
-        "translation_router_error": translation_router_error,
+        "translation_groups_error": translation_groups_error,
         "subtitle_validator": service.subtitle_validator_view(),
         "path_display_rules": public_value(service.path_display_rules),
         "prompt_categories": public_value(service.all_prompt_categories()),
@@ -202,16 +197,6 @@ def update_servers(
             if payload.stt_token is not None
             else current.stt_token
         ),
-        lm_base_url=payload.lm_base_url,
-        lm_token=(
-            ""
-            if payload.clear_lm_token
-            else payload.lm_token
-            if payload.lm_token is not None
-            else current.lm_token
-        ),
-        lm_model=payload.lm_model,
-        translation_workers=payload.translation_workers,
     )
     try:
         service.update_remote_servers(updated)
@@ -289,10 +274,10 @@ def probe_runtime_endpoint(
         raise bad_request(error) from error
 
 
-def _translation_router_failure(error: Exception) -> HTTPException:
+def _translation_settings_failure(error: Exception) -> HTTPException:
     return HTTPException(
         status_code=502,
-        detail="번역 라우터 설정 요청을 처리할 수 없습니다.",
+        detail="번역 서버 설정 요청을 처리할 수 없습니다.",
     )
 
 
@@ -308,7 +293,7 @@ def update_translation_group_model(
             payload.model,
         )
     except (ExternalServiceError, ValueError) as error:
-        raise _translation_router_failure(error) from error
+        raise _translation_settings_failure(error) from error
 
 
 @router.post("/translation-groups/{stage}/servers", status_code=201)
@@ -323,7 +308,7 @@ def create_translation_endpoint(
             payload.model_dump()
         )
     except (ExternalServiceError, ValueError) as error:
-        raise _translation_router_failure(error) from error
+        raise _translation_settings_failure(error) from error
 
 
 @router.put("/translation-groups/{stage}/servers/{endpoint_id}")
@@ -340,7 +325,7 @@ def update_translation_endpoint(
             payload.model_dump(),
         )
     except (ExternalServiceError, ValueError) as error:
-        raise _translation_router_failure(error) from error
+        raise _translation_settings_failure(error) from error
 
 
 @router.delete(
@@ -358,7 +343,7 @@ def delete_translation_endpoint(
             endpoint_id,
         )
     except (ExternalServiceError, ValueError) as error:
-        raise _translation_router_failure(error) from error
+        raise _translation_settings_failure(error) from error
     return Response(status_code=204)
 
 
@@ -374,7 +359,7 @@ def probe_translation_endpoint(
             endpoint_id
         )
     except (ExternalServiceError, ValueError) as error:
-        raise _translation_router_failure(error) from error
+        raise _translation_settings_failure(error) from error
 
 
 @router.put("/translation-groups/{stage}/servers/{endpoint_id}/routing")
@@ -393,7 +378,7 @@ def update_translation_endpoint_routing(
             payload.model_dump(),
         )
     except (ExternalServiceError, ValueError) as error:
-        raise _translation_router_failure(error) from error
+        raise _translation_settings_failure(error) from error
 
 
 @router.post("/dependencies/transcription/probe")
@@ -407,40 +392,6 @@ def probe_transcription(request: Request) -> dict[str, Any]:
             detail=service.sanitize_external_error(str(error)),
         ) from error
     return {"state": service.stt_gate_state, "retried": resumed}
-
-
-@router.post("/settings/translation-models")
-def translation_models(
-    payload: TranslationModelLookupRequest,
-    request: Request,
-) -> dict[str, list[str]]:
-    service = service_from_request(request)
-    current = service.remote_servers
-    token = (
-        ""
-        if payload.clear_lm_token
-        else payload.lm_token
-        if payload.lm_token is not None
-        else current.lm_token
-    )
-    try:
-        base_url = normalize_server_url(
-            payload.lm_base_url,
-            "OPENAI_COMPATIBLE_BASE_URL",
-        )
-        models = list_openai_compatible_models(
-            base_url,
-            token,
-            request_observer=service.record_external_request,
-        )
-    except ValueError as error:
-        raise bad_request(error) from error
-    except ExternalServiceError as error:
-        raise HTTPException(
-            status_code=502,
-            detail="번역 서버에서 모델 목록을 조회할 수 없습니다.",
-        ) from error
-    return {"models": models}
 
 
 @router.put("/settings/subtitle-validator")

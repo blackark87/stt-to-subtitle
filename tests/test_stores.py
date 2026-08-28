@@ -1588,9 +1588,6 @@ class JobStoreTests(unittest.TestCase):
             store.save_remote_server_settings(
                 stt_base_url="http://stt.test",
                 stt_token="stt-token",
-                lm_base_url="http://lm.test/v1",
-                lm_token="lm-token",
-                lm_model="model",
             )
 
             self.assertEqual(
@@ -1598,11 +1595,64 @@ class JobStoreTests(unittest.TestCase):
                 {
                     "stt_base_url": "http://stt.test",
                     "stt_token": "stt-token",
-                    "lm_base_url": "http://lm.test/v1",
-                    "lm_token": "lm-token",
-                    "lm_model": "model",
-                    "translation_workers": 1,
                 },
+            )
+
+    def test_migrates_legacy_combined_server_settings_to_runtime_only(self) -> None:
+        with TemporaryDirectory() as directory:
+            database_path = Path(directory) / "jobs.sqlite3"
+            with sqlite3.connect(database_path) as connection:
+                connection.execute(
+                    """
+                    CREATE TABLE remote_server_settings (
+                        id INTEGER PRIMARY KEY,
+                        stt_base_url TEXT NOT NULL,
+                        stt_token TEXT NOT NULL,
+                        lm_base_url TEXT NOT NULL,
+                        lm_token TEXT NOT NULL,
+                        lm_model TEXT NOT NULL,
+                        translation_workers INTEGER NOT NULL,
+                        updated_at REAL NOT NULL
+                    )
+                    """
+                )
+                connection.execute(
+                    "INSERT INTO remote_server_settings VALUES "
+                    "(1, ?, ?, ?, ?, ?, ?, 1)",
+                    (
+                        "http://stt.test",
+                        "stt-token",
+                        "http://obsolete.test/v1",
+                        "obsolete-token",
+                        "obsolete-model",
+                        7,
+                    ),
+                )
+
+            store = JobStore(database_path)
+
+            self.assertEqual(
+                store.get_remote_server_settings(),
+                {
+                    "stt_base_url": "http://stt.test",
+                    "stt_token": "stt-token",
+                },
+            )
+            with sqlite3.connect(database_path) as connection:
+                legacy = connection.execute(
+                    "SELECT 1 FROM sqlite_master "
+                    "WHERE type = 'table' AND name = 'remote_server_settings'"
+                ).fetchone()
+                columns = {
+                    row[1]
+                    for row in connection.execute(
+                        "PRAGMA table_info(builtin_runtime_settings)"
+                    )
+                }
+            self.assertIsNone(legacy)
+            self.assertEqual(
+                columns,
+                {"id", "stt_base_url", "stt_token", "updated_at"},
             )
 
     def test_persists_runtime_pool_and_atomic_job_assignment(self) -> None:

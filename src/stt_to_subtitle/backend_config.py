@@ -235,66 +235,37 @@ def normalize_server_url(value: str, setting: str) -> str:
     return normalized
 
 
-def _first_configured_env(*names: str) -> str:
-    for name in names:
-        value = os.environ.get(name, "")
-        if value.strip():
-            return value
-    return ""
+def _enabled_env(name: str, default: str) -> bool:
+    return os.environ.get(name, default).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 @dataclass(frozen=True)
 class RemoteServerSettings:
     stt_base_url: str
     stt_token: str
-    lm_base_url: str
-    lm_token: str
-    lm_model: str
-    translation_workers: int = 1
 
     @property
     def stt_is_complete(self) -> bool:
         return bool(self.stt_base_url.strip())
 
     @property
-    def translation_is_complete(self) -> bool:
-        return bool(self.lm_base_url.strip() and self.lm_model.strip())
-
-    @property
     def is_complete(self) -> bool:
-        return self.stt_is_complete and self.translation_is_complete
+        return self.stt_is_complete
 
     def normalized(self) -> RemoteServerSettings:
         if not self.stt_base_url.strip():
             raise ValueError("required server setting is missing: STT_BASE_URL")
-        translation_values = (
-            self.lm_base_url.strip(),
-            self.lm_model.strip(),
-        )
-        if any(translation_values) and not all(translation_values):
-            raise ValueError(
-                "OPENAI_COMPATIBLE_BASE_URL and OPENAI_COMPATIBLE_MODEL "
-                "must be configured together"
-            )
-        if not 1 <= self.translation_workers <= 8:
-            raise ValueError("TRANSLATION_WORKERS must be between 1 and 8")
         return RemoteServerSettings(
             stt_base_url=normalize_server_url(
                 self.stt_base_url,
                 "STT_BASE_URL",
             ),
             stt_token=self.stt_token,
-            lm_base_url=(
-                normalize_server_url(
-                    self.lm_base_url,
-                    "OPENAI_COMPATIBLE_BASE_URL",
-                )
-                if self.lm_base_url.strip()
-                else ""
-            ),
-            lm_token=self.lm_token,
-            lm_model=self.lm_model.strip(),
-            translation_workers=self.translation_workers,
         )
 
 
@@ -363,9 +334,6 @@ class BackendSettings:
     media_root: Path
     stt_base_url: str
     stt_token: str
-    lm_base_url: str
-    lm_token: str
-    lm_model: str
     gpu_prometheus_url: str = ""
     gpu_prometheus_token: str = ""
     gpu_metrics_refresh_seconds: float = 10.0
@@ -375,9 +343,23 @@ class BackendSettings:
     translation_batch_characters: int = 6000
     audio_workers: int = 1
     work_dir: Path | None = None
-    translation_service_base_url: str = ""
-    translation_service_token: str = ""
-    translation_service_model: str = ""
+    translation_state_dir: Path | None = None
+    translation_builtin_name: str = "기본 서버"
+    translation_builtin_base_url: str = ""
+    translation_builtin_token: str = ""
+    translation_builtin_capacity: int = 1
+    translation_builtin_draft_enabled: bool = True
+    translation_builtin_review_enabled: bool = False
+    translation_builtin_draft_model: str = (
+        "gemma-4-12b-coder-fable5-composer2.5-v1-uncensored-heretic"
+    )
+    translation_builtin_review_model: str = (
+        "gemma-4-26b-a4b-it-ultra-uncensored-heretic"
+    )
+    translation_builtin_draft_batch_preferred: bool = False
+    translation_builtin_review_batch_preferred: bool = False
+    translation_connect_timeout_seconds: float = 10.0
+    translation_read_timeout_seconds: float = 600.0
 
     @classmethod
     def from_env(cls) -> BackendSettings:
@@ -390,18 +372,6 @@ class BackendSettings:
             ).expanduser(),
             stt_base_url=os.environ.get("STT_BASE_URL", "").strip(),
             stt_token=os.environ.get("STT_API_TOKEN", ""),
-            lm_base_url=_first_configured_env(
-                "OPENAI_COMPATIBLE_BASE_URL",
-                "LM_STUDIO_BASE_URL",
-            ).strip(),
-            lm_token=_first_configured_env(
-                "OPENAI_COMPATIBLE_TOKEN",
-                "LM_STUDIO_TOKEN",
-            ),
-            lm_model=_first_configured_env(
-                "OPENAI_COMPATIBLE_MODEL",
-                "LM_STUDIO_MODEL",
-            ).strip(),
             work_dir=(
                 Path(os.environ["BACKEND_WORK_DIR"]).expanduser()
                 if os.environ.get("BACKEND_WORK_DIR", "").strip()
@@ -433,23 +403,65 @@ class BackendSettings:
             audio_workers=int(
                 os.environ.get("BACKEND_AUDIO_WORKERS", "1")
             ),
-            translation_service_base_url=os.environ.get(
-                "TRANSLATION_SERVICE_BASE_URL",
+            translation_state_dir=(
+                Path(os.environ["TRANSLATION_STATE_DIR"]).expanduser()
+                if os.environ.get("TRANSLATION_STATE_DIR", "").strip()
+                else None
+            ),
+            translation_builtin_name=os.environ.get(
+                "TRANSLATION_BUILTIN_NAME",
+                "기본 서버",
+            ).strip(),
+            translation_builtin_base_url=os.environ.get(
+                "TRANSLATION_BUILTIN_BASE_URL",
                 "",
             ).strip(),
-            translation_service_token=os.environ.get(
-                "TRANSLATION_SERVICE_TOKEN",
+            translation_builtin_token=os.environ.get(
+                "TRANSLATION_BUILTIN_TOKEN",
                 "",
             ),
-            translation_service_model=os.environ.get(
-                "TRANSLATION_SERVICE_MODEL",
-                "",
+            translation_builtin_capacity=int(
+                os.environ.get("TRANSLATION_BUILTIN_CAPACITY", "1")
+            ),
+            translation_builtin_draft_enabled=_enabled_env(
+                "TRANSLATION_BUILTIN_DRAFT_ENABLED",
+                "true",
+            ),
+            translation_builtin_review_enabled=_enabled_env(
+                "TRANSLATION_BUILTIN_REVIEW_ENABLED",
+                "false",
+            ),
+            translation_builtin_draft_model=os.environ.get(
+                "TRANSLATION_BUILTIN_DRAFT_MODEL",
+                "gemma-4-12b-coder-fable5-composer2.5-v1-uncensored-heretic",
             ).strip(),
+            translation_builtin_review_model=os.environ.get(
+                "TRANSLATION_BUILTIN_REVIEW_MODEL",
+                "gemma-4-26b-a4b-it-ultra-uncensored-heretic",
+            ).strip(),
+            translation_builtin_draft_batch_preferred=_enabled_env(
+                "TRANSLATION_BUILTIN_DRAFT_BATCH_PREFERRED",
+                "false",
+            ),
+            translation_builtin_review_batch_preferred=_enabled_env(
+                "TRANSLATION_BUILTIN_REVIEW_BATCH_PREFERRED",
+                "false",
+            ),
+            translation_connect_timeout_seconds=float(
+                os.environ.get("TRANSLATION_CONNECT_TIMEOUT_SECONDS", "10")
+            ),
+            translation_read_timeout_seconds=float(
+                os.environ.get("TRANSLATION_READ_TIMEOUT_SECONDS", "600")
+            ),
         )
 
     @property
     def jobs_dir(self) -> Path:
         return self.work_dir or self.state_dir / "jobs"
+
+    @property
+    def translation_dir(self) -> Path:
+        return self.translation_state_dir or self.state_dir / "translation"
 
     def validate(self) -> None:
         if self.maximum_listed_files < 1:
@@ -470,44 +482,30 @@ class BackendSettings:
             raise ValueError("translation batch limits must be positive")
         if self.audio_workers < 1:
             raise ValueError("BACKEND_AUDIO_WORKERS must be at least 1")
-        service_values = (
-            self.translation_service_base_url.strip(),
-            self.translation_service_model.strip(),
-        )
-        if any(service_values) and not all(service_values):
-            raise ValueError(
-                "TRANSLATION_SERVICE_BASE_URL and "
-                "TRANSLATION_SERVICE_MODEL must be configured together"
-            )
-        if self.translation_service_base_url:
+        if not self.translation_builtin_name.strip():
+            raise ValueError("TRANSLATION_BUILTIN_NAME is required")
+        if not 1 <= self.translation_builtin_capacity <= 8:
+            raise ValueError("TRANSLATION_BUILTIN_CAPACITY must be 1..8")
+        if (
+            not self.translation_builtin_draft_model.strip()
+            or not self.translation_builtin_review_model.strip()
+        ):
+            raise ValueError("translation stage models are required")
+        if self.translation_builtin_base_url:
             normalize_server_url(
-                self.translation_service_base_url,
-                "TRANSLATION_SERVICE_BASE_URL",
+                self.translation_builtin_base_url,
+                "TRANSLATION_BUILTIN_BASE_URL",
             )
+        if (
+            self.translation_connect_timeout_seconds <= 0
+            or self.translation_read_timeout_seconds <= 0
+        ):
+            raise ValueError("translation timeouts must be positive")
 
     def remote_servers(self) -> RemoteServerSettings:
-        translation_service_configured = bool(
-            self.translation_service_base_url.strip()
-        )
         return RemoteServerSettings(
             stt_base_url=self.stt_base_url,
             stt_token=self.stt_token,
-            lm_base_url=(
-                self.translation_service_base_url
-                if translation_service_configured
-                else self.lm_base_url
-            ),
-            lm_token=(
-                self.translation_service_token
-                if translation_service_configured
-                else self.lm_token
-            ),
-            lm_model=(
-                self.translation_service_model
-                if translation_service_configured
-                else self.lm_model
-            ),
-            translation_workers=1,
         )
 
 class MediaLibrary:

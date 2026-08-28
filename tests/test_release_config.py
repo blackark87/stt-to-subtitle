@@ -18,18 +18,16 @@ class ReleaseConfigurationTests(unittest.TestCase):
 
         self.assertIn("dockerfile: Dockerfile.web", compose)
         self.assertIn("dockerfile: Dockerfile.backend", compose)
-        self.assertIn("dockerfile: Dockerfile.translation", compose)
+        self.assertNotIn("dockerfile: Dockerfile.translation", compose)
         self.assertIn("dockerfile: Dockerfile.runtime", compose)
         self.assertIn("dockerfile: Dockerfile.stt-runtime", compose)
-        self.assertEqual(compose.count("context: ${WORKSPACE:-.}"), 5)
+        self.assertEqual(compose.count("context: ${WORKSPACE:-.}"), 4)
         self.assertIn("STT_RUNTIME_BASE_IMAGE:", compose)
         self.assertIn("stt-to-subtitle-runtime-base:py311-cuda-v4", compose)
         backend_dockerfile = (ROOT / "Dockerfile.backend").read_text(
             encoding="utf-8"
         )
-        translation_dockerfile = (ROOT / "Dockerfile.translation").read_text(
-            encoding="utf-8"
-        )
+        self.assertFalse((ROOT / "Dockerfile.translation").exists())
         runtime_dockerfile = (ROOT / "Dockerfile.runtime").read_text(
             encoding="utf-8"
         )
@@ -197,15 +195,9 @@ class ReleaseConfigurationTests(unittest.TestCase):
             'ENTRYPOINT ["python", "-m", "stt_to_subtitle.runtime_api"]',
             runtime_dockerfile,
         )
-        self.assertIn(
-            'ENTRYPOINT ["python", "-m", "stt_to_subtitle.translation_api"]',
-            translation_dockerfile,
-        )
         self.assertIn("build_service_package.py", backend_dockerfile)
         self.assertIn("build_service_package.py", runtime_dockerfile)
-        self.assertIn("build_service_package.py", translation_dockerfile)
-        self.assertNotIn("requirements-kotoba.txt", translation_dockerfile)
-        self.assertEqual(compose.count("cap_drop:"), 4)
+        self.assertEqual(compose.count("cap_drop:"), 3)
         self.assertIn("condition: service_healthy", compose)
 
     def test_standalone_runtime_compose_publishes_only_the_runtime_api(self) -> None:

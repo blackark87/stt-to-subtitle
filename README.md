@@ -19,17 +19,15 @@ Docker Compose 프로젝트로 빌드하고 실행합니다. 애플리케이션 
                                   ├──▶ Runtime 풀 (HTTP + 진행 상태 SSE)
                                   │      ├─ runtime:8100 (기본)
                                   │      └─ 외부 GPU Runtime 1..N
-                                  ├──▶ translation:8200 (독립 서버 그룹·라우터)
-                                  │      ├─ 1차(초벌): 기본 + 추가 서버 1..N
-                                  │      └─ 2차(검증): 기본 + 추가 서버 1..N
+                                  ├──▶ 1차(초벌) OpenAI 호환 API 0..N
+                                  ├──▶ 2차(검증) OpenAI 호환 API 0..N
                                   └──▶ 선택형 상용 검증 Provider
 ```
 
-Compose 프로젝트에는 네 실행 컨테이너가 있습니다.
+Compose 프로젝트에는 세 실행 컨테이너가 있습니다.
 
 - `web`: Nginx로 최소 정적 화면과 자산을 제공하고 `/api`만 프록시
 - `backend`: 작업 API, 상태 저장, FFmpeg 추출, 번역, SRT·ASS 렌더링
-- `translation`: 1차·2차 독립 서버 등록, 모델 조회, 단계별 요청 라우팅
 - `runtime`: WhisperJAV, Kotoba, WhisperX, 하이브리드 전사를 제공하는 CUDA
   FastAPI 서버
 
@@ -41,8 +39,9 @@ Web UI에서 주소를 추가해 같은 전사 작업 풀로 확장할 수 있�
 서버는 전사 Runtime 풀과 분리됩니다. 1차(초벌)와 2차(검증) 번역도 서로 다른
 서버 레지스트리와 모델 설정을 가집니다. 각 그룹에서 기본 서버와 추가 서버를
 독립적으로 켜고 끄며 이름·주소·토큰·동시 요청 수·일괄 우선 서버를 설정합니다.
-Backend는 GPU나 호스트 역할을 알지 못하고 번역 라우터에 단계와 실행 모드만
-전달합니다.
+Backend가 두 번역 서버 레지스트리를 직접 소유하고 각 OpenAI 호환 API를
+호출합니다. 번역 요청에는 구간 ID·원문·문맥과 2차 검증에 필요한 초벌 번역문만
+전달하며, 전사 Runtime·GPU·워커·STT 모델 정보는 전달하지 않습니다.
 
 Kotoba, WhisperX, WhisperJAV는 요구하는 PyTorch·모델 의존성이 다르므로
 STT 이미지 안에서도 각각 `/opt/venvs/kotoba`, `/opt/venvs/whisperx`,

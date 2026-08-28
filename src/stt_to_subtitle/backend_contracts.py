@@ -46,17 +46,6 @@ class ServerSettingsUpdateRequest(BaseModel):
     stt_base_url: str
     stt_token: str | None = None
     clear_stt_token: bool = False
-    lm_base_url: str = ""
-    lm_token: str | None = None
-    clear_lm_token: bool = False
-    lm_model: str = ""
-    translation_workers: int = 1
-
-
-class TranslationModelLookupRequest(BaseModel):
-    lm_base_url: str
-    lm_token: str | None = None
-    clear_lm_token: bool = False
 
 
 class TranslationEndpointCreateRequest(BaseModel):

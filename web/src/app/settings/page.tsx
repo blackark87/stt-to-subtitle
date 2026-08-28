@@ -378,7 +378,7 @@ export default function SettingsPage() {
           </div>
         </section>
 
-        {data?.translation_router_error ? <p role="alert" className="translation-router-error">번역 라우터 연결 실패: {data.translation_router_error}</p> : null}
+        {data?.translation_groups_error ? <p role="alert" className="translation-router-error">번역 서버 설정 조회 실패: {data.translation_groups_error}</p> : null}
         {translationGroups.map((group) => {
           const models = Array.from(new Set([group.model, ...group.servers.flatMap((server) => server.models)].filter(Boolean)));
           const editingServer = group.servers.find((server) => server.id === translationForm.id);

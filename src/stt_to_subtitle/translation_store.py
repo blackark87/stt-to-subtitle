@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 import json
 from pathlib import Path
@@ -149,6 +150,7 @@ class TranslationServerGroupStore:
         enabled: bool,
         capacity: int,
         batch_preferred: bool,
+        legacy_names: Sequence[str] = (),
     ) -> None:
         now = time.time()
         with self._connect() as connection:
@@ -172,6 +174,21 @@ class TranslationServerGroupStore:
                     now,
                 ),
             )
+            if legacy_names:
+                placeholders = ", ".join("?" for _ in legacy_names)
+                connection.execute(
+                    f"""
+                    UPDATE translation_servers
+                    SET name = ?, updated_at = ?
+                    WHERE id = ? AND name IN ({placeholders})
+                    """,
+                    (
+                        name,
+                        now,
+                        BUILTIN_TRANSLATION_SERVER_ID,
+                        *legacy_names,
+                    ),
+                )
 
     def list(self) -> list[TranslationServer]:
         with self._connect() as connection:
