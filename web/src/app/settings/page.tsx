@@ -238,13 +238,17 @@ export default function SettingsPage() {
     stage: TranslationStage,
     endpoint: TranslationServer,
     update: Partial<Pick<TranslationServer, "enabled" | "batch_preferred">>,
-  ) => guard(
-    () => api.updateTranslationEndpointRouting(stage, endpoint.id, {
-      enabled: update.enabled ?? endpoint.enabled,
-      batch_preferred: update.batch_preferred ?? endpoint.batch_preferred,
-    }),
-    "번역 라우팅 설정을 저장했습니다.",
-  );
+  ) => {
+    const enabled = update.enabled ?? endpoint.enabled;
+    return guard(
+      () => api.updateTranslationEndpointRouting(stage, endpoint.id, {
+        enabled,
+        batch_preferred: enabled
+          && (update.batch_preferred ?? endpoint.batch_preferred),
+      }),
+      "번역 라우팅 설정을 저장했습니다.",
+    );
+  };
 
   const editPrompt = (category: PromptCategory) => {
     setPromptForm({
@@ -382,10 +386,9 @@ export default function SettingsPage() {
         {translationGroups.map((group) => {
           const models = Array.from(new Set([group.model, ...group.servers.flatMap((server) => server.models)].filter(Boolean)));
           const editingServer = group.servers.find((server) => server.id === translationForm.id);
-          const batchServer = group.servers.find((server) => server.batch_preferred);
           return <section className="card" key={group.stage}>
             <div className="card-head">
-              <div><h2>{group.label}</h2><span className="sub m">{group.servers.length}개 서버 · 일괄 처리 서버 {batchServer?.name ?? "미선택"}</span></div>
+              <h2>{group.label}</h2>
               {translationEditorStage === group.stage ? <span className="b line">{translationForm.id ? "수정 중" : "추가 중"}</span> : <button type="button" className="btn sec sm" onClick={() => { setTranslationForm(EMPTY_TRANSLATION_ENDPOINT); setTranslationEditorStage(group.stage); }}><Icon name="plus" size={14} />서버 추가</button>}
             </div>
             <div className="card-body translation-group-model"><label className="f"><span className="lb">모델 선택</span><select className="ctl" value={group.model} disabled={busy} onChange={(event) => void guard(() => api.updateTranslationGroupModel(group.stage, event.target.value), "번역 모델을 저장했습니다.")}>{models.map((model) => <option value={model} key={model}>{model}</option>)}</select></label></div>
@@ -397,7 +400,7 @@ export default function SettingsPage() {
                     <div role="cell" data-label="서버" className="inline-server-fields"><input required maxLength={80} className={field} aria-label="서버 이름" value={translationForm.name} onChange={(event) => setTranslationForm({ ...translationForm, name: event.target.value })} /><input required type="url" className={field} aria-label="API 주소" value={translationForm.base_url} onChange={(event) => setTranslationForm({ ...translationForm, base_url: event.target.value })} /><input type="password" autoComplete="new-password" className={field} aria-label="API 토큰" value={translationForm.token} onChange={(event) => setTranslationForm({ ...translationForm, token: event.target.value })} placeholder={editingServer?.token_configured ? "토큰: 비우면 유지" : "API 토큰"} /></div>
                     <span role="cell" data-label="상태"><span className="b line">수정 중</span></span>
                     <label role="cell" data-label="요청" className="inline-number-field"><input type="number" min={1} max={8} className={field} aria-label="동시 요청" value={translationForm.capacity} onChange={(event) => setTranslationForm({ ...translationForm, capacity: Number(event.target.value) })} /></label>
-                    <label role="cell" data-label="사용" className="translation-toggle"><input type="checkbox" checked={translationForm.enabled} onChange={(event) => setTranslationForm({ ...translationForm, enabled: event.target.checked })} /><span>{translationForm.enabled ? "ON" : "OFF"}</span></label>
+                    <label role="cell" data-label="사용" className="translation-toggle"><input type="checkbox" checked={translationForm.enabled} onChange={(event) => setTranslationForm({ ...translationForm, enabled: event.target.checked, batch_preferred: event.target.checked && translationForm.batch_preferred })} /><span>{translationForm.enabled ? "ON" : "OFF"}</span></label>
                     <span role="cell" data-label="일괄 처리 서버" className="m">{translationForm.batch_preferred ? "선택됨" : "미선택"}</span>
                     <span role="cell" data-label="관리" className="btns translation-server-actions"><button type="submit" className="btn sm" disabled={busy}>저장</button><button type="button" className="btn sec sm" onClick={() => { setTranslationForm(EMPTY_TRANSLATION_ENDPOINT); setTranslationEditorStage(null); }}>취소</button></span>
                   </form>;

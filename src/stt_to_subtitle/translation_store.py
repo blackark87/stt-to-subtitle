@@ -153,6 +153,7 @@ class TranslationServerGroupStore:
         legacy_names: Sequence[str] = (),
     ) -> None:
         now = time.time()
+        resolved_batch_preferred = enabled and batch_preferred
         with self._connect() as connection:
             connection.execute(
                 """
@@ -169,7 +170,7 @@ class TranslationServerGroupStore:
                     token,
                     int(enabled),
                     capacity,
-                    int(batch_preferred),
+                    int(resolved_batch_preferred),
                     now,
                     now,
                 ),
@@ -223,8 +224,9 @@ class TranslationServerGroupStore:
     ) -> TranslationServer:
         resolved_id = server_id or uuid4().hex
         now = time.time()
+        resolved_batch_preferred = enabled and batch_preferred
         with self._connect() as connection:
-            if batch_preferred:
+            if resolved_batch_preferred:
                 connection.execute(
                     "UPDATE translation_servers SET batch_preferred = 0, updated_at = ?",
                     (now,),
@@ -244,7 +246,7 @@ class TranslationServerGroupStore:
                     token,
                     int(enabled),
                     capacity,
-                    int(batch_preferred),
+                    int(resolved_batch_preferred),
                     json.dumps(list(models), ensure_ascii=False),
                     checked_at,
                     now,
@@ -273,7 +275,9 @@ class TranslationServerGroupStore:
                 SET name = ?,
                     models_json = CASE WHEN base_url != ? THEN '[]' ELSE models_json END,
                     checked_at = CASE WHEN base_url != ? THEN NULL ELSE checked_at END,
-                    base_url = ?, token = ?, enabled = ?, capacity = ?, updated_at = ?
+                    base_url = ?, token = ?, enabled = ?,
+                    batch_preferred = CASE WHEN ? THEN batch_preferred ELSE 0 END,
+                    capacity = ?, updated_at = ?
                 WHERE id = ?
                 """,
                 (
@@ -282,6 +286,7 @@ class TranslationServerGroupStore:
                     base_url,
                     base_url,
                     token,
+                    int(enabled),
                     int(enabled),
                     capacity,
                     time.time(),
@@ -311,8 +316,9 @@ class TranslationServerGroupStore:
         batch_preferred: bool,
     ) -> TranslationServer:
         now = time.time()
+        resolved_batch_preferred = enabled and batch_preferred
         with self._connect() as connection:
-            if batch_preferred:
+            if resolved_batch_preferred:
                 connection.execute(
                     "UPDATE translation_servers SET batch_preferred = 0, updated_at = ?",
                     (now,),
@@ -323,7 +329,7 @@ class TranslationServerGroupStore:
                 SET enabled = ?, batch_preferred = ?, updated_at = ?
                 WHERE id = ?
                 """,
-                (int(enabled), int(batch_preferred), now, server_id),
+                (int(enabled), int(resolved_batch_preferred), now, server_id),
             )
         if cursor.rowcount != 1:
             raise ValueError("번역 서버를 찾을 수 없습니다.")

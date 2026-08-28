@@ -820,8 +820,8 @@ class JobStoreTests(unittest.TestCase):
             self.assertEqual(
                 snapshot["database"]["migrations"],
                 {
-                    "applied_count": 10,
-                    "latest_sequence": 54,
+                    "applied_count": 11,
+                    "latest_sequence": 55,
                     "unsequenced_count": 0,
                 },
             )

@@ -80,6 +80,67 @@ class TranslationServerGroupStoreTests(unittest.TestCase):
             self.assertFalse(selected[first.id])
             self.assertTrue(selected[second.id])
 
+    def test_disabling_server_clears_batch_selection(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = TranslationServerGroupStore(Path(directory) / "draft.sqlite3")
+            server = store.create(
+                name="batch",
+                base_url="http://batch.test/v1",
+                token="",
+                enabled=True,
+                capacity=1,
+                batch_preferred=True,
+            )
+
+            disabled = store.set_routing(
+                server.id,
+                enabled=False,
+                batch_preferred=True,
+            )
+
+            self.assertFalse(disabled.enabled)
+            self.assertFalse(disabled.batch_preferred)
+
+    def test_disabled_server_cannot_be_created_as_batch_selection(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = TranslationServerGroupStore(Path(directory) / "draft.sqlite3")
+
+            server = store.create(
+                name="disabled",
+                base_url="http://disabled.test/v1",
+                token="",
+                enabled=False,
+                capacity=1,
+                batch_preferred=True,
+            )
+
+            self.assertFalse(server.enabled)
+            self.assertFalse(server.batch_preferred)
+
+    def test_editing_selected_server_to_disabled_clears_selection(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = TranslationServerGroupStore(Path(directory) / "draft.sqlite3")
+            server = store.create(
+                name="selected",
+                base_url="http://selected.test/v1",
+                token="",
+                enabled=True,
+                capacity=1,
+                batch_preferred=True,
+            )
+
+            disabled = store.update(
+                server.id,
+                name=server.name,
+                base_url=server.base_url,
+                token=server.token,
+                enabled=False,
+                capacity=server.capacity,
+            )
+
+            self.assertFalse(disabled.enabled)
+            self.assertFalse(disabled.batch_preferred)
+
     def test_migrates_shared_endpoint_into_independent_groups_once(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
