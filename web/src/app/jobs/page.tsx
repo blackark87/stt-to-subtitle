@@ -348,6 +348,7 @@ export default function JobsPage() {
                   const state = asJobState(job.state);
                   const reason = reasonLabel(job.reason_code) ?? job.error ?? "—";
                   const on = selected.has(job.id);
+                  const selectionId = `job-select-${job.id}`;
                   const runtime = job.stt_runtime_id
                     ? runtimeNames.get(job.stt_runtime_id) ?? job.stt_runtime_id
                     : null;
@@ -360,15 +361,16 @@ export default function JobsPage() {
                       role="row"
                       aria-selected={on}
                     >
-                      <span role="cell" className="job-select-cell"><input
+                      <label role="cell" className="job-select-cell" htmlFor={selectionId}><input
+                          id={selectionId}
                           type="checkbox"
                           checked={on}
                           onChange={() => toggle(job.id)}
                           aria-label={`${fileName(job.source_rel)} 선택`}
-                        /></span>
-                      <div role="cell" className="job-meta-cell job-state-cell" data-label="상태">
+                        /></label>
+                      <label role="cell" htmlFor={selectionId} className="job-meta-cell job-state-cell" data-label="상태">
                         <span className={state ? BADGE_CLASS[state] : "b"} title={stateText}>{stateText}</span>
-                      </div>
+                      </label>
                       <div role="cell" className="job-name-cell" data-label="작업">
                         <div className="t-name" title={job.source_rel}>
                           <b><Link href={`/jobs/${encodeURIComponent(job.id)}`}>{fileName(job.source_rel)}</Link></b>

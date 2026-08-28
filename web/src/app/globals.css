@@ -164,8 +164,11 @@ a { color: var(--accent); text-decoration: none; }
 .t-name a:hover { color: var(--accent); }
 .t-name > span { color: var(--muted); font-size: .74rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .job-name-cell, .job-meta-cell { min-width: 0; }
-.jobs-table .job-grid-row { grid-template-columns: 36px 156px minmax(240px, 1fr) 110px minmax(120px, 220px) 132px; }
+.jobs-table .job-grid-row { grid-template-columns: 44px 156px minmax(240px, 1fr) 110px minmax(120px, 220px) 132px; }
 .jobs-table .tr.empty { grid-template-columns: minmax(0, 1fr); }
+.jobs-table input[type="checkbox"] { width: 18px; height: 18px; margin: 0; accent-color: var(--accent); cursor: pointer; }
+.job-select-cell { display: flex; align-self: stretch; align-items: center; cursor: pointer; }
+.job-state-cell { display: flex; align-self: stretch; align-items: center; cursor: pointer; }
 .job-meta-cell > .b { justify-self: start; }
 .job-state-cell > .b, .job-phase-cell > .b {
   max-width: 100%;
@@ -290,7 +293,7 @@ a.brand, .primary-nav a, .t-name a { text-decoration: none; }
 /* 작업 상태를 글자 단위로 접지 않는다. 좁은 데스크톱에서는 표 자체를
    스크롤하고, 860px 이하에서는 아래의 카드형 레이아웃으로 전환한다. */
 @media (min-width: 861px) {
-  .jobs-table { min-width: 880px; }
+  .jobs-table { min-width: 890px; }
   .jobs-table .tr.head > [role="columnheader"] { white-space: nowrap; }
 }
 
@@ -809,7 +812,7 @@ progress::-moz-progress-bar { background: var(--accent-solid); border-radius: 99
   .tbl:not(.jobs-table) .tr:not(.head) > [data-label] { display: grid; grid-template-columns: 92px minmax(0, 1fr); align-items: start; gap: 8px; width: 100%; }
   .tbl:not(.jobs-table) .tr:not(.head) > [data-label]::before { content: attr(data-label); color: var(--muted); font-size: .7rem; font-weight: 700; }
   .jobs-table .job-table-row {
-    grid-template-columns: 22px repeat(2, minmax(0, 1fr)) !important;
+    grid-template-columns: 32px repeat(2, minmax(0, 1fr)) !important;
     grid-template-areas:
       "select name name"
       ". state phase"
@@ -903,7 +906,7 @@ progress::-moz-progress-bar { background: var(--accent-solid); border-radius: 99
 
 @media (max-width: 360px) {
   .jobs-table .job-table-row {
-    grid-template-columns: 22px minmax(0, 1fr) !important;
+    grid-template-columns: 32px minmax(0, 1fr) !important;
     grid-template-areas:
       "select name"
       ". state"
