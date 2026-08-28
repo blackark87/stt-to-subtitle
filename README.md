@@ -446,6 +446,7 @@ checkpoint가 끝난 WAL 없는 DB는 immutable read-only로 열어 원본 디�
 전사·번역 단계 소요 시간은
 `/api/v1/operations/metrics/media-durations`에서 기본 최근 30일을 영상 길이별로
 조회할 수 있습니다. 실제 영상 길이는 가장 가까운 15분 단위로 정규화합니다.
+Web UI에서는 왼쪽 메뉴의 **통계**(`/metrics`)에서 같은 집계를 확인할 수 있습니다.
 예를 들어 약 14분과 16분은 15분 구간, 약 28분과 32분은 30분 구간에
 집계됩니다. `window_days`로 조회 기간을 조정할 수 있습니다.
 

@@ -217,7 +217,7 @@ export default function SettingsPage() {
           </div>
           <div className="card-body flush">
             <div className="tbl" role="table" aria-label="전사 Runtime 목록">
-              <div className="tr head" role="row" style={{ gridTemplateColumns: "minmax(0, 1fr) 128px 96px 200px" }}>
+              <div className="tr head runtime-grid" role="row">
                 <span role="columnheader">Runtime</span>
                 <span role="columnheader">상태</span>
                 <span role="columnheader" className="r">작업</span>
@@ -232,21 +232,23 @@ export default function SettingsPage() {
                   const parsed = asRuntimeStatus(runtime.status);
                   const tone = parsed ? RUNTIME_STATUS_TONE[parsed] : null;
                   return (
-                    <div key={runtime.id} className="tr" role="row" style={{ gridTemplateColumns: "minmax(0, 1fr) 128px 96px 200px" }}>
+                    <div key={runtime.id} className="tr runtime-grid" role="row">
                       <div className="t-name" role="cell" data-label="Runtime" title={`${runtime.name}\n${runtime.base_url}`}>
-                        <b>
-                          {runtime.name}
-                          {runtime.builtin ? <span className="b line" style={{ marginLeft: 6 }}>기본</span> : null}
-                        </b>
+                        <div className="runtime-title">
+                          <strong>{runtime.name}</strong>
+                          {runtime.builtin ? <span className="b line">기본</span> : null}
+                        </div>
                         <span className="m">{runtime.base_url}</span>
                       </div>
-                      <span role="cell" data-label="상태" className={tone ? BADGE_CLASS[tone] : "b"} title={runtime.message ?? undefined}>
-                        {parsed ? RUNTIME_STATUS_LABEL[parsed] : runtime.status}
-                      </span>
-                      <span role="cell" data-label="작업" className="r m" style={{ fontSize: ".78rem" }}>
+                      <div role="cell" data-label="상태" className="runtime-status-cell">
+                        <span className={tone ? BADGE_CLASS[tone] : "b"} title={runtime.message ?? undefined}>
+                          {parsed ? RUNTIME_STATUS_LABEL[parsed] : runtime.status}
+                        </span>
+                      </div>
+                      <span role="cell" data-label="작업" className="runtime-count-cell r m">
                         {runtime.running_jobs} / {runtime.capacity}
                       </span>
-                      <span role="cell" data-label="관리" className="btns" style={{ justifyContent: "flex-end" }}>
+                      <span role="cell" data-label="관리" className="btns runtime-actions">
                         <button type="button" className="btn sec sm" disabled={busy} onClick={() => void guard(() => api.probeRuntime(runtime.id))}>
                           확인
                         </button>

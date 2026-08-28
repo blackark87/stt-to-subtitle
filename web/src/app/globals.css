@@ -276,12 +276,6 @@ a.brand, .primary-nav a, .t-name a { text-decoration: none; }
 /* 표는 카드 안에서 가로로 스크롤한다. 레이아웃 밖으로 밀어내지 않는다. */
 .card-body.flush { overflow-x: auto; }
 
-@media (max-width: 1100px) {
-  /* 단계 스트립은 자기 줄을 차지한다. */
-  .tr.tall { grid-template-columns: minmax(0, 1fr) 88px 116px !important; }
-  .tr.tall > .stages { grid-column: 1 / -1; grid-row: 2; }
-}
-
 @media (max-width: 860px) {
   .app-shell { grid-template-columns: 1fr; }
   .sidebar {
@@ -318,7 +312,7 @@ a.brand, .primary-nav a, .t-name a { text-decoration: none; }
   --sans: "Noto Sans KR Variable", "Apple SD Gothic Neo", ui-sans-serif, system-ui, sans-serif;
   --h-ctl: 40px;
   --h-sm: 34px;
-  --h-badge: 26px;
+  --h-badge: 22px;
   --h-row: 48px;
 }
 
@@ -383,10 +377,10 @@ button:disabled, .btn:disabled {
 .theme-toggle { width: 100%; justify-content: center; text-align: center; }
 
 .topbar {
-  min-height: 72px;
-  height: auto;
-  padding: 12px 24px;
-  flex-wrap: wrap;
+  min-height: 58px;
+  height: 58px;
+  padding: 0 22px;
+  flex-wrap: nowrap;
 }
 .page-title { min-width: 0; display: grid; gap: 2px; }
 .page-title h1, .topbar h1 { font-size: 1.08rem; }
@@ -404,6 +398,14 @@ button:disabled, .btn:disabled {
 .card-head h2 { font-size: .96rem; }
 .card-head .sub { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .card-body { padding: 16px; }
+
+.runtime-grid { grid-template-columns: minmax(0, 1fr) 128px 96px minmax(200px, auto) !important; }
+.runtime-title { min-width: 0; display: flex; align-items: center; gap: 6px; }
+.runtime-title > strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: .88rem; }
+.runtime-title > .b { flex: none; }
+.runtime-status-cell { min-width: 0; justify-self: start; }
+.runtime-count-cell { color: var(--muted); font-size: .78rem; }
+.runtime-actions { justify-content: flex-end; flex-wrap: nowrap; }
 
 .btn {
   min-height: var(--h-ctl);
@@ -644,6 +646,17 @@ progress::-moz-progress-bar { background: var(--accent-solid); border-radius: 99
 .comparison-time { color: var(--muted); font-size: .68rem; }
 .comparison-head { position: sticky; top: 0; z-index: 2; background: var(--band); color: var(--muted); }
 
+/* 처리 시간 통계 */
+.metrics-note { display: grid; gap: 4px; }
+.metrics-note p { margin: 0; }
+.metrics-note .muted { font-size: .78rem; }
+.metrics-grid { grid-template-columns: 100px minmax(150px, 1fr) 72px 104px repeat(3, 92px) 132px !important; }
+.metrics-grid.translation { grid-template-columns: 100px minmax(120px, .8fr) 72px 104px repeat(3, 92px) 132px !important; }
+.metrics-number { justify-self: end; color: var(--muted); font-size: .78rem; text-align: right; font-variant-numeric: tabular-nums; }
+.metrics-primary { color: var(--text); font-weight: 700; }
+.metrics-range { line-height: 1.35; }
+.metrics-empty { min-height: 96px; }
+
 /* 작은 폭 */
 @media (max-width: 1180px) {
   .summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -667,6 +680,9 @@ progress::-moz-progress-bar { background: var(--accent-solid); border-radius: 99
   .content { padding: 14px; gap: 14px; }
   .card-head { align-items: flex-start; flex-wrap: wrap; }
   .card-head > .btns { width: 100%; justify-content: flex-start; }
+  .runtime-actions { justify-content: flex-start; flex-wrap: wrap; }
+  .runtime-status-cell > .b { justify-self: start; }
+  .metrics-number { justify-self: stretch; text-align: left; }
   .mobile-page-select { display: inline-flex; }
   .search-panel, .progress-body { grid-template-columns: minmax(0, 1fr); }
   .breadcrumbs { justify-content: flex-start; }

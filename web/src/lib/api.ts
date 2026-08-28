@@ -213,6 +213,57 @@ export interface LibraryProgressItem {
   segments: LibraryProgressSegment[];
 }
 
+export interface MediaDurationMetricGroup {
+  media_duration_bucket_minutes: number;
+  phase: "transcription" | "translation";
+  runtime_id: string | null;
+  runtime_name: string | null;
+  outcome: string;
+  sample_count: number;
+  processing_total_seconds: number;
+  processing_average_seconds: number;
+  processing_minimum_seconds: number;
+  processing_p50_seconds: number;
+  processing_p95_seconds: number;
+  processing_maximum_seconds: number;
+  media_average_seconds: number;
+  media_minimum_seconds: number;
+  media_maximum_seconds: number;
+}
+
+export interface TranslationPassMetric {
+  media_duration_bucket_minutes: number;
+  pass: "draft" | "review";
+  outcome: string;
+  sample_count: number;
+  active_total_seconds: number;
+  active_average_seconds: number;
+  active_minimum_seconds: number;
+  active_p50_seconds: number;
+  active_p95_seconds: number;
+  active_maximum_seconds: number;
+  request_total_seconds: number;
+  request_count: number;
+  media_average_seconds: number;
+  media_minimum_seconds: number;
+  media_maximum_seconds: number;
+}
+
+export interface MediaDurationMetricsPayload {
+  schema_version: number;
+  generated_at: number;
+  window_start: number;
+  window_end: number;
+  window_seconds: number;
+  bucket_interval_minutes: number;
+  bucket_strategy: string;
+  unmatched_terminal_events: number;
+  missing_media_duration_events: number;
+  groups: MediaDurationMetricGroup[];
+  invalid_translation_pass_events: number;
+  translation_passes: TranslationPassMetric[];
+}
+
 export class ApiError extends Error {
   readonly status: number;
   constructor(message: string, status: number) {
@@ -249,6 +300,11 @@ const json = (body: unknown): RequestInit => ({ body: JSON.stringify(body) });
 
 export const api = {
   dashboard: () => request<DashboardPayload>("/dashboard"),
+
+  mediaDurationMetrics: (windowDays = 30) =>
+    request<MediaDurationMetricsPayload>(
+      `/operations/metrics/media-durations?window_days=${encodeURIComponent(windowDays)}`,
+    ),
 
   jobs: (params: {
     limit?: number;
