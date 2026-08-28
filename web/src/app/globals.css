@@ -411,6 +411,10 @@ button:disabled, .btn:disabled {
 .settings-prompt-row { grid-template-columns: minmax(0, 1fr) auto; }
 .settings-prompt-actions { justify-content: flex-end; flex-wrap: nowrap; }
 .settings-prompt-form { max-width: none; }
+.settings-editor { display: grid; gap: 14px; border-top: 1px solid var(--line); background: var(--sunken); }
+.settings-editor-head { display: grid; gap: 3px; }
+.settings-editor-head > strong { font-size: .88rem; }
+.settings-editor-head > span { color: var(--muted); font-size: .74rem; }
 
 .btn {
   min-height: var(--h-ctl);

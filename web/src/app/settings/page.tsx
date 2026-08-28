@@ -59,7 +59,9 @@ export default function SettingsPage() {
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [runtimeEditorOpen, setRuntimeEditorOpen] = useState(false);
   const [promptForm, setPromptForm] = useState<PromptForm>(EMPTY_PROMPT);
+  const [promptEditorOpen, setPromptEditorOpen] = useState(false);
   const [pathRuleForm, setPathRuleForm] = useState<PathRuleForm>(EMPTY_PATH_RULE);
 
   const servers = data?.servers;
@@ -109,7 +111,10 @@ export default function SettingsPage() {
             }),
       existing ? "Runtime을 수정했습니다." : "Runtime을 추가했습니다.",
     );
-    if (ok) setForm(EMPTY);
+    if (ok) {
+      setForm(EMPTY);
+      setRuntimeEditorOpen(false);
+    }
   };
 
   const submitServers = async (event: React.FormEvent) => {
@@ -142,7 +147,21 @@ export default function SettingsPage() {
         : api.createPromptCategory(body),
       promptForm.id ? "프롬프트를 수정했습니다." : "프롬프트를 추가했습니다.",
     );
-    if (ok) setPromptForm(EMPTY_PROMPT);
+    if (ok) {
+      setPromptForm(EMPTY_PROMPT);
+      setPromptEditorOpen(false);
+    }
+  };
+
+  const editRuntime = (runtime: RuntimeEndpoint) => {
+    setForm({
+      id: runtime.id,
+      name: runtime.name,
+      base_url: runtime.base_url,
+      token: "",
+      capacity: runtime.capacity,
+    });
+    setRuntimeEditorOpen(true);
   };
 
   const editPrompt = (category: PromptCategory) => {
@@ -152,6 +171,7 @@ export default function SettingsPage() {
       translation_prompt: category.translation_prompt ?? "",
       review_prompt: category.review_prompt ?? "",
     });
+    setPromptEditorOpen(true);
   };
 
   const submitPathRule = async (event: React.FormEvent) => {
@@ -211,8 +231,14 @@ export default function SettingsPage() {
 
         <section className="card">
           <div className="card-head">
-            <h2>전사 서버</h2>
-            <span className="sub m" title={`${runtimes.length}개 Runtime`}>{runtimes.length}개 Runtime</span>
+            <div><h2>전사 서버</h2><span className="sub m" title={`${runtimes.length}개 Runtime`}>{runtimes.length}개 Runtime</span></div>
+            {runtimeEditorOpen ? (
+              <span className="b line">{form.id ? "수정 중" : "추가 중"}</span>
+            ) : (
+              <button type="button" className="btn sec sm" aria-expanded="false" aria-controls="runtime-editor" onClick={() => { setForm(EMPTY); setRuntimeEditorOpen(true); }}>
+                <Icon name="plus" size={14} />Runtime 추가
+              </button>
+            )}
           </div>
           <div className="card-body flush">
             <div className="tbl settings-runtime-table" role="table" aria-label="전사 Runtime 목록">
@@ -278,15 +304,7 @@ export default function SettingsPage() {
                               aria-label={`${runtime.name} 설정 수정`}
                               title="설정 수정"
                               disabled={busy}
-                              onClick={() =>
-                                setForm({
-                                  id: runtime.id,
-                                  name: runtime.name,
-                                  base_url: runtime.base_url,
-                                  token: "",
-                                  capacity: runtime.capacity,
-                                })
-                              }
+                              onClick={() => editRuntime(runtime)}
                             >
                               <Icon name="pencil" size={13} />
                             </button>
@@ -312,7 +330,8 @@ export default function SettingsPage() {
               )}
             </div>
           </div>
-          <div className="card-body">
+          {runtimeEditorOpen ? <div className="card-body settings-editor" id="runtime-editor">
+            <div className="settings-editor-head"><strong>{form.id ? "Runtime 수정" : "새 Runtime 추가"}</strong><span>{form.id ? "비밀번호를 비우면 기존 API 토큰을 유지합니다." : "전사 서버 연결 정보와 할당 슬롯을 입력하세요."}</span></div>
             <form onSubmit={submitRuntime} className="fg settings-form-grid">
               <label className="f">
                 <span className="lb">이름</span>
@@ -334,12 +353,10 @@ export default function SettingsPage() {
                 <button type="submit" className="btn sm" disabled={busy}>
                   {form.id ? "변경 저장" : "Runtime 추가"}
                 </button>
-                {form.id ? (
-                  <button type="button" className="btn sec sm" onClick={() => setForm(EMPTY)}>취소</button>
-                ) : null}
+                <button type="button" className="btn sec sm" onClick={() => { setForm(EMPTY); setRuntimeEditorOpen(false); }}>취소</button>
               </div>
             </form>
-          </div>
+          </div> : null}
         </section>
 
         <section className="card">
@@ -378,8 +395,14 @@ export default function SettingsPage() {
 
         <section className="card">
           <div className="card-head">
-            <h2>번역 프롬프트</h2>
-            <span className="sub m" title={`${(data?.prompt_categories ?? []).length}개`}>{(data?.prompt_categories ?? []).length}개</span>
+            <div><h2>번역 프롬프트</h2><span className="sub m" title={`${(data?.prompt_categories ?? []).length}개`}>{(data?.prompt_categories ?? []).length}개</span></div>
+            {promptEditorOpen ? (
+              <span className="b line">{promptForm.id ? "수정 중" : "추가 중"}</span>
+            ) : (
+              <button type="button" className="btn sec sm" aria-expanded="false" aria-controls="prompt-editor" onClick={() => { setPromptForm(EMPTY_PROMPT); setPromptEditorOpen(true); }}>
+                <Icon name="plus" size={14} />프롬프트 추가
+              </button>
+            )}
           </div>
           <div className="card-body flush">
             <div className="tbl settings-prompt-table" role="table" aria-label="번역 프롬프트 목록">
@@ -411,7 +434,8 @@ export default function SettingsPage() {
               )}
             </div>
           </div>
-          <div className="card-body">
+          {promptEditorOpen ? <div className="card-body settings-editor" id="prompt-editor">
+            <div className="settings-editor-head"><strong>{promptForm.id ? "프롬프트 수정" : "새 프롬프트 추가"}</strong><span>초벌 번역과 검증 단계에서 사용할 지시문을 관리합니다.</span></div>
             <form className="prompt-form settings-prompt-form" onSubmit={submitPrompt}>
               <label className="f">
                 <span className="lb">이름</span>
@@ -427,10 +451,10 @@ export default function SettingsPage() {
               </label>
               <div className="btns">
                 <button type="submit" className="btn" disabled={busy}>{promptForm.id ? "변경 저장" : "프롬프트 추가"}</button>
-                {promptForm.id ? <button type="button" className="btn sec" onClick={() => setPromptForm(EMPTY_PROMPT)}>취소</button> : null}
+                <button type="button" className="btn sec" onClick={() => { setPromptForm(EMPTY_PROMPT); setPromptEditorOpen(false); }}>취소</button>
               </div>
             </form>
-          </div>
+          </div> : null}
         </section>
 
         <section className="card path-settings-card" id="path-display-rules" aria-labelledby="path-display-title">

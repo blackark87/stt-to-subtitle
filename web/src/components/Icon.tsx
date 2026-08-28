@@ -19,6 +19,7 @@ const PATHS: Record<string, string> = {
   pause: "<rect x=\"6\" y=\"4\" width=\"4\" height=\"16\" rx=\"1\" fill=\"currentColor\" stroke=\"none\"/><rect x=\"14\" y=\"4\" width=\"4\" height=\"16\" rx=\"1\" fill=\"currentColor\" stroke=\"none\"/>",
   pencil: "<path d=\"M12 20h9\"/><path d=\"M16.5 3.5 20.5 7.5 8 20H4v-4Z\"/>",
   play: "<polygon points=\"6 3 20 12 6 21 6 3\" fill=\"currentColor\" stroke=\"none\"/>",
+  plus: "<line x1=\"12\" y1=\"5\" x2=\"12\" y2=\"19\"/><line x1=\"5\" y1=\"12\" x2=\"19\" y2=\"12\"/>",
   refresh: "<path d=\"M4 12a8 8 0 0 1 13.86-5.66\"/><polyline points=\"18 2 18 7 13 7\"/><path d=\"M20 12a8 8 0 0 1-13.86 5.66\"/><polyline points=\"6 22 6 17 11 17\"/>",
   search: "<circle cx=\"11\" cy=\"11\" r=\"7\"/><line x1=\"16\" y1=\"16\" x2=\"21\" y2=\"21\"/>",
   settings: "<line x1=\"4\" y1=\"6\" x2=\"20\" y2=\"6\"/><circle cx=\"9\" cy=\"6\" r=\"2\"/><line x1=\"4\" y1=\"12\" x2=\"20\" y2=\"12\"/><circle cx=\"15\" cy=\"12\" r=\"2\"/><line x1=\"4\" y1=\"18\" x2=\"20\" y2=\"18\"/><circle cx=\"9\" cy=\"18\" r=\"2\"/>",
