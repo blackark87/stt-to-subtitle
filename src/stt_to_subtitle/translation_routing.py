@@ -27,10 +27,6 @@ from .translation_store import (
 
 
 LOGGER = logging.getLogger(__name__)
-DEFAULT_DRAFT_MODEL = (
-    "gemma-4-12b-coder-fable5-composer2.5-v1-uncensored-heretic"
-)
-DEFAULT_REVIEW_MODEL = "gemma-4-26b-a4b-it-ultra-uncensored-heretic"
 TRANSLATION_STAGES = ("draft", "review")
 TRANSLATION_STAGE_LABELS = {
     "draft": "1차(초벌) 번역",
@@ -99,8 +95,6 @@ class TranslationRoutingDefaults:
     builtin_capacity: int = 1
     draft_enabled: bool = True
     review_enabled: bool = False
-    draft_model: str = DEFAULT_DRAFT_MODEL
-    review_model: str = DEFAULT_REVIEW_MODEL
     draft_batch_preferred: bool = False
     review_batch_preferred: bool = False
     connect_timeout_seconds: float = 10.0
@@ -111,8 +105,6 @@ class TranslationRoutingDefaults:
             raise ValueError("기본 번역 서버 이름이 필요합니다.")
         if not 1 <= self.builtin_capacity <= 8:
             raise ValueError("기본 번역 서버 동시 요청 수는 1~8이어야 합니다.")
-        if not self.draft_model.strip() or not self.review_model.strip():
-            raise ValueError("1차·2차 번역 모델이 필요합니다.")
         if self.connect_timeout_seconds <= 0 or self.read_timeout_seconds <= 0:
             raise ValueError("번역 서버 제한 시간은 양수여야 합니다.")
         return TranslationRoutingDefaults(
@@ -130,8 +122,6 @@ class TranslationRoutingDefaults:
             builtin_capacity=self.builtin_capacity,
             draft_enabled=self.draft_enabled,
             review_enabled=self.review_enabled,
-            draft_model=self.draft_model.strip(),
-            review_model=self.review_model.strip(),
             draft_batch_preferred=self.draft_batch_preferred,
             review_batch_preferred=self.review_batch_preferred,
             connect_timeout_seconds=self.connect_timeout_seconds,
@@ -163,8 +153,6 @@ class BackendTranslationRouting:
             draft_store=self.stores["draft"],
             review_store=self.stores["review"],
         )
-        self.stores["draft"].ensure_model(self.defaults.draft_model)
-        self.stores["review"].ensure_model(self.defaults.review_model)
         self.stores["draft"].sync_builtin(
             name=self.defaults.builtin_name,
             base_url=self.defaults.builtin_base_url,
@@ -213,6 +201,7 @@ class BackendTranslationRouting:
             "capacity": server.capacity,
             "builtin": server.builtin,
             "batch_preferred": server.batch_preferred,
+            "selected_model": server.selected_model,
             "models": list(server.models),
             "status": status,
             "message": current.get("message"),
@@ -223,31 +212,27 @@ class BackendTranslationRouting:
 
     def group(self, stage: str) -> dict[str, Any]:
         resolved = translation_stage(stage)
-        store = self.stores[resolved]
         return {
             "stage": resolved,
             "label": TRANSLATION_STAGE_LABELS[resolved],
-            "model": store.model(),
             "servers": [
-                self._public_server(resolved, server) for server in store.list()
+                self._public_server(resolved, server)
+                for server in self.stores[resolved].list()
             ],
         }
 
     def groups(self) -> list[dict[str, Any]]:
         return [self.group(stage) for stage in TRANSLATION_STAGES]
 
-    def update_model(self, stage: str, model: str) -> dict[str, Any]:
+    def update_server_model(
+        self,
+        stage: str,
+        server_id: str,
+        model: str,
+    ) -> dict[str, Any]:
         resolved = translation_stage(stage)
-        normalized = model.strip()
-        available = {
-            item
-            for server in self.stores[resolved].list()
-            for item in server.models
-        }
-        if available and normalized not in available:
-            raise ValueError("등록된 서버가 제공하지 않는 모델입니다.")
-        self.stores[resolved].set_model(normalized)
-        return self.group(resolved)
+        server = self.stores[resolved].set_selected_model(server_id, model)
+        return self._public_server(resolved, server)
 
     @staticmethod
     def _server_values(payload: Mapping[str, Any]) -> tuple[str, str, int]:
@@ -387,14 +372,16 @@ class BackendTranslationRouting:
         resolved = translation_stage(stage)
         if mode not in {"live", "batch"}:
             raise ValueError("번역 실행 모드는 live 또는 batch여야 합니다.")
-        store = self.stores[resolved]
-        model = store.model()
         candidates = [
             server
-            for server in store.list()
+            for server in self.stores[resolved].list()
             if server.enabled
             and server.base_url
-            and (not server.models or model in server.models)
+            and server.selected_model
+            and (
+                not server.models
+                or server.selected_model in server.models
+            )
             and (mode != "batch" or server.batch_preferred)
         ]
         with self._lock:
@@ -424,7 +411,11 @@ class BackendTranslationRouting:
 
     def model_contract(self) -> str:
         return "+".join(
-            f"{stage}:{self.stores[stage].model()}"
+            f"{stage}:" + ",".join(
+                f"{server.id}={server.selected_model}"
+                for server in self.stores[stage].list()
+                if server.selected_model
+            )
             for stage in TRANSLATION_STAGES
         )
 
@@ -458,7 +449,6 @@ class BackendTranslationRouting:
             raise ExternalServiceError(
                 f"{TRANSLATION_STAGE_LABELS[resolved]} 서버가 설정되지 않았습니다."
             )
-        model = self.stores[resolved].model()
         last_response: requests.Response | None = None
         attempted = False
         for server in candidates:
@@ -482,7 +472,7 @@ class BackendTranslationRouting:
                 for key, value in payload.items()
                 if key in OPENAI_COMPLETION_FIELDS
             }
-            upstream_payload["model"] = model
+            upstream_payload["model"] = server.selected_model
             try:
                 response = client.request(
                     "POST",

@@ -786,8 +786,6 @@ class BackendSettingsTests(unittest.TestCase):
                 "TRANSLATION_BUILTIN_NAME": "로컬 LLM",
                 "TRANSLATION_BUILTIN_BASE_URL": "http://translation.test/v1",
                 "TRANSLATION_BUILTIN_TOKEN": "token",
-                "TRANSLATION_BUILTIN_DRAFT_MODEL": "draft-model",
-                "TRANSLATION_BUILTIN_REVIEW_MODEL": "review-model",
             },
             clear=True,
         ):
@@ -799,8 +797,6 @@ class BackendSettingsTests(unittest.TestCase):
             "http://translation.test/v1",
         )
         self.assertEqual(settings.translation_builtin_token, "token")
-        self.assertEqual(settings.translation_builtin_draft_model, "draft-model")
-        self.assertEqual(settings.translation_builtin_review_model, "review-model")
         self.assertEqual(
             settings.state_dir,
             Path("/var/lib/stt"),

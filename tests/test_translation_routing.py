@@ -8,14 +8,16 @@ from unittest.mock import Mock, patch
 from stt_to_subtitle.service_clients import ExternalServiceError, RetryingJSONClient
 from stt_to_subtitle.translation_routing import (
     BackendTranslationRouting,
-    DEFAULT_DRAFT_MODEL,
-    DEFAULT_REVIEW_MODEL,
     TranslationRoutingDefaults,
 )
 from stt_to_subtitle.translation_store import (
     TranslationServerGroupStore,
     migrate_legacy_translation_endpoints,
 )
+
+
+DRAFT_MODEL = "draft-model"
+REVIEW_MODEL = "review-model"
 
 
 def model_response(*model_ids: str) -> Mock:
@@ -35,23 +37,22 @@ def completion_response(text: str = "ok") -> Mock:
 
 
 class TranslationServerGroupStoreTests(unittest.TestCase):
-    def test_groups_own_models_and_servers_independently(self) -> None:
+    def test_groups_own_server_model_selections_independently(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
             draft = TranslationServerGroupStore(root / "draft.sqlite3")
             review = TranslationServerGroupStore(root / "review.sqlite3")
-            draft.ensure_model(DEFAULT_DRAFT_MODEL)
-            review.ensure_model(DEFAULT_REVIEW_MODEL)
             draft.create(
                 name="draft-only",
                 base_url="http://draft.test/v1",
                 token="",
                 enabled=True,
                 capacity=1,
+                selected_model=DRAFT_MODEL,
+                models=(DRAFT_MODEL,),
             )
 
-            self.assertEqual(draft.model(), DEFAULT_DRAFT_MODEL)
-            self.assertEqual(review.model(), DEFAULT_REVIEW_MODEL)
+            self.assertEqual(draft.list()[0].selected_model, DRAFT_MODEL)
             self.assertEqual([item.name for item in draft.list()], ["draft-only"])
             self.assertEqual(review.list(), [])
 
@@ -141,6 +142,69 @@ class TranslationServerGroupStoreTests(unittest.TestCase):
             self.assertFalse(disabled.enabled)
             self.assertFalse(disabled.batch_preferred)
 
+    def test_migrates_group_model_to_each_existing_server(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "draft.sqlite3"
+            with sqlite3.connect(path) as connection:
+                connection.executescript(
+                    """
+                    CREATE TABLE translation_servers (
+                        id TEXT PRIMARY KEY, name TEXT NOT NULL,
+                        base_url TEXT NOT NULL UNIQUE,
+                        token TEXT NOT NULL DEFAULT '',
+                        enabled INTEGER NOT NULL DEFAULT 1,
+                        capacity INTEGER NOT NULL DEFAULT 1,
+                        builtin INTEGER NOT NULL DEFAULT 0,
+                        batch_preferred INTEGER NOT NULL DEFAULT 0,
+                        models_json TEXT NOT NULL DEFAULT '[]',
+                        checked_at REAL, created_at REAL NOT NULL,
+                        updated_at REAL NOT NULL
+                    );
+                    CREATE TABLE translation_group_settings (
+                        key TEXT PRIMARY KEY, value TEXT NOT NULL,
+                        updated_at REAL NOT NULL
+                    );
+                    """
+                )
+                connection.execute(
+                    "INSERT INTO translation_group_settings VALUES ('model', ?, 1)",
+                    (DRAFT_MODEL,),
+                )
+                connection.execute(
+                    "INSERT INTO translation_servers VALUES "
+                    "('exact', 'exact', 'http://exact.test/v1', '', 1, 1, 0, 0, ?, 1, 1, 1)",
+                    (json.dumps([DRAFT_MODEL, "other-model"]),),
+                )
+                connection.execute(
+                    "INSERT INTO translation_servers VALUES "
+                    "('single', 'single', 'http://single.test/v1', '', 1, 1, 0, 0, ?, 1, 1, 1)",
+                    (json.dumps(["provider-specific-model"]),),
+                )
+
+            store = TranslationServerGroupStore(path)
+            selected = {item.id: item.selected_model for item in store.list()}
+
+            self.assertEqual(selected["exact"], DRAFT_MODEL)
+            self.assertEqual(selected["single"], "provider-specific-model")
+
+    def test_server_model_must_come_from_that_server(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = TranslationServerGroupStore(Path(directory) / "draft.sqlite3")
+            server = store.create(
+                name="models",
+                base_url="http://models.test/v1",
+                token="",
+                enabled=True,
+                capacity=1,
+                models=("first", "second"),
+            )
+
+            selected = store.set_selected_model(server.id, "second")
+
+            self.assertEqual(selected.selected_model, "second")
+            with self.assertRaisesRegex(ValueError, "제공하지 않습니다"):
+                store.set_selected_model(server.id, "another-server-model")
+
     def test_migrates_shared_endpoint_into_independent_groups_once(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -165,9 +229,9 @@ class TranslationServerGroupStoreTests(unittest.TestCase):
                         "server 01",
                         "http://server.test/v1",
                         "",
-                        DEFAULT_DRAFT_MODEL,
-                        DEFAULT_REVIEW_MODEL,
-                        json.dumps([DEFAULT_DRAFT_MODEL, DEFAULT_REVIEW_MODEL]),
+                        DRAFT_MODEL,
+                        REVIEW_MODEL,
+                        json.dumps([DRAFT_MODEL, REVIEW_MODEL]),
                     ),
                 )
             draft = TranslationServerGroupStore(root / "draft.sqlite3")
@@ -181,8 +245,8 @@ class TranslationServerGroupStoreTests(unittest.TestCase):
 
             self.assertEqual([item.id for item in draft.list()], ["server-1"])
             self.assertEqual([item.id for item in review.list()], ["server-1"])
-            self.assertEqual(draft.model(), DEFAULT_DRAFT_MODEL)
-            self.assertEqual(review.model(), DEFAULT_REVIEW_MODEL)
+            self.assertEqual(draft.list()[0].selected_model, DRAFT_MODEL)
+            self.assertEqual(review.list()[0].selected_model, REVIEW_MODEL)
 
 
 class BackendTranslationRoutingTests(unittest.TestCase):
@@ -209,10 +273,13 @@ class BackendTranslationRoutingTests(unittest.TestCase):
             "review_enabled": False,
         }
         values.update(changes)
-        return BackendTranslationRouting(
+        routing = BackendTranslationRouting(
             TranslationRoutingDefaults(**values),
             stores=stores,
         )
+        routing.stores["draft"].save_models("builtin", [DRAFT_MODEL])
+        routing.stores["review"].save_models("builtin", [REVIEW_MODEL])
+        return routing
 
     def test_lists_two_independent_groups_without_exposing_tokens(self) -> None:
         with TemporaryDirectory() as directory:
@@ -221,8 +288,9 @@ class BackendTranslationRoutingTests(unittest.TestCase):
             groups = routing.groups()
 
             self.assertEqual([item["stage"] for item in groups], ["draft", "review"])
-            self.assertEqual(groups[0]["model"], DEFAULT_DRAFT_MODEL)
-            self.assertEqual(groups[1]["model"], DEFAULT_REVIEW_MODEL)
+            self.assertNotIn("model", groups[0])
+            self.assertEqual(groups[0]["servers"][0]["selected_model"], DRAFT_MODEL)
+            self.assertEqual(groups[1]["servers"][0]["selected_model"], REVIEW_MODEL)
             self.assertTrue(groups[0]["servers"][0]["enabled"])
             self.assertFalse(groups[1]["servers"][0]["enabled"])
             self.assertNotIn("token", groups[0]["servers"][0])
@@ -324,7 +392,7 @@ class BackendTranslationRoutingTests(unittest.TestCase):
             self.assertNotIn("X-Translation-Pass", headers)
             self.assertEqual(
                 request.call_args.kwargs["json"]["model"],
-                DEFAULT_DRAFT_MODEL,
+                DRAFT_MODEL,
             )
             self.assertEqual(
                 set(request.call_args.kwargs["json"]),
@@ -372,6 +440,8 @@ class BackendTranslationRoutingTests(unittest.TestCase):
                 token="",
                 enabled=True,
                 capacity=1,
+                selected_model="review-server-model",
+                models=("review-server-model",),
             )
             routing = self.routing(root, stores=stores)
             with patch.object(
@@ -407,6 +477,8 @@ class BackendTranslationRoutingTests(unittest.TestCase):
                 token="",
                 enabled=True,
                 capacity=1,
+                selected_model="fallback-model",
+                models=("fallback-model",),
             )
             routing = self.routing(root, stores=stores)
             with patch.object(
@@ -428,6 +500,14 @@ class BackendTranslationRoutingTests(unittest.TestCase):
             self.assertEqual(
                 request.call_args_list[1].args[1],
                 f"{fallback.base_url}/chat/completions",
+            )
+            self.assertEqual(
+                request.call_args_list[0].kwargs["json"]["model"],
+                DRAFT_MODEL,
+            )
+            self.assertEqual(
+                request.call_args_list[1].kwargs["json"]["model"],
+                "fallback-model",
             )
 
 

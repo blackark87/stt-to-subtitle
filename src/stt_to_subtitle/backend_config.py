@@ -350,12 +350,6 @@ class BackendSettings:
     translation_builtin_capacity: int = 1
     translation_builtin_draft_enabled: bool = True
     translation_builtin_review_enabled: bool = False
-    translation_builtin_draft_model: str = (
-        "gemma-4-12b-coder-fable5-composer2.5-v1-uncensored-heretic"
-    )
-    translation_builtin_review_model: str = (
-        "gemma-4-26b-a4b-it-ultra-uncensored-heretic"
-    )
     translation_builtin_draft_batch_preferred: bool = False
     translation_builtin_review_batch_preferred: bool = False
     translation_connect_timeout_seconds: float = 10.0
@@ -431,14 +425,6 @@ class BackendSettings:
                 "TRANSLATION_BUILTIN_REVIEW_ENABLED",
                 "false",
             ),
-            translation_builtin_draft_model=os.environ.get(
-                "TRANSLATION_BUILTIN_DRAFT_MODEL",
-                "gemma-4-12b-coder-fable5-composer2.5-v1-uncensored-heretic",
-            ).strip(),
-            translation_builtin_review_model=os.environ.get(
-                "TRANSLATION_BUILTIN_REVIEW_MODEL",
-                "gemma-4-26b-a4b-it-ultra-uncensored-heretic",
-            ).strip(),
             translation_builtin_draft_batch_preferred=_enabled_env(
                 "TRANSLATION_BUILTIN_DRAFT_BATCH_PREFERRED",
                 "false",
@@ -486,11 +472,6 @@ class BackendSettings:
             raise ValueError("TRANSLATION_BUILTIN_NAME is required")
         if not 1 <= self.translation_builtin_capacity <= 8:
             raise ValueError("TRANSLATION_BUILTIN_CAPACITY must be 1..8")
-        if (
-            not self.translation_builtin_draft_model.strip()
-            or not self.translation_builtin_review_model.strip()
-        ):
-            raise ValueError("translation stage models are required")
         if self.translation_builtin_base_url:
             normalize_server_url(
                 self.translation_builtin_base_url,

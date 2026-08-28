@@ -84,11 +84,12 @@ chmod 600 .env.compose
 - `MEDIA_PATH`: 영상과 자막을 읽고 쓸 호스트 디렉터리
 - `TRAEFIK_HOST`: 웹 애플리케이션에 사용할 DNS 호스트명
 - `TRANSLATION_BUILTIN_BASE_URL`: 1차·2차 그룹에 각각 생성되는 기본 서버의 OpenAI 호환 API 루트
-- `TRANSLATION_BUILTIN_DRAFT_MODEL`: 1차(초벌) 번역 그룹의 초기 모델 ID
-- `TRANSLATION_BUILTIN_REVIEW_MODEL`: 2차(검증) 번역 그룹의 초기 모델 ID
 - `TRANSLATION_BUILTIN_DRAFT_ENABLED`: 1차 그룹의 기본 서버 사용 여부
 - `TRANSLATION_BUILTIN_REVIEW_ENABLED`: 2차 그룹의 기본 서버 사용 여부
-- `TRANSLATION_STATE_PATH`: 추가 번역 서버와 모델 선택을 보존할 상태 디렉터리
+- `TRANSLATION_STATE_PATH`: 번역 서버와 서버별 모델 선택을 보존할 상태 디렉터리
+
+각 번역 서버의 모델은 설정 화면에서 연결 확인 후 해당 서버가 제공하는
+모델 목록 중 하나를 선택합니다.
 
 Compose는 경로 오타로 빈 호스트 디렉터리를 만들지 않습니다. 미디어, 상태,
 작업 공간과 모델 캐시 디렉터리를 먼저 만들고 쓰기 권한을 확인합니다.

@@ -57,6 +57,7 @@ export interface TranslationServer {
   capacity: number;
   builtin: boolean;
   batch_preferred: boolean;
+  selected_model: string;
   models: string[];
   status: string;
   message: string | null;
@@ -68,7 +69,6 @@ export interface TranslationServer {
 export interface TranslationGroup {
   stage: TranslationStage;
   label: string;
-  model: string;
   servers: TranslationServer[];
 }
 
@@ -423,11 +423,12 @@ export const api = {
     stt_base_url: string;
     stt_token?: string | null;
   }) => request<unknown>("/settings/servers", { method: "PUT", ...json(body) }),
-  updateTranslationGroupModel: (
+  updateTranslationServerModel: (
     stage: TranslationStage,
+    id: string,
     model: string,
-  ) => request<TranslationGroup>(
-    `/translation-groups/${stage}/model`,
+  ) => request<TranslationServer>(
+    `/translation-groups/${stage}/servers/${encodeURIComponent(id)}/model`,
     { method: "PUT", ...json({ model }) },
   ),
   createTranslationEndpoint: (stage: TranslationStage, body: {

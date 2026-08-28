@@ -25,7 +25,7 @@ from .backend_contracts import (
     TranslationEndpointCreateRequest,
     TranslationEndpointRoutingRequest,
     TranslationEndpointUpdateRequest,
-    TranslationGroupModelRequest,
+    TranslationServerModelRequest,
 )
 from .job_state import JobPhase, JobReason, JobState
 from .gpu_monitoring import gpu_snapshot_payload
@@ -281,15 +281,17 @@ def _translation_settings_failure(error: Exception) -> HTTPException:
     )
 
 
-@router.put("/translation-groups/{stage}/model")
-def update_translation_group_model(
+@router.put("/translation-groups/{stage}/servers/{endpoint_id}/model")
+def update_translation_server_model(
     stage: str,
-    payload: TranslationGroupModelRequest,
+    endpoint_id: str,
+    payload: TranslationServerModelRequest,
     request: Request,
 ) -> dict[str, Any]:
     try:
-        return service_from_request(request).update_translation_group_model(
+        return service_from_request(request).update_translation_server_model(
             stage,
+            endpoint_id,
             payload.model,
         )
     except (ExternalServiceError, ValueError) as error:

@@ -70,7 +70,7 @@ class TranslationEndpointRoutingRequest(BaseModel):
     batch_preferred: bool = False
 
 
-class TranslationGroupModelRequest(BaseModel):
+class TranslationServerModelRequest(BaseModel):
     model: str = Field(min_length=1)
 
 

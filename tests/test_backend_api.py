@@ -50,7 +50,10 @@ class BackendAPIBoundaryTests(unittest.TestCase):
         self.assertIn("/api/v1/runtimes", paths)
         self.assertIn("/api/v1/runtimes/{runtime_id}", paths)
         self.assertIn("/api/v1/runtimes/{runtime_id}/probe", paths)
-        self.assertIn("/api/v1/translation-groups/{stage}/model", paths)
+        self.assertIn(
+            "/api/v1/translation-groups/{stage}/servers/{endpoint_id}/model",
+            paths,
+        )
         self.assertIn("/api/v1/translation-groups/{stage}/servers", paths)
         self.assertIn(
             "/api/v1/translation-groups/{stage}/servers/{endpoint_id}/routing",

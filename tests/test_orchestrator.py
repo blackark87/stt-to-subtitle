@@ -26,7 +26,54 @@ from stt_to_subtitle.service_clients import (
 )
 
 
+def configure_translation_models(
+    orchestrator: SubtitleOrchestrator,
+) -> SubtitleOrchestrator:
+    orchestrator._translation_routing.stores["draft"].save_models(
+        "builtin",
+        ["draft-model"],
+    )
+    orchestrator._translation_routing.stores["review"].save_models(
+        "builtin",
+        ["review-model"],
+    )
+    orchestrator._refresh_translation_circuit_from_routing()
+    return orchestrator
+
+
 class SubtitleOrchestratorTests(unittest.TestCase):
+    def test_selecting_server_model_refreshes_translation_circuit(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            orchestrator = SubtitleOrchestrator(
+                BackendSettings(
+                    state_dir=root / "state",
+                    media_root=media_root,
+                    stt_base_url="http://stt.test",
+                    stt_token="",
+                    translation_builtin_base_url="http://translation.test/v1",
+                )
+            )
+            try:
+                orchestrator._translation_routing.stores["draft"].save_models(
+                    "builtin",
+                    ["first", "second"],
+                )
+                self.assertEqual(orchestrator.translation_circuit_state, "offline")
+
+                server = orchestrator.update_translation_server_model(
+                    "draft",
+                    "builtin",
+                    "second",
+                )
+
+                self.assertEqual(server["selected_model"], "second")
+                self.assertEqual(orchestrator.translation_circuit_state, "ready")
+            finally:
+                orchestrator.stop()
+
     def test_compacts_nested_transcription_model_metadata(self) -> None:
         revision = _transcription_model_revision(
             {
@@ -124,7 +171,7 @@ class SubtitleOrchestratorTests(unittest.TestCase):
         root: Path,
         media_root: Path,
     ) -> SubtitleOrchestrator:
-        return SubtitleOrchestrator(
+        return configure_translation_models(SubtitleOrchestrator(
             BackendSettings(
                 state_dir=root / "state",
                 media_root=media_root,
@@ -132,7 +179,7 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                 stt_token="stt-token",
                 translation_builtin_base_url="http://translation.test/v1",
             )
-        )
+        ))
 
     def test_translation_dispatches_without_server_start_action(self) -> None:
         with TemporaryDirectory() as directory:
@@ -149,6 +196,7 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                     translation_builtin_base_url="http://translation.test/v1",
                 )
             )
+            configure_translation_models(orchestrator)
             try:
                 job = orchestrator.create_job(
                     "movie.mkv",
@@ -183,7 +231,7 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                 stt_token="",
                 translation_builtin_base_url="http://translation.test/v1",
             )
-            first = SubtitleOrchestrator(settings)
+            first = configure_translation_models(SubtitleOrchestrator(settings))
             try:
                 job = first.create_job(
                     "movie.mkv",
@@ -436,7 +484,7 @@ class SubtitleOrchestratorTests(unittest.TestCase):
             media_root = root / "media"
             media_root.mkdir()
             (media_root / "movie.mkv").write_bytes(b"not-read-in-this-test")
-            orchestrator = SubtitleOrchestrator(
+            orchestrator = configure_translation_models(SubtitleOrchestrator(
                 BackendSettings(
                     state_dir=root / "state",
                     media_root=media_root,
@@ -444,7 +492,7 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                     stt_token="stt-token",
                     translation_builtin_base_url="http://translation.test/v1",
                 )
-            )
+            ))
             try:
                 job = orchestrator.create_job(
                     "movie.mkv",
@@ -3077,10 +3125,9 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                     stt_token="stt-token",
                     translation_builtin_base_url="http://lm.test/v1",
                     translation_builtin_token="lm-token",
-                    translation_builtin_draft_model="model",
-                    translation_builtin_review_model="model",
                 )
             )
+            configure_translation_models(orchestrator)
             try:
                 orchestrator.update_runtime_endpoint(
                     "builtin",
@@ -4094,11 +4141,10 @@ class SchedulerDispatchTests(unittest.TestCase):
                 stt_token="stt-token",
                 translation_builtin_base_url="http://lm.test/v1",
                 translation_builtin_token="lm-token",
-                translation_builtin_draft_model="model",
-                translation_builtin_review_model="model",
                 audio_workers=audio_workers,
             )
         )
+        configure_translation_models(orchestrator)
         orchestrator._audio_executor = _RecordingExecutor()
         orchestrator._render_executor = _RecordingExecutor()
         orchestrator._stt_executor = _RecordingExecutor()

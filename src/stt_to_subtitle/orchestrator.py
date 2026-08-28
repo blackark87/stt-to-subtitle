@@ -340,8 +340,6 @@ class SubtitleOrchestrator:
                 builtin_capacity=settings.translation_builtin_capacity,
                 draft_enabled=settings.translation_builtin_draft_enabled,
                 review_enabled=settings.translation_builtin_review_enabled,
-                draft_model=settings.translation_builtin_draft_model,
-                review_model=settings.translation_builtin_review_model,
                 draft_batch_preferred=(
                     settings.translation_builtin_draft_batch_preferred
                 ),
@@ -486,12 +484,19 @@ class SubtitleOrchestrator:
     def translation_groups_view(self) -> list[dict[str, Any]]:
         return self._translation_routing.groups()
 
-    def update_translation_group_model(
+    def update_translation_server_model(
         self,
         stage: str,
+        endpoint_id: str,
         model: str,
     ) -> dict[str, Any]:
-        return self._translation_routing.update_model(stage, model)
+        result = self._translation_routing.update_server_model(
+            stage,
+            endpoint_id,
+            model,
+        )
+        self._refresh_translation_circuit_from_routing()
+        return result
 
     def create_translation_endpoint(
         self,
@@ -525,7 +530,9 @@ class SubtitleOrchestrator:
         stage: str,
         endpoint_id: str,
     ) -> dict[str, Any]:
-        return self._translation_routing.probe_server(stage, endpoint_id)
+        result = self._translation_routing.probe_server(stage, endpoint_id)
+        self._refresh_translation_circuit_from_routing()
+        return result
 
     def update_translation_endpoint_routing(
         self,

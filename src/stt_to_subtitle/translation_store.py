@@ -24,6 +24,7 @@ class TranslationServer:
     capacity: int
     builtin: bool
     batch_preferred: bool
+    selected_model: str
     models: tuple[str, ...]
     checked_at: float | None
     created_at: float
@@ -31,7 +32,7 @@ class TranslationServer:
 
 
 class TranslationServerGroupStore:
-    """Own the servers and selected model for one translation stage."""
+    """Own the servers for one translation stage."""
 
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -48,6 +49,7 @@ class TranslationServerGroupStore:
                     capacity INTEGER NOT NULL DEFAULT 1,
                     builtin INTEGER NOT NULL DEFAULT 0,
                     batch_preferred INTEGER NOT NULL DEFAULT 0,
+                    selected_model TEXT NOT NULL DEFAULT '',
                     models_json TEXT NOT NULL DEFAULT '[]',
                     checked_at REAL,
                     created_at REAL NOT NULL,
@@ -62,19 +64,64 @@ class TranslationServerGroupStore:
                     translation_builtin_server_idx
                 ON translation_servers(builtin)
                 WHERE builtin = 1;
-
-                CREATE TABLE IF NOT EXISTS translation_group_settings (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL,
-                    updated_at REAL NOT NULL
-                );
                 """
             )
+            columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(translation_servers)"
+                ).fetchall()
+            }
+            if "selected_model" not in columns:
+                connection.execute(
+                    "ALTER TABLE translation_servers "
+                    "ADD COLUMN selected_model TEXT NOT NULL DEFAULT ''"
+                )
+                self._migrate_group_model(connection)
+            connection.execute("DROP TABLE IF EXISTS translation_group_settings")
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=30.0)
         connection.row_factory = sqlite3.Row
         return connection
+
+    @staticmethod
+    def _migrate_group_model(connection: sqlite3.Connection) -> None:
+        table = connection.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'translation_group_settings'"
+        ).fetchone()
+        legacy = (
+            connection.execute(
+                "SELECT value FROM translation_group_settings WHERE key = 'model'"
+            ).fetchone()
+            if table is not None
+            else None
+        )
+        legacy_model = str(legacy["value"]).strip() if legacy is not None else ""
+        rows = connection.execute(
+            "SELECT id, models_json FROM translation_servers"
+        ).fetchall()
+        for row in rows:
+            try:
+                parsed = json.loads(str(row["models_json"]))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                parsed = []
+            models = [
+                str(model).strip()
+                for model in parsed
+                if str(model).strip()
+            ] if isinstance(parsed, list) else []
+            selected = (
+                legacy_model
+                if legacy_model and legacy_model in models
+                else models[0] if len(models) == 1 else ""
+            )
+            if selected:
+                connection.execute(
+                    "UPDATE translation_servers SET selected_model = ? WHERE id = ?",
+                    (selected, str(row["id"])),
+                )
 
     @staticmethod
     def _server(row: sqlite3.Row) -> TranslationServer:
@@ -96,6 +143,7 @@ class TranslationServerGroupStore:
             capacity=int(row["capacity"]),
             builtin=bool(row["builtin"]),
             batch_preferred=bool(row["batch_preferred"]),
+            selected_model=str(row["selected_model"]),
             models=models,
             checked_at=(
                 float(row["checked_at"])
@@ -112,34 +160,6 @@ class TranslationServerGroupStore:
                 "SELECT COUNT(*) AS count FROM translation_servers"
             ).fetchone()
         return row is None or int(row["count"]) == 0
-
-    def model(self, default: str = "") -> str:
-        with self._connect() as connection:
-            row = connection.execute(
-                "SELECT value FROM translation_group_settings WHERE key = 'model'"
-            ).fetchone()
-        return str(row["value"]) if row is not None else default
-
-    def set_model(self, model: str) -> str:
-        normalized = model.strip()
-        if not normalized:
-            raise ValueError("번역 모델을 선택해야 합니다.")
-        with self._connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO translation_group_settings (key, value, updated_at)
-                VALUES ('model', ?, ?)
-                ON CONFLICT(key) DO UPDATE SET
-                    value = excluded.value,
-                    updated_at = excluded.updated_at
-                """,
-                (normalized, time.time()),
-            )
-        return normalized
-
-    def ensure_model(self, model: str) -> str:
-        current = self.model()
-        return current if current else self.set_model(model)
 
     def sync_builtin(
         self,
@@ -219,12 +239,16 @@ class TranslationServerGroupStore:
         capacity: int,
         server_id: str | None = None,
         batch_preferred: bool = False,
+        selected_model: str = "",
         models: tuple[str, ...] = (),
         checked_at: float | None = None,
     ) -> TranslationServer:
         resolved_id = server_id or uuid4().hex
         now = time.time()
         resolved_batch_preferred = enabled and batch_preferred
+        resolved_selected_model = selected_model.strip()
+        if resolved_selected_model and resolved_selected_model not in models:
+            raise ValueError("선택한 모델을 번역 서버가 제공하지 않습니다.")
         with self._connect() as connection:
             if resolved_batch_preferred:
                 connection.execute(
@@ -235,9 +259,9 @@ class TranslationServerGroupStore:
                 """
                 INSERT INTO translation_servers (
                     id, name, base_url, token, enabled, capacity, builtin,
-                    batch_preferred, models_json, checked_at,
+                    batch_preferred, selected_model, models_json, checked_at,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     resolved_id,
@@ -247,6 +271,7 @@ class TranslationServerGroupStore:
                     int(enabled),
                     capacity,
                     int(resolved_batch_preferred),
+                    resolved_selected_model,
                     json.dumps(list(models), ensure_ascii=False),
                     checked_at,
                     now,
@@ -274,6 +299,7 @@ class TranslationServerGroupStore:
                 UPDATE translation_servers
                 SET name = ?,
                     models_json = CASE WHEN base_url != ? THEN '[]' ELSE models_json END,
+                    selected_model = CASE WHEN base_url != ? THEN '' ELSE selected_model END,
                     checked_at = CASE WHEN base_url != ? THEN NULL ELSE checked_at END,
                     base_url = ?, token = ?, enabled = ?,
                     batch_preferred = CASE WHEN ? THEN batch_preferred ELSE 0 END,
@@ -282,6 +308,7 @@ class TranslationServerGroupStore:
                 """,
                 (
                     name,
+                    base_url,
                     base_url,
                     base_url,
                     base_url,
@@ -345,16 +372,74 @@ class TranslationServerGroupStore:
     ) -> TranslationServer:
         now = time.time()
         with self._connect() as connection:
+            current = connection.execute(
+                "SELECT selected_model FROM translation_servers WHERE id = ?",
+                (server_id,),
+            ).fetchone()
+            if current is None:
+                raise ValueError("번역 서버를 찾을 수 없습니다.")
+            current_model = str(current["selected_model"])
+            selected_model = (
+                current_model
+                if current_model in models
+                else models[0] if len(models) == 1 else ""
+            )
             cursor = connection.execute(
                 """
                 UPDATE translation_servers
-                SET models_json = ?, checked_at = ?, updated_at = ?
+                SET models_json = ?, selected_model = ?,
+                    checked_at = ?, updated_at = ?
                 WHERE id = ?
                 """,
-                (json.dumps(models, ensure_ascii=False), now, now, server_id),
+                (
+                    json.dumps(models, ensure_ascii=False),
+                    selected_model,
+                    now,
+                    now,
+                    server_id,
+                ),
             )
         if cursor.rowcount != 1:
             raise ValueError("번역 서버를 찾을 수 없습니다.")
+        server = self.get(server_id)
+        if server is None:
+            raise RuntimeError("translation server disappeared")
+        return server
+
+    def set_selected_model(
+        self,
+        server_id: str,
+        model: str,
+    ) -> TranslationServer:
+        normalized = model.strip()
+        if not normalized:
+            raise ValueError("번역 모델을 선택해야 합니다.")
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT models_json FROM translation_servers WHERE id = ?",
+                (server_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("번역 서버를 찾을 수 없습니다.")
+            try:
+                parsed = json.loads(str(row["models_json"]))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                parsed = []
+            models = {
+                str(item).strip()
+                for item in parsed
+                if str(item).strip()
+            } if isinstance(parsed, list) else set()
+            if normalized not in models:
+                raise ValueError("선택한 모델을 번역 서버가 제공하지 않습니다.")
+            connection.execute(
+                """
+                UPDATE translation_servers
+                SET selected_model = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (normalized, time.time(), server_id),
+            )
         server = self.get(server_id)
         if server is None:
             raise RuntimeError("translation server disappeared")
@@ -418,9 +503,21 @@ def migrate_legacy_translation_endpoints(
         }
         draft_model = str(row["draft_model"]).strip()
         if draft_model:
-            draft_store.create(**common)
-            draft_store.ensure_model(draft_model)
+            draft_store.create(
+                **common,
+                selected_model=(
+                    draft_model
+                    if draft_model in models
+                    else models[0] if len(models) == 1 else ""
+                ),
+            )
         review_model = str(row["review_model"]).strip()
         if bool(row["review_enabled"]) and review_model:
-            review_store.create(**common)
-            review_store.ensure_model(review_model)
+            review_store.create(
+                **common,
+                selected_model=(
+                    review_model
+                    if review_model in models
+                    else models[0] if len(models) == 1 else ""
+                ),
+            )
