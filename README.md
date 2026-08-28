@@ -42,6 +42,11 @@ Web UI에서 주소를 추가해 같은 전사 작업 풀로 확장할 수 있�
 Backend가 두 번역 서버 레지스트리를 직접 소유하고 각 OpenAI 호환 API를
 호출합니다. 번역 요청에는 구간 ID·원문·문맥과 2차 검증에 필요한 초벌 번역문만
 전달하며, 전사 Runtime·GPU·워커·STT 모델 정보는 전달하지 않습니다.
+기본 Runtime과 같은 메모리를 쓰는 Ollama 호스트는
+`TRANSLATION_STT_HARD_BREAKER_HOSTS`에 등록할 수 있습니다. 이 호스트들은
+기본 Runtime 전사 중 번역 라우팅에서 제외되며, 전사 시작 전에 진행 중 요청을
+비우고 상주 LLM이 모두 언로드됐는지 확인합니다. 확인에 실패하면 메모리 경합을
+감수하지 않고 해당 Runtime의 전사 시작을 차단합니다.
 
 Kotoba, WhisperX, WhisperJAV는 요구하는 PyTorch·모델 의존성이 다르므로
 STT 이미지 안에서도 각각 `/opt/venvs/kotoba`, `/opt/venvs/whisperx`,
@@ -87,6 +92,8 @@ chmod 600 .env.compose
 - `TRANSLATION_BUILTIN_DRAFT_ENABLED`: 1차 그룹의 기본 서버 사용 여부
 - `TRANSLATION_BUILTIN_REVIEW_ENABLED`: 2차 그룹의 기본 서버 사용 여부
 - `TRANSLATION_STATE_PATH`: 번역 서버와 서버별 모델 선택을 보존할 상태 디렉터리
+- `TRANSLATION_STT_HARD_BREAKER_HOSTS`: 기본 Runtime과 메모리를 공유하는
+  Ollama 호스트 목록(쉼표 구분, 선택 사항)
 
 각 번역 서버의 모델은 설정 화면에서 연결 확인 후 해당 서버가 제공하는
 모델 목록 중 하나를 선택합니다.

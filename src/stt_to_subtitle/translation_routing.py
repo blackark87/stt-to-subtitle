@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 import logging
 from pathlib import Path
 import sqlite3
 import threading
+import time
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 import requests
 
@@ -18,6 +19,7 @@ from .service_clients import (
     RequestConcurrencyLimiter,
     RequestObserver,
     RetryingJSONClient,
+    TranslationDeferred,
 )
 from .translation_store import (
     TranslationServer,
@@ -34,6 +36,9 @@ TRANSLATION_STAGE_LABELS = {
 }
 OPENAI_COMPLETION_FIELDS = frozenset(
     {"messages", "temperature", "response_format"}
+)
+HARD_BREAKER_MESSAGE = (
+    "전사 모델의 메모리를 보호하기 위해 번역 서버를 일시 중지했습니다."
 )
 
 
@@ -99,6 +104,8 @@ class TranslationRoutingDefaults:
     review_batch_preferred: bool = False
     connect_timeout_seconds: float = 10.0
     read_timeout_seconds: float = 600.0
+    stt_hard_breaker_hosts: tuple[str, ...] = ()
+    stt_hard_breaker_timeout_seconds: float = 600.0
 
     def normalized(self) -> TranslationRoutingDefaults:
         if not self.builtin_name.strip():
@@ -107,6 +114,8 @@ class TranslationRoutingDefaults:
             raise ValueError("기본 번역 서버 동시 요청 수는 1~8이어야 합니다.")
         if self.connect_timeout_seconds <= 0 or self.read_timeout_seconds <= 0:
             raise ValueError("번역 서버 제한 시간은 양수여야 합니다.")
+        if self.stt_hard_breaker_timeout_seconds <= 0:
+            raise ValueError("번역/STT 하드 브레이커 제한 시간은 양수여야 합니다.")
         return TranslationRoutingDefaults(
             state_dir=self.state_dir,
             builtin_name=self.builtin_name.strip(),
@@ -126,6 +135,14 @@ class TranslationRoutingDefaults:
             review_batch_preferred=self.review_batch_preferred,
             connect_timeout_seconds=self.connect_timeout_seconds,
             read_timeout_seconds=self.read_timeout_seconds,
+            stt_hard_breaker_hosts=tuple(dict.fromkeys(
+                host.strip().casefold().rstrip(".")
+                for host in self.stt_hard_breaker_hosts
+                if host.strip()
+            )),
+            stt_hard_breaker_timeout_seconds=(
+                self.stt_hard_breaker_timeout_seconds
+            ),
         )
 
 
@@ -137,6 +154,7 @@ class BackendTranslationRouting:
         defaults: TranslationRoutingDefaults,
         *,
         stores: Mapping[str, TranslationServerGroupStore] | None = None,
+        stt_hard_breaker_active: Callable[[], bool] | None = None,
     ) -> None:
         self.defaults = defaults.normalized()
         self.stores = dict(stores or {
@@ -172,11 +190,167 @@ class BackendTranslationRouting:
             legacy_names=("기본 Runtime",),
         )
         self._lock = threading.RLock()
+        self._condition = threading.Condition(self._lock)
         self._health: dict[tuple[str, str], dict[str, Any]] = {}
         self._active_requests: dict[tuple[str, str], int] = {}
+        self._stt_hard_breaker_active = stt_hard_breaker_active
+        self._hard_breaker_holders = 0
 
     def _store(self, stage: str) -> TranslationServerGroupStore:
         return self.stores[translation_stage(stage)]
+
+    @staticmethod
+    def _server_host(server: TranslationServer) -> str:
+        return (urlsplit(server.base_url).hostname or "").casefold().rstrip(".")
+
+    def _uses_shared_stt_memory(self, server: TranslationServer) -> bool:
+        return self._server_host(server) in set(
+            self.defaults.stt_hard_breaker_hosts
+        )
+
+    def _external_hard_breaker_active(self) -> bool:
+        if self._stt_hard_breaker_active is None:
+            return False
+        try:
+            return bool(self._stt_hard_breaker_active())
+        except (OSError, RuntimeError, sqlite3.Error):
+            LOGGER.exception("failed to read shared-accelerator STT state")
+            return True
+
+    def hard_breaker_active(self) -> bool:
+        with self._lock:
+            locally_held = self._hard_breaker_holders > 0
+        return locally_held or self._external_hard_breaker_active()
+
+    def _hard_blocked_server_keys(self) -> set[tuple[str, str]]:
+        return {
+            (stage, server.id)
+            for stage in TRANSLATION_STAGES
+            for server in self.stores[stage].list()
+            if self._uses_shared_stt_memory(server)
+        }
+
+    def _ollama_origins(self) -> dict[str, TranslationServer]:
+        origins: dict[str, TranslationServer] = {}
+        for stage in TRANSLATION_STAGES:
+            for server in self.stores[stage].list():
+                if not server.base_url or not self._uses_shared_stt_memory(server):
+                    continue
+                parsed = urlsplit(server.base_url)
+                origin = urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
+                origins.setdefault(origin, server)
+        return origins
+
+    @staticmethod
+    def _loaded_ollama_models(response: requests.Response) -> list[str]:
+        if response.status_code != 200:
+            raise ExternalServiceError(
+                "공유 메모리 번역 서버의 모델 상태를 확인할 수 없습니다."
+            )
+        try:
+            models = response.json()["models"]
+        except (KeyError, TypeError, ValueError, requests.JSONDecodeError) as error:
+            raise ExternalServiceError(
+                "공유 메모리 번역 서버의 모델 상태 응답이 올바르지 않습니다."
+            ) from error
+        if not isinstance(models, list):
+            raise ExternalServiceError(
+                "공유 메모리 번역 서버의 모델 상태 응답이 올바르지 않습니다."
+            )
+        return sorted({
+            str(item.get("name") or item.get("model") or "").strip()
+            for item in models
+            if isinstance(item, Mapping)
+            and str(item.get("name") or item.get("model") or "").strip()
+        })
+
+    def _ollama_models(self, origin: str, server: TranslationServer) -> list[str]:
+        try:
+            response = requests.get(
+                f"{origin}/api/ps",
+                headers=_server_headers(server),
+                timeout=(self.defaults.connect_timeout_seconds, 30.0),
+            )
+        except requests.RequestException as error:
+            raise ExternalServiceError(
+                "공유 메모리 번역 서버의 모델 상태를 확인할 수 없습니다."
+            ) from error
+        try:
+            return self._loaded_ollama_models(response)
+        finally:
+            response.close()
+
+    def _unload_ollama_models(self) -> list[str]:
+        unloaded: list[str] = []
+        for origin, server in self._ollama_origins().items():
+            loaded = self._ollama_models(origin, server)
+            for model in loaded:
+                try:
+                    response = requests.post(
+                        f"{origin}/api/generate",
+                        headers=_server_headers(server),
+                        json={
+                            "model": model,
+                            "prompt": "",
+                            "stream": False,
+                            "keep_alive": 0,
+                        },
+                        timeout=(self.defaults.connect_timeout_seconds, 30.0),
+                    )
+                except requests.RequestException as error:
+                    raise ExternalServiceError(
+                        "공유 메모리 번역 모델을 강제 언로드할 수 없습니다."
+                    ) from error
+                try:
+                    if not 200 <= response.status_code < 300:
+                        raise ExternalServiceError(
+                            "공유 메모리 번역 모델을 강제 언로드할 수 없습니다."
+                        )
+                finally:
+                    response.close()
+                unloaded.append(model)
+            if self._ollama_models(origin, server):
+                raise ExternalServiceError(
+                    "공유 메모리 번역 모델이 언로드되지 않아 전사를 차단했습니다."
+                )
+        return unloaded
+
+    def engage_stt_hard_breaker(self) -> dict[str, Any]:
+        """Drain translation calls and unload Ollama before local STT starts."""
+        if not self.defaults.stt_hard_breaker_hosts:
+            return {"enabled": False, "unloaded_models": []}
+        blocked_keys = self._hard_blocked_server_keys()
+        deadline = (
+            time.monotonic()
+            + self.defaults.stt_hard_breaker_timeout_seconds
+        )
+        with self._condition:
+            self._hard_breaker_holders += 1
+            while any(self._active_requests.get(key, 0) for key in blocked_keys):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self._hard_breaker_holders -= 1
+                    self._condition.notify_all()
+                    raise ExternalServiceError(
+                        "공유 메모리 번역 요청이 끝나지 않아 전사를 차단했습니다."
+                    )
+                self._condition.wait(timeout=min(1.0, remaining))
+        try:
+            unloaded = self._unload_ollama_models()
+        except BaseException:
+            self.release_stt_hard_breaker()
+            raise
+        return {
+            "enabled": True,
+            "hosts": list(self.defaults.stt_hard_breaker_hosts),
+            "unloaded_models": unloaded,
+        }
+
+    def release_stt_hard_breaker(self) -> None:
+        with self._condition:
+            if self._hard_breaker_holders > 0:
+                self._hard_breaker_holders -= 1
+            self._condition.notify_all()
 
     def _public_server(
         self,
@@ -187,7 +361,15 @@ class BackendTranslationRouting:
         with self._lock:
             current = dict(self._health.get(key, {}))
             running = self._active_requests.get(key, 0)
-        if not server.base_url:
+        hard_blocked = (
+            bool(server.base_url)
+            and self._uses_shared_stt_memory(server)
+            and self.hard_breaker_active()
+        )
+        if hard_blocked:
+            status = "suspended"
+            current["message"] = HARD_BREAKER_MESSAGE
+        elif not server.base_url:
             status = "unconfigured"
         else:
             status = str(current.get("status", "unknown"))
@@ -207,7 +389,9 @@ class BackendTranslationRouting:
             "message": current.get("message"),
             "checked_at": server.checked_at,
             "running_jobs": running,
-            "available_slots": max(0, server.capacity - running),
+            "available_slots": (
+                0 if hard_blocked else max(0, server.capacity - running)
+            ),
         }
 
     def group(self, stage: str) -> dict[str, Any]:
@@ -368,11 +552,15 @@ class BackendTranslationRouting:
             raise ValueError("번역 서버를 찾을 수 없습니다.")
         return self._public_server(resolved, self._probe(resolved, server))
 
-    def _candidates(self, stage: str, mode: str) -> list[TranslationServer]:
+    def _configured_candidates(
+        self,
+        stage: str,
+        mode: str,
+    ) -> list[TranslationServer]:
         resolved = translation_stage(stage)
         if mode not in {"live", "batch"}:
             raise ValueError("번역 실행 모드는 live 또는 batch여야 합니다.")
-        candidates = [
+        return [
             server
             for server in self.stores[resolved].list()
             if server.enabled
@@ -383,6 +571,18 @@ class BackendTranslationRouting:
                 or server.selected_model in server.models
             )
             and (mode != "batch" or server.batch_preferred)
+        ]
+
+    def _candidates(self, stage: str, mode: str) -> list[TranslationServer]:
+        resolved = translation_stage(stage)
+        hard_breaker_active = self.hard_breaker_active()
+        candidates = [
+            server
+            for server in self._configured_candidates(resolved, mode)
+            if not (
+                hard_breaker_active
+                and self._uses_shared_stt_memory(server)
+            )
         ]
         with self._lock:
             running = dict(self._active_requests)
@@ -402,7 +602,29 @@ class BackendTranslationRouting:
         return candidates
 
     def is_configured(self, stage: str = "draft", mode: str = "live") -> bool:
+        return bool(self._configured_candidates(stage, mode))
+
+    def has_routable_server(
+        self,
+        stage: str = "draft",
+        mode: str = "live",
+    ) -> bool:
         return bool(self._candidates(stage, mode))
+
+    def route_suspended_by_stt(
+        self,
+        stage: str = "draft",
+        mode: str = "live",
+    ) -> bool:
+        configured = self._configured_candidates(stage, mode)
+        return bool(
+            configured
+            and self.hard_breaker_active()
+            and all(
+                self._uses_shared_stt_memory(server)
+                for server in configured
+            )
+        )
 
     def worker_limit(self, mode: str) -> int:
         """Return the usable draft concurrency for one translation job."""
@@ -421,7 +643,11 @@ class BackendTranslationRouting:
 
     def endpoint_contract(self, mode: str) -> str:
         server_ids = [
-            f"{stage}:{','.join(server.id for server in self._candidates(stage, mode))}"
+            f"{stage}:"
+            + ",".join(
+                server.id
+                for server in self._configured_candidates(stage, mode)
+            )
             for stage in TRANSLATION_STAGES
         ]
         return f"backend-direct:{mode}:" + ";".join(server_ids)
@@ -446,6 +672,12 @@ class BackendTranslationRouting:
         resolved = translation_stage(stage)
         candidates = self._candidates(resolved, mode)
         if not candidates:
+            configured = self._configured_candidates(resolved, mode)
+            if configured and any(
+                self._uses_shared_stt_memory(server)
+                for server in configured
+            ) and self.hard_breaker_active():
+                raise TranslationDeferred(HARD_BREAKER_MESSAGE)
             raise ExternalServiceError(
                 f"{TRANSLATION_STAGE_LABELS[resolved]} 서버가 설정되지 않았습니다."
             )
@@ -453,7 +685,12 @@ class BackendTranslationRouting:
         attempted = False
         for server in candidates:
             key = (resolved, server.id)
-            with self._lock:
+            with self._condition:
+                if (
+                    self._hard_breaker_holders > 0
+                    and self._uses_shared_stt_memory(server)
+                ):
+                    continue
                 running = self._active_requests.get(key, 0)
                 if running >= server.capacity:
                     continue
@@ -497,11 +734,12 @@ class BackendTranslationRouting:
                 )
                 continue
             finally:
-                with self._lock:
+                with self._condition:
                     self._active_requests[key] = max(
                         0,
                         self._active_requests.get(key, 1) - 1,
                     )
+                    self._condition.notify_all()
             if 200 <= response.status_code < 300:
                 with self._lock:
                     self._health[key] = {"status": "ready", "message": None}
@@ -514,5 +752,11 @@ class BackendTranslationRouting:
         if last_response is not None:
             return last_response
         if not attempted:
+            configured = self._configured_candidates(resolved, mode)
+            if configured and all(
+                self._uses_shared_stt_memory(server)
+                for server in configured
+            ) and self.hard_breaker_active():
+                raise TranslationDeferred(HARD_BREAKER_MESSAGE)
             raise ExternalServiceError("모든 번역 서버의 동시 요청 수가 가득 찼습니다.")
         raise ExternalServiceError("번역 서버에 연결할 수 없습니다.")

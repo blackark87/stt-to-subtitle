@@ -67,6 +67,10 @@ class TranslationPaused(RuntimeError):
     """Translation stopped cleanly after a persisted logical batch."""
 
 
+class TranslationDeferred(RuntimeError):
+    """Translation yielded because a shared accelerator is reserved for STT."""
+
+
 class OperationStopped(RuntimeError):
     """A local pipeline stage reached a safe user-requested stop point."""
 

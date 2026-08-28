@@ -22,6 +22,7 @@ from stt_to_subtitle.files import sha256_file
 from stt_to_subtitle.service_clients import (
     ExternalServiceError,
     RemoteTranscriptionFailed,
+    TranslationDeferred,
     TranslationPaused,
 )
 
@@ -217,6 +218,141 @@ class SubtitleOrchestratorTests(unittest.TestCase):
             self.assertEqual(orchestrator.translation_circuit_state, "ready")
             self.assertEqual(persisted_circuit["state"], "ready")
             orchestrator._translation_executor.submit.assert_called_once()
+
+    def test_shared_host_translation_waits_while_builtin_stt_runs(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            orchestrator = SubtitleOrchestrator(
+                BackendSettings(
+                    state_dir=root / "state",
+                    media_root=media_root,
+                    stt_base_url="http://stt.test",
+                    stt_token="",
+                    translation_builtin_base_url=(
+                        "http://shared-accelerator.test/v1"
+                    ),
+                    translation_stt_hard_breaker_hosts=(
+                        "shared-accelerator.test",
+                    ),
+                )
+            )
+            configure_translation_models(orchestrator)
+            try:
+                translating = orchestrator.store.create(
+                    job_id="translation-waiting-for-stt",
+                    source_rel="translation.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                orchestrator.store.update(
+                    translating.id,
+                    status="transcribed",
+                )
+                transcribing = orchestrator.store.create(
+                    job_id="builtin-stt-running",
+                    source_rel="transcription.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                orchestrator.store.update(
+                    transcribing.id,
+                    status="transcription_running",
+                    stt_runtime_id="builtin",
+                )
+                orchestrator._translation_executor.submit = Mock()
+
+                dispatched = orchestrator._dispatch_translations()
+                server = orchestrator.translation_groups_view()[0][
+                    "servers"
+                ][0]
+            finally:
+                orchestrator.stop()
+
+            self.assertEqual(dispatched, 0)
+            self.assertEqual(server["status"], "suspended")
+            orchestrator._translation_executor.submit.assert_not_called()
+
+    def test_builtin_stt_stage_holds_hard_breaker_around_operation(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            orchestrator = SubtitleOrchestrator(
+                BackendSettings(
+                    state_dir=root / "state",
+                    media_root=media_root,
+                    stt_base_url="http://stt.test",
+                    stt_token="",
+                    translation_builtin_base_url="http://shared.test/v1",
+                    translation_stt_hard_breaker_hosts=("shared.test",),
+                )
+            )
+            configure_translation_models(orchestrator)
+            calls: list[str] = []
+            try:
+                job = orchestrator.store.create(
+                    job_id="guarded-transcription",
+                    source_rel="transcription.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                orchestrator.store.update(
+                    job.id,
+                    status="transcription_running",
+                    stt_runtime_id="builtin",
+                )
+                orchestrator._translation_routing.engage_stt_hard_breaker = Mock(
+                    side_effect=lambda: (
+                        calls.append("engage")
+                        or {"enabled": True, "unloaded_models": []}
+                    )
+                )
+                orchestrator._translation_routing.release_stt_hard_breaker = Mock(
+                    side_effect=lambda: calls.append("release")
+                )
+
+                orchestrator._run_stage(
+                    job.id,
+                    "transcription",
+                    lambda _job: calls.append("transcribe"),
+                )
+            finally:
+                orchestrator.stop()
+
+            self.assertEqual(calls, ["engage", "transcribe", "release"])
+
+    def test_translation_hard_breaker_defer_keeps_circuit_ready(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            orchestrator = self.make_orchestrator(root, media_root)
+            try:
+                job = orchestrator.store.create(
+                    job_id="deferred-translation",
+                    source_rel="translation.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                orchestrator.store.update(
+                    job.id,
+                    status="translation_running",
+                )
+
+                orchestrator._run_stage(
+                    job.id,
+                    "translation",
+                    Mock(side_effect=TranslationDeferred("STT is running")),
+                )
+                deferred = orchestrator.store.get(job.id)
+            finally:
+                orchestrator.stop()
+
+            self.assertEqual(deferred.status, "transcribed")
+            self.assertEqual(deferred.state, "waiting")
+            self.assertEqual(orchestrator.translation_circuit_state, "ready")
 
     def test_translation_failure_circuit_reopens_on_job_retry(self) -> None:
         with TemporaryDirectory() as directory:

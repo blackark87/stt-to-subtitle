@@ -803,6 +803,44 @@ class BackendSettingsTests(unittest.TestCase):
         )
         self.assertEqual(settings.jobs_dir, Path("/var/lib/stt/jobs"))
 
+    def test_reads_shared_accelerator_hard_breaker_hosts(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "TRANSLATION_STT_HARD_BREAKER_HOSTS": (
+                    "192.0.2.10, LLM.internal.,192.0.2.10"
+                ),
+                "TRANSLATION_STT_HARD_BREAKER_TIMEOUT_SECONDS": "45",
+            },
+            clear=True,
+        ):
+            settings = BackendSettings.from_env()
+
+        settings.validate()
+        self.assertEqual(
+            settings.translation_stt_hard_breaker_hosts,
+            ("192.0.2.10", "llm.internal"),
+        )
+        self.assertEqual(
+            settings.translation_stt_hard_breaker_timeout_seconds,
+            45.0,
+        )
+
+    def test_rejects_hard_breaker_urls_in_host_list(self) -> None:
+        settings = BackendSettings(
+            state_dir=Path("/state"),
+            media_root=Path("/media"),
+            stt_base_url="",
+            stt_token="",
+            translation_stt_hard_breaker_hosts=("http://llm.test",),
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "TRANSLATION_STT_HARD_BREAKER_HOSTS",
+        ):
+            settings.validate()
+
     def test_ignores_legacy_combined_translation_settings(self) -> None:
         with patch.dict(
             os.environ,

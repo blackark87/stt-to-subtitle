@@ -73,6 +73,7 @@ from .service_clients import (
     RemoteTranscriptionFailed,
     STTAPIClient,
     SubtitleValidationClient,
+    TranslationDeferred,
     TranslationPaused,
 )
 from .subtitle import write_styled_subtitles_atomic
@@ -350,7 +351,16 @@ class SubtitleOrchestrator:
                     settings.translation_connect_timeout_seconds
                 ),
                 read_timeout_seconds=settings.translation_read_timeout_seconds,
-            )
+                stt_hard_breaker_hosts=(
+                    settings.translation_stt_hard_breaker_hosts
+                ),
+                stt_hard_breaker_timeout_seconds=(
+                    settings.translation_stt_hard_breaker_timeout_seconds
+                ),
+            ),
+            stt_hard_breaker_active=(
+                self._builtin_transcription_uses_shared_memory
+            ),
         )
         self._remote_runtime: tuple[
             STTAPIClient | None,
@@ -465,6 +475,16 @@ class SubtitleOrchestrator:
     @property
     def translation_server_configured(self) -> bool:
         return self._translation_routing.is_configured()
+
+    def _builtin_transcription_uses_shared_memory(self) -> bool:
+        if not self.settings.translation_stt_hard_breaker_hosts:
+            return False
+        try:
+            counts = self.store.transcription_runtime_counts()
+        except (OSError, RuntimeError, sqlite3.Error):
+            LOGGER.exception("failed to read built-in transcription count")
+            return True
+        return counts.get(BUILTIN_RUNTIME_ID, 0) > 0
 
     def remote_servers_view(self) -> dict[str, Any]:
         servers = self.remote_servers
@@ -3663,6 +3683,18 @@ class SubtitleOrchestrator:
             return 0
         if self.store.ids_with_status("translation_running"):
             return 0
+
+        def has_route(job: PipelineJob) -> bool:
+            mode = str(
+                job.options.get(TRANSLATION_EXECUTION_MODE_OPTION, "live")
+            ).strip()
+            if mode not in {"live", "batch"}:
+                mode = "live"
+            return not self._translation_routing.route_suspended_by_stt(
+                "draft",
+                mode,
+            )
+
         return int(
             self._dispatch_one(
                 "transcribed",
@@ -3670,6 +3702,7 @@ class SubtitleOrchestrator:
                 "translation",
                 self._translation_executor,
                 self._translate,
+                job_filter=has_route,
             )
         )
 
@@ -3682,9 +3715,15 @@ class SubtitleOrchestrator:
         operation: Callable[[PipelineJob], None],
         *,
         stt_runtime_id: str | None = None,
+        job_filter: Callable[[PipelineJob], bool] | None = None,
     ) -> bool:
         waiting_ids = self.store.dispatchable_ids_with_status(waiting)
         for job_id in waiting_ids:
+            waiting_job = self.store.get(job_id)
+            if waiting_job is None or (
+                job_filter is not None and not job_filter(waiting_job)
+            ):
+                continue
             lease_token = self.store.claim_for_dispatch(
                 job_id,
                 waiting,
@@ -3780,8 +3819,31 @@ class SubtitleOrchestrator:
                 daemon=True,
             )
             lease_heartbeat.start()
+        hard_breaker_engaged = False
         try:
             self._raise_if_job_stop_requested(job_id)
+            if (
+                stage == "transcription"
+                and (job.stt_runtime_id or BUILTIN_RUNTIME_ID)
+                == BUILTIN_RUNTIME_ID
+            ):
+                breaker = (
+                    self._translation_routing.engage_stt_hard_breaker()
+                )
+                hard_breaker_engaged = bool(breaker["enabled"])
+                if hard_breaker_engaged:
+                    self.store.add_event(
+                        job_id,
+                        "info",
+                        "shared-accelerator translation hard breaker engaged",
+                        event_code="transcription.hard_breaker.engaged",
+                        phase="transcription",
+                        payload={
+                            "unloaded_models": len(
+                                breaker["unloaded_models"]
+                            ),
+                        },
+                    )
             operation(job)
             self._raise_if_job_stop_requested(job_id)
         except WorkerLeaseLost:
@@ -3879,6 +3941,29 @@ class SubtitleOrchestrator:
                 stage,
                 outcome,
                 message,
+            )
+        except TranslationDeferred as error:
+            message = self._sanitize_error(str(error))
+            if not self._update_stage_job(
+                job,
+                status="transcribed",
+                blocked_stage=None,
+                reason_code=None,
+                error=None,
+            ):
+                self._record_lease_fencing_rejection(
+                    stage,
+                    "hard_breaker_defer",
+                )
+                return
+            self.store.add_event(
+                job_id,
+                "info",
+                f"translation deferred: {message}",
+                event_code="translation.hard_breaker.deferred",
+                from_state=JobState.RUNNING.value,
+                to_state=JobState.WAITING.value,
+                phase="translation",
             )
         except ExternalServiceError as error:
             message = self._sanitize_error(str(error))
@@ -3981,6 +4066,21 @@ class SubtitleOrchestrator:
             )
             LOGGER.exception("job %s %s failed", job_id, stage)
         finally:
+            if hard_breaker_engaged:
+                self._translation_routing.release_stt_hard_breaker()
+                try:
+                    self.store.add_event(
+                        job_id,
+                        "info",
+                        "shared-accelerator translation hard breaker released",
+                        event_code="transcription.hard_breaker.released",
+                        phase="transcription",
+                    )
+                except (OSError, RuntimeError, sqlite3.Error, ValueError):
+                    LOGGER.exception(
+                        "hard breaker release event write failed for %s",
+                        job_id,
+                    )
             if lease_stop is not None:
                 lease_stop.set()
             if lease_heartbeat is not None:
@@ -5198,6 +5298,15 @@ class SubtitleOrchestrator:
             )
             self._raise_if_job_stop_requested(job.id)
             translation_outcome = "completed"
+        except TranslationDeferred as error:
+            translation_outcome = "deferred"
+            self.store.mark_translation_generation(
+                generation["id"],
+                state="partial",
+                error=None,
+                generation_attempt=generation_attempt,
+            )
+            raise
         except TranslationPaused as error:
             translation_outcome = "paused"
             self.store.mark_translation_generation(

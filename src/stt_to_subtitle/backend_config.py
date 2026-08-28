@@ -244,6 +244,15 @@ def _enabled_env(name: str, default: str) -> bool:
     }
 
 
+def _host_list_env(name: str) -> tuple[str, ...]:
+    hosts: list[str] = []
+    for item in os.environ.get(name, "").split(","):
+        host = item.strip().casefold().rstrip(".")
+        if host and host not in hosts:
+            hosts.append(host)
+    return tuple(hosts)
+
+
 @dataclass(frozen=True)
 class RemoteServerSettings:
     stt_base_url: str
@@ -354,6 +363,8 @@ class BackendSettings:
     translation_builtin_review_batch_preferred: bool = False
     translation_connect_timeout_seconds: float = 10.0
     translation_read_timeout_seconds: float = 600.0
+    translation_stt_hard_breaker_hosts: tuple[str, ...] = ()
+    translation_stt_hard_breaker_timeout_seconds: float = 600.0
 
     @classmethod
     def from_env(cls) -> BackendSettings:
@@ -439,6 +450,15 @@ class BackendSettings:
             translation_read_timeout_seconds=float(
                 os.environ.get("TRANSLATION_READ_TIMEOUT_SECONDS", "600")
             ),
+            translation_stt_hard_breaker_hosts=_host_list_env(
+                "TRANSLATION_STT_HARD_BREAKER_HOSTS"
+            ),
+            translation_stt_hard_breaker_timeout_seconds=float(
+                os.environ.get(
+                    "TRANSLATION_STT_HARD_BREAKER_TIMEOUT_SECONDS",
+                    "600",
+                )
+            ),
         )
 
     @property
@@ -482,6 +502,20 @@ class BackendSettings:
             or self.translation_read_timeout_seconds <= 0
         ):
             raise ValueError("translation timeouts must be positive")
+        if self.translation_stt_hard_breaker_timeout_seconds <= 0:
+            raise ValueError(
+                "TRANSLATION_STT_HARD_BREAKER_TIMEOUT_SECONDS must be positive"
+            )
+        for host in self.translation_stt_hard_breaker_hosts:
+            if (
+                not host
+                or "://" in host
+                or any(character in host for character in "/?#@")
+            ):
+                raise ValueError(
+                    "TRANSLATION_STT_HARD_BREAKER_HOSTS must contain "
+                    "comma-separated host names or IP addresses"
+                )
 
     def remote_servers(self) -> RemoteServerSettings:
         return RemoteServerSettings(

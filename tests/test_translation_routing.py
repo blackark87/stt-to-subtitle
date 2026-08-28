@@ -1,11 +1,18 @@
+from collections.abc import Callable
 import json
 from pathlib import Path
 import sqlite3
 from tempfile import TemporaryDirectory
+import threading
+import time
 import unittest
 from unittest.mock import Mock, patch
 
-from stt_to_subtitle.service_clients import ExternalServiceError, RetryingJSONClient
+from stt_to_subtitle.service_clients import (
+    ExternalServiceError,
+    RetryingJSONClient,
+    TranslationDeferred,
+)
 from stt_to_subtitle.translation_routing import (
     BackendTranslationRouting,
     TranslationRoutingDefaults,
@@ -262,6 +269,7 @@ class BackendTranslationRoutingTests(unittest.TestCase):
         root: Path,
         *,
         stores: dict[str, TranslationServerGroupStore] | None = None,
+        stt_hard_breaker_active: Callable[[], bool] | None = None,
         **changes: object,
     ) -> BackendTranslationRouting:
         values = {
@@ -276,6 +284,7 @@ class BackendTranslationRoutingTests(unittest.TestCase):
         routing = BackendTranslationRouting(
             TranslationRoutingDefaults(**values),
             stores=stores,
+            stt_hard_breaker_active=stt_hard_breaker_active,
         )
         routing.stores["draft"].save_models("builtin", [DRAFT_MODEL])
         routing.stores["review"].save_models("builtin", [REVIEW_MODEL])
@@ -509,6 +518,167 @@ class BackendTranslationRoutingTests(unittest.TestCase):
                 request.call_args_list[1].kwargs["json"]["model"],
                 "fallback-model",
             )
+
+    def test_hard_breaker_routes_away_from_shared_stt_host(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            stores = self.stores(root)
+            fallback = stores["draft"].create(
+                name="separate accelerator",
+                base_url="http://fallback.test/v1",
+                token="",
+                enabled=True,
+                capacity=1,
+                selected_model="fallback-model",
+                models=("fallback-model",),
+            )
+            routing = self.routing(
+                root,
+                stores=stores,
+                stt_hard_breaker_hosts=("builtin.test",),
+                stt_hard_breaker_active=lambda: True,
+            )
+            with patch.object(
+                RetryingJSONClient,
+                "request",
+                return_value=completion_response(),
+            ) as request:
+                response = routing.request_completion(
+                    "draft",
+                    "live",
+                    {"messages": []},
+                )
+
+            builtin = routing.group("draft")["servers"][0]
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(builtin["status"], "suspended")
+            self.assertEqual(builtin["available_slots"], 0)
+            self.assertIn("전사 모델", builtin["message"])
+            self.assertEqual(
+                request.call_args.args[1],
+                f"{fallback.base_url}/chat/completions",
+            )
+
+    def test_hard_breaker_defers_when_every_route_shares_stt_memory(self) -> None:
+        with TemporaryDirectory() as directory:
+            routing = self.routing(
+                Path(directory),
+                stt_hard_breaker_hosts=("builtin.test",),
+                stt_hard_breaker_active=lambda: True,
+            )
+
+            self.assertTrue(routing.is_configured())
+            self.assertFalse(routing.has_routable_server())
+            with self.assertRaisesRegex(TranslationDeferred, "일시 중지"):
+                routing.request_completion("draft", "live", {"messages": []})
+
+    def test_engaging_hard_breaker_unloads_and_verifies_ollama_models(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            routing = self.routing(
+                Path(directory),
+                stt_hard_breaker_hosts=("builtin.test",),
+            )
+            loaded = Mock(status_code=200)
+            loaded.json.return_value = {"models": [{"name": DRAFT_MODEL}]}
+            empty = Mock(status_code=200)
+            empty.json.return_value = {"models": []}
+            unloaded = Mock(status_code=200)
+            with patch(
+                "stt_to_subtitle.translation_routing.requests.get",
+                side_effect=[loaded, empty],
+            ) as get, patch(
+                "stt_to_subtitle.translation_routing.requests.post",
+                return_value=unloaded,
+            ) as post:
+                result = routing.engage_stt_hard_breaker()
+                suspended = routing.group("draft")["servers"][0]
+                routing.release_stt_hard_breaker()
+
+            self.assertTrue(result["enabled"])
+            self.assertEqual(result["unloaded_models"], [DRAFT_MODEL])
+            self.assertEqual(suspended["status"], "suspended")
+            self.assertEqual(get.call_count, 2)
+            post.assert_called_once_with(
+                "http://builtin.test/api/generate",
+                headers={
+                    "Accept": "application/json",
+                    "Authorization": "Bearer builtin-secret",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": DRAFT_MODEL,
+                    "prompt": "",
+                    "stream": False,
+                    "keep_alive": 0,
+                },
+                timeout=(10.0, 30.0),
+            )
+
+    def test_hard_breaker_drains_active_request_before_unloading(self) -> None:
+        with TemporaryDirectory() as directory:
+            routing = self.routing(
+                Path(directory),
+                stt_hard_breaker_hosts=("builtin.test",),
+            )
+            key = ("draft", "builtin")
+            with routing._condition:
+                routing._active_requests[key] = 1
+            finished = threading.Event()
+            failures: list[BaseException] = []
+
+            def engage() -> None:
+                try:
+                    routing.engage_stt_hard_breaker()
+                except BaseException as error:
+                    failures.append(error)
+                finally:
+                    finished.set()
+
+            with patch.object(
+                routing,
+                "_unload_ollama_models",
+                return_value=[],
+            ) as unload:
+                thread = threading.Thread(target=engage)
+                thread.start()
+                deadline = time.monotonic() + 1.0
+                while not routing.hard_breaker_active():
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(0.01)
+                self.assertFalse(finished.is_set())
+                unload.assert_not_called()
+                with routing._condition:
+                    routing._active_requests[key] = 0
+                    routing._condition.notify_all()
+                thread.join(timeout=1.0)
+
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(failures, [])
+            unload.assert_called_once_with()
+            routing.release_stt_hard_breaker()
+
+    def test_hard_breaker_fails_closed_when_ollama_cannot_be_verified(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            routing = self.routing(
+                Path(directory),
+                stt_hard_breaker_hosts=("builtin.test",),
+            )
+            unavailable = Mock(status_code=503)
+
+            with patch(
+                "stt_to_subtitle.translation_routing.requests.get",
+                return_value=unavailable,
+            ), self.assertRaisesRegex(
+                ExternalServiceError,
+                "확인할 수 없습니다",
+            ):
+                routing.engage_stt_hard_breaker()
+
+            self.assertFalse(routing.hard_breaker_active())
 
 
 if __name__ == "__main__":
