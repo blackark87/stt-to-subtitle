@@ -29,7 +29,7 @@ export function clock(value: string | number | null | undefined): string {
       hourCycle: "h23",
     }).formatToParts(parsed).map((part) => [part.type, part.value]),
   );
-  return `${parts.year}${parts.month}${parts.day} ${parts.hour}:${parts.minute}:${parts.second}`;
+  return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second}`;
 }
 
 export function relativeFromNow(value: Date | null): string {

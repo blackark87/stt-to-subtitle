@@ -509,8 +509,8 @@ def create_translation_app(
         except ValueError as error:
             return _error_response(str(error), 404)
         current = group_stores[resolved].get(server_id)
-        if current is None or current.builtin:
-            return _error_response("추가 번역 서버를 찾을 수 없습니다.", 404)
+        if current is None:
+            return _error_response("번역 서버를 찾을 수 없습니다.", 404)
         token = "" if payload.clear_token else (
             payload.token if payload.token is not None else current.token
         )

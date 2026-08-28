@@ -158,23 +158,7 @@ class TranslationServerGroupStore:
                     id, name, base_url, token, enabled, capacity, builtin,
                     batch_preferred, created_at, updated_at
                 ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    name = excluded.name,
-                    models_json = CASE
-                        WHEN translation_servers.base_url != excluded.base_url
-                        THEN '[]'
-                        ELSE translation_servers.models_json
-                    END,
-                    checked_at = CASE
-                        WHEN translation_servers.base_url != excluded.base_url
-                        THEN NULL
-                        ELSE translation_servers.checked_at
-                    END,
-                    base_url = excluded.base_url,
-                    token = excluded.token,
-                    capacity = excluded.capacity,
-                    builtin = 1,
-                    updated_at = excluded.updated_at
+                ON CONFLICT(id) DO NOTHING
                 """,
                 (
                     BUILTIN_TRANSLATION_SERVER_ID,
@@ -273,7 +257,7 @@ class TranslationServerGroupStore:
                     models_json = CASE WHEN base_url != ? THEN '[]' ELSE models_json END,
                     checked_at = CASE WHEN base_url != ? THEN NULL ELSE checked_at END,
                     base_url = ?, token = ?, enabled = ?, capacity = ?, updated_at = ?
-                WHERE id = ? AND builtin = 0
+                WHERE id = ?
                 """,
                 (
                     name,
@@ -288,7 +272,7 @@ class TranslationServerGroupStore:
                 ),
             )
         if cursor.rowcount != 1:
-            raise ValueError("추가 번역 서버를 찾을 수 없습니다.")
+            raise ValueError("번역 서버를 찾을 수 없습니다.")
         server = self.get(server_id)
         if server is None:
             raise RuntimeError("translation server disappeared")

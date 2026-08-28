@@ -193,6 +193,58 @@ class TranslationRouterAPITests(unittest.TestCase):
                 [DEFAULT_DRAFT_MODEL, DEFAULT_REVIEW_MODEL],
             )
 
+    def test_builtin_address_is_editable_per_group_and_survives_restart(self) -> None:
+        with TemporaryDirectory() as directory, patch(
+            "stt_to_subtitle.translation_api.requests.get",
+            return_value=model_response("local-ollama-model"),
+        ):
+            root = Path(directory)
+            stores = self.stores(root)
+            app = create_translation_app(self.settings(root), stores=stores)
+            with TestClient(app) as client:
+                response = client.put(
+                    "/v1/router/groups/draft/servers/builtin",
+                    headers={"Authorization": "Bearer router-secret"},
+                    json={
+                        "name": "로컬 Ollama",
+                        "base_url": "http://127.0.0.1:11434/v1",
+                        "enabled": True,
+                        "capacity": 2,
+                    },
+                )
+
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(
+                response.json()["base_url"],
+                "http://127.0.0.1:11434/v1",
+            )
+            self.assertEqual(response.json()["models"], ["local-ollama-model"])
+            self.assertEqual(
+                stores["review"].get("builtin").base_url,
+                "http://builtin.test/v1",
+            )
+
+            restarted = create_translation_app(
+                self.settings(
+                    root,
+                    builtin_name="다른 배포 기본값",
+                    builtin_base_url="http://replacement.test/v1",
+                ),
+                stores=stores,
+            )
+            with TestClient(restarted) as client:
+                persisted = client.get(
+                    "/v1/router/groups/draft",
+                    headers={"Authorization": "Bearer router-secret"},
+                )
+
+            builtin = persisted.json()["servers"][0]
+            self.assertEqual(builtin["name"], "로컬 Ollama")
+            self.assertEqual(
+                builtin["base_url"],
+                "http://127.0.0.1:11434/v1",
+            )
+
     def test_routes_each_stage_through_its_own_server_group(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
