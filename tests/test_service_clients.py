@@ -707,7 +707,7 @@ class TranslationResponseTests(unittest.TestCase):
         )
         calls: list[tuple[list[str], list[str]]] = []
 
-        def translate_batch(batch, context, _prompt):
+        def translate_batch(batch, context, _prompt, _all_segments):
             calls.append(
                 (
                     [str(item["id"]) for item in batch],
@@ -1233,6 +1233,65 @@ class TranslationResponseTests(unittest.TestCase):
             ["segment-1", "segment-2", "segment-3"],
         )
 
+    def test_recovery_keeps_reference_context_bounded(self) -> None:
+        client = LMStudioClient("http://lm.test/v1", "", "model")
+        all_segments = [
+            {"id": f"segment-{index:03d}", "text": str(index)}
+            for index in range(60)
+        ]
+        calls: list[tuple[list[str], list[str]]] = []
+
+        def translate_batch(segments, reference_context, *_args):
+            calls.append(
+                (
+                    [str(item["id"]) for item in segments],
+                    [str(item["id"]) for item in reference_context],
+                )
+            )
+            if len(segments) > 1:
+                raise TranslationResponseIDError("mismatch")
+            return [
+                {
+                    "id": str(segments[0]["id"]),
+                    "text": f"번역-{segments[0]['id']}",
+                }
+            ]
+
+        client._translate_batch = Mock(side_effect=translate_batch)
+        targets = all_segments[15:45]
+
+        result = client._translate_batch_with_recovery(
+            targets,
+            client._reference_context(
+                all_segments,
+                targets,
+                before=5,
+                after=3,
+            ),
+            all_segments=all_segments,
+        )
+
+        self.assertEqual(len(result), len(targets))
+        self.assertTrue(all(len(context) <= 8 for _targets, context in calls))
+        single_context = next(
+            context
+            for call_targets, context in calls
+            if call_targets == ["segment-030"]
+        )
+        self.assertEqual(
+            single_context,
+            [
+                "segment-025",
+                "segment-026",
+                "segment-027",
+                "segment-028",
+                "segment-029",
+                "segment-031",
+                "segment-032",
+                "segment-033",
+            ],
+        )
+
     def test_classifies_an_output_limited_response_for_recovery(self) -> None:
         client = OpenAICompatibleClient(
             "http://translation.test/v1",
@@ -1369,6 +1428,10 @@ class TranslationResponseTests(unittest.TestCase):
         self.assertEqual(
             user_payload["draft_translations"],
             [{"id": "segment-1", "text": "초벌"}],
+        )
+        self.assertEqual(
+            user_payload["reference_context"],
+            [{"text": "文脈"}],
         )
 
     def test_translation_payload_excludes_transcription_metadata(self) -> None:

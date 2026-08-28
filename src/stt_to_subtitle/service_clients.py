@@ -1434,6 +1434,7 @@ class OpenAICompatibleClient(RetryingJSONClient):
             batch,
             reference_context,
             system_prompt,
+            all_segments,
         )
         translated = draft
         if review_rounds:
@@ -1443,6 +1444,7 @@ class OpenAICompatibleClient(RetryingJSONClient):
                     reference_context,
                     translated,
                     review_prompt,
+                    all_segments,
                 )
                 if reviewed == translated:
                     break
@@ -1478,6 +1480,7 @@ class OpenAICompatibleClient(RetryingJSONClient):
         segments: Sequence[Mapping[str, Any]],
         reference_context: Sequence[Mapping[str, Any]] = (),
         system_prompt: str = KOREAN_JAV_DRAFT_PROMPT,
+        all_segments: Sequence[Mapping[str, Any]] | None = None,
     ) -> list[dict[str, str]]:
         try:
             return self._translate_batch(
@@ -1495,16 +1498,36 @@ class OpenAICompatibleClient(RetryingJSONClient):
                 midpoint,
                 len(segments) - midpoint,
             )
+            left = segments[:midpoint]
+            right = segments[midpoint:]
+            if all_segments is None:
+                left_context = [*reference_context, *right]
+                right_context = [*reference_context, *left]
+            else:
+                left_context = self._reference_context(
+                    all_segments,
+                    left,
+                    before=5,
+                    after=3,
+                )
+                right_context = self._reference_context(
+                    all_segments,
+                    right,
+                    before=5,
+                    after=3,
+                )
             return [
                 *self._translate_batch_with_recovery(
-                    segments[:midpoint],
-                    [*reference_context, *segments[midpoint:]],
+                    left,
+                    left_context,
                     system_prompt,
+                    all_segments,
                 ),
                 *self._translate_batch_with_recovery(
-                    segments[midpoint:],
-                    [*reference_context, *segments[:midpoint]],
+                    right,
+                    right_context,
                     system_prompt,
+                    all_segments,
                 ),
             ]
 
@@ -1514,6 +1537,7 @@ class OpenAICompatibleClient(RetryingJSONClient):
         reference_context: Sequence[Mapping[str, Any]],
         drafts: Sequence[Mapping[str, str]],
         review_prompt: str,
+        all_segments: Sequence[Mapping[str, Any]] | None = None,
     ) -> list[dict[str, str]]:
         try:
             return self._review_batch(
@@ -1529,18 +1553,36 @@ class OpenAICompatibleClient(RetryingJSONClient):
             draft_by_id = {str(item["id"]): item for item in drafts}
             left = segments[:midpoint]
             right = segments[midpoint:]
+            if all_segments is None:
+                left_context = [*reference_context, *right]
+                right_context = [*reference_context, *left]
+            else:
+                left_context = self._reference_context(
+                    all_segments,
+                    left,
+                    before=5,
+                    after=3,
+                )
+                right_context = self._reference_context(
+                    all_segments,
+                    right,
+                    before=5,
+                    after=3,
+                )
             return [
                 *self._review_batch_with_recovery(
                     left,
-                    [*reference_context, *right],
+                    left_context,
                     [draft_by_id[str(segment["id"])] for segment in left],
                     review_prompt,
+                    all_segments,
                 ),
                 *self._review_batch_with_recovery(
                     right,
-                    [*reference_context, *left],
+                    right_context,
                     [draft_by_id[str(segment["id"])] for segment in right],
                     review_prompt,
+                    all_segments,
                 ),
             ]
 
@@ -1561,7 +1603,7 @@ class OpenAICompatibleClient(RetryingJSONClient):
                     for segment in segments
                 ],
                 "reference_context": [
-                    {"id": str(segment["id"]), "text": str(segment["text"])}
+                    {"text": str(segment["text"])}
                     for segment in reference_context
                 ],
             },
@@ -1585,7 +1627,7 @@ class OpenAICompatibleClient(RetryingJSONClient):
                     for segment in segments
                 ],
                 "reference_context": [
-                    {"id": str(segment["id"]), "text": str(segment["text"])}
+                    {"text": str(segment["text"])}
                     for segment in reference_context
                 ],
                 "draft_translations": [dict(item) for item in drafts],
