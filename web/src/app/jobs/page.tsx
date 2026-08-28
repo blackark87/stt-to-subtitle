@@ -48,7 +48,7 @@ const ROW_CLASS: Record<JobState, string> = {
   done: "on-ok",
 };
 
-const GRID = "36px 92px minmax(0, 1fr) 110px minmax(0, 220px) 132px";
+const GRID = "36px 156px minmax(240px, 1fr) 110px minmax(120px, 220px) 132px";
 
 export default function JobsPage() {
   const router = useRouter();
