@@ -289,7 +289,7 @@ a.brand, .primary-nav a, .t-name a { text-decoration: none; }
   }
   .sidebar .primary-nav { display: flex; gap: 4px; }
   .sidebar-foot { margin-top: 0; margin-left: auto; }
-  .topbar { height: auto; flex-wrap: wrap; padding: 10px 14px; }
+  .topbar { height: auto; flex-wrap: wrap; row-gap: 0; padding: 0 14px; }
   .content { padding: 14px; }
 
   /* 모든 표를 셀 단위로 쌓는다. 머리글은 숨기고 셀마다 라벨을 보여준다. */
@@ -675,7 +675,7 @@ progress::-moz-progress-bar { background: var(--accent-solid); border-radius: 99
   .sidebar .brand { flex: none; }
   .sidebar-foot { display: flex; }
   .theme-toggle { width: auto; }
-  .topbar { min-height: 64px; padding: 10px 14px; }
+  .topbar { min-height: 58px; padding: 0 14px; }
   .topbar-spacer { flex-basis: 0; }
   .content { padding: 14px; gap: 14px; }
   .card-head { align-items: flex-start; flex-wrap: wrap; }
