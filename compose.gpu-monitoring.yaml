@@ -3,7 +3,8 @@ services:
     environment:
       GPU_PROMETHEUS_URL: ${GPU_PROMETHEUS_URL:-http://prometheus:9090}
     networks:
-      - gpu-monitoring
+      gpu-monitoring:
+        ipv4_address: ${BACKEND_GPU_MONITORING_IPV4:-172.22.0.5}
 
 networks:
   gpu-monitoring:
