@@ -79,6 +79,25 @@ class OperationStopped(RuntimeError):
     """A local pipeline stage reached a safe user-requested stop point."""
 
 
+def _recoverable_translation_batch_error(error: ExternalServiceError) -> bool:
+    if isinstance(
+        error,
+        (TranslationResponseIDError, TranslationResponseFormatError),
+    ):
+        return True
+    message = str(error).casefold()
+    return any(
+        marker in message
+        for marker in (
+            "context size has been exceeded",
+            "context length exceeded",
+            "context_length_exceeded",
+            "maximum context length",
+            "context window exceeded",
+        )
+    )
+
+
 class RequestConcurrencyLimiter:
     """Share an adjustable concurrent-request limit across service clients."""
 
@@ -1524,12 +1543,15 @@ class OpenAICompatibleClient(RetryingJSONClient):
                 reference_context,
                 system_prompt,
             )
-        except (TranslationResponseIDError, TranslationResponseFormatError):
-            if len(segments) <= 1:
+        except ExternalServiceError as error:
+            if (
+                len(segments) <= 1
+                or not _recoverable_translation_batch_error(error)
+            ):
                 raise
             midpoint = len(segments) // 2
             LOGGER.warning(
-                "translation server returned a recoverable batch response; "
+                "translation batch exceeded a recoverable response limit; "
                 "retrying as %d and %d segment batches",
                 midpoint,
                 len(segments) - midpoint,
@@ -1582,10 +1604,19 @@ class OpenAICompatibleClient(RetryingJSONClient):
                 drafts,
                 review_prompt,
             )
-        except (TranslationResponseIDError, TranslationResponseFormatError):
-            if len(segments) <= 1:
+        except ExternalServiceError as error:
+            if (
+                len(segments) <= 1
+                or not _recoverable_translation_batch_error(error)
+            ):
                 raise
             midpoint = len(segments) // 2
+            LOGGER.warning(
+                "translation review batch exceeded a recoverable response "
+                "limit; retrying as %d and %d segment batches",
+                midpoint,
+                len(segments) - midpoint,
+            )
             draft_by_id = {str(item["id"]): item for item in drafts}
             left = segments[:midpoint]
             right = segments[midpoint:]

@@ -1280,6 +1280,75 @@ class TranslationResponseTests(unittest.TestCase):
             ["segment-1", "segment-2", "segment-3"],
         )
 
+    def test_splits_a_context_limited_draft_batch_for_recovery(self) -> None:
+        client = LMStudioClient("http://lm.test/v1", "", "model")
+
+        def translate_batch(segments, *_args):
+            if len(segments) > 1:
+                raise ExternalServiceError(
+                    "HTTP 400: Context size has been exceeded."
+                )
+            return [
+                {
+                    "id": str(segments[0]["id"]),
+                    "text": f"번역-{segments[0]['id']}",
+                }
+            ]
+
+        client._translate_batch = Mock(side_effect=translate_batch)
+        result = client._translate_batch_with_recovery(
+            [
+                {"id": "segment-1", "text": "一"},
+                {"id": "segment-2", "text": "二"},
+            ]
+        )
+
+        self.assertEqual(
+            [item["id"] for item in result],
+            ["segment-1", "segment-2"],
+        )
+
+    def test_splits_a_context_limited_review_batch_with_its_drafts(
+        self,
+    ) -> None:
+        client = LMStudioClient("http://lm.test/v1", "", "model")
+        seen_drafts: list[list[str]] = []
+
+        def review_batch(segments, _context, drafts, _prompt):
+            seen_drafts.append([str(item["id"]) for item in drafts])
+            if len(segments) > 1:
+                raise ExternalServiceError(
+                    "HTTP 400: maximum context length exceeded"
+                )
+            return [dict(drafts[0])]
+
+        segments = [
+            {"id": "segment-1", "text": "一"},
+            {"id": "segment-2", "text": "二"},
+        ]
+        drafts = [
+            {"id": "segment-1", "text": "하나"},
+            {"id": "segment-2", "text": "둘"},
+        ]
+        client._review_batch = Mock(side_effect=review_batch)
+
+        result = client._review_batch_with_recovery(
+            segments,
+            [],
+            drafts,
+            "review",
+        )
+
+        self.assertEqual(result, drafts)
+        self.assertEqual(
+            seen_drafts,
+            [
+                ["segment-1", "segment-2"],
+                ["segment-1"],
+                ["segment-2"],
+            ],
+        )
+
     def test_recovery_keeps_reference_context_bounded(self) -> None:
         client = LMStudioClient("http://lm.test/v1", "", "model")
         all_segments = [
