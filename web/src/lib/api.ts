@@ -35,7 +35,29 @@ export interface RuntimeEndpoint {
   token_configured: boolean;
   enabled: boolean;
   capacity: number;
+  kotoba_batch_size: number | null;
+  whisperx_batch_size: number | null;
   builtin: boolean;
+  status: string;
+  message: string | null;
+  checked_at: number | null;
+  running_jobs: number;
+  available_slots: number;
+}
+
+export interface TranslationEndpoint {
+  id: string;
+  name: string;
+  base_url: string;
+  token_configured: boolean;
+  enabled: boolean;
+  capacity: number;
+  builtin: boolean;
+  draft_model: string;
+  review_model: string;
+  review_enabled: boolean;
+  batch_preferred: boolean;
+  models: string[];
   status: string;
   message: string | null;
   checked_at: number | null;
@@ -147,6 +169,8 @@ export interface ServerSettings {
 export interface SettingsPayload {
   servers: ServerSettings;
   runtimes: RuntimeEndpoint[];
+  translation_endpoints: TranslationEndpoint[];
+  translation_router_error: string | null;
   path_display_rules: PathDisplayRule[];
   prompt_categories: PromptCategory[];
 }
@@ -400,6 +424,50 @@ export const api = {
     lm_model: string;
     translation_workers: number;
   }) => request<unknown>("/settings/servers", { method: "PUT", ...json(body) }),
+  createTranslationEndpoint: (body: {
+    name: string;
+    base_url: string;
+    token: string;
+    enabled: boolean;
+    capacity: number;
+  }) => request<TranslationEndpoint>("/translation-endpoints", {
+    method: "POST",
+    ...json(body),
+  }),
+  updateTranslationEndpoint: (
+    id: string,
+    body: {
+      name: string;
+      base_url: string;
+      token?: string | null;
+      clear_token?: boolean;
+      enabled: boolean;
+      capacity: number;
+    },
+  ) => request<TranslationEndpoint>(
+    `/translation-endpoints/${encodeURIComponent(id)}`,
+    { method: "PUT", ...json(body) },
+  ),
+  deleteTranslationEndpoint: (id: string) => request<unknown>(
+    `/translation-endpoints/${encodeURIComponent(id)}`,
+    { method: "DELETE" },
+  ),
+  probeTranslationEndpoint: (id: string) => request<TranslationEndpoint>(
+    `/translation-endpoints/${encodeURIComponent(id)}/probe`,
+    { method: "POST" },
+  ),
+  updateTranslationEndpointRouting: (
+    id: string,
+    body: {
+      draft_model: string;
+      review_model: string;
+      review_enabled: boolean;
+      batch_preferred: boolean;
+    },
+  ) => request<TranslationEndpoint>(
+    `/translation-endpoints/${encodeURIComponent(id)}/routing`,
+    { method: "PUT", ...json(body) },
+  ),
   createPathDisplayRule: (body: {
     source_pattern: string;
     display_pattern: string;
@@ -464,6 +532,8 @@ export const api = {
     token: string;
     enabled: boolean;
     capacity: number;
+    kotoba_batch_size?: number | null;
+    whisperx_batch_size?: number | null;
   }) => request<RuntimeEndpoint>("/runtimes", { method: "POST", ...json(body) }),
   updateRuntime: (
     id: string,
@@ -474,6 +544,10 @@ export const api = {
       clear_token?: boolean;
       enabled: boolean;
       capacity: number;
+      kotoba_batch_size?: number | null;
+      whisperx_batch_size?: number | null;
+      clear_kotoba_batch_size?: boolean;
+      clear_whisperx_batch_size?: boolean;
     },
   ) =>
     request<RuntimeEndpoint>(`/runtimes/${encodeURIComponent(id)}`, {

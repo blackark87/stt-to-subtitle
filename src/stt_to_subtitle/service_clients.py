@@ -903,6 +903,120 @@ def list_openai_compatible_models(
     return sorted(model_ids, key=str.casefold)
 
 
+class TranslationRouterAdminClient(RetryingJSONClient):
+    """Manage the dedicated translation endpoint registry."""
+
+    def __init__(
+        self,
+        base_url: str,
+        token: str,
+        *,
+        request_observer: RequestObserver | None = None,
+    ) -> None:
+        super().__init__(
+            token=token,
+            read_timeout=30.0,
+            attempts=1,
+            service_name="translation_router_admin",
+            request_observer=request_observer,
+        )
+        self.base_url = base_url.rstrip("/")
+
+    def _json_request(
+        self,
+        method: str,
+        path: str,
+        *,
+        payload: Mapping[str, Any] | None = None,
+        expected_statuses: set[int] = {200},
+    ) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {"headers": self.headers}
+        if payload is not None:
+            kwargs["headers"] = {
+                **self.headers,
+                "Content-Type": "application/json",
+            }
+            kwargs["json"] = dict(payload)
+        response = self.request(
+            method,
+            f"{self.base_url}{path}",
+            metric_operation="endpoint_settings",
+            **kwargs,
+        )
+        if response.status_code not in expected_statuses:
+            raise ExternalServiceError(
+                "translation router settings request failed: "
+                f"HTTP {response.status_code}: {_safe_error(response)}"
+            )
+        if response.status_code == 204:
+            return {}
+        try:
+            result = response.json()
+        except (TypeError, ValueError, requests.JSONDecodeError) as error:
+            raise ExternalServiceError(
+                "translation router returned invalid settings JSON"
+            ) from error
+        if not isinstance(result, Mapping):
+            raise ExternalServiceError(
+                "translation router returned invalid settings JSON"
+            )
+        return dict(result)
+
+    def list_endpoints(self) -> list[dict[str, Any]]:
+        payload = self._json_request("GET", "/router/endpoints")
+        items = payload.get("items")
+        if not isinstance(items, list) or not all(
+            isinstance(item, Mapping) for item in items
+        ):
+            raise ExternalServiceError(
+                "translation router returned an invalid endpoint list"
+            )
+        return [dict(item) for item in items]
+
+    def create_endpoint(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        return self._json_request(
+            "POST",
+            "/router/endpoints",
+            payload=payload,
+            expected_statuses={201},
+        )
+
+    def update_endpoint(
+        self,
+        endpoint_id: str,
+        payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        return self._json_request(
+            "PUT",
+            f"/router/endpoints/{endpoint_id}",
+            payload=payload,
+        )
+
+    def delete_endpoint(self, endpoint_id: str) -> None:
+        self._json_request(
+            "DELETE",
+            f"/router/endpoints/{endpoint_id}",
+            expected_statuses={204},
+        )
+
+    def probe_endpoint(self, endpoint_id: str) -> dict[str, Any]:
+        return self._json_request(
+            "POST",
+            f"/router/endpoints/{endpoint_id}/probe",
+        )
+
+    def update_routing(
+        self,
+        endpoint_id: str,
+        payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        return self._json_request(
+            "PUT",
+            f"/router/endpoints/{endpoint_id}/routing",
+            payload=payload,
+        )
+
+
 class SubtitleValidationClient(RetryingJSONClient):
     """Run one explicit structured subtitle review against a paid LLM."""
 
@@ -1177,6 +1291,7 @@ class OpenAICompatibleClient(RetryingJSONClient):
         self.model = model.strip()
         self.max_segments = max_segments
         self.max_characters = max_characters
+        self.translation_execution_mode = "live"
 
     def translate(
         self,
@@ -1198,6 +1313,7 @@ class OpenAICompatibleClient(RetryingJSONClient):
         should_pause: Callable[[], bool] | None = None,
         on_review_warning: Callable[[str], None] | None = None,
         max_workers: int = 1,
+        execution_mode: str = "live",
     ) -> list[dict[str, str]]:
         if not system_prompt.strip():
             raise ValueError("translation system prompt is required")
@@ -1207,6 +1323,9 @@ class OpenAICompatibleClient(RetryingJSONClient):
             raise ValueError("translation review prompt is required")
         if max_workers < 1:
             raise ValueError("translation max_workers must be at least 1")
+        if execution_mode not in {"live", "batch"}:
+            raise ValueError("translation execution_mode must be live or batch")
+        self.translation_execution_mode = execution_mode
         expected_ids = [str(segment["id"]) for segment in segments]
         expected_set = set(expected_ids)
         known = {
@@ -1637,7 +1756,14 @@ class OpenAICompatibleClient(RetryingJSONClient):
         response = self.request(
             "POST",
             f"{self.base_url}/chat/completions",
-            headers={**self.headers, "Content-Type": "application/json"},
+            headers={
+                **self.headers,
+                "Content-Type": "application/json",
+                "X-Translation-Mode": self.translation_execution_mode,
+                "X-Translation-Pass": (
+                    "review" if "review" in schema_name else "draft"
+                ),
+            },
             json=request_payload,
             metric_operation=(
                 "review" if "review" in schema_name else "translation"

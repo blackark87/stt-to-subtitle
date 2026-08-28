@@ -803,6 +803,42 @@ class BackendSettingsTests(unittest.TestCase):
         )
         self.assertEqual(settings.jobs_dir, Path("/var/lib/stt/jobs"))
 
+    def test_translation_service_overrides_legacy_direct_lm_connection(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "OPENAI_COMPATIBLE_BASE_URL": "http://legacy.test/v1",
+                "OPENAI_COMPATIBLE_TOKEN": "legacy-token",
+                "OPENAI_COMPATIBLE_MODEL": "legacy-model",
+                "TRANSLATION_SERVICE_BASE_URL": "http://router.test/v1",
+                "TRANSLATION_SERVICE_TOKEN": "router-token",
+                "TRANSLATION_SERVICE_MODEL": "translation-router",
+            },
+            clear=True,
+        ):
+            settings = BackendSettings.from_env()
+            settings.validate()
+            servers = settings.remote_servers()
+
+        self.assertEqual(servers.lm_base_url, "http://router.test/v1")
+        self.assertEqual(servers.lm_token, "router-token")
+        self.assertEqual(servers.lm_model, "translation-router")
+
+    def test_rejects_partial_translation_service_connection(self) -> None:
+        settings = BackendSettings(
+            state_dir=Path("/state"),
+            media_root=Path("/media"),
+            stt_base_url="",
+            stt_token="",
+            lm_base_url="",
+            lm_token="",
+            lm_model="",
+            translation_service_base_url="http://router.test/v1",
+        )
+
+        with self.assertRaisesRegex(ValueError, "TRANSLATION_SERVICE_MODEL"):
+            settings.validate()
+
     def test_reads_backend_storage_directories(self) -> None:
         with patch.dict(
             os.environ,

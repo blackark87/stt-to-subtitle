@@ -820,8 +820,8 @@ class JobStoreTests(unittest.TestCase):
             self.assertEqual(
                 snapshot["database"]["migrations"],
                 {
-                    "applied_count": 9,
-                    "latest_sequence": 53,
+                    "applied_count": 10,
+                    "latest_sequence": 54,
                     "unsequenced_count": 0,
                 },
             )
@@ -1616,6 +1616,11 @@ class JobStoreTests(unittest.TestCase):
                 enabled=True,
                 capacity=2,
             )
+            store.save_runtime_batch_settings(
+                endpoint.id,
+                kotoba_batch_size=4,
+                whisperx_batch_size=16,
+            )
             job = store.create(
                 job_id="runtime-assignment",
                 source_rel="movie.mkv",
@@ -1642,6 +1647,13 @@ class JobStoreTests(unittest.TestCase):
             self.assertEqual(
                 reloaded.list_runtime_endpoints()[0].token,
                 "runtime-token",
+            )
+            self.assertEqual(
+                reloaded.runtime_batch_settings()[endpoint.id],
+                {
+                    "kotoba_batch_size": 4,
+                    "whisperx_batch_size": 16,
+                },
             )
 
     def test_persists_dependency_gate_state_without_credentials(self) -> None:

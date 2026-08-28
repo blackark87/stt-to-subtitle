@@ -53,6 +53,11 @@ class BackendAPIBoundaryTests(unittest.TestCase):
         self.assertIn("/api/v1/runtimes", paths)
         self.assertIn("/api/v1/runtimes/{runtime_id}", paths)
         self.assertIn("/api/v1/runtimes/{runtime_id}/probe", paths)
+        self.assertIn("/api/v1/translation-endpoints", paths)
+        self.assertIn(
+            "/api/v1/translation-endpoints/{endpoint_id}/routing",
+            paths,
+        )
         self.assertIn("/api/v1/settings/subtitle-validator", paths)
         self.assertIn("/api/v1/settings/path-display-rules", paths)
         self.assertIn("/api/v1/settings/prompt-categories", paths)
@@ -244,18 +249,36 @@ class BackendAPIBoundaryTests(unittest.TestCase):
                         "base_url": "http://runtime-02.test:8100",
                         "token": "secret-runtime-token",
                         "capacity": 2,
+                        "kotoba_batch_size": 4,
+                        "whisperx_batch_size": 16,
                         "enabled": False,
                     },
                 )
                 runtime_id = created.json()["id"]
                 listed = client.get("/api/v1/runtimes")
+                builtin_updated = client.put(
+                    "/api/v1/runtimes/builtin",
+                    json={
+                        "name": "기본 Runtime",
+                        "base_url": "http://runtime:8100",
+                        "enabled": True,
+                        "capacity": 1,
+                        "kotoba_batch_size": 8,
+                        "whisperx_batch_size": 24,
+                    },
+                )
                 deleted = client.delete(f"/api/v1/runtimes/{runtime_id}")
 
         self.assertEqual(created.status_code, 201)
         self.assertTrue(created.json()["token_configured"])
+        self.assertEqual(created.json()["kotoba_batch_size"], 4)
+        self.assertEqual(created.json()["whisperx_batch_size"], 16)
         self.assertNotIn("token", created.json())
         self.assertEqual(listed.status_code, 200)
         self.assertEqual(listed.json()["total"], 2)
+        self.assertEqual(builtin_updated.status_code, 200)
+        self.assertEqual(builtin_updated.json()["kotoba_batch_size"], 8)
+        self.assertEqual(builtin_updated.json()["whisperx_batch_size"], 24)
         self.assertEqual(deleted.status_code, 204)
 
     def test_media_api_applies_display_rules_and_actor_profiles(self) -> None:

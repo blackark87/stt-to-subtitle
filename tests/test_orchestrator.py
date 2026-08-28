@@ -2945,6 +2945,12 @@ class SubtitleOrchestratorTests(unittest.TestCase):
             self.assertTrue(
                 all(job.options["duration_seconds"] is None for job in jobs)
             )
+            self.assertTrue(
+                all(
+                    job.options["translation_execution_mode"] == "batch"
+                    for job in jobs
+                )
+            )
 
     def test_folder_expansion_skips_completed_requested_stage(self) -> None:
         with TemporaryDirectory() as directory:
@@ -3101,6 +3107,17 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                 )
             )
             try:
+                orchestrator.update_runtime_endpoint(
+                    "builtin",
+                    name="기본 Runtime",
+                    base_url="http://stt.test",
+                    token=None,
+                    clear_token=False,
+                    enabled=True,
+                    capacity=1,
+                    kotoba_batch_size=4,
+                    whisperx_batch_size=24,
+                )
                 job = orchestrator.create_job(
                     "movie.mkv",
                     force_overwrite=False,
@@ -3208,7 +3225,8 @@ class SubtitleOrchestratorTests(unittest.TestCase):
             self.assertEqual(sent_options["chunk_length_seconds"], 15)
             self.assertTrue(sent_options["noise_filter"])
             self.assertEqual(sent_options["backend"], "hybrid")
-            self.assertEqual(sent_options["batch_size"], 12)
+            self.assertEqual(sent_options["batch_size"], 24)
+            self.assertEqual(sent_options["kotoba_batch_size"], 4)
             self.assertEqual(
                 sent_options["subtitle_segmentation"],
                 {

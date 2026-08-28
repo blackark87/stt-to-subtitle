@@ -80,7 +80,7 @@ function gpuErrorLabel(code?: string): string {
 
 function epochTime(value?: number | null): string {
   if (!value) return "기록 없음";
-  return new Date(value * 1000).toLocaleTimeString("ko-KR", { hour12: false });
+  return clock(value);
 }
 
 function dependencyLabel(value: string): string {

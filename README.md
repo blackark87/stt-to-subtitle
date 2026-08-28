@@ -19,13 +19,17 @@ Docker Compose 프로젝트로 빌드하고 실행합니다. 애플리케이션 
                                   ├──▶ Runtime 풀 (HTTP + 진행 상태 SSE)
                                   │      ├─ runtime:8100 (기본)
                                   │      └─ 외부 GPU Runtime 1..N
-                                  └──▶ 외부 번역·검증 Provider
+                                  ├──▶ translation:8200 (서버 레지스트리·라우터)
+                                  │      ├─ 기본 번역 서버
+                                  │      └─ 추가 번역 서버 1..N
+                                  └──▶ 선택형 상용 검증 Provider
 ```
 
-Compose 프로젝트에는 세 실행 컨테이너가 있습니다.
+Compose 프로젝트에는 네 실행 컨테이너가 있습니다.
 
 - `web`: Nginx로 최소 정적 화면과 자산을 제공하고 `/api`만 프록시
 - `backend`: 작업 API, 상태 저장, FFmpeg 추출, 번역, SRT·ASS 렌더링
+- `translation`: 번역 서버 등록, 모델 조회, 초벌·검증 요청 라우팅
 - `runtime`: WhisperJAV, Kotoba, WhisperX, 하이브리드 전사를 제공하는 CUDA
   FastAPI 서버
 
@@ -34,7 +38,10 @@ Backend와 Runtime은 Compose 내부 네트워크의 `http://runtime:8100`으로
 Traefik 외부 네트워크에 연결되고 HTTPS 라우터를 통해 제공됩니다.
 기본 Runtime을 포함한 All-in-One 구성이 기본값이며, 외부 호스트의 Runtime은
 Web UI에서 주소를 추가해 같은 전사 작업 풀로 확장할 수 있습니다. 번역 LLM
-서버는 Runtime 풀에 포함되지 않고 Backend가 별도로 호출합니다.
+서버는 전사 Runtime 풀과 분리됩니다. 기본 번역 서버는 배포 환경에서 등록하고,
+추가 번역 서버는 Web UI에서 Runtime과 같은 방식으로 이름·주소·토큰·동시 요청
+수를 설정합니다. Backend는 GPU나 호스트 역할을 알지 못하고 독립 번역 라우터에
+단계와 실행 모드만 전달합니다.
 
 Kotoba, WhisperX, WhisperJAV는 요구하는 PyTorch·모델 의존성이 다르므로
 STT 이미지 안에서도 각각 `/opt/venvs/kotoba`, `/opt/venvs/whisperx`,
@@ -76,8 +83,10 @@ chmod 600 .env.compose
 - `HF_TOKEN`: Pyannote 접근 권한이 있는 Hugging Face read 토큰
 - `MEDIA_PATH`: 영상과 자막을 읽고 쓸 호스트 디렉터리
 - `TRAEFIK_HOST`: 웹 애플리케이션에 사용할 DNS 호스트명
-- `OPENAI_COMPATIBLE_BASE_URL`: 번역 API 루트
-- `OPENAI_COMPATIBLE_MODEL`: 번역 모델 ID
+- `TRANSLATION_BUILTIN_BASE_URL`: 기본 OpenAI 호환 번역 서버 API 루트
+- `TRANSLATION_BUILTIN_DRAFT_MODEL`: 기본 서버의 초기 초벌 모델 ID
+- `TRANSLATION_BUILTIN_REVIEW_ENABLED`: 기본 서버를 검증 후보로 사용할지 여부
+- `TRANSLATION_STATE_PATH`: 추가 번역 서버와 모델 선택을 보존할 상태 디렉터리
 
 Compose는 경로 오타로 빈 호스트 디렉터리를 만들지 않습니다. 미디어, 상태,
 작업 공간과 모델 캐시 디렉터리를 먼저 만들고 쓰기 권한을 확인합니다.
@@ -85,12 +94,14 @@ Compose는 경로 오타로 빈 호스트 디렉터리를 만들지 않습니다
 ```bash
 mkdir -p ./media \
   /var/lib/homelab/stt-to-subtitle/web-state \
+  /var/lib/homelab/stt-to-subtitle/translation-state \
   /var/lib/homelab/stt-to-subtitle/stt-state \
   /data/work/stt-to-subtitle/web-jobs \
   /data/work/stt-to-subtitle/stt-incoming \
   /data/models/stt-to-subtitle
 test -w ./media
 test -w /var/lib/homelab/stt-to-subtitle/web-state
+test -w /var/lib/homelab/stt-to-subtitle/translation-state
 test -w /var/lib/homelab/stt-to-subtitle/stt-state
 test -w /data/work/stt-to-subtitle/web-jobs
 test -w /data/work/stt-to-subtitle/stt-incoming
@@ -170,6 +181,7 @@ mkdir -p /var/lib/stt-to-subtitle/runtime-state \
 등록하면 준비 상태 확인 후 새 전사 작업부터 사용됩니다. 진행 중인 작업은
 접수한 Runtime에 고정되며 Backend 재시작 후에도 같은 원격 작업에 재연결합니다.
 Runtime 비활성화와 삭제는 해당 Runtime의 진행 작업이 없을 때만 허용됩니다.
+같은 화면에서 GPU별 Kotoba·WhisperX 배치 크기도 독립적으로 설정할 수 있습니다.
 
 Backend는 Runtime의 작업별 SSE 스트림으로 장시간 전사 진행 상태를 받습니다.
 최소 정적 화면은 `/api/v1/jobs`를 10초마다 조회합니다. 오디오 추출이 끝나면 WAV
@@ -213,7 +225,7 @@ Backend는 Runtime의 작업별 SSE 스트림으로 장시간 전사 진행 상�
 | `STT_RUNTIME_CACHE_PATH` | `/data/cache/buildkit/stt-runtime-py311-cuda-v4-20260825` | 외부에서 준비한 고비용 런타임 빌드 캐시 |
 | `STT_DEVICE` | `cuda` | `cuda` 또는 `cuda:<index>` |
 | `STT_DIARIZATION_DEVICE` | `cuda` | 화자 분리 장치, VRAM 절약 시 `cpu` |
-| `STT_BATCH_SIZE` | `8` | Kotoba 파이프라인 배치 크기, 로드 시점에 고정 |
+| `STT_BATCH_SIZE` | `8` | Runtime별 재정의가 없을 때 쓰는 Kotoba 배치 크기 |
 | `STT_THREADS` | `8` | Torch와 WhisperX 워커의 CPU 스레드 수 |
 | `WHISPERX_BATCH_SIZE` | `8` | `whisperx`·`hybrid` 백엔드 배치 크기, 요청별 `batch_size`(1~64)로 재정의 가능 |
 | `STT_CHUNK_PROGRESS_EVERY` | `10` | 청크 진행 로그 묶음 기준, `10` 또는 `100` (SSE 변경 알림은 매 변경 시 전송) |
@@ -227,11 +239,16 @@ Backend는 Runtime의 작업별 SSE 스트림으로 장시간 전사 진행 상�
 전환하지 않고 STT 준비 상태가 실패합니다. VRAM이 부족한 경우 먼저
 `STT_DIARIZATION_DEVICE=cpu`를 사용합니다.
 
-`WHISPERX_BATCH_SIZE`는 `whisperx`와 `hybrid` 백엔드에만 적용됩니다. Kotoba
-파이프라인은 로드 시점에 배치 크기를 고정하므로 요청별 `batch_size`를 보내면
-거부되며, `STT_BATCH_SIZE`로만 조정합니다. WhisperX 전사 중 CUDA 메모리가
-부족하면 워커가 배치 크기를 절반씩 줄여 자동으로 재시도하고, 실제로 사용한
-값을 결과의 `runtime.effective_batch_size`에 기록합니다.
+Web UI의 **설정 → 전사 서버**에서 기본 Runtime과 외부 Runtime마다 Kotoba와
+WhisperX 배치 크기(1~64)를 따로 지정할 수 있습니다. 비워 두면 각 Runtime의
+`STT_BATCH_SIZE`와 `WHISPERX_BATCH_SIZE`를 사용합니다. 설정값은 Runtime에
+배정된 새 작업부터 요청 옵션으로 전달됩니다. Kotoba 배치가 현재 상주 모델과
+다르면 다음 Kotoba 작업을 시작하기 전에 모델을 새 배치 크기로 다시 적재합니다.
+하이브리드는 `batch_size`를 WhisperX에, `kotoba_batch_size`를 구조 복구용
+Kotoba에 사용합니다. WhisperJAV는 별도의 배치 의미와 정확도 특성이 있어 이
+공통 설정을 적용하지 않습니다. WhisperX 전사 중 CUDA 메모리가 부족하면 워커가
+배치 크기를 절반씩 줄여 자동으로 재시도하고, 실제로 사용한 값을 결과의
+`runtime.effective_batch_size`에 기록합니다.
 
 `STT_DEBUG_ARTIFACTS=true`는 단계별 JSON에 민감한 전사문을 저장할 수
 있으므로 기본적으로 꺼져 있습니다. 토큰은 이미지, 로그, 결과 메타데이터에
@@ -333,6 +350,21 @@ JSON·번역 체크포인트부터 이어집니다.
 SQLite에 저장합니다. 부분 JSON은 DB 결과에서 다시 만들 수 있고, 프롬프트 변경
 재번역과 JSON 직접 편집은 이전 결과를 보존한 새 generation으로 기록됩니다.
 작업 상세의 **번역 이력**에서 generation별 JSON을 내려받을 수 있습니다.
+
+**설정 → 번역 서버**에서 추가 OpenAI 호환 서버를 등록한 뒤 서버가 제공하는
+`/models` 목록을 갱신합니다. **초벌 번역**과 **검증 번역**은 서버마다 별도의
+모델 드롭다운을 사용합니다. 단건 초벌은 사용 가능한 서버의 여유 슬롯으로
+분산되고 실패 시 다음 서버로 전환됩니다. 여러 작업을 함께 등록한 일괄 번역은
+`일괄 처리 우선`으로 지정한 서버를 먼저 사용합니다.
+
+검증 단계는 서버별 **검증 서버 사용** 스위치가 켜져 있고 검증 모델이 선택된
+경우에만 후보에 포함됩니다. 따라서 큰 검증 모델을 적재할 수 없는 기본 서버는
+스위치를 끄면 모델 로드와 요청 자체가 발생하지 않습니다. 현재 예시 설정의 초벌
+모델은 `gemma-4-12b-coder-fable5-composer2.5-v1-uncensored-heretic`이며,
+추가 서버에서 조회되는 검증 모델로
+`gemma-4-26b-a4b-it-ultra-uncensored-heretic`를 선택할 수 있습니다. 상용 검증은
+이 로컬 2단계와 분리되어 있으며 설정된 경우에도 사용자가 명시적으로 요청할
+때만 실행합니다.
 
 렌더된 SRT/ASS도 자막 generation으로 보존합니다. 미디어 옆 `.ko.srt/.ko.ass`는
 현재 게시 generation의 복사본이며, 작업 상세의 **자막 이력**에서 이전 버전을

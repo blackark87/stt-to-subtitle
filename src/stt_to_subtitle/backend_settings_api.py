@@ -22,6 +22,9 @@ from .backend_contracts import (
     RuntimeEndpointUpdateRequest,
     ServerSettingsUpdateRequest,
     SubtitleValidatorUpdateRequest,
+    TranslationEndpointCreateRequest,
+    TranslationEndpointRoutingRequest,
+    TranslationEndpointUpdateRequest,
     TranslationModelLookupRequest,
 )
 from .job_state import JobPhase, JobReason, JobState
@@ -162,9 +165,20 @@ def capabilities() -> dict[str, Any]:
 @router.get("/settings")
 def settings(request: Request) -> dict[str, Any]:
     service = service_from_request(request)
+    translation_endpoints: list[dict[str, Any]] = []
+    translation_router_error: str | None = None
+    if service.settings.translation_service_base_url.strip():
+        try:
+            translation_endpoints = service.translation_endpoints_view()
+        except (ExternalServiceError, ValueError) as error:
+            translation_router_error = service.sanitize_external_error(
+                str(error)
+            )
     return {
         "servers": service.remote_servers_view(),
         "runtimes": service.runtime_endpoints_view(),
+        "translation_endpoints": translation_endpoints,
+        "translation_router_error": translation_router_error,
         "subtitle_validator": service.subtitle_validator_view(),
         "path_display_rules": public_value(service.path_display_rules),
         "prompt_categories": public_value(service.all_prompt_categories()),
@@ -223,6 +237,8 @@ def create_runtime_endpoint(
             token=payload.token,
             enabled=payload.enabled,
             capacity=payload.capacity,
+            kotoba_batch_size=payload.kotoba_batch_size,
+            whisperx_batch_size=payload.whisperx_batch_size,
         )
     except ValueError as error:
         raise bad_request(error) from error
@@ -243,6 +259,10 @@ def update_runtime_endpoint(
             clear_token=payload.clear_token,
             enabled=payload.enabled,
             capacity=payload.capacity,
+            kotoba_batch_size=payload.kotoba_batch_size,
+            whisperx_batch_size=payload.whisperx_batch_size,
+            clear_kotoba_batch_size=payload.clear_kotoba_batch_size,
+            clear_whisperx_batch_size=payload.clear_whisperx_batch_size,
         )
     except ValueError as error:
         raise bad_request(error) from error
@@ -266,6 +286,83 @@ def probe_runtime_endpoint(
         return service_from_request(request).probe_runtime_endpoint(runtime_id)
     except ValueError as error:
         raise bad_request(error) from error
+
+
+def _translation_router_failure(error: Exception) -> HTTPException:
+    return HTTPException(
+        status_code=502,
+        detail="번역 라우터 설정 요청을 처리할 수 없습니다.",
+    )
+
+
+@router.post("/translation-endpoints", status_code=201)
+def create_translation_endpoint(
+    payload: TranslationEndpointCreateRequest,
+    request: Request,
+) -> dict[str, Any]:
+    try:
+        return service_from_request(request).create_translation_endpoint(
+            payload.model_dump()
+        )
+    except (ExternalServiceError, ValueError) as error:
+        raise _translation_router_failure(error) from error
+
+
+@router.put("/translation-endpoints/{endpoint_id}")
+def update_translation_endpoint(
+    endpoint_id: str,
+    payload: TranslationEndpointUpdateRequest,
+    request: Request,
+) -> dict[str, Any]:
+    try:
+        return service_from_request(request).update_translation_endpoint(
+            endpoint_id,
+            payload.model_dump(),
+        )
+    except (ExternalServiceError, ValueError) as error:
+        raise _translation_router_failure(error) from error
+
+
+@router.delete("/translation-endpoints/{endpoint_id}", status_code=204)
+def delete_translation_endpoint(
+    endpoint_id: str,
+    request: Request,
+) -> Response:
+    try:
+        service_from_request(request).delete_translation_endpoint(endpoint_id)
+    except (ExternalServiceError, ValueError) as error:
+        raise _translation_router_failure(error) from error
+    return Response(status_code=204)
+
+
+@router.post("/translation-endpoints/{endpoint_id}/probe")
+def probe_translation_endpoint(
+    endpoint_id: str,
+    request: Request,
+) -> dict[str, Any]:
+    try:
+        return service_from_request(request).probe_translation_endpoint(
+            endpoint_id
+        )
+    except (ExternalServiceError, ValueError) as error:
+        raise _translation_router_failure(error) from error
+
+
+@router.put("/translation-endpoints/{endpoint_id}/routing")
+def update_translation_endpoint_routing(
+    endpoint_id: str,
+    payload: TranslationEndpointRoutingRequest,
+    request: Request,
+) -> dict[str, Any]:
+    try:
+        return service_from_request(
+            request
+        ).update_translation_endpoint_routing(
+            endpoint_id,
+            payload.model_dump(),
+        )
+    except (ExternalServiceError, ValueError) as error:
+        raise _translation_router_failure(error) from error
 
 
 @router.post("/dependencies/transcription/probe")

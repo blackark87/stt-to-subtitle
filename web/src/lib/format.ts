@@ -9,7 +9,7 @@ export function parentPath(path: string): string {
   return parts.join("/");
 }
 
-/** 백엔드는 KST ISO 문자열을 준다. 표시에는 시:분:초만 쓴다. */
+/** 작업 관련 시각을 날짜가 포함된 고정 KST 형식으로 표시한다. */
 export function clock(value: string | number | null | undefined): string {
   if (!value) return "-";
   const normalized = typeof value === "number" && value < 1_000_000_000_000
@@ -17,7 +17,19 @@ export function clock(value: string | number | null | undefined): string {
     : value;
   const parsed = new Date(normalized);
   if (Number.isNaN(parsed.getTime())) return String(value);
-  return parsed.toLocaleTimeString("ko-KR", { hour12: false });
+  const parts = Object.fromEntries(
+    new Intl.DateTimeFormat("en-CA", {
+      timeZone: "Asia/Seoul",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hourCycle: "h23",
+    }).formatToParts(parsed).map((part) => [part.type, part.value]),
+  );
+  return `${parts.year}${parts.month}${parts.day} ${parts.hour}:${parts.minute}:${parts.second}`;
 }
 
 export function relativeFromNow(value: Date | null): string {

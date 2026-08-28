@@ -228,7 +228,9 @@ class STTAPIHelpersTests(unittest.TestCase):
 
                 self.assertEqual(options["batch_size"], 8)
 
-    def test_allows_per_job_batch_size_for_whisperx_paths(self) -> None:
+    def test_allows_per_job_batch_size_for_supported_runtime_backends(
+        self,
+    ) -> None:
         settings = STTAPISettings(
             state_dir=Path("/tmp/not-used"),
             api_token="",
@@ -236,7 +238,7 @@ class STTAPIHelpersTests(unittest.TestCase):
             whisperx_batch_size=8,
         )
 
-        for backend in ("whisperx", "hybrid"):
+        for backend in ("kotoba", "whisperx", "hybrid"):
             with self.subTest(backend=backend):
                 options = _parse_options(
                     json.dumps({"backend": backend, "batch_size": 16}),
@@ -244,6 +246,27 @@ class STTAPIHelpersTests(unittest.TestCase):
                 )
 
                 self.assertEqual(options["batch_size"], 16)
+
+    def test_keeps_separate_hybrid_batch_defaults_and_overrides(self) -> None:
+        settings = STTAPISettings(
+            state_dir=Path("/tmp/not-used"),
+            api_token="",
+            hf_token="hf-token",
+            batch_size=2,
+            whisperx_batch_size=8,
+        )
+
+        defaults = _parse_options('{"backend":"hybrid"}', settings)
+        overridden = _parse_options(
+            '{"backend":"hybrid","batch_size":16,'
+            '"kotoba_batch_size":4}',
+            settings,
+        )
+
+        self.assertEqual(defaults["batch_size"], 8)
+        self.assertEqual(defaults["kotoba_batch_size"], 2)
+        self.assertEqual(overridden["batch_size"], 16)
+        self.assertEqual(overridden["kotoba_batch_size"], 4)
 
     def test_rejects_per_job_batch_size_outside_the_supported_range(
         self,
@@ -264,22 +287,18 @@ class STTAPIHelpersTests(unittest.TestCase):
                         settings,
                     )
 
-    def test_rejects_per_job_batch_size_for_load_time_backends(self) -> None:
+    def test_rejects_common_batch_size_for_whisperjav(self) -> None:
         settings = STTAPISettings(
             state_dir=Path("/tmp/not-used"),
             api_token="",
             hf_token="hf-token",
         )
 
-        for backend in ("kotoba", "whisperjav"):
-            with self.subTest(backend=backend):
-                with self.assertRaisesRegex(
-                    ValueError, "fixed at pipeline load"
-                ):
-                    _parse_options(
-                        json.dumps({"backend": backend, "batch_size": 4}),
-                        settings,
-                    )
+        with self.assertRaisesRegex(ValueError, "does not support"):
+            _parse_options(
+                '{"backend":"whisperjav","batch_size":4}',
+                settings,
+            )
 
     def test_accepts_request_level_whisperx_backend_case_insensitively(self) -> None:
         settings = STTAPISettings(
@@ -883,7 +902,7 @@ class STTAPIHelpersTests(unittest.TestCase):
                     ) as run_kotoba:
                         service._run_job("hybrid-job")
 
-            get_pipeline.assert_called_once_with()
+                get_pipeline.assert_called_once_with(1)
             run_whisperx.assert_called_once()
             # Kotoba must not stay resident while WhisperX batches on the GPU.
             self.assertTrue(
@@ -1473,6 +1492,29 @@ class IdleModelReleaseTests(unittest.TestCase):
             **overrides,
         )
         return TranscriptionService(settings)
+
+    def test_reloads_kotoba_when_the_requested_batch_size_changes(self) -> None:
+        with TemporaryDirectory() as directory:
+            service = self._service(Path(directory), batch_size=2)
+            pipelines = [SimpleNamespace(), SimpleNamespace()]
+
+            with patch(
+                "stt_to_subtitle.runtime_api.load_pipeline",
+                side_effect=pipelines,
+            ) as loader:
+                first = service._get_pipeline(4)
+                reused = service._get_pipeline(4)
+                changed = service._get_pipeline(8)
+
+            self.assertIs(first, pipelines[0])
+            self.assertIs(reused, pipelines[0])
+            self.assertIs(changed, pipelines[1])
+            self.assertEqual(loader.call_count, 2)
+            self.assertEqual(
+                [call.kwargs["batch_size"] for call in loader.call_args_list],
+                [4, 8],
+            )
+            self.assertEqual(service._pipeline_batch_size, 8)
 
     def test_releases_the_pipeline_once_it_has_been_idle_past_the_limit(
         self,

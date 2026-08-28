@@ -70,6 +70,9 @@ services:
       runtime:
         condition: service_healthy
         restart: true
+      translation:
+        condition: service_healthy
+        restart: true
     expose:
       - "8080"
     environment:
@@ -79,9 +82,9 @@ services:
       BACKEND_FORWARDED_ALLOW_IPS: "${BACKEND_FORWARDED_ALLOW_IPS:-*}"
       STT_BASE_URL: http://runtime:8100
       STT_API_TOKEN: ${STT_API_TOKEN:-}
-      OPENAI_COMPATIBLE_BASE_URL: ${OPENAI_COMPATIBLE_BASE_URL:-}
-      OPENAI_COMPATIBLE_TOKEN: ${OPENAI_COMPATIBLE_TOKEN:-}
-      OPENAI_COMPATIBLE_MODEL: ${OPENAI_COMPATIBLE_MODEL:-}
+      TRANSLATION_SERVICE_BASE_URL: http://translation:8200/v1
+      TRANSLATION_SERVICE_TOKEN: ${TRANSLATION_API_TOKEN:-}
+      TRANSLATION_SERVICE_MODEL: translation-router
       GPU_PROMETHEUS_URL: ${GPU_PROMETHEUS_URL:-}
       GPU_PROMETHEUS_TOKEN: ${GPU_PROMETHEUS_TOKEN:-}
       GPU_METRICS_REFRESH_SECONDS: ${GPU_METRICS_REFRESH_SECONDS:-10}
@@ -110,6 +113,48 @@ services:
     networks:
       - app
       - runtime
+      - translation
+
+  translation:
+    platform: linux/amd64
+    build:
+      context: ${WORKSPACE:-.}
+      dockerfile: Dockerfile.translation
+    user: "${BACKEND_PUID:-${WEB_PUID:-1026}}:${BACKEND_PGID:-${WEB_PGID:-100}}"
+    init: true
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    expose:
+      - "8200"
+    environment:
+      TRANSLATION_HOST: 0.0.0.0
+      TRANSLATION_PORT: 8200
+      TRANSLATION_STATE_DIR: /var/lib/stt-translation
+      TRANSLATION_API_TOKEN: ${TRANSLATION_API_TOKEN:-}
+      TRANSLATION_BUILTIN_NAME: ${TRANSLATION_BUILTIN_NAME:-기본 번역 서버}
+      TRANSLATION_BUILTIN_BASE_URL: ${TRANSLATION_BUILTIN_BASE_URL:-}
+      TRANSLATION_BUILTIN_TOKEN: ${TRANSLATION_BUILTIN_TOKEN:-}
+      TRANSLATION_BUILTIN_CAPACITY: ${TRANSLATION_BUILTIN_CAPACITY:-1}
+      TRANSLATION_BUILTIN_DRAFT_MODEL: ${TRANSLATION_BUILTIN_DRAFT_MODEL:-gemma-4-12b-coder-fable5-composer2.5-v1-uncensored-heretic}
+      TRANSLATION_BUILTIN_REVIEW_MODEL: ${TRANSLATION_BUILTIN_REVIEW_MODEL:-}
+      TRANSLATION_BUILTIN_REVIEW_ENABLED: ${TRANSLATION_BUILTIN_REVIEW_ENABLED:-false}
+      TRANSLATION_BUILTIN_BATCH_PREFERRED: ${TRANSLATION_BUILTIN_BATCH_PREFERRED:-false}
+      TRANSLATION_CONNECT_TIMEOUT_SECONDS: ${TRANSLATION_CONNECT_TIMEOUT_SECONDS:-10}
+      TRANSLATION_READ_TIMEOUT_SECONDS: ${TRANSLATION_READ_TIMEOUT_SECONDS:-600}
+    volumes:
+      - type: bind
+        source: ${TRANSLATION_STATE_PATH:-/var/lib/homelab/stt-to-subtitle/translation-state}
+        target: /var/lib/stt-translation
+        bind:
+          create_host_path: false
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    networks:
+      - translation
 
   runtime:
     platform: linux/amd64
@@ -189,6 +234,7 @@ services:
 networks:
   app:
   runtime:
+  translation:
   traefik:
     name: ${TRAEFIK_NETWORK:-proxy}
     external: true

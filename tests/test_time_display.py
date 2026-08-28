@@ -12,7 +12,7 @@ class KSTTimeDisplayTests(unittest.TestCase):
     def test_formats_epoch_as_kst_for_ui_and_api(self) -> None:
         self.assertEqual(
             format_kst_timestamp(0),
-            "1970-01-01 09:00:00 KST",
+            "19700101 09:00:00",
         )
         self.assertEqual(
             format_kst_iso(0),
@@ -32,12 +32,12 @@ class KSTTimeDisplayTests(unittest.TestCase):
         record.created = 0
         formatter = KSTLogFormatter(
             "%(asctime)s %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S KST",
+            datefmt="%Y%m%d %H:%M:%S",
         )
 
         self.assertEqual(
             formatter.format(record),
-            "1970-01-01 09:00:00 KST message",
+            "19700101 09:00:00 message",
         )
 
 

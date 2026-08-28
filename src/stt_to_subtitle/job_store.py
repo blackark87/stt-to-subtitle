@@ -683,6 +683,25 @@ class JobStore:
                     CHECK (capacity BETWEEN 1 AND 8)
                 );
 
+                CREATE TABLE IF NOT EXISTS runtime_batch_settings (
+                    runtime_id TEXT PRIMARY KEY,
+                    kotoba_batch_size INTEGER,
+                    whisperx_batch_size INTEGER,
+                    updated_at REAL NOT NULL,
+                    CHECK (
+                        kotoba_batch_size IS NULL
+                        OR kotoba_batch_size BETWEEN 1 AND 64
+                    ),
+                    CHECK (
+                        whisperx_batch_size IS NULL
+                        OR whisperx_batch_size BETWEEN 1 AND 64
+                    ),
+                    CHECK (
+                        kotoba_batch_size IS NOT NULL
+                        OR whisperx_batch_size IS NOT NULL
+                    )
+                );
+
                 CREATE TABLE IF NOT EXISTS dependency_states (
                     dependency TEXT PRIMARY KEY,
                     state TEXT NOT NULL,
@@ -1287,7 +1306,39 @@ class JobStore:
                     "runtime_pool_v1",
                     self._migrate_runtime_pool,
                 ),
+                Migration(
+                    54,
+                    "runtime_batch_settings_v1",
+                    self._migrate_runtime_batch_settings,
+                ),
             ),
+        )
+
+    @staticmethod
+    def _migrate_runtime_batch_settings(
+        connection: sqlite3.Connection,
+    ) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS runtime_batch_settings (
+                runtime_id TEXT PRIMARY KEY,
+                kotoba_batch_size INTEGER,
+                whisperx_batch_size INTEGER,
+                updated_at REAL NOT NULL,
+                CHECK (
+                    kotoba_batch_size IS NULL
+                    OR kotoba_batch_size BETWEEN 1 AND 64
+                ),
+                CHECK (
+                    whisperx_batch_size IS NULL
+                    OR whisperx_batch_size BETWEEN 1 AND 64
+                ),
+                CHECK (
+                    kotoba_batch_size IS NOT NULL
+                    OR whisperx_batch_size IS NOT NULL
+                )
+            )
+            """
         )
 
     @staticmethod
@@ -2485,12 +2536,73 @@ class JobStore:
 
     def delete_runtime_endpoint(self, runtime_id: str) -> None:
         with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM runtime_batch_settings WHERE runtime_id = ?",
+                (runtime_id,),
+            )
             result = connection.execute(
                 "DELETE FROM runtime_endpoints WHERE id = ?",
                 (runtime_id,),
             )
         if result.rowcount != 1:
             raise ValueError("Runtime을 찾을 수 없습니다.")
+
+    def runtime_batch_settings(self) -> dict[str, dict[str, int | None]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT runtime_id, kotoba_batch_size, whisperx_batch_size
+                FROM runtime_batch_settings
+                """
+            ).fetchall()
+        return {
+            str(row["runtime_id"]): {
+                "kotoba_batch_size": (
+                    int(row["kotoba_batch_size"])
+                    if row["kotoba_batch_size"] is not None
+                    else None
+                ),
+                "whisperx_batch_size": (
+                    int(row["whisperx_batch_size"])
+                    if row["whisperx_batch_size"] is not None
+                    else None
+                ),
+            }
+            for row in rows
+        }
+
+    def save_runtime_batch_settings(
+        self,
+        runtime_id: str,
+        *,
+        kotoba_batch_size: int | None,
+        whisperx_batch_size: int | None,
+    ) -> None:
+        with self._connect() as connection:
+            if kotoba_batch_size is None and whisperx_batch_size is None:
+                connection.execute(
+                    "DELETE FROM runtime_batch_settings WHERE runtime_id = ?",
+                    (runtime_id,),
+                )
+                return
+            connection.execute(
+                """
+                INSERT INTO runtime_batch_settings (
+                    runtime_id, kotoba_batch_size,
+                    whisperx_batch_size, updated_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(runtime_id) DO UPDATE SET
+                    kotoba_batch_size = excluded.kotoba_batch_size,
+                    whisperx_batch_size = excluded.whisperx_batch_size,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    runtime_id,
+                    kotoba_batch_size,
+                    whisperx_batch_size,
+                    time.time(),
+                ),
+            )
 
     def transcription_runtime_counts(self) -> dict[str, int]:
         with self._connect() as connection:

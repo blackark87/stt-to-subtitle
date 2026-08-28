@@ -3,7 +3,7 @@
 import { useCallback, useState } from "react";
 import { Icon } from "@/components/Icon";
 import { Freshness } from "@/components/Freshness";
-import { api, type PathDisplayRule, type PromptCategory, type RuntimeEndpoint } from "@/lib/api";
+import { api, type PathDisplayRule, type PromptCategory, type RuntimeEndpoint, type TranslationEndpoint } from "@/lib/api";
 import { RUNTIME_STATUS_LABEL, RUNTIME_STATUS_TONE, asRuntimeStatus, type JobState } from "@/lib/domain";
 import { useLiveQuery } from "@/lib/useLiveQuery";
 
@@ -27,8 +27,33 @@ interface RuntimeForm {
   base_url: string;
   token: string;
   capacity: number;
+  kotoba_batch_size: number | null;
+  whisperx_batch_size: number | null;
 }
-const EMPTY: RuntimeForm = { id: null, name: "", base_url: "", token: "", capacity: 1 };
+const EMPTY: RuntimeForm = {
+  id: null,
+  name: "",
+  base_url: "",
+  token: "",
+  capacity: 1,
+  kotoba_batch_size: null,
+  whisperx_batch_size: null,
+};
+
+interface TranslationEndpointForm {
+  id: string | null;
+  name: string;
+  base_url: string;
+  token: string;
+  capacity: number;
+}
+const EMPTY_TRANSLATION_ENDPOINT: TranslationEndpointForm = {
+  id: null,
+  name: "",
+  base_url: "",
+  token: "",
+  capacity: 1,
+};
 
 interface PromptForm {
   id: string | null;
@@ -50,12 +75,8 @@ export default function SettingsPage() {
   const { data, status, error, updatedAt, refreshing, refresh } = useLiveQuery(fetcher, SETTINGS_INTERVAL_MS);
 
   const [form, setForm] = useState<RuntimeForm>(EMPTY);
-  const [lmDraft, setLm] = useState<{
-    base_url: string;
-    model: string;
-    token: string;
-    workers: number;
-  } | null>(null);
+  const [translationForm, setTranslationForm] = useState<TranslationEndpointForm>(EMPTY_TRANSLATION_ENDPOINT);
+  const [translationEditorOpen, setTranslationEditorOpen] = useState(false);
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -64,14 +85,6 @@ export default function SettingsPage() {
   const [promptEditorOpen, setPromptEditorOpen] = useState(false);
   const [pathRuleForm, setPathRuleForm] = useState<PathRuleForm>(EMPTY_PATH_RULE);
   const [pathRuleEditorOpen, setPathRuleEditorOpen] = useState(false);
-
-  const servers = data?.servers;
-  const lm = lmDraft ?? {
-    base_url: servers?.lm_base_url ?? "",
-    model: servers?.lm_model ?? "",
-    token: "",
-    workers: servers?.translation_workers ?? 1,
-  };
 
   const guard = async (task: () => Promise<unknown>, message?: string) => {
     setBusy(true);
@@ -102,6 +115,10 @@ export default function SettingsPage() {
               token: form.token || null,
               enabled: existing.enabled,
               capacity: form.capacity,
+              kotoba_batch_size: form.kotoba_batch_size,
+              whisperx_batch_size: form.whisperx_batch_size,
+              clear_kotoba_batch_size: form.kotoba_batch_size == null,
+              clear_whisperx_batch_size: form.whisperx_batch_size == null,
             })
           : api.createRuntime({
               name: form.name,
@@ -109,6 +126,8 @@ export default function SettingsPage() {
               token: form.token,
               enabled: true,
               capacity: form.capacity,
+              kotoba_batch_size: form.kotoba_batch_size,
+              whisperx_batch_size: form.whisperx_batch_size,
             }),
       existing ? "Runtime을 수정했습니다." : "Runtime을 추가했습니다.",
     );
@@ -118,21 +137,32 @@ export default function SettingsPage() {
     }
   };
 
-  const submitServers = async (event: React.FormEvent) => {
+  const submitTranslationEndpoint = async (event: React.FormEvent) => {
     event.preventDefault();
-    if (!servers) return;
+    const existing = (data?.translation_endpoints ?? []).find((item) => item.id === translationForm.id);
     const ok = await guard(
       () =>
-        api.updateServers({
-          stt_base_url: servers.stt_base_url,
-          lm_base_url: lm.base_url,
-          lm_token: lm.token || null,
-          lm_model: lm.model,
-          translation_workers: lm.workers,
-        }),
-      "번역 서버 설정을 저장했습니다.",
+        existing
+          ? api.updateTranslationEndpoint(existing.id, {
+              name: translationForm.name,
+              base_url: translationForm.base_url,
+              token: translationForm.token || null,
+              enabled: existing.enabled,
+              capacity: translationForm.capacity,
+            })
+          : api.createTranslationEndpoint({
+              name: translationForm.name,
+              base_url: translationForm.base_url,
+              token: translationForm.token,
+              enabled: true,
+              capacity: translationForm.capacity,
+            }),
+      existing ? "번역 서버를 수정했습니다." : "번역 서버를 추가했습니다.",
     );
-    if (ok) setLm(null);
+    if (ok) {
+      setTranslationForm(EMPTY_TRANSLATION_ENDPOINT);
+      setTranslationEditorOpen(false);
+    }
   };
 
   const submitPrompt = async (event: React.FormEvent) => {
@@ -161,9 +191,35 @@ export default function SettingsPage() {
       base_url: runtime.base_url,
       token: "",
       capacity: runtime.capacity,
+      kotoba_batch_size: runtime.kotoba_batch_size,
+      whisperx_batch_size: runtime.whisperx_batch_size,
     });
     setRuntimeEditorOpen(true);
   };
+
+  const editTranslationEndpoint = (endpoint: TranslationEndpoint) => {
+    setTranslationForm({
+      id: endpoint.id,
+      name: endpoint.name,
+      base_url: endpoint.base_url,
+      token: "",
+      capacity: endpoint.capacity,
+    });
+    setTranslationEditorOpen(true);
+  };
+
+  const updateTranslationRouting = (
+    endpoint: TranslationEndpoint,
+    update: Partial<Pick<TranslationEndpoint, "draft_model" | "review_model" | "review_enabled" | "batch_preferred">>,
+  ) => guard(
+    () => api.updateTranslationEndpointRouting(endpoint.id, {
+      draft_model: update.draft_model ?? endpoint.draft_model,
+      review_model: update.review_model ?? endpoint.review_model,
+      review_enabled: update.review_enabled ?? endpoint.review_enabled,
+      batch_preferred: update.batch_preferred ?? endpoint.batch_preferred,
+    }),
+    "번역 라우팅 설정을 저장했습니다.",
+  );
 
   const editPrompt = (category: PromptCategory) => {
     setPromptForm({
@@ -216,6 +272,9 @@ export default function SettingsPage() {
 
   const field = "ctl";
   const runtimes = data?.runtimes ?? [];
+  const translationEndpoints = data?.translation_endpoints ?? [];
+  const editingRuntime = runtimes.find((item) => item.id === form.id);
+  const editingTranslationEndpoint = translationEndpoints.find((item) => item.id === translationForm.id);
 
   return (
     <>
@@ -254,6 +313,7 @@ export default function SettingsPage() {
                 <span role="columnheader">Runtime</span>
                 <span role="columnheader">상태</span>
                 <span role="columnheader" className="r">작업</span>
+                <span role="columnheader">배치</span>
                 <span role="columnheader" className="r">관리</span>
               </div>
               {runtimes.length === 0 ? (
@@ -281,11 +341,14 @@ export default function SettingsPage() {
                       <span role="cell" data-label="작업" className="runtime-count-cell r m">
                         {runtime.running_jobs} / {runtime.capacity}
                       </span>
+                      <span role="cell" data-label="배치" className="runtime-batch-cell m">
+                        K {runtime.kotoba_batch_size ?? "자동"} · W {runtime.whisperx_batch_size ?? "자동"}
+                      </span>
                       <span role="cell" data-label="관리" className="btns runtime-actions">
                         <button type="button" className="btn sec sm" disabled={busy} onClick={() => void guard(() => api.probeRuntime(runtime.id))}>
                           확인
                         </button>
-                        {runtime.builtin ? null : (
+                        {!runtime.builtin ? (
                           <>
                             <button
                               type="button"
@@ -330,6 +393,17 @@ export default function SettingsPage() {
                               <Icon name="trash" size={13} />
                             </button>
                           </>
+                        ) : (
+                          <button
+                            type="button"
+                            className="btn sec sm"
+                            aria-label={`${runtime.name} 배치 설정 수정`}
+                            title="배치 설정 수정"
+                            disabled={busy}
+                            onClick={() => editRuntime(runtime)}
+                          >
+                            <Icon name="pencil" size={13} />
+                          </button>
                         )}
                       </span>
                     </div>
@@ -339,23 +413,31 @@ export default function SettingsPage() {
             </div>
           </div>
           {runtimeEditorOpen ? <div className="card-body settings-editor" id="runtime-editor">
-            <div className="settings-editor-head"><strong>{form.id ? "Runtime 수정" : "새 Runtime 추가"}</strong><span>{form.id ? "비밀번호를 비우면 기존 API 토큰을 유지합니다." : "전사 서버 연결 정보와 할당 슬롯을 입력하세요."}</span></div>
+            <div className="settings-editor-head"><strong>{form.id ? "Runtime 수정" : "새 Runtime 추가"}</strong><span>{editingRuntime?.builtin ? "기본 Runtime은 배치 크기만 변경할 수 있습니다." : form.id ? "비밀번호를 비우면 기존 API 토큰을 유지합니다." : "전사 서버 연결 정보와 할당 슬롯을 입력하세요."}</span></div>
             <form onSubmit={submitRuntime} className="fg settings-form-grid">
               <label className="f">
                 <span className="lb">이름</span>
-                <input required maxLength={80} className={field} value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="GPU Runtime 02" />
+                <input required disabled={editingRuntime?.builtin} maxLength={80} className={field} value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="GPU Runtime 02" />
               </label>
               <label className="f">
                 <span className="lb">API 주소</span>
-                <input required type="url" className={field} value={form.base_url} onChange={(e) => setForm({ ...form, base_url: e.target.value })} placeholder="http://runtime-host:8100" />
+                <input required disabled={editingRuntime?.builtin} type="url" className={field} value={form.base_url} onChange={(e) => setForm({ ...form, base_url: e.target.value })} placeholder="http://runtime-host:8100" />
               </label>
               <label className="f">
                 <span className="lb">API 토큰</span>
-                <input type="password" autoComplete="new-password" className={field} value={form.token} onChange={(e) => setForm({ ...form, token: e.target.value })} placeholder={form.id ? "비우면 유지" : ""} />
+                <input disabled={editingRuntime?.builtin} type="password" autoComplete="new-password" className={field} value={form.token} onChange={(e) => setForm({ ...form, token: e.target.value })} placeholder={form.id ? "비우면 유지" : ""} />
               </label>
               <label className="f">
                 <span className="lb">할당 슬롯</span>
-                <input type="number" min={1} max={8} className={field} value={form.capacity} onChange={(e) => setForm({ ...form, capacity: Number(e.target.value) })} />
+                <input disabled={editingRuntime?.builtin} type="number" min={1} max={8} className={field} value={form.capacity} onChange={(e) => setForm({ ...form, capacity: Number(e.target.value) })} />
+              </label>
+              <label className="f">
+                <span className="lb">Kotoba 배치</span>
+                <input type="number" min={1} max={64} className={field} value={form.kotoba_batch_size ?? ""} onChange={(e) => setForm({ ...form, kotoba_batch_size: e.target.value ? Number(e.target.value) : null })} placeholder="Runtime 기본값" />
+              </label>
+              <label className="f">
+                <span className="lb">WhisperX 배치</span>
+                <input type="number" min={1} max={64} className={field} value={form.whisperx_batch_size ?? ""} onChange={(e) => setForm({ ...form, whisperx_batch_size: e.target.value ? Number(e.target.value) : null })} placeholder="Runtime 기본값" />
               </label>
               <div className="w btns">
                 <button type="submit" className="btn sm" disabled={busy}>
@@ -369,35 +451,91 @@ export default function SettingsPage() {
 
         <section className="card">
           <div className="card-head">
-            <h2>번역 서버</h2>
-            {servers ? (
-              <span className={servers.translation_configured ? "b ok" : "b wait"}>
-                {servers.translation_configured ? "설정됨" : "미설정"}
-              </span>
-            ) : null}
+            <div><h2>번역 서버</h2><span className="sub m">{translationEndpoints.length}개 서버</span></div>
+            {translationEditorOpen ? (
+              <span className="b line">{translationForm.id ? "수정 중" : "추가 중"}</span>
+            ) : (
+              <button type="button" className="btn sec sm" onClick={() => { setTranslationForm(EMPTY_TRANSLATION_ENDPOINT); setTranslationEditorOpen(true); }}>
+                <Icon name="plus" size={14} />서버 추가
+              </button>
+            )}
           </div>
-          <div className="card-body">
-            <form onSubmit={submitServers} className="fg settings-form-grid">
-              <label className="f">
-                <span className="lb">API 주소</span>
-                <input type="url" className={field} value={lm.base_url} onChange={(e) => setLm({ ...lm, base_url: e.target.value })} placeholder="http://lm-host:8000/v1" />
-              </label>
-              <label className="f">
-                <span className="lb">모델</span>
-                <input className={field} value={lm.model} onChange={(e) => setLm({ ...lm, model: e.target.value })} />
-              </label>
-              <label className="f">
-                <span className="lb">API 토큰</span>
-                <input type="password" autoComplete="new-password" className={field} value={lm.token} onChange={(e) => setLm({ ...lm, token: e.target.value })} placeholder={servers?.lm_token_configured ? "비우면 유지" : ""} />
-              </label>
-              <label className="f">
-                <span className="lb">번역 동시 실행</span>
-                <input type="number" min={1} max={8} className={field} value={lm.workers} onChange={(e) => setLm({ ...lm, workers: Number(e.target.value) })} />
-              </label>
-              <div className="w btns">
-                <button type="submit" className="btn sm" disabled={busy}>저장</button>
+          <div className="card-body flush">
+            {data?.translation_router_error ? (
+              <p role="alert" className="translation-router-error">번역 라우터 연결 실패: {data.translation_router_error}</p>
+            ) : null}
+            <div className="tbl settings-translation-table" role="table" aria-label="번역 서버 목록">
+              <div className="tr head translation-server-grid" role="row">
+                <span role="columnheader">서버</span>
+                <span role="columnheader">상태</span>
+                <span role="columnheader" className="r">요청</span>
+                <span role="columnheader" className="r">관리</span>
               </div>
-            </form>
+              {translationEndpoints.length === 0 ? (
+                <div className="tr empty" role="row" style={{ gridTemplateColumns: "minmax(0, 1fr)" }}>
+                  <span role="cell">등록된 번역 서버 없음</span>
+                </div>
+              ) : translationEndpoints.map((endpoint) => (
+                <div key={endpoint.id} className="tr translation-server-grid" role="row">
+                  <div className="t-name" role="cell" data-label="서버" title={`${endpoint.name}\n${endpoint.base_url}`}>
+                    <div className="runtime-title"><strong>{endpoint.name}</strong>{endpoint.builtin ? <span className="b line">기본</span> : null}</div>
+                    <span className="m">{endpoint.base_url}</span>
+                  </div>
+                  <span role="cell" data-label="상태"><span className={endpoint.status === "ready" ? "b ok dot" : endpoint.status === "unavailable" ? "b bad dot" : "b wait dot"}>{endpoint.status}</span></span>
+                  <span role="cell" data-label="요청" className="r m">{endpoint.running_jobs} / {endpoint.capacity}</span>
+                  <span role="cell" data-label="관리" className="btns translation-server-actions">
+                    <button type="button" className="btn sec sm" disabled={busy} onClick={() => void guard(() => api.probeTranslationEndpoint(endpoint.id), "모델 목록을 갱신했습니다.")}>확인</button>
+                    {!endpoint.builtin ? (
+                      <>
+                        <button type="button" className="btn sec sm" disabled={busy} onClick={() => void guard(() => api.updateTranslationEndpoint(endpoint.id, { name: endpoint.name, base_url: endpoint.base_url, enabled: !endpoint.enabled, capacity: endpoint.capacity }))}>{endpoint.enabled ? "중지" : "사용"}</button>
+                        <button type="button" className="btn sec sm" disabled={busy} onClick={() => editTranslationEndpoint(endpoint)}><Icon name="pencil" size={13} />수정</button>
+                        <button type="button" className="btn dgr sm" disabled={busy} onClick={() => { if (window.confirm(`${endpoint.name} 번역 서버를 삭제할까요?`)) void guard(() => api.deleteTranslationEndpoint(endpoint.id), "번역 서버를 삭제했습니다."); }}><Icon name="trash" size={13} /></button>
+                      </>
+                    ) : null}
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
+          {translationEditorOpen ? (
+            <div className="card-body settings-editor">
+              <div className="settings-editor-head"><strong>{translationForm.id ? "번역 서버 수정" : "새 번역 서버 추가"}</strong><span>{editingTranslationEndpoint ? "토큰을 비우면 기존 값을 유지합니다." : "OpenAI 호환 서버 연결 정보를 입력하세요."}</span></div>
+              <form onSubmit={submitTranslationEndpoint} className="fg settings-form-grid">
+                <label className="f"><span className="lb">이름</span><input required maxLength={80} className={field} value={translationForm.name} onChange={(event) => setTranslationForm({ ...translationForm, name: event.target.value })} /></label>
+                <label className="f"><span className="lb">API 주소</span><input required type="url" className={field} value={translationForm.base_url} onChange={(event) => setTranslationForm({ ...translationForm, base_url: event.target.value })} placeholder="http://model-server:1234/v1" /></label>
+                <label className="f"><span className="lb">API 토큰</span><input type="password" autoComplete="new-password" className={field} value={translationForm.token} onChange={(event) => setTranslationForm({ ...translationForm, token: event.target.value })} placeholder={editingTranslationEndpoint?.token_configured ? "비우면 유지" : ""} /></label>
+                <label className="f"><span className="lb">동시 요청</span><input type="number" min={1} max={8} className={field} value={translationForm.capacity} onChange={(event) => setTranslationForm({ ...translationForm, capacity: Number(event.target.value) })} /></label>
+                <div className="w btns"><button type="submit" className="btn sm" disabled={busy}>{translationForm.id ? "변경 저장" : "서버 추가"}</button><button type="button" className="btn sec sm" onClick={() => { setTranslationForm(EMPTY_TRANSLATION_ENDPOINT); setTranslationEditorOpen(false); }}>취소</button></div>
+              </form>
+            </div>
+          ) : null}
+        </section>
+
+        <section className="card">
+          <div className="card-head"><div><h2>초벌 번역</h2><span className="sub m">가용 서버 중 여유 슬롯을 사용하며, 일괄 작업은 우선 서버를 먼저 사용합니다.</span></div></div>
+          <div className="card-body translation-model-list">
+            {translationEndpoints.map((endpoint) => {
+              const models = Array.from(new Set([endpoint.draft_model, ...endpoint.models].filter(Boolean)));
+              return <div className="translation-model-row" key={`draft-${endpoint.id}`}>
+                <div className="runtime-title"><strong>{endpoint.name}</strong>{endpoint.builtin ? <span className="b line">기본</span> : null}</div>
+                <label className="f"><span className="lb">모델 선택</span><select className="ctl" value={endpoint.draft_model} disabled={busy || !endpoint.enabled} onChange={(event) => void updateTranslationRouting(endpoint, { draft_model: event.target.value })}><option value="">사용 안 함</option>{models.map((model) => <option value={model} key={model}>{model}</option>)}</select></label>
+                <label className="translation-toggle"><input type="checkbox" checked={endpoint.batch_preferred} disabled={busy || !endpoint.enabled} onChange={(event) => void updateTranslationRouting(endpoint, { batch_preferred: event.target.checked })} /><span>일괄 처리 우선</span></label>
+              </div>;
+            })}
+          </div>
+        </section>
+
+        <section className="card">
+          <div className="card-head"><div><h2>검증 번역</h2><span className="sub m">서버별 사용 여부를 명시적으로 켠 경우에만 검증 모델을 호출합니다.</span></div></div>
+          <div className="card-body translation-model-list">
+            {translationEndpoints.map((endpoint) => {
+              const models = Array.from(new Set([endpoint.review_model, ...endpoint.models].filter(Boolean)));
+              return <div className="translation-model-row" key={`review-${endpoint.id}`}>
+                <div className="runtime-title"><strong>{endpoint.name}</strong>{endpoint.builtin ? <span className="b line">기본</span> : null}</div>
+                <label className="f"><span className="lb">모델 선택</span><select className="ctl" value={endpoint.review_model} disabled={busy || !endpoint.enabled} onChange={(event) => void updateTranslationRouting(endpoint, { review_model: event.target.value })}><option value="">선택 안 함</option>{models.map((model) => <option value={model} key={model}>{model}</option>)}</select></label>
+                <label className="translation-toggle"><input type="checkbox" checked={endpoint.review_enabled} disabled={busy || !endpoint.enabled} onChange={(event) => void updateTranslationRouting(endpoint, { review_enabled: event.target.checked })} /><span>검증 서버 사용</span></label>
+              </div>;
+            })}
           </div>
         </section>
 

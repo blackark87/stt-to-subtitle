@@ -74,6 +74,7 @@ from .service_clients import (
     RequestConcurrencyLimiter,
     STTAPIClient,
     SubtitleValidationClient,
+    TranslationRouterAdminClient,
     TranslationPaused,
 )
 from .subtitle import write_styled_subtitles_atomic
@@ -160,6 +161,7 @@ def _transcription_model_revision(
 USER_STOP_MESSAGE = "사용자 요청으로 전체 작업이 중단되었습니다."
 USER_SELECTED_STOP_MESSAGE = "사용자 요청으로 작업이 중단되었습니다."
 TRANSLATION_PROMPT_OPTION = "translation_prompt"
+TRANSLATION_EXECUTION_MODE_OPTION = "translation_execution_mode"
 TRANSLATION_REVIEW_ROUNDS = 2
 SUBTITLE_RENDERER_VERSION = "1"
 SUPPORTED_OPERATIONS = {"extract", "transcribe", "translate", "full"}
@@ -321,6 +323,14 @@ class SubtitleOrchestrator:
             if saved_servers is not None
             else settings.remote_servers()
         )
+        if settings.translation_service_base_url.strip():
+            service_servers = settings.remote_servers()
+            initial_servers = replace(
+                initial_servers,
+                lm_base_url=service_servers.lm_base_url,
+                lm_token=service_servers.lm_token,
+                lm_model=service_servers.lm_model,
+            )
         saved_validator = self.store.get_subtitle_validator_settings()
         self._subtitle_validator = (
             SubtitleValidatorSettings(**saved_validator)
@@ -472,6 +482,54 @@ class SubtitleOrchestrator:
             "stt_gate_message": stt_gate_message,
         }
 
+    def _translation_router_admin(self) -> TranslationRouterAdminClient:
+        if not self.settings.translation_service_base_url.strip():
+            raise ValueError("독립 번역 라우터가 설정되지 않았습니다.")
+        servers = self.remote_servers
+        return TranslationRouterAdminClient(
+            servers.lm_base_url,
+            servers.lm_token,
+            request_observer=self.record_external_request,
+        )
+
+    def translation_endpoints_view(self) -> list[dict[str, Any]]:
+        return self._translation_router_admin().list_endpoints()
+
+    def create_translation_endpoint(
+        self,
+        payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        return self._translation_router_admin().create_endpoint(payload)
+
+    def update_translation_endpoint(
+        self,
+        endpoint_id: str,
+        payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        return self._translation_router_admin().update_endpoint(
+            endpoint_id,
+            payload,
+        )
+
+    def delete_translation_endpoint(self, endpoint_id: str) -> None:
+        self._translation_router_admin().delete_endpoint(endpoint_id)
+
+    def probe_translation_endpoint(
+        self,
+        endpoint_id: str,
+    ) -> dict[str, Any]:
+        return self._translation_router_admin().probe_endpoint(endpoint_id)
+
+    def update_translation_endpoint_routing(
+        self,
+        endpoint_id: str,
+        payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        return self._translation_router_admin().update_routing(
+            endpoint_id,
+            payload,
+        )
+
     @staticmethod
     def _validate_runtime_values(
         *,
@@ -486,6 +544,18 @@ class SubtitleOrchestrator:
             raise ValueError("Runtime 동시 작업 수는 1~8이어야 합니다.")
         normalized_url = normalize_server_url(base_url, "RUNTIME_BASE_URL")
         return normalized_name, normalized_url, capacity
+
+    @staticmethod
+    def _validate_runtime_batch_size(
+        value: int | None,
+        *,
+        name: str,
+    ) -> int | None:
+        if value is None:
+            return None
+        if not WHISPERX_MIN_BATCH_SIZE <= value <= WHISPERX_MAX_BATCH_SIZE:
+            raise ValueError(f"{name} 배치 크기는 1~64여야 합니다.")
+        return value
 
     def _load_external_runtimes(self) -> None:
         with self._runtime_lock:
@@ -516,6 +586,8 @@ class SubtitleOrchestrator:
     def _runtime_definitions(self) -> list[dict[str, Any]]:
         definitions: list[dict[str, Any]] = []
         servers = self.remote_servers
+        batch_settings = self.store.runtime_batch_settings()
+        builtin_batches = batch_settings.get(BUILTIN_RUNTIME_ID, {})
         if servers.stt_is_complete:
             definitions.append(
                 {
@@ -525,6 +597,12 @@ class SubtitleOrchestrator:
                     "token": servers.stt_token,
                     "enabled": True,
                     "capacity": 1,
+                    "kotoba_batch_size": builtin_batches.get(
+                        "kotoba_batch_size"
+                    ),
+                    "whisperx_batch_size": builtin_batches.get(
+                        "whisperx_batch_size"
+                    ),
                     "builtin": True,
                 }
             )
@@ -536,6 +614,12 @@ class SubtitleOrchestrator:
                 "token": endpoint.token,
                 "enabled": endpoint.enabled,
                 "capacity": endpoint.capacity,
+                "kotoba_batch_size": batch_settings.get(
+                    endpoint.id, {}
+                ).get("kotoba_batch_size"),
+                "whisperx_batch_size": batch_settings.get(
+                    endpoint.id, {}
+                ).get("whisperx_batch_size"),
                 "builtin": False,
             }
             for endpoint in self.store.list_runtime_endpoints()
@@ -631,6 +715,10 @@ class SubtitleOrchestrator:
                     "token_configured": bool(definition["token"]),
                     "enabled": bool(definition["enabled"]),
                     "capacity": capacity,
+                    "kotoba_batch_size": definition["kotoba_batch_size"],
+                    "whisperx_batch_size": definition[
+                        "whisperx_batch_size"
+                    ],
                     "builtin": bool(definition["builtin"]),
                     "status": current.get("status", "unknown"),
                     "message": current.get("message"),
@@ -664,11 +752,21 @@ class SubtitleOrchestrator:
         token: str,
         enabled: bool,
         capacity: int,
+        kotoba_batch_size: int | None = None,
+        whisperx_batch_size: int | None = None,
     ) -> dict[str, Any]:
         name, base_url, capacity = self._validate_runtime_values(
             name=name,
             base_url=base_url,
             capacity=capacity,
+        )
+        kotoba_batch_size = self._validate_runtime_batch_size(
+            kotoba_batch_size,
+            name="Kotoba",
+        )
+        whisperx_batch_size = self._validate_runtime_batch_size(
+            whisperx_batch_size,
+            name="WhisperX",
         )
         with self._runtime_lock:
             if (
@@ -684,6 +782,11 @@ class SubtitleOrchestrator:
                 token=token,
                 enabled=enabled,
                 capacity=capacity,
+            )
+            self.store.save_runtime_batch_settings(
+                endpoint.id,
+                kotoba_batch_size=kotoba_batch_size,
+                whisperx_batch_size=whisperx_batch_size,
             )
             self._install_runtime_endpoint(endpoint)
         if enabled:
@@ -724,15 +827,60 @@ class SubtitleOrchestrator:
         clear_token: bool,
         enabled: bool,
         capacity: int,
+        kotoba_batch_size: int | None = None,
+        whisperx_batch_size: int | None = None,
+        clear_kotoba_batch_size: bool = False,
+        clear_whisperx_batch_size: bool = False,
     ) -> dict[str, Any]:
-        if runtime_id == BUILTIN_RUNTIME_ID:
-            raise ValueError("기본 Runtime은 서버 설정에서 변경하세요.")
         name, base_url, capacity = self._validate_runtime_values(
             name=name,
             base_url=base_url,
             capacity=capacity,
         )
+        kotoba_batch_size = self._validate_runtime_batch_size(
+            kotoba_batch_size,
+            name="Kotoba",
+        )
+        whisperx_batch_size = self._validate_runtime_batch_size(
+            whisperx_batch_size,
+            name="WhisperX",
+        )
         with self._runtime_lock:
+            definition = self._runtime_definition(runtime_id)
+            current_kotoba_batch_size = definition["kotoba_batch_size"]
+            current_whisperx_batch_size = definition["whisperx_batch_size"]
+            resolved_kotoba_batch_size = (
+                None
+                if clear_kotoba_batch_size
+                else current_kotoba_batch_size
+                if kotoba_batch_size is None
+                else kotoba_batch_size
+            )
+            resolved_whisperx_batch_size = (
+                None
+                if clear_whisperx_batch_size
+                else current_whisperx_batch_size
+                if whisperx_batch_size is None
+                else whisperx_batch_size
+            )
+            if runtime_id == BUILTIN_RUNTIME_ID:
+                if (
+                    name != definition["name"]
+                    or base_url != definition["base_url"]
+                    or not enabled
+                    or capacity != definition["capacity"]
+                    or clear_token
+                    or token is not None
+                ):
+                    raise ValueError(
+                        "기본 Runtime은 배치 크기만 변경할 수 있습니다."
+                    )
+                self.store.save_runtime_batch_settings(
+                    runtime_id,
+                    kotoba_batch_size=resolved_kotoba_batch_size,
+                    whisperx_batch_size=resolved_whisperx_batch_size,
+                )
+                return self._runtime_view(runtime_id)
             current = self.store.get_runtime_endpoint(runtime_id)
             if current is None:
                 raise ValueError("Runtime을 찾을 수 없습니다.")
@@ -757,6 +905,11 @@ class SubtitleOrchestrator:
                 ),
                 enabled=enabled,
                 capacity=capacity,
+            )
+            self.store.save_runtime_batch_settings(
+                runtime_id,
+                kotoba_batch_size=resolved_kotoba_batch_size,
+                whisperx_batch_size=resolved_whisperx_batch_size,
             )
             self._install_runtime_endpoint(updated)
         if enabled:
@@ -1345,6 +1498,14 @@ class SubtitleOrchestrator:
         self,
         settings: RemoteServerSettings,
     ) -> RemoteServerSettings:
+        if self.settings.translation_service_base_url.strip():
+            service_servers = self.settings.remote_servers()
+            settings = replace(
+                settings,
+                lm_base_url=service_servers.lm_base_url,
+                lm_token=service_servers.lm_token,
+                lm_model=service_servers.lm_model,
+            )
         return self._set_remote_servers(settings, persist=True)
 
     def _set_remote_servers(
@@ -1776,6 +1937,9 @@ class SubtitleOrchestrator:
 
         normalized_options = self._normalize_options(options)
         if operation in TRANSLATION_OPERATIONS:
+            normalized_options[TRANSLATION_EXECUTION_MODE_OPTION] = (
+                "batch" if len(unique_source_rels) > 1 else "live"
+            )
             if prompt_category_id:
                 normalized_options[TRANSLATION_PROMPT_OPTION] = (
                     self._prompt_snapshot(prompt_category_id)
@@ -1930,12 +2094,20 @@ class SubtitleOrchestrator:
                                 "translation requested; continuing completed "
                                 "transcription in the same job"
                             ),
+                            execution_mode=str(
+                                normalized_options[
+                                    TRANSLATION_EXECUTION_MODE_OPTION
+                                ]
+                            ),
                         )
                     )
                     continue
                 reusable_options = dict(reusable.options)
                 reusable_options[TRANSLATION_PROMPT_OPTION] = (
                     normalized_options[TRANSLATION_PROMPT_OPTION]
+                )
+                reusable_options[TRANSLATION_EXECUTION_MODE_OPTION] = (
+                    normalized_options[TRANSLATION_EXECUTION_MODE_OPTION]
                 )
                 created = self.store.create(
                     job_id=uuid4().hex,
@@ -2203,6 +2375,7 @@ class SubtitleOrchestrator:
             reusable_transcripts.append(job)
 
         transitioned_jobs: list[PipelineJob] = []
+        execution_mode = "batch" if len(reusable_transcripts) > 1 else "live"
         for reusable in reusable_transcripts:
             transitioned_jobs.append(
                 self._continue_completed_transcription(
@@ -2213,6 +2386,7 @@ class SubtitleOrchestrator:
                         "selected completed transcription continued in "
                         "translation queue"
                     ),
+                    execution_mode=execution_mode,
                 )
             )
         return transitioned_jobs
@@ -2224,10 +2398,12 @@ class SubtitleOrchestrator:
         prompt_snapshot: Mapping[str, Any],
         force_overwrite: bool,
         event_message: str,
+        execution_mode: str,
     ) -> PipelineJob:
         """Continue translation in a completed transcription's job record."""
         options = dict(job.options)
         options[TRANSLATION_PROMPT_OPTION] = dict(prompt_snapshot)
+        options[TRANSLATION_EXECUTION_MODE_OPTION] = execution_mode
         transitioned = self.store.update_if_status(
             job.id,
             {"transcription_completed"},
@@ -2340,6 +2516,9 @@ class SubtitleOrchestrator:
                 if key not in comparison_option_keys
             }
             options[TRANSLATION_PROMPT_OPTION] = dict(prompt_snapshot)
+            options[TRANSLATION_EXECUTION_MODE_OPTION] = (
+                "batch" if len(selected_transcripts) > 1 else "live"
+            )
             options["comparison_transcript_source"] = {
                 "comparison_id": normalized_comparison_id,
                 "job_id": reusable.id,
@@ -4070,6 +4249,7 @@ class SubtitleOrchestrator:
         stt_client = self._runtime_client(runtime_id)
         if stt_client is None:
             raise ExternalServiceError("assigned Runtime is not configured")
+        runtime_definition = self._runtime_definition(runtime_id)
         if not job.audio_path or not Path(job.audio_path).is_file():
             raise RuntimeError("extracted WAV is unavailable")
         options = {
@@ -4091,6 +4271,18 @@ class SubtitleOrchestrator:
         ):
             if key in job.options:
                 options[key] = job.options[key]
+        backend = str(options["backend"])
+        kotoba_batch_size = runtime_definition["kotoba_batch_size"]
+        whisperx_batch_size = runtime_definition["whisperx_batch_size"]
+        if backend == "kotoba" and kotoba_batch_size is not None:
+            options["batch_size"] = kotoba_batch_size
+        elif backend == "whisperx" and whisperx_batch_size is not None:
+            options["batch_size"] = whisperx_batch_size
+        elif backend == "hybrid":
+            if whisperx_batch_size is not None:
+                options["batch_size"] = whisperx_batch_size
+            if kotoba_batch_size is not None:
+                options["kotoba_batch_size"] = kotoba_batch_size
         audio_duration = wav_duration_seconds(Path(job.audio_path))
         source_start = float(job.options["start_seconds"])
         source_end = (
@@ -4112,6 +4304,8 @@ class SubtitleOrchestrator:
             "provider": "remote_stt",
             "backend": options["backend"],
             "chunk_length_seconds": options["chunk_length_seconds"],
+            "batch_size": options.get("batch_size"),
+            "kotoba_batch_size": options.get("kotoba_batch_size"),
             "chunk_length_semantics": (
                 "not_applicable"
                 if options["backend"] == "whisperjav"
@@ -4763,6 +4957,28 @@ class SubtitleOrchestrator:
         except (TypeError, ValueError):
             review_rounds = 0
         review_rounds = min(TRANSLATION_REVIEW_ROUNDS, max(0, review_rounds))
+        execution_mode = str(
+            job.options.get(TRANSLATION_EXECUTION_MODE_OPTION, "live")
+        ).strip()
+        if execution_mode not in {"live", "batch"}:
+            execution_mode = "live"
+        self.store.add_event(
+            job.id,
+            "info",
+            "translation route selected",
+            event_code="translation.route.selected",
+            phase="translation",
+            payload={
+                "execution_mode": execution_mode,
+                "draft_pass": True,
+                "local_review_pass": bool(review_rounds),
+                "external_validation": (
+                    "configured"
+                    if self._subtitle_validator.is_complete
+                    else "disabled"
+                ),
+            },
+        )
         if not job.transcript_path:
             raise RuntimeError("transcript artifact is unavailable")
         transcript_payload = json.loads(
@@ -4981,6 +5197,7 @@ class SubtitleOrchestrator:
                 should_pause=should_pause,
                 on_review_warning=review_warning,
                 max_workers=servers.translation_workers,
+                execution_mode=execution_mode,
             )
             self._raise_if_job_stop_requested(job.id)
             translation_outcome = "completed"
@@ -5715,6 +5932,7 @@ class SubtitleOrchestrator:
         for secret in {
             self.settings.stt_token,
             self.settings.lm_token,
+            self.settings.translation_service_token,
             self.remote_servers.stt_token,
             self.remote_servers.lm_token,
             self._subtitle_validator.token,

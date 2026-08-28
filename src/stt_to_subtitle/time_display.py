@@ -8,12 +8,12 @@ import logging
 
 KST = timezone(timedelta(hours=9), name="KST")
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s %(message)s"
-LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S KST"
+LOG_DATE_FORMAT = "%Y%m%d %H:%M:%S"
 
 
 def format_kst_timestamp(value: float | int | str) -> str:
     return datetime.fromtimestamp(float(value), tz=KST).strftime(
-        "%Y-%m-%d %H:%M:%S KST"
+        "%Y%m%d %H:%M:%S"
     )
 
 

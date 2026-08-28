@@ -58,12 +58,38 @@ class TranslationModelLookupRequest(BaseModel):
     clear_lm_token: bool = False
 
 
+class TranslationEndpointCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    base_url: str
+    token: str = ""
+    enabled: bool = True
+    capacity: int = Field(default=1, ge=1, le=8)
+
+
+class TranslationEndpointUpdateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    base_url: str
+    token: str | None = None
+    clear_token: bool = False
+    enabled: bool = True
+    capacity: int = Field(default=1, ge=1, le=8)
+
+
+class TranslationEndpointRoutingRequest(BaseModel):
+    draft_model: str = ""
+    review_model: str = ""
+    review_enabled: bool = False
+    batch_preferred: bool = False
+
+
 class RuntimeEndpointCreateRequest(BaseModel):
     name: str = Field(min_length=1, max_length=80)
     base_url: str
     token: str = ""
     enabled: bool = True
     capacity: int = Field(default=1, ge=1, le=8)
+    kotoba_batch_size: int | None = Field(default=None, ge=1, le=64)
+    whisperx_batch_size: int | None = Field(default=None, ge=1, le=64)
 
 
 class RuntimeEndpointUpdateRequest(BaseModel):
@@ -73,6 +99,10 @@ class RuntimeEndpointUpdateRequest(BaseModel):
     clear_token: bool = False
     enabled: bool = True
     capacity: int = Field(default=1, ge=1, le=8)
+    kotoba_batch_size: int | None = Field(default=None, ge=1, le=64)
+    whisperx_batch_size: int | None = Field(default=None, ge=1, le=64)
+    clear_kotoba_batch_size: bool = False
+    clear_whisperx_batch_size: bool = False
 
 
 class SubtitleValidatorUpdateRequest(BaseModel):

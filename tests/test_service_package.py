@@ -62,6 +62,30 @@ class ServicePackageBoundaryTests(unittest.TestCase):
             self.assertFalse((destination / "templates").exists())
             self.assertFalse((destination / "static").exists())
 
+    def test_translation_package_excludes_backend_and_model_runtime(self) -> None:
+        with TemporaryDirectory() as directory:
+            destination = Path(directory) / "stt_to_subtitle"
+            selected = MODULE.stage(
+                "translation",
+                ROOT / "src" / "stt_to_subtitle",
+                destination,
+            )
+
+            self.assertIn("translation_api", selected)
+            self.assertIn("translation_store", selected)
+            for module in (
+                "backend_api",
+                "orchestrator",
+                "job_store",
+                "runtime_api",
+                "kotoba",
+                "hybrid_stt",
+                "whisperx_worker",
+                "whisperjav_worker",
+            ):
+                self.assertNotIn(module, selected)
+                self.assertFalse((destination / f"{module}.py").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

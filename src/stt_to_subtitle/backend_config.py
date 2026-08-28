@@ -375,6 +375,9 @@ class BackendSettings:
     translation_batch_characters: int = 6000
     audio_workers: int = 1
     work_dir: Path | None = None
+    translation_service_base_url: str = ""
+    translation_service_token: str = ""
+    translation_service_model: str = ""
 
     @classmethod
     def from_env(cls) -> BackendSettings:
@@ -430,6 +433,18 @@ class BackendSettings:
             audio_workers=int(
                 os.environ.get("BACKEND_AUDIO_WORKERS", "1")
             ),
+            translation_service_base_url=os.environ.get(
+                "TRANSLATION_SERVICE_BASE_URL",
+                "",
+            ).strip(),
+            translation_service_token=os.environ.get(
+                "TRANSLATION_SERVICE_TOKEN",
+                "",
+            ),
+            translation_service_model=os.environ.get(
+                "TRANSLATION_SERVICE_MODEL",
+                "",
+            ).strip(),
         )
 
     @property
@@ -455,14 +470,43 @@ class BackendSettings:
             raise ValueError("translation batch limits must be positive")
         if self.audio_workers < 1:
             raise ValueError("BACKEND_AUDIO_WORKERS must be at least 1")
+        service_values = (
+            self.translation_service_base_url.strip(),
+            self.translation_service_model.strip(),
+        )
+        if any(service_values) and not all(service_values):
+            raise ValueError(
+                "TRANSLATION_SERVICE_BASE_URL and "
+                "TRANSLATION_SERVICE_MODEL must be configured together"
+            )
+        if self.translation_service_base_url:
+            normalize_server_url(
+                self.translation_service_base_url,
+                "TRANSLATION_SERVICE_BASE_URL",
+            )
 
     def remote_servers(self) -> RemoteServerSettings:
+        translation_service_configured = bool(
+            self.translation_service_base_url.strip()
+        )
         return RemoteServerSettings(
             stt_base_url=self.stt_base_url,
             stt_token=self.stt_token,
-            lm_base_url=self.lm_base_url,
-            lm_token=self.lm_token,
-            lm_model=self.lm_model,
+            lm_base_url=(
+                self.translation_service_base_url
+                if translation_service_configured
+                else self.lm_base_url
+            ),
+            lm_token=(
+                self.translation_service_token
+                if translation_service_configured
+                else self.lm_token
+            ),
+            lm_model=(
+                self.translation_service_model
+                if translation_service_configured
+                else self.lm_model
+            ),
             translation_workers=1,
         )
 

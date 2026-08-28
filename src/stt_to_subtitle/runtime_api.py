@@ -394,16 +394,14 @@ def _resolve_batch_size(
 ) -> int:
     """Resolve the effective batch size for a transcription request.
 
-    Client overrides are only honoured for the WhisperX-backed paths; the
-    Kotoba pipeline caches its batch size at load time and WhisperJAV uses a
-    different batching concept entirely.
+    Kotoba reloads its cached pipeline when this value changes. WhisperJAV
+    uses a different batching concept and does not accept this option.
     """
 
     if decoded.get("batch_size") is not None:
-        if backend not in {"whisperx", "hybrid"}:
+        if backend == "whisperjav":
             raise ValueError(
-                f"{backend} batch_size is fixed at pipeline load; "
-                "set STT_BATCH_SIZE instead"
+                "whisperjav does not support the common batch_size option"
             )
         raw_value = decoded["batch_size"]
         if isinstance(raw_value, bool) or not isinstance(raw_value, int):
@@ -432,6 +430,7 @@ def _parse_options(raw_options: str, settings: STTAPISettings) -> dict[str, Any]
     allowed = {
         "backend",
         "batch_size",
+        "kotoba_batch_size",
         "chunk_length_seconds",
         "num_speakers",
         "min_speakers",
@@ -466,6 +465,8 @@ def _parse_options(raw_options: str, settings: STTAPISettings) -> dict[str, Any]
             f"{backend} backend requires noise_filter=true for VAD"
         )
     batch_size = _resolve_batch_size(decoded, backend, settings)
+    if decoded.get("kotoba_batch_size") is not None and backend != "hybrid":
+        raise ValueError("kotoba_batch_size requires backend='hybrid'")
     options = TranscriptionOptions(
         batch_size=batch_size,
         chunk_length_seconds=int(
@@ -540,8 +541,28 @@ def _parse_options(raw_options: str, settings: STTAPISettings) -> dict[str, Any]
             }
         )
         if backend == "hybrid":
+            raw_kotoba_batch_size = decoded.get(
+                "kotoba_batch_size",
+                settings.batch_size,
+            )
+            if (
+                isinstance(raw_kotoba_batch_size, bool)
+                or not isinstance(raw_kotoba_batch_size, int)
+            ):
+                raise ValueError("kotoba_batch_size must be an integer")
+            if not (
+                WHISPERX_MIN_BATCH_SIZE
+                <= raw_kotoba_batch_size
+                <= WHISPERX_MAX_BATCH_SIZE
+            ):
+                raise ValueError(
+                    "kotoba_batch_size must be between "
+                    f"{WHISPERX_MIN_BATCH_SIZE} and "
+                    f"{WHISPERX_MAX_BATCH_SIZE}"
+                )
             hybrid = HybridRescueOptions.from_options(decoded)
             parsed["hybrid_rescue"] = asdict(hybrid)
+            parsed["kotoba_batch_size"] = raw_kotoba_batch_size
             parsed["chunk_length_seconds"] = (
                 hybrid.kotoba_chunk_length_seconds
             )
@@ -676,6 +697,7 @@ class TranscriptionService:
             )
         self._queue: queue.Queue[str | None] = queue.Queue()
         self._pipeline: SpeechPipeline | None = None
+        self._pipeline_batch_size: int | None = None
         # Held for the whole of a job so the idle reaper can never unload the
         # pipeline out from under a running transcription.
         self._pipeline_lock = threading.RLock()
@@ -832,6 +854,7 @@ class TranscriptionService:
             "queued_jobs": queue_snapshot["queued"],
             "queue": queue_snapshot,
             "loaded_backend": "kotoba" if self._pipeline is not None else None,
+            "loaded_kotoba_batch_size": self._pipeline_batch_size,
             "model_idle_timeout_seconds": (
                 self.settings.model_idle_timeout_seconds
             ),
@@ -851,6 +874,10 @@ class TranscriptionService:
             },
             "device": self.settings.device,
             "diarization_device": self.settings.diarization_device,
+            "default_batch_sizes": {
+                "kotoba": self.settings.batch_size,
+                "whisperx": self.settings.whisperx_batch_size,
+            },
             "hf_token_configured": bool(self.settings.hf_token.strip()),
             "queue": self.queue_snapshot(),
             "backends": {
@@ -977,21 +1004,32 @@ class TranscriptionService:
         self._queue.put(job.id)
         return job
 
-    def _get_pipeline(self) -> SpeechPipeline:
+    def _get_pipeline(self, batch_size: int | None = None) -> SpeechPipeline:
+        effective_batch_size = batch_size or self.settings.batch_size
+        if (
+            self._pipeline is not None
+            and self._pipeline_batch_size != effective_batch_size
+        ):
+            self._release_pipeline(
+                "to change batch size from "
+                f"{self._pipeline_batch_size} to {effective_batch_size}"
+            )
         if self._pipeline is None:
             LOGGER.info(
-                "loading %s on %s with Pyannote on %s",
+                "loading %s on %s with Pyannote on %s and batch_size=%s",
                 MODEL_ID,
                 self.settings.device,
                 self.settings.diarization_device,
+                effective_batch_size,
             )
             self._pipeline = load_pipeline(
                 self.settings.hf_token,
-                batch_size=self.settings.batch_size,
+                batch_size=effective_batch_size,
                 device=self.settings.device,
                 diarization_device=self.settings.diarization_device,
                 threads=self.settings.threads,
             )
+            self._pipeline_batch_size = effective_batch_size
             LOGGER.info("transcription model loaded")
         self._pipeline_idle_since = time.monotonic()
         return self._pipeline
@@ -1011,7 +1049,7 @@ class TranscriptionService:
         the window and are reconciled at the transcript-normalization
         boundary.
         """
-        pipeline = self._get_pipeline()
+        pipeline = self._get_pipeline(options.batch_size)
         source = Path(job.audio_path)
         segments: list[dict[str, Any]] = []
         removed_spans: list[dict[str, Any]] = []
@@ -1149,6 +1187,7 @@ class TranscriptionService:
             return
         LOGGER.info("unloading Kotoba transcription model %s", reason)
         self._pipeline = None
+        self._pipeline_batch_size = None
         gc.collect()
         try:
             import torch
@@ -1469,9 +1508,13 @@ class TranscriptionService:
             self._raise_if_cancel_requested(job_id)
             backend = str(job.options.get("backend", "kotoba"))
             audio_duration = _wav_duration(Path(job.audio_path))
+            kotoba_batch_size = int(
+                job.options.get("kotoba_batch_size", job.options["batch_size"])
+            )
             warm_start = (
                 backend in {"hybrid", "kotoba"}
                 and self._pipeline is not None
+                and self._pipeline_batch_size == kotoba_batch_size
             )
             stt_call_count = 2 if backend in {"hybrid", "whisperjav"} else 1
             artifact_dir = (
@@ -1622,6 +1665,7 @@ class TranscriptionService:
                 )
                 kotoba_options = replace(
                     options,
+                    batch_size=kotoba_batch_size,
                     chunk_length_seconds=(
                         hybrid_options.kotoba_chunk_length_seconds
                     ),
@@ -1732,7 +1776,7 @@ class TranscriptionService:
                         index=5,
                         total=7,
                     )
-                    pipeline = self._get_pipeline()
+                    pipeline = self._get_pipeline(kotoba_options.batch_size)
                     fallback_result = run_pipeline(
                         pipeline,
                         Path(job.audio_path),
@@ -1927,7 +1971,7 @@ class TranscriptionService:
                     total=2,
                 )
                 raw_result = run_pipeline(
-                    self._get_pipeline(),
+                    self._get_pipeline(options.batch_size),
                     Path(job.audio_path),
                     options,
                     progress_callback=lambda progress: self._record_chunk_progress(

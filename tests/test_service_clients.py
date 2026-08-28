@@ -19,6 +19,7 @@ from stt_to_subtitle.service_clients import (
     SubtitleValidationClient,
     TranslationPaused,
     TranslationResponseIDError,
+    TranslationRouterAdminClient,
     batch_segments,
     list_openai_compatible_models,
     normalize_translation_response,
@@ -165,6 +166,33 @@ class OpenAICompatibleModelTests(unittest.TestCase):
 
     def test_legacy_client_name_is_a_backward_compatible_alias(self) -> None:
         self.assertIs(LMStudioClient, OpenAICompatibleClient)
+
+
+class TranslationRouterAdminClientTests(unittest.TestCase):
+    def test_lists_translation_endpoints_without_changing_payload(self) -> None:
+        response = Mock(status_code=200)
+        response.json.return_value = {
+            "items": [{"id": "builtin", "name": "기본 번역 서버"}],
+            "total": 1,
+        }
+        client = TranslationRouterAdminClient(
+            "http://translation.test/v1/",
+            "secret",
+        )
+
+        with patch.object(client, "request", return_value=response) as request:
+            items = client.list_endpoints()
+
+        self.assertEqual(items[0]["id"], "builtin")
+        request.assert_called_once_with(
+            "GET",
+            "http://translation.test/v1/router/endpoints",
+            metric_operation="endpoint_settings",
+            headers={
+                "Accept": "application/json",
+                "Authorization": "Bearer secret",
+            },
+        )
 
 
 class SubtitleValidationClientTests(unittest.TestCase):
@@ -1194,6 +1222,7 @@ class TranslationResponseTests(unittest.TestCase):
             ]
         }
         client.request = Mock(return_value=response)
+        client.translation_execution_mode = "batch"
 
         result = client._translate_batch(
             [{"id": "segment-1", "text": "翻訳"}]
@@ -1201,6 +1230,9 @@ class TranslationResponseTests(unittest.TestCase):
 
         self.assertEqual(result, [{"id": "segment-1", "text": "번역"}])
         request_payload = client.request.call_args.kwargs["json"]
+        request_headers = client.request.call_args.kwargs["headers"]
+        self.assertEqual(request_headers["X-Translation-Pass"], "draft")
+        self.assertEqual(request_headers["X-Translation-Mode"], "batch")
         self.assertEqual(
             request_payload["messages"][0],
             {

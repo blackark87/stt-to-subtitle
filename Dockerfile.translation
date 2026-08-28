@@ -1,0 +1,45 @@
+# syntax=docker/dockerfile:1
+
+ARG PYTHON_IMAGE=python:3.11.15-slim-bookworm@sha256:b18992999dbe963a45a8a4da40ac2b1975be1a776d939d098c647482bcad5cba
+
+FROM ${PYTHON_IMAGE} AS service-source
+
+WORKDIR /build
+COPY src ./src
+COPY scripts/build_service_package.py ./scripts/build_service_package.py
+RUN python scripts/build_service_package.py \
+    translation src/stt_to_subtitle /service/stt_to_subtitle
+
+FROM ${PYTHON_IMAGE} AS translation-dependencies
+
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1
+
+WORKDIR /build
+COPY requirements-backend.txt ./
+RUN --mount=type=cache,id=stt-translation-pip,target=/root/.cache/pip \
+    python -m pip install --prefix=/install -r requirements-backend.txt
+
+FROM ${PYTHON_IMAGE} AS runtime
+
+ARG APP_UID=1000
+ARG APP_GID=1000
+
+ENV PYTHONUNBUFFERED=1 \
+    HOME=/tmp \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/opt/stt
+
+RUN groupadd --gid "${APP_GID}" app \
+    && useradd --uid "${APP_UID}" --gid "${APP_GID}" --no-create-home app
+
+COPY --from=translation-dependencies /install /usr/local
+COPY --from=service-source /service/stt_to_subtitle /opt/stt/stt_to_subtitle
+
+USER app
+WORKDIR /app
+EXPOSE 8200
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+    CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8200/healthz', timeout=3)"]
+
+ENTRYPOINT ["python", "-m", "stt_to_subtitle.translation_api"]
