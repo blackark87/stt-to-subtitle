@@ -1237,6 +1237,7 @@ class TranslationResponseTests(unittest.TestCase):
         request_headers = client.request.call_args.kwargs["headers"]
         self.assertNotIn("X-Translation-Pass", request_headers)
         self.assertNotIn("X-Translation-Mode", request_headers)
+        self.assertEqual(request_payload["reasoning_effort"], "none")
         self.assertEqual(
             request_payload["messages"][0],
             {

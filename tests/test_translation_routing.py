@@ -377,6 +377,7 @@ class BackendTranslationRoutingTests(unittest.TestCase):
                     {
                         "model": "placeholder",
                         "messages": [],
+                        "reasoning_effort": "none",
                         "runtime": "gpu-3080",
                         "worker": "transcription-worker-7",
                         "stt_model": "whisperjav",
@@ -405,7 +406,7 @@ class BackendTranslationRoutingTests(unittest.TestCase):
             )
             self.assertEqual(
                 set(request.call_args.kwargs["json"]),
-                {"model", "messages"},
+                {"model", "messages", "reasoning_effort"},
             )
 
     def test_explicit_probe_checks_a_disabled_server(self) -> None:

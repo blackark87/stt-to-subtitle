@@ -1629,6 +1629,10 @@ class OpenAICompatibleClient(RetryingJSONClient):
         request_payload = {
             "model": self.model,
             "temperature": 0,
+            # Translation needs the schema-constrained answer, not a hidden
+            # reasoning trace. Thinking models can otherwise exhaust their
+            # context window before emitting message.content.
+            "reasoning_effort": "none",
             "messages": [
                 {
                     "role": "system",
