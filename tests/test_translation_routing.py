@@ -577,6 +577,97 @@ class BackendTranslationRoutingTests(unittest.TestCase):
             self.assertFalse(review_thread.is_alive())
             self.assertEqual(failures, [])
 
+    def test_review_priority_session_releases_draft_host_after_run(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            stores = self.stores(root)
+            shared = stores["draft"].create(
+                name="shared draft",
+                base_url="http://shared.test:1234/v1",
+                token="",
+                enabled=True,
+                capacity=1,
+                selected_model="shared-draft-model",
+                models=("shared-draft-model",),
+            )
+            stores["review"].create(
+                name="shared review",
+                base_url="http://shared.test:1234/v1",
+                token="",
+                enabled=True,
+                capacity=1,
+                selected_model="shared-review-model",
+                models=("shared-review-model",),
+            )
+            routing = self.routing(root, stores=stores)
+            calls: list[str] = []
+
+            def request(*args: object, **_kwargs: object) -> Mock:
+                calls.append(str(args[1]))
+                return completion_response()
+
+            with patch.object(RetryingJSONClient, "request", side_effect=request):
+                with routing.review_priority("live"):
+                    suspended = next(
+                        server
+                        for server in routing.group("draft")["servers"]
+                        if server["id"] == shared.id
+                    )
+                    self.assertEqual(suspended["status"], "suspended")
+                    routing.request_completion(
+                        "draft",
+                        "live",
+                        {"messages": []},
+                    )
+
+                with routing._condition:
+                    routing._active_requests[("draft", "builtin")] = 1
+                restored = next(
+                    server
+                    for server in routing.group("draft")["servers"]
+                    if server["id"] == shared.id
+                )
+                routing.request_completion(
+                    "draft",
+                    "live",
+                    {"messages": []},
+                )
+                with routing._condition:
+                    routing._active_requests[("draft", "builtin")] = 0
+                    routing._condition.notify_all()
+
+            self.assertNotEqual(restored["status"], "suspended")
+            self.assertEqual(
+                calls,
+                [
+                    "http://builtin.test/v1/chat/completions",
+                    "http://shared.test:1234/v1/chat/completions",
+                ],
+            )
+
+    def test_review_retries_a_transient_model_loading_failure(self) -> None:
+        with TemporaryDirectory() as directory:
+            routing = self.routing(Path(directory), review_enabled=True)
+            loading = Mock(status_code=500)
+            loading.close = Mock()
+            completed = completion_response()
+
+            with patch(
+                "stt_to_subtitle.service_clients.requests.Session.request",
+                side_effect=[loading, completed],
+            ) as request, patch(
+                "stt_to_subtitle.service_clients.time.sleep",
+            ) as sleep:
+                response = routing.request_completion(
+                    "review",
+                    "live",
+                    {"messages": []},
+                )
+
+            self.assertIs(response, completed)
+            self.assertEqual(request.call_count, 2)
+            sleep.assert_called_once_with(1.0)
+
     def test_batch_requires_the_selected_server(self) -> None:
         with TemporaryDirectory() as directory:
             routing = self.routing(Path(directory))

@@ -1436,28 +1436,18 @@ class OpenAICompatibleClient(RetryingJSONClient):
             system_prompt,
         )
         translated = draft
-        review_warning: str | None = None
         if review_rounds:
             for _round in range(review_rounds):
-                try:
-                    reviewed = self._review_batch_with_recovery(
-                        batch,
-                        reference_context,
-                        translated,
-                        review_prompt,
-                    )
-                    if reviewed == translated:
-                        break
-                    translated = reviewed
-                except ExternalServiceError as error:
-                    review_warning = str(error)
-                    LOGGER.warning(
-                        "translation review failed; using latest successful "
-                        "translation: %s",
-                        error,
-                    )
+                reviewed = self._review_batch_with_recovery(
+                    batch,
+                    reference_context,
+                    translated,
+                    review_prompt,
+                )
+                if reviewed == translated:
                     break
-        return translated, review_warning
+                translated = reviewed
+        return translated, None
 
     @staticmethod
     def _reference_context(

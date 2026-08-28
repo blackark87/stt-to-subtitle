@@ -769,7 +769,7 @@ class TranslationResponseTests(unittest.TestCase):
         self.assertEqual(result, reviewed)
         self.assertEqual(client._review_batch_with_recovery.call_count, 2)
 
-    def test_uses_the_initial_translation_when_review_fails(self) -> None:
+    def test_fails_the_logical_batch_when_review_fails(self) -> None:
         client = OpenAICompatibleClient(
             "http://translation.test/v1",
             "",
@@ -782,17 +782,17 @@ class TranslationResponseTests(unittest.TestCase):
             side_effect=ExternalServiceError("review unavailable")
         )
 
-        result = client.translate(
-            [{"id": "segment-1", "text": "原文"}],
-            review_prompt="review",
-            review_rounds=2,
-            on_review_warning=warnings.append,
-        )
+        with self.assertRaisesRegex(ExternalServiceError, "review unavailable"):
+            client.translate(
+                [{"id": "segment-1", "text": "原文"}],
+                review_prompt="review",
+                review_rounds=2,
+                on_review_warning=warnings.append,
+            )
 
-        self.assertEqual(result, draft)
-        self.assertEqual(warnings, ["review unavailable"])
+        self.assertEqual(warnings, [])
 
-    def test_keeps_the_latest_successful_translation_when_a_later_review_fails(
+    def test_fails_when_a_later_review_round_is_unavailable(
         self,
     ) -> None:
         client = OpenAICompatibleClient(
@@ -811,15 +811,18 @@ class TranslationResponseTests(unittest.TestCase):
             ]
         )
 
-        result = client.translate(
-            [{"id": "segment-1", "text": "原文"}],
-            review_prompt="review",
-            review_rounds=2,
-            on_review_warning=warnings.append,
-        )
+        with self.assertRaisesRegex(
+            ExternalServiceError,
+            "second review unavailable",
+        ):
+            client.translate(
+                [{"id": "segment-1", "text": "原文"}],
+                review_prompt="review",
+                review_rounds=2,
+                on_review_warning=warnings.append,
+            )
 
-        self.assertEqual(result, reviewed)
-        self.assertEqual(warnings, ["second review unavailable"])
+        self.assertEqual(warnings, [])
 
     def test_reports_logical_batch_progress_and_pauses_after_checkpoint(
         self,

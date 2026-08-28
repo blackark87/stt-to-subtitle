@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor, wait
+from contextlib import nullcontext
 from dataclasses import asdict, replace
 import hashlib
 import json
@@ -5267,35 +5268,32 @@ class SubtitleOrchestrator:
                 )
             )
 
-        def review_warning(message: str) -> None:
-            self.store.add_event(
-                job.id,
-                "warning",
-                "translation review failed; using latest successful "
-                "translation: "
-                f"{self._sanitize_error(message)}",
-            )
-
         translation_outcome = "failed"
+        translation_workers = self._translation_routing.worker_limit(
+            execution_mode
+        )
+        review_priority = (
+            self._translation_routing.review_priority(execution_mode)
+            if review_rounds
+            else nullcontext()
+        )
         try:
-            translations = lm_client.translate(
-                segments,
-                system_prompt=translation_prompt,
-                review_prompt=review_prompt,
-                review_rounds=review_rounds,
-                existing=existing,
-                on_batch=save_batch,
-                on_batch_started=start_batch,
-                on_logical_batch=complete_batch,
-                on_batch_failed=fail_batch,
-                on_progress=update_translation_progress,
-                should_pause=should_pause,
-                on_review_warning=review_warning,
-                max_workers=self._translation_routing.worker_limit(
-                    execution_mode
-                ),
-                execution_mode=execution_mode,
-            )
+            with review_priority:
+                translations = lm_client.translate(
+                    segments,
+                    system_prompt=translation_prompt,
+                    review_prompt=review_prompt,
+                    review_rounds=review_rounds,
+                    existing=existing,
+                    on_batch=save_batch,
+                    on_batch_started=start_batch,
+                    on_logical_batch=complete_batch,
+                    on_batch_failed=fail_batch,
+                    on_progress=update_translation_progress,
+                    should_pause=should_pause,
+                    max_workers=translation_workers,
+                    execution_mode=execution_mode,
+                )
             self._raise_if_job_stop_requested(job.id)
             translation_outcome = "completed"
         except TranslationDeferred as error:

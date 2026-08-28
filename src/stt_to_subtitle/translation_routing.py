@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 import logging
 from pathlib import Path
@@ -50,6 +51,7 @@ REVIEW_PRIORITY_MESSAGE = (
     "같은 서버의 2차 검수를 우선 처리하는 동안 1차 요청을 다른 "
     "서버로 전환합니다."
 )
+REVIEW_REQUEST_ATTEMPTS = 7
 
 
 def normalize_translation_url(value: str, setting: str = "base_url") -> str:
@@ -674,6 +676,63 @@ class BackendTranslationRouting:
             ]
         return max(1, min(8, sum(server.capacity for server in usable)))
 
+    @contextmanager
+    def review_priority(self, mode: str) -> Iterator[None]:
+        """Reserve review hosts for one two-pass translation run.
+
+        A run-level reservation closes the gaps between individual review
+        requests. This prevents a draft model from being loaded again while
+        concurrent logical batches are moving through the review pass.
+        """
+
+        review_servers = self._configured_candidates("review", mode)
+        if not review_servers:
+            raise ExternalServiceError(
+                f"{TRANSLATION_STAGE_LABELS['review']} 서버가 설정되지 않았습니다."
+            )
+        hosts = tuple(sorted({
+            self._server_host(server)
+            for server in review_servers
+        }))
+        deadline = time.monotonic() + self.defaults.read_timeout_seconds
+        with self._condition:
+            for host in hosts:
+                self._review_host_holders[host] = (
+                    self._review_host_holders.get(host, 0) + 1
+                )
+            try:
+                while any(
+                    self._active_requests_on_host_locked("draft", host) > 0
+                    for host in hosts
+                ):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise ExternalServiceError(
+                            "같은 서버의 1차 번역이 끝나지 않아 2차 검수 "
+                            "우선 경로를 시작할 수 없습니다."
+                        )
+                    self._condition.wait(timeout=min(1.0, remaining))
+            except BaseException:
+                self._release_review_priority_hosts_locked(hosts)
+                raise
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._release_review_priority_hosts_locked(hosts)
+
+    def _release_review_priority_hosts_locked(
+        self,
+        hosts: tuple[str, ...],
+    ) -> None:
+        for host in hosts:
+            holders = max(0, self._review_host_holders.get(host, 1) - 1)
+            if holders:
+                self._review_host_holders[host] = holders
+            else:
+                self._review_host_holders.pop(host, None)
+        self._condition.notify_all()
+
     def model_contract(self) -> str:
         return "+".join(
             f"{stage}:" + ",".join(
@@ -847,7 +906,11 @@ class BackendTranslationRouting:
             client = RetryingJSONClient(
                 token=server.token,
                 read_timeout=self.defaults.read_timeout_seconds,
-                attempts=1,
+                attempts=(
+                    REVIEW_REQUEST_ATTEMPTS
+                    if resolved == "review"
+                    else 1
+                ),
                 request_limiter=request_limiter,
                 service_name=f"translation_{resolved}",
                 request_observer=request_observer,
