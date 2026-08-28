@@ -78,8 +78,8 @@ from .service_clients import (
 from .subtitle import write_styled_subtitles_atomic
 from .subtitle_validation import build_subtitle_validator_payload
 from .translation_prompt import (
-    KOREAN_JAV_SYSTEM_PROMPT,
-    KOREAN_TRANSLATION_REVIEW_PROMPT,
+    KOREAN_JAV_DRAFT_PROMPT,
+    KOREAN_JAV_REVIEW_PROMPT,
 )
 from .translation_routing import (
     BackendTranslationRouting,
@@ -164,7 +164,7 @@ USER_STOP_MESSAGE = "사용자 요청으로 전체 작업이 중단되었습니�
 USER_SELECTED_STOP_MESSAGE = "사용자 요청으로 작업이 중단되었습니다."
 TRANSLATION_PROMPT_OPTION = "translation_prompt"
 TRANSLATION_EXECUTION_MODE_OPTION = "translation_execution_mode"
-TRANSLATION_REVIEW_ROUNDS = 2
+TRANSLATION_REVIEW_ROUNDS = 1
 SUBTITLE_RENDERER_VERSION = "1"
 SUPPORTED_OPERATIONS = {"extract", "transcribe", "translate", "full"}
 TRANSLATION_OPERATIONS = {"translate", "full"}
@@ -1512,8 +1512,8 @@ class SubtitleOrchestrator:
             "category_name": "JAV (기존 작업)",
             "revision_id": None,
             "revision_number": None,
-            "translation_prompt": KOREAN_JAV_SYSTEM_PROMPT,
-            "review_prompt": KOREAN_TRANSLATION_REVIEW_PROMPT,
+            "translation_prompt": KOREAN_JAV_DRAFT_PROMPT,
+            "review_prompt": KOREAN_JAV_REVIEW_PROMPT,
             "review_rounds": 0,
         }
 
@@ -4938,10 +4938,10 @@ class SubtitleOrchestrator:
             prompt_snapshot = self._legacy_prompt_snapshot()
         translation_prompt = str(
             prompt_snapshot.get("translation_prompt", "")
-        ).strip() or KOREAN_JAV_SYSTEM_PROMPT
+        ).strip() or KOREAN_JAV_DRAFT_PROMPT
         review_prompt = str(
             prompt_snapshot.get("review_prompt", "")
-        ).strip() or KOREAN_TRANSLATION_REVIEW_PROMPT
+        ).strip() or KOREAN_JAV_REVIEW_PROMPT
         try:
             review_rounds = int(prompt_snapshot.get("review_rounds", 0))
         except (TypeError, ValueError):
@@ -4952,6 +4952,11 @@ class SubtitleOrchestrator:
         ).strip()
         if execution_mode not in {"live", "batch"}:
             execution_mode = "live"
+        if review_rounds and not self._translation_routing.is_configured(
+            "review",
+            execution_mode,
+        ):
+            review_rounds = 0
         self.store.add_event(
             job.id,
             "info",
@@ -5166,7 +5171,8 @@ class SubtitleOrchestrator:
             self.store.add_event(
                 job.id,
                 "warning",
-                "translation review failed; using initial translation: "
+                "translation review failed; using latest successful "
+                "translation: "
                 f"{self._sanitize_error(message)}",
             )
 

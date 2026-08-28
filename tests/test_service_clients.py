@@ -23,7 +23,10 @@ from stt_to_subtitle.service_clients import (
     list_openai_compatible_models,
     normalize_translation_response,
 )
-from stt_to_subtitle.translation_prompt import KOREAN_JAV_SYSTEM_PROMPT
+from stt_to_subtitle.translation_prompt import (
+    KOREAN_JAV_REVIEW_PROMPT,
+    KOREAN_JAV_SYSTEM_PROMPT,
+)
 
 
 class BatchSegmentsTests(unittest.TestCase):
@@ -788,6 +791,35 @@ class TranslationResponseTests(unittest.TestCase):
         self.assertEqual(result, draft)
         self.assertEqual(warnings, ["review unavailable"])
 
+    def test_keeps_the_latest_successful_translation_when_a_later_review_fails(
+        self,
+    ) -> None:
+        client = OpenAICompatibleClient(
+            "http://translation.test/v1",
+            "",
+            "model",
+        )
+        draft = [{"id": "segment-1", "text": "초벌"}]
+        reviewed = [{"id": "segment-1", "text": "1차 교정"}]
+        warnings: list[str] = []
+        client._translate_batch_with_recovery = Mock(return_value=draft)
+        client._review_batch_with_recovery = Mock(
+            side_effect=[
+                reviewed,
+                ExternalServiceError("second review unavailable"),
+            ]
+        )
+
+        result = client.translate(
+            [{"id": "segment-1", "text": "原文"}],
+            review_prompt="review",
+            review_rounds=2,
+            on_review_warning=warnings.append,
+        )
+
+        self.assertEqual(result, reviewed)
+        self.assertEqual(warnings, ["second review unavailable"])
+
     def test_reports_logical_batch_progress_and_pauses_after_checkpoint(
         self,
     ) -> None:
@@ -1212,7 +1244,7 @@ class TranslationResponseTests(unittest.TestCase):
                 "content": KOREAN_JAV_SYSTEM_PROMPT,
             },
         )
-        self.assertIn("Japanese spoken subtitle segments", KOREAN_JAV_SYSTEM_PROMPT)
+        self.assertIn("ROLE — FIRST-PASS", KOREAN_JAV_SYSTEM_PROMPT)
         self.assertIn('"translations"', KOREAN_JAV_SYSTEM_PROMPT)
         self.assertIn("Preserve every target id exactly", KOREAN_JAV_SYSTEM_PROMPT)
         self.assertIn("生ハメ→노콘", KOREAN_JAV_SYSTEM_PROMPT)
@@ -1226,6 +1258,62 @@ class TranslationResponseTests(unittest.TestCase):
             "<<<JZ_DONE>>>",
         ):
             self.assertNotIn(metadata_marker, KOREAN_JAV_SYSTEM_PROMPT)
+
+    def test_sends_review_source_draft_and_review_only_prompt(self) -> None:
+        calls: list[tuple[str, str, dict[str, object]]] = []
+        response = Mock(status_code=200)
+        response.json.return_value = {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "translations": [
+                                    {"id": "segment-1", "text": "교정"}
+                                ]
+                            },
+                            ensure_ascii=False,
+                        )
+                    }
+                }
+            ]
+        }
+
+        def completion_request(stage, mode, payload):
+            calls.append((stage, mode, payload))
+            return response
+
+        client = OpenAICompatibleClient(
+            "",
+            "",
+            "",
+            completion_request=completion_request,
+        )
+        client.translation_execution_mode = "live"
+
+        result = client._review_batch(
+            [{"id": "segment-1", "text": "原文"}],
+            [{"id": "segment-0", "text": "文脈"}],
+            [{"id": "segment-1", "text": "초벌"}],
+            KOREAN_JAV_REVIEW_PROMPT,
+        )
+
+        self.assertEqual(result, [{"id": "segment-1", "text": "교정"}])
+        self.assertEqual(calls[0][0:2], ("review", "live"))
+        request_payload = calls[0][2]
+        self.assertEqual(
+            request_payload["messages"][0]["content"],
+            KOREAN_JAV_REVIEW_PROMPT,
+        )
+        user_payload = json.loads(request_payload["messages"][1]["content"])
+        self.assertEqual(
+            set(user_payload),
+            {"target_segments", "reference_context", "draft_translations"},
+        )
+        self.assertEqual(
+            user_payload["draft_translations"],
+            [{"id": "segment-1", "text": "초벌"}],
+        )
 
     def test_translation_payload_excludes_transcription_metadata(self) -> None:
         client = OpenAICompatibleClient(

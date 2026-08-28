@@ -2167,6 +2167,10 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                 {"segment-000001": "안녕하세요"},
             )
             self.assertEqual(
+                translation_client.translate.call_args.kwargs["review_rounds"],
+                0,
+            )
+            self.assertEqual(
                 measurements,
                 {
                     ("legacy_json", "reused"): 1.0,
@@ -3490,6 +3494,11 @@ class SubtitleOrchestratorTests(unittest.TestCase):
             source = media_root / "movie.mkv"
             source.write_bytes(b"media")
             orchestrator = self.make_orchestrator(root, media_root)
+            orchestrator.update_translation_endpoint_routing(
+                "review",
+                "builtin",
+                {"enabled": True, "batch_preferred": False},
+            )
             job = orchestrator.create_job(
                 "movie.mkv",
                 force_overwrite=False,
@@ -3662,10 +3671,10 @@ class SubtitleOrchestratorTests(unittest.TestCase):
             )
             self.assertEqual(
                 translation_client.translate.call_args.kwargs["review_rounds"],
-                2,
+                1,
             )
             self.assertIn(
-                "television variety",
+                "JAPANESE VARIETY AND TALK-SHOW POLICY",
                 translation_client.translate.call_args.kwargs["system_prompt"],
             )
             self.assertTrue(

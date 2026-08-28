@@ -470,19 +470,19 @@ export default function SettingsPage() {
             </div>
           </div>
           {promptEditorOpen ? <div className="card-body settings-editor" id="prompt-editor">
-            <div className="settings-editor-head"><strong>{promptForm.id ? "프롬프트 수정" : "새 프롬프트 추가"}</strong><span>초벌 번역과 검증 단계에서 사용할 지시문을 관리합니다.</span></div>
+            <div className="settings-editor-head"><strong>{promptForm.id ? "프롬프트 수정" : "새 프롬프트 추가"}</strong><span>장르별 1차 번역과 2차 검증 지시문을 한 쌍의 revision으로 관리합니다.</span></div>
             <form className="prompt-form settings-prompt-form" onSubmit={submitPrompt}>
               <label className="f">
                 <span className="lb">이름</span>
                 <input className="ctl" required maxLength={120} value={promptForm.name} onChange={(event) => setPromptForm({ ...promptForm, name: event.target.value })} />
               </label>
               <label className="f">
-                <span className="lb">번역 프롬프트</span>
+                <span className="lb">1차(초벌) 번역 프롬프트</span>
                 <textarea className="ctl textarea" required rows={8} value={promptForm.translation_prompt} onChange={(event) => setPromptForm({ ...promptForm, translation_prompt: event.target.value })} />
               </label>
               <label className="f">
-                <span className="lb">검토 프롬프트</span>
-                <textarea className="ctl textarea" rows={5} value={promptForm.review_prompt} onChange={(event) => setPromptForm({ ...promptForm, review_prompt: event.target.value })} />
+                <span className="lb">2차(검사·교정) 프롬프트</span>
+                <textarea className="ctl textarea" required rows={8} value={promptForm.review_prompt} onChange={(event) => setPromptForm({ ...promptForm, review_prompt: event.target.value })} />
               </label>
               <div className="btns">
                 <button type="submit" className="btn" disabled={busy}>{promptForm.id ? "변경 저장" : "프롬프트 추가"}</button>

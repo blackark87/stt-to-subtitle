@@ -14,6 +14,10 @@ from stt_to_subtitle.job_store import (
     media_duration_bucket_minutes,
 )
 from stt_to_subtitle.transcription_store import TranscriptionStore
+from stt_to_subtitle.translation_prompt import (
+    BUILTIN_PROMPT_PAIRS,
+    LEGACY_BUILTIN_PROMPT_PAIR_HASHES,
+)
 
 
 class TranscriptionStoreTests(unittest.TestCase):
@@ -820,8 +824,8 @@ class JobStoreTests(unittest.TestCase):
             self.assertEqual(
                 snapshot["database"]["migrations"],
                 {
-                    "applied_count": 11,
-                    "latest_sequence": 55,
+                    "applied_count": 12,
+                    "latest_sequence": 56,
                     "unsequenced_count": 0,
                 },
             )
@@ -1254,6 +1258,108 @@ class JobStoreTests(unittest.TestCase):
                         database_path
                     ).list_prompt_categories(include_archived=True)
                 },
+            )
+
+    def test_upgrades_untouched_builtin_prompts_as_new_revisions(self) -> None:
+        with TemporaryDirectory() as directory:
+            database_path = Path(directory) / "jobs.sqlite3"
+            store = JobStore(database_path)
+            legacy_pairs = {
+                "jav": ("legacy jav draft", "legacy jav review"),
+                "variety": ("legacy variety draft", "legacy variety review"),
+            }
+            with sqlite3.connect(database_path) as connection:
+                for category_id, (draft_prompt, review_prompt) in (
+                    legacy_pairs.items()
+                ):
+                    category = store.get_prompt_category(category_id)
+                    connection.execute(
+                        """
+                        UPDATE prompt_categories
+                        SET translation_prompt = ?, review_prompt = ?
+                        WHERE id = ?
+                        """,
+                        (draft_prompt, review_prompt, category_id),
+                    )
+                    connection.execute(
+                        """
+                        UPDATE prompt_revisions
+                        SET translation_prompt = ?, review_prompt = ?,
+                            content_hash = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            draft_prompt,
+                            review_prompt,
+                            next(
+                                iter(
+                                    LEGACY_BUILTIN_PROMPT_PAIR_HASHES[
+                                        category_id
+                                    ]
+                                )
+                            ),
+                            category.prompt_revision_id,
+                        ),
+                    )
+                connection.execute(
+                    "DELETE FROM schema_migrations "
+                    "WHERE name = 'builtin_translation_prompts_v2'"
+                )
+
+            upgraded = JobStore(database_path)
+
+            for category_id, expected_pair in BUILTIN_PROMPT_PAIRS.items():
+                category = upgraded.get_prompt_category(category_id)
+                revisions = upgraded.list_prompt_revisions(category_id)
+                self.assertEqual(
+                    (category.translation_prompt, category.review_prompt),
+                    expected_pair,
+                )
+                self.assertEqual(category.prompt_revision_number, 2)
+                self.assertEqual(
+                    (
+                        revisions[0]["translation_prompt"],
+                        revisions[0]["review_prompt"],
+                    ),
+                    legacy_pairs[category_id],
+                )
+                self.assertEqual(
+                    (
+                        revisions[1]["translation_prompt"],
+                        revisions[1]["review_prompt"],
+                    ),
+                    expected_pair,
+                )
+
+    def test_builtin_prompt_upgrade_preserves_user_edits(self) -> None:
+        with TemporaryDirectory() as directory:
+            database_path = Path(directory) / "jobs.sqlite3"
+            store = JobStore(database_path)
+            edited = store.update_prompt_category(
+                "jav",
+                name="JAV 사용자 설정",
+                translation_prompt="custom draft",
+                review_prompt="custom review",
+            )
+            with sqlite3.connect(database_path) as connection:
+                connection.execute(
+                    "DELETE FROM schema_migrations "
+                    "WHERE name = 'builtin_translation_prompts_v2'"
+                )
+
+            restarted = JobStore(database_path)
+            preserved = restarted.get_prompt_category("jav")
+
+            self.assertEqual(preserved.name, "JAV 사용자 설정")
+            self.assertEqual(preserved.translation_prompt, "custom draft")
+            self.assertEqual(preserved.review_prompt, "custom review")
+            self.assertEqual(
+                preserved.prompt_revision_id,
+                edited.prompt_revision_id,
+            )
+            self.assertEqual(
+                len(restarted.list_prompt_revisions("jav")),
+                2,
             )
 
     def test_manages_path_display_rules_without_reseeding_deleted_default(

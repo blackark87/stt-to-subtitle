@@ -25,10 +25,12 @@ from .job_state import JobPhase, JobReason, JobState, structured_state_from_lega
 from .storage_paths import rebase_stored_path
 from .transcription_progress import TRANSCRIPTION_STAGE_LABELS
 from .translation_prompt import (
-    KOREAN_JAV_SYSTEM_PROMPT,
+    BUILTIN_PROMPT_PAIRS,
+    KOREAN_JAV_DRAFT_PROMPT,
     KOREAN_JAV_REVIEW_PROMPT,
+    KOREAN_VARIETY_DRAFT_PROMPT,
     KOREAN_VARIETY_REVIEW_PROMPT,
-    KOREAN_VARIETY_SYSTEM_PROMPT,
+    LEGACY_BUILTIN_PROMPT_PAIR_HASHES,
 )
 
 SUCCESS_STATUSES = {
@@ -946,7 +948,7 @@ class JobStore:
                     (
                         "jav",
                         "JAV",
-                        KOREAN_JAV_SYSTEM_PROMPT,
+                        KOREAN_JAV_DRAFT_PROMPT,
                         KOREAN_JAV_REVIEW_PROMPT,
                         now,
                         now,
@@ -954,7 +956,7 @@ class JobStore:
                     (
                         "variety",
                         "버라이어티",
-                        KOREAN_VARIETY_SYSTEM_PROMPT,
+                        KOREAN_VARIETY_DRAFT_PROMPT,
                         KOREAN_VARIETY_REVIEW_PROMPT,
                         now,
                         now,
@@ -1302,8 +1304,132 @@ class JobStore:
                     "runtime_settings_split_v1",
                     self._migrate_runtime_settings_split,
                 ),
+                Migration(
+                    56,
+                    "builtin_translation_prompts_v2",
+                    self._upgrade_builtin_translation_prompts,
+                ),
             ),
         )
+
+    @staticmethod
+    def _upgrade_builtin_translation_prompts(
+        connection: sqlite3.Connection,
+    ) -> None:
+        """Append v2 only when a built-in prompt pair is still untouched."""
+
+        now = time.time()
+        for category_id, (draft_prompt, review_prompt) in (
+            BUILTIN_PROMPT_PAIRS.items()
+        ):
+            row = connection.execute(
+                """
+                SELECT
+                    category.translation_prompt,
+                    category.review_prompt,
+                    category.active_revision_id,
+                    revision.translation_prompt AS revision_translation_prompt,
+                    revision.review_prompt AS revision_review_prompt,
+                    revision.content_hash AS revision_content_hash
+                FROM prompt_categories AS category
+                LEFT JOIN prompt_revisions AS revision
+                  ON revision.id = category.active_revision_id
+                WHERE category.id = ?
+                """,
+                (category_id,),
+            ).fetchone()
+            if row is None:
+                continue
+            current_pair = {
+                "translation_prompt": str(row["translation_prompt"]),
+                "review_prompt": str(row["review_prompt"]),
+            }
+            current_hash = _canonical_json_hash(current_pair)
+            active_revision_id = row["active_revision_id"]
+            if active_revision_id is not None:
+                revision_pair = {
+                    "translation_prompt": str(
+                        row["revision_translation_prompt"]
+                    ),
+                    "review_prompt": str(row["revision_review_prompt"]),
+                }
+                if revision_pair != current_pair or str(
+                    row["revision_content_hash"]
+                ) not in LEGACY_BUILTIN_PROMPT_PAIR_HASHES[category_id]:
+                    continue
+            elif current_hash not in LEGACY_BUILTIN_PROMPT_PAIR_HASHES[
+                category_id
+            ]:
+                continue
+            latest = connection.execute(
+                """
+                SELECT COALESCE(MAX(revision_number), 0) AS latest
+                FROM prompt_revisions
+                WHERE category_id = ?
+                """,
+                (category_id,),
+            ).fetchone()
+            revision_number = int(latest["latest"])
+            if active_revision_id is None:
+                legacy_revision_id = uuid4().hex
+                revision_number += 1
+                connection.execute(
+                    """
+                    INSERT INTO prompt_revisions (
+                        id, category_id, revision_number,
+                        translation_prompt, review_prompt,
+                        content_hash, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        legacy_revision_id,
+                        category_id,
+                        revision_number,
+                        current_pair["translation_prompt"],
+                        current_pair["review_prompt"],
+                        current_hash,
+                        now,
+                    ),
+                )
+            new_pair = {
+                "translation_prompt": draft_prompt,
+                "review_prompt": review_prompt,
+            }
+            revision_id = uuid4().hex
+            revision_number += 1
+            connection.execute(
+                """
+                INSERT INTO prompt_revisions (
+                    id, category_id, revision_number,
+                    translation_prompt, review_prompt,
+                    content_hash, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    revision_id,
+                    category_id,
+                    revision_number,
+                    draft_prompt,
+                    review_prompt,
+                    _canonical_json_hash(new_pair),
+                    now,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE prompt_categories
+                SET translation_prompt = ?, review_prompt = ?,
+                    active_revision_id = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    draft_prompt,
+                    review_prompt,
+                    revision_id,
+                    now,
+                    category_id,
+                ),
+            )
 
     @staticmethod
     def _migrate_runtime_settings_split(

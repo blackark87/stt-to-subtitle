@@ -17,7 +17,7 @@ import requests
 
 from .contracts import validate_transcript, validate_translation_items
 from .transcription_progress import parse_stage_progress
-from .translation_prompt import KOREAN_JAV_SYSTEM_PROMPT
+from .translation_prompt import KOREAN_JAV_DRAFT_PROMPT
 
 LOGGER = logging.getLogger(__name__)
 TRANSCRIPTION_FAILURE_SCOPES = frozenset(
@@ -1187,7 +1187,7 @@ class OpenAICompatibleClient(RetryingJSONClient):
         self,
         segments: Sequence[Mapping[str, Any]],
         *,
-        system_prompt: str = KOREAN_JAV_SYSTEM_PROMPT,
+        system_prompt: str = KOREAN_JAV_DRAFT_PROMPT,
         review_prompt: str = "",
         review_rounds: int = 0,
         existing: Mapping[str, str] | None = None,
@@ -1430,8 +1430,8 @@ class OpenAICompatibleClient(RetryingJSONClient):
         translated = draft
         review_warning: str | None = None
         if review_rounds:
-            try:
-                for _round in range(review_rounds):
+            for _round in range(review_rounds):
+                try:
                     reviewed = self._review_batch_with_recovery(
                         batch,
                         reference_context,
@@ -1441,13 +1441,14 @@ class OpenAICompatibleClient(RetryingJSONClient):
                     if reviewed == translated:
                         break
                     translated = reviewed
-            except ExternalServiceError as error:
-                translated = draft
-                review_warning = str(error)
-                LOGGER.warning(
-                    "translation review failed; using initial translation: %s",
-                    error,
-                )
+                except ExternalServiceError as error:
+                    review_warning = str(error)
+                    LOGGER.warning(
+                        "translation review failed; using latest successful "
+                        "translation: %s",
+                        error,
+                    )
+                    break
         return translated, review_warning
 
     @staticmethod
@@ -1478,7 +1479,7 @@ class OpenAICompatibleClient(RetryingJSONClient):
         self,
         segments: Sequence[Mapping[str, Any]],
         reference_context: Sequence[Mapping[str, Any]] = (),
-        system_prompt: str = KOREAN_JAV_SYSTEM_PROMPT,
+        system_prompt: str = KOREAN_JAV_DRAFT_PROMPT,
     ) -> list[dict[str, str]]:
         try:
             return self._translate_batch(
@@ -1549,7 +1550,7 @@ class OpenAICompatibleClient(RetryingJSONClient):
         self,
         segments: Sequence[Mapping[str, Any]],
         reference_context: Sequence[Mapping[str, Any]] = (),
-        system_prompt: str = KOREAN_JAV_SYSTEM_PROMPT,
+        system_prompt: str = KOREAN_JAV_DRAFT_PROMPT,
     ) -> list[dict[str, str]]:
         return self._request_translation_items(
             system_prompt=system_prompt,
