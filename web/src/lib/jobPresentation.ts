@@ -1,4 +1,4 @@
-import type { JobEvent, PipelineJob } from "@/lib/api";
+import type { JobEvent, PipelineJob, TranslationMode } from "@/lib/api";
 import {
   PHASE_LABEL,
   STATE_LABEL,
@@ -45,7 +45,29 @@ function stateName(value: unknown): string {
   return legacy[raw] ?? "저장된 중간 지점";
 }
 
+export function jobTranslationMode(job: PipelineJob): TranslationMode {
+  const rawSnapshot = job.options.translation_prompt;
+  const snapshot = rawSnapshot && typeof rawSnapshot === "object"
+    ? rawSnapshot as Record<string, unknown>
+    : {};
+  const explicit = text(snapshot.translation_mode);
+  if (explicit === "draft_only" || explicit === "review_existing" || explicit === "draft_and_review") {
+    return explicit;
+  }
+  if (text(snapshot.target_stage) === "draft" || number(snapshot.review_rounds) === 0) {
+    return "draft_only";
+  }
+  return "draft_and_review";
+}
+
 export function jobStateLabel(job: PipelineJob): string {
+  if (
+    job.state === "done"
+    && (job.operation === "translate" || job.operation === "full")
+    && jobTranslationMode(job) === "draft_only"
+  ) {
+    return "1차 자막 완료";
+  }
   if (job.state === "done") return operationCompletionLabel(job.operation);
   const state = asJobState(job.state);
   return state ? STATE_LABEL[state] : job.state;
@@ -145,6 +167,9 @@ function genericMessage(message: string, eventCode: string | undefined): string 
   }
   if (message.includes("selected completed transcription continued in translation queue")) {
     return "선택한 전사 완료 작업을 번역 대기열로 보냈습니다.";
+  }
+  if (message.includes("selected completed first-pass translation continued in review queue")) {
+    return "완료된 1차 자막을 2차 보정 대기열로 보냈습니다.";
   }
   if (message.includes("selected translation requested; reusing completed transcript")) {
     return "완료된 전사 결과를 재사용해 선택 번역을 요청했습니다.";

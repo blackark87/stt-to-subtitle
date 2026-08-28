@@ -167,6 +167,11 @@ USER_SELECTED_STOP_MESSAGE = "사용자 요청으로 작업이 중단되었습�
 TRANSLATION_PROMPT_OPTION = "translation_prompt"
 TRANSLATION_EXECUTION_MODE_OPTION = "translation_execution_mode"
 TRANSLATION_REVIEW_ROUNDS = 1
+TRANSLATION_MODES = frozenset({
+    "draft_only",
+    "review_existing",
+    "draft_and_review",
+})
 SUBTITLE_RENDERER_VERSION = "1"
 SUPPORTED_OPERATIONS = {"extract", "transcribe", "translate", "full"}
 TRANSLATION_OPERATIONS = {"translate", "full"}
@@ -389,7 +394,10 @@ class SubtitleOrchestrator:
             "lost"
             if saved_translation_state_name == "lost"
             else "ready"
-            if self._translation_routing.is_configured()
+            if (
+                self._translation_routing.is_configured("draft")
+                or self._translation_routing.is_configured("review")
+            )
             else "offline"
         )
         if saved_translation_state_name != self._translation_circuit_state:
@@ -571,7 +579,12 @@ class SubtitleOrchestrator:
 
     def _refresh_translation_circuit_from_routing(self) -> None:
         self._set_translation_circuit(
-            "ready" if self._translation_routing.is_configured() else "offline"
+            "ready"
+            if (
+                self._translation_routing.is_configured("draft")
+                or self._translation_routing.is_configured("review")
+            )
+            else "offline"
         )
 
     @staticmethod
@@ -1523,6 +1536,8 @@ class SubtitleOrchestrator:
             "revision_number": selected_revision_number,
             "translation_prompt": translation_prompt,
             "review_prompt": review_prompt,
+            "translation_mode": "draft_and_review",
+            "target_stage": "review",
             "review_rounds": TRANSLATION_REVIEW_ROUNDS,
         }
 
@@ -1535,8 +1550,83 @@ class SubtitleOrchestrator:
             "revision_number": None,
             "translation_prompt": KOREAN_JAV_DRAFT_PROMPT,
             "review_prompt": KOREAN_JAV_REVIEW_PROMPT,
+            "translation_mode": "draft_only",
+            "target_stage": "draft",
             "review_rounds": 0,
         }
+
+    @staticmethod
+    def _translation_mode(
+        prompt_snapshot: Mapping[str, Any],
+    ) -> str:
+        explicit = str(
+            prompt_snapshot.get("translation_mode", "")
+        ).strip()
+        if explicit in TRANSLATION_MODES:
+            return explicit
+        if str(prompt_snapshot.get("target_stage", "")).strip() == "draft":
+            return "draft_only"
+        try:
+            review_rounds = int(prompt_snapshot.get("review_rounds", 0))
+        except (TypeError, ValueError):
+            review_rounds = 0
+        return "draft_and_review" if review_rounds > 0 else "draft_only"
+
+    @staticmethod
+    def _prompt_snapshot_for_mode(
+        prompt_snapshot: Mapping[str, Any],
+        translation_mode: str,
+        *,
+        review_source_generation_id: str | None = None,
+    ) -> dict[str, Any]:
+        if translation_mode not in TRANSLATION_MODES:
+            raise ValueError("지원하지 않는 번역 실행 방식입니다.")
+        snapshot = dict(prompt_snapshot)
+        snapshot["translation_mode"] = translation_mode
+        snapshot["target_stage"] = (
+            "draft" if translation_mode == "draft_only" else "review"
+        )
+        snapshot["review_rounds"] = (
+            0
+            if translation_mode == "draft_only"
+            else TRANSLATION_REVIEW_ROUNDS
+        )
+        snapshot.pop("review_source_generation_id", None)
+        if translation_mode == "review_existing":
+            if not review_source_generation_id:
+                raise ValueError("2차 보정에 사용할 1차 번역 결과가 없습니다.")
+            snapshot["review_source_generation_id"] = (
+                review_source_generation_id
+            )
+        return snapshot
+
+    def _require_translation_mode_routes(
+        self,
+        translation_mode: str,
+        execution_mode: str,
+        *,
+        error_type: type[Exception] = ValueError,
+    ) -> None:
+        required_stages = (
+            ("draft",)
+            if translation_mode == "draft_only"
+            else ("review",)
+            if translation_mode == "review_existing"
+            else ("draft", "review")
+        )
+        labels = {"draft": "1차 번역", "review": "2차 보정"}
+        missing = [
+            labels[stage]
+            for stage in required_stages
+            if not self._translation_routing.is_configured(
+                stage,
+                execution_mode,
+            )
+        ]
+        if missing:
+            raise error_type(
+                f"{', '.join(missing)} 서버 설정이 필요합니다."
+            )
 
     def update_remote_servers(
         self,
@@ -2322,13 +2412,20 @@ class SubtitleOrchestrator:
         job_ids: Sequence[str],
         *,
         prompt_category_id: str,
-        target_stage: str = "review",
+        translation_mode: str = "draft_and_review",
+        target_stage: str | None = None,
     ) -> list[PipelineJob]:
-        """Move selected, latest completed transcripts into translation."""
-        if target_stage not in {"draft", "review"}:
-            raise ValueError("지원하지 않는 번역 단계입니다.")
-        if not self.translation_server_configured:
-            raise ValueError("번역 서버 설정이 필요합니다.")
+        """Queue draft, existing-draft review, or combined translation."""
+        if target_stage is not None:
+            if target_stage not in {"draft", "review"}:
+                raise ValueError("지원하지 않는 번역 단계입니다.")
+            translation_mode = (
+                "draft_only"
+                if target_stage == "draft"
+                else "draft_and_review"
+            )
+        if translation_mode not in TRANSLATION_MODES:
+            raise ValueError("지원하지 않는 번역 실행 방식입니다.")
         selected_ids = list(
             dict.fromkeys(job_id.strip() for job_id in job_ids if job_id.strip())
         )
@@ -2337,42 +2434,59 @@ class SubtitleOrchestrator:
         if len(selected_ids) > self.settings.maximum_listed_files:
             raise ValueError("한 번에 등록할 수 있는 파일 수를 초과했습니다.")
 
-        prompt_snapshot = self._prompt_snapshot(prompt_category_id)
-        prompt_snapshot["target_stage"] = target_stage
-        prompt_snapshot["review_rounds"] = (
-            TRANSLATION_REVIEW_ROUNDS if target_stage == "review" else 0
+        execution_mode = "batch" if len(selected_ids) > 1 else "live"
+        self._require_translation_mode_routes(
+            translation_mode,
+            execution_mode,
+        )
+        prompt_snapshot = (
+            self._prompt_snapshot_for_mode(
+                self._prompt_snapshot(prompt_category_id),
+                translation_mode,
+            )
+            if translation_mode != "review_existing"
+            else None
         )
         latest_jobs = self.store.latest_jobs_by_source()
-        reusable_transcripts: list[PipelineJob] = []
+        selections: list[tuple[PipelineJob, str | None]] = []
         for job_id in selected_ids:
             job = self.store.get(job_id)
             if job is None:
                 raise ValueError("선택한 작업을 찾을 수 없습니다.")
             latest = latest_jobs.get(job.source_rel)
-            if (
-                not job.can_start_translation
-                or latest is None
-                or latest.id != job.id
-            ):
+            if latest is None or latest.id != job.id:
                 raise ValueError(
-                    f"{job.source_rel}: 최신 전사 완료 작업만 번역할 수 있습니다."
+                    f"{job.source_rel}: 최신 작업만 번역할 수 있습니다."
                 )
             if job.options.get("comparison_id"):
                 raise ValueError(
                     f"{job.source_rel}: 전사 비교 결과는 비교 상세 화면에서 "
                     "번역할 결과를 선택하세요."
                 )
+            if translation_mode == "review_existing":
+                current_prompt = job.options.get(TRANSLATION_PROMPT_OPTION)
+                if not isinstance(current_prompt, Mapping):
+                    current_prompt = self._legacy_prompt_snapshot()
+                if (
+                    job.status != "completed"
+                    or job.operation not in TRANSLATION_OPERATIONS
+                    or self._translation_mode(current_prompt) != "draft_only"
+                ):
+                    raise ValueError(
+                        f"{job.source_rel}: 1차 번역만 완료된 작업만 "
+                        "2차 보정할 수 있습니다."
+                    )
+            elif not job.can_start_translation:
+                raise ValueError(
+                    f"{job.source_rel}: 최신 전사 완료 작업만 번역할 수 "
+                    "있습니다."
+                )
             self.library.resolve_file(job.source_rel)
             transcript_path = Path(job.transcript_path or "")
             try:
-                transcript_payload = json.loads(
-                    transcript_path.read_text(encoding="utf-8")
+                transcript_payload, segments, _transcript_job_id = (
+                    self._load_translation_transcript(transcript_path)
                 )
-                if not isinstance(transcript_payload, Mapping):
-                    raise ValueError(
-                        "transcript JSON document must be an object"
-                    )
-                validate_transcript(transcript_payload)
             except (
                 OSError,
                 UnicodeError,
@@ -2383,23 +2497,53 @@ class SubtitleOrchestrator:
                     f"{job.source_rel}: 번역에 사용할 유효한 전사 결과가 "
                     "없습니다."
                 ) from error
-            reusable_transcripts.append(job)
+            review_source_generation_id = None
+            if translation_mode == "review_existing":
+                source_generation, _source_items = (
+                    self._review_source_generation(
+                        job,
+                        transcript_payload,
+                        segments,
+                        current_prompt,
+                    )
+                )
+                review_source_generation_id = str(source_generation["id"])
+            selections.append((job, review_source_generation_id))
 
         transitioned_jobs: list[PipelineJob] = []
-        execution_mode = "batch" if len(reusable_transcripts) > 1 else "live"
-        for reusable in reusable_transcripts:
-            transitioned_jobs.append(
-                self._continue_completed_transcription(
-                    reusable,
-                    prompt_snapshot=prompt_snapshot,
-                    force_overwrite=True,
-                    event_message=(
-                        "selected completed transcription continued in "
-                        "translation queue"
+        for reusable, review_source_generation_id in selections:
+            if translation_mode == "review_existing":
+                restarted = self.restart_translation(
+                    reusable.id,
+                    prompt_category_id=prompt_category_id,
+                    translation_mode=translation_mode,
+                    review_source_generation_id=(
+                        review_source_generation_id
                     ),
                     execution_mode=execution_mode,
                 )
-            )
+                self.store.add_event(
+                    reusable.id,
+                    "info",
+                    "selected completed first-pass translation continued "
+                    "in review queue",
+                )
+                transitioned_jobs.append(restarted)
+            else:
+                if prompt_snapshot is None:
+                    raise RuntimeError("translation prompt is unavailable")
+                transitioned_jobs.append(
+                    self._continue_completed_transcription(
+                        reusable,
+                        prompt_snapshot=prompt_snapshot,
+                        force_overwrite=True,
+                        event_message=(
+                            "selected completed transcription continued in "
+                            "translation queue"
+                        ),
+                        execution_mode=execution_mode,
+                    )
+                )
         return transitioned_jobs
 
     def _continue_completed_transcription(
@@ -3014,11 +3158,75 @@ class SubtitleOrchestrator:
             )
         self.delete_job_record(job_id)
 
+    def _review_source_generation(
+        self,
+        job: PipelineJob,
+        transcript_payload: Mapping[str, Any],
+        segments: Sequence[Mapping[str, Any]],
+        prompt_snapshot: Mapping[str, Any],
+        *,
+        generation_id: str | None = None,
+    ) -> tuple[dict[str, Any], dict[str, str]]:
+        """Return one complete, transcript-matched first-pass generation."""
+        if not job.transcript_path:
+            raise ValueError("2차 보정에 사용할 전사 결과가 없습니다.")
+        if generation_id is None:
+            self._capture_legacy_translation_generation(
+                job,
+                transcript_payload,
+                segments,
+                prompt_snapshot,
+            )
+            generation = self.store.latest_translation_generation(job.id)
+        else:
+            generation = self.store.get_translation_generation(generation_id)
+        if generation is None or generation["job_id"] != job.id:
+            raise ValueError("2차 보정에 사용할 1차 번역 결과가 없습니다.")
+        if generation["state"] != "completed":
+            raise ValueError("완료된 1차 번역 결과만 2차 보정할 수 있습니다.")
+        if generation["transcript_hash"] != sha256_file(
+            Path(job.transcript_path)
+        ):
+            raise ValueError(
+                "1차 번역과 현재 전사 결과가 달라 2차 보정할 수 없습니다."
+            )
+        stored_items = self.store.translation_items(generation["id"])
+        expected_ids = [str(segment["id"]) for segment in segments]
+        try:
+            validated = validate_translation_items(
+                self._translation_snapshot_items(stored_items),
+                expected_ids,
+            )
+        except ValueError as error:
+            raise ValueError(
+                "1차 번역 결과가 완전하지 않아 2차 보정할 수 없습니다."
+            ) from error
+        source_hashes = {
+            str(item["id"]): str(item["source_hash"])
+            for item in stored_items
+        }
+        if any(
+            source_hashes.get(str(segment["id"]))
+            != _canonical_payload_hash(dict(segment))
+            for segment in segments
+        ):
+            raise ValueError(
+                "1차 번역 구간과 현재 전사 구간이 달라 2차 보정할 수 "
+                "없습니다."
+            )
+        return generation, {
+            str(item["id"]): str(item["text"]) for item in validated
+        }
+
     def restart_translation(
         self,
         job_id: str,
         prompt_category_id: str | None = None,
         transcript_revision_id: str | None = None,
+        *,
+        translation_mode: str | None = None,
+        review_source_generation_id: str | None = None,
+        execution_mode: str | None = None,
     ) -> PipelineJob:
         """Reset translation only while preserving a completed transcript."""
         job = self.store.get(job_id)
@@ -3102,18 +3310,64 @@ class SubtitleOrchestrator:
             ),
         )
 
+        if translation_mode is not None and translation_mode not in (
+            TRANSLATION_MODES
+        ):
+            raise ValueError("지원하지 않는 번역 실행 방식입니다.")
+        resolved_execution_mode = (
+            execution_mode
+            if execution_mode is not None
+            else str(
+                job.options.get(TRANSLATION_EXECUTION_MODE_OPTION, "live")
+            ).strip()
+        )
+        if resolved_execution_mode not in {"live", "batch"}:
+            raise ValueError("지원하지 않는 번역 실행 모드입니다.")
+
         updated_options = dict(job.options)
         if prompt_category_id:
-            updated_options[TRANSLATION_PROMPT_OPTION] = self._prompt_snapshot(
-                prompt_category_id
-            )
+            base_prompt_snapshot = self._prompt_snapshot(prompt_category_id)
         elif not isinstance(
             updated_options.get(TRANSLATION_PROMPT_OPTION),
             Mapping,
         ):
-            updated_options[TRANSLATION_PROMPT_OPTION] = (
-                self._legacy_prompt_snapshot()
+            base_prompt_snapshot = self._legacy_prompt_snapshot()
+        else:
+            base_prompt_snapshot = dict(
+                updated_options[TRANSLATION_PROMPT_OPTION]
             )
+        resolved_translation_mode = (
+            translation_mode
+            if translation_mode is not None
+            else self._translation_mode(base_prompt_snapshot)
+        )
+        source_generation_id = review_source_generation_id
+        if resolved_translation_mode == "review_existing":
+            source_generation, _source_items = self._review_source_generation(
+                selected_job,
+                transcript_payload,
+                segments,
+                current_prompt_snapshot,
+                generation_id=source_generation_id,
+            )
+            source_generation_id = str(source_generation["id"])
+        elif source_generation_id is not None:
+            raise ValueError(
+                "1차 번역 결과 지정은 2차 보정에서만 사용할 수 있습니다."
+            )
+        self._require_translation_mode_routes(
+            resolved_translation_mode,
+            resolved_execution_mode,
+        )
+        updated_prompt_snapshot = self._prompt_snapshot_for_mode(
+            base_prompt_snapshot,
+            resolved_translation_mode,
+            review_source_generation_id=source_generation_id,
+        )
+        updated_options[TRANSLATION_PROMPT_OPTION] = updated_prompt_snapshot
+        updated_options[TRANSLATION_EXECUTION_MODE_OPTION] = (
+            resolved_execution_mode
+        )
         translation_path = (
             Path(job.translation_path)
             if job.translation_path
@@ -3124,9 +3378,7 @@ class SubtitleOrchestrator:
                 "translation",
             )
         )
-        updated_prompt_snapshot = updated_options.get(TRANSLATION_PROMPT_OPTION)
-        if not isinstance(updated_prompt_snapshot, Mapping):
-            updated_prompt_snapshot = self._legacy_prompt_snapshot()
+        selected_job = replace(selected_job, options=updated_options)
         generation = self._create_translation_generation(
             selected_job,
             transcript_payload,
@@ -3175,6 +3427,8 @@ class SubtitleOrchestrator:
                 "generation_number": generation["generation_number"],
                 "transcript_revision_id": selected_revision_id,
                 "prompt_revision_id": generation.get("prompt_revision_id"),
+                "translation_mode": resolved_translation_mode,
+                "review_source_generation_id": source_generation_id,
             },
         )
         restarted = self.store.get(job.id)
@@ -3698,8 +3952,16 @@ class SubtitleOrchestrator:
             ).strip()
             if mode not in {"live", "batch"}:
                 mode = "live"
+            prompt_snapshot = job.options.get(TRANSLATION_PROMPT_OPTION)
+            if not isinstance(prompt_snapshot, Mapping):
+                prompt_snapshot = self._legacy_prompt_snapshot()
+            required_stage = (
+                "review"
+                if self._translation_mode(prompt_snapshot) == "review_existing"
+                else "draft"
+            )
             return not self._translation_routing.route_suspended_by_stt(
-                "draft",
+                required_stage,
                 mode,
             )
 
@@ -4926,8 +5188,32 @@ class SubtitleOrchestrator:
         return generation
 
     def _translate(self, job: PipelineJob) -> None:
-        if not self.translation_server_configured:
-            raise ExternalServiceError("translation server is not configured")
+        prompt_snapshot = job.options.get(TRANSLATION_PROMPT_OPTION)
+        if not isinstance(prompt_snapshot, Mapping):
+            prompt_snapshot = self._legacy_prompt_snapshot()
+        translation_mode = self._translation_mode(prompt_snapshot)
+        execution_mode = str(
+            job.options.get(TRANSLATION_EXECUTION_MODE_OPTION, "live")
+        ).strip()
+        if execution_mode not in {"live", "batch"}:
+            execution_mode = "live"
+        self._require_translation_mode_routes(
+            translation_mode,
+            execution_mode,
+            error_type=ExternalServiceError,
+        )
+        draft_pass = translation_mode != "review_existing"
+        review_rounds = (
+            0
+            if translation_mode == "draft_only"
+            else TRANSLATION_REVIEW_ROUNDS
+        )
+        translation_prompt = str(
+            prompt_snapshot.get("translation_prompt", "")
+        ).strip() or KOREAN_JAV_DRAFT_PROMPT
+        review_prompt = str(
+            prompt_snapshot.get("review_prompt", "")
+        ).strip() or KOREAN_JAV_REVIEW_PROMPT
         media_duration: float | None = None
         if job.audio_revision_id:
             audio_revision = self.store.get_audio_revision(
@@ -5041,30 +5327,6 @@ class SubtitleOrchestrator:
         lm_client = self._make_translation_client(
             request_observer=observe_translation_request,
         )
-        prompt_snapshot = job.options.get(TRANSLATION_PROMPT_OPTION)
-        if not isinstance(prompt_snapshot, Mapping):
-            prompt_snapshot = self._legacy_prompt_snapshot()
-        translation_prompt = str(
-            prompt_snapshot.get("translation_prompt", "")
-        ).strip() or KOREAN_JAV_DRAFT_PROMPT
-        review_prompt = str(
-            prompt_snapshot.get("review_prompt", "")
-        ).strip() or KOREAN_JAV_REVIEW_PROMPT
-        try:
-            review_rounds = int(prompt_snapshot.get("review_rounds", 0))
-        except (TypeError, ValueError):
-            review_rounds = 0
-        review_rounds = min(TRANSLATION_REVIEW_ROUNDS, max(0, review_rounds))
-        execution_mode = str(
-            job.options.get(TRANSLATION_EXECUTION_MODE_OPTION, "live")
-        ).strip()
-        if execution_mode not in {"live", "batch"}:
-            execution_mode = "live"
-        if review_rounds and not self._translation_routing.is_configured(
-            "review",
-            execution_mode,
-        ):
-            review_rounds = 0
         self.store.add_event(
             job.id,
             "info",
@@ -5073,7 +5335,8 @@ class SubtitleOrchestrator:
             phase="translation",
             payload={
                 "execution_mode": execution_mode,
-                "draft_pass": True,
+                "translation_mode": translation_mode,
+                "draft_pass": draft_pass,
                 "local_review_pass": bool(review_rounds),
                 "external_validation": (
                     "configured"
@@ -5088,6 +5351,20 @@ class SubtitleOrchestrator:
             Path(job.transcript_path).read_text(encoding="utf-8")
         )
         segments = validate_transcript(transcript_payload)
+        draft_translations: dict[str, str] = {}
+        if not draft_pass:
+            review_source_generation_id = str(
+                prompt_snapshot.get("review_source_generation_id", "")
+            ).strip()
+            _source_generation, draft_translations = (
+                self._review_source_generation(
+                    job,
+                    transcript_payload,
+                    segments,
+                    prompt_snapshot,
+                    generation_id=review_source_generation_id or None,
+                )
+            )
         translation_path = (
             Path(job.translation_path)
             if job.translation_path
@@ -5277,7 +5554,8 @@ class SubtitleOrchestrator:
 
         translation_outcome = "failed"
         translation_workers = self._translation_routing.worker_limit(
-            execution_mode
+            execution_mode,
+            stage="draft" if draft_pass else "review",
         )
         review_priority = (
             self._translation_routing.review_priority(execution_mode)
@@ -5291,6 +5569,8 @@ class SubtitleOrchestrator:
                     system_prompt=translation_prompt,
                     review_prompt=review_prompt,
                     review_rounds=review_rounds,
+                    draft_pass=draft_pass,
+                    draft_translations=draft_translations,
                     existing=existing,
                     on_batch=save_batch,
                     on_batch_started=start_batch,
@@ -5397,6 +5677,7 @@ class SubtitleOrchestrator:
             payload={
                 "translation_generation_id": generation["id"],
                 "generation_number": generation["generation_number"],
+                "translation_mode": translation_mode,
                 "segment_count": len(completed_translations),
             },
         )

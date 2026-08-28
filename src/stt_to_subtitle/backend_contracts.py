@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 
 JobOperation = Literal["extract", "transcribe", "translate", "full", "compare"]
 TranslationStage = Literal["draft", "review"]
+TranslationMode = Literal["draft_only", "review_existing", "draft_and_review"]
 
 
 class JobCreateRequest(BaseModel):
@@ -26,7 +27,8 @@ class JobIdsRequest(BaseModel):
 
 class TranslationSelectionRequest(JobIdsRequest):
     prompt_category_id: str
-    target_stage: TranslationStage = "review"
+    translation_mode: TranslationMode = "draft_and_review"
+    target_stage: TranslationStage | None = None
 
 
 class ReprocessRequest(BaseModel):

@@ -24,7 +24,7 @@ import {
   type JobState,
 } from "@/lib/domain";
 import { clock, fileName, parentPath } from "@/lib/format";
-import { jobStateLabel } from "@/lib/jobPresentation";
+import { jobStateLabel, jobTranslationMode } from "@/lib/jobPresentation";
 import { useLiveQuery } from "@/lib/useLiveQuery";
 
 const JOBS_INTERVAL_MS = 5000;
@@ -150,8 +150,16 @@ export default function JobsPage() {
   const pauseIds = selectedJobs
     .filter((job) => canPauseTranslation(asJobState(job.state), job.phase))
     .map((job) => job.id);
-  const translationIds = selectedJobs
+  const draftTranslationIds = selectedJobs
     .filter((job) => job.status === "transcription_completed" && !job.options.comparison_id)
+    .map((job) => job.id);
+  const reviewTranslationIds = selectedJobs
+    .filter((job) => (
+      job.status === "completed"
+      && (job.operation === "translate" || job.operation === "full")
+      && !job.options.comparison_id
+      && jobTranslationMode(job) === "draft_only"
+    ))
     .map((job) => job.id);
   const stopIds = selectedJobs
     .filter((job) => canStopJob(asJobState(job.state)))
@@ -286,30 +294,44 @@ export default function JobsPage() {
               <button
                 type="button"
                 className="btn sec sm"
-                disabled={!translationIds.length || !translationPromptId || busy}
-                title={!translationIds.length ? "전사 완료 작업을 선택하세요." : !translationPromptId ? "번역 프롬프트를 선택하세요." : "1차 초벌 번역까지만 실행합니다."}
+                disabled={!draftTranslationIds.length || !translationPromptId || busy}
+                title={!draftTranslationIds.length ? "전사 완료 작업을 선택하세요." : !translationPromptId ? "번역 프롬프트를 선택하세요." : "1차 초벌 번역까지만 실행합니다."}
                 onClick={() => void run(
-                  translationIds,
-                  (ids) => api.translateJobs(ids, translationPromptId, "draft"),
-                  `${translationIds.length}건의 1차 번역을 시작했습니다.`,
+                  draftTranslationIds,
+                  (ids) => api.translateJobs(ids, translationPromptId, "draft_only"),
+                  `${draftTranslationIds.length}건의 1차 번역을 시작했습니다.`,
                 )}
               >
                 <Icon name="play" size={13} />
-                1차 번역 {translationIds.length || ""}
+                1차 번역 {draftTranslationIds.length || ""}
+              </button>
+              <button
+                type="button"
+                className="btn sec sm"
+                disabled={!reviewTranslationIds.length || !translationPromptId || busy}
+                title={!reviewTranslationIds.length ? "1차 자막 완료 작업을 선택하세요." : !translationPromptId ? "번역 프롬프트를 선택하세요." : "기존 1차 번역을 다시 번역하지 않고 검수·교정합니다."}
+                onClick={() => void run(
+                  reviewTranslationIds,
+                  (ids) => api.translateJobs(ids, translationPromptId, "review_existing"),
+                  `${reviewTranslationIds.length}건의 2차 보정을 시작했습니다.`,
+                )}
+              >
+                <Icon name="play" size={13} />
+                2차 보정 {reviewTranslationIds.length || ""}
               </button>
               <button
                 type="button"
                 className="btn sm"
-                disabled={!translationIds.length || !translationPromptId || busy}
-                title={!translationIds.length ? "전사 완료 작업을 선택하세요." : !translationPromptId ? "번역 프롬프트를 선택하세요." : "1차 초벌 번역 후 2차 검수·교정을 실행합니다."}
+                disabled={!draftTranslationIds.length || !translationPromptId || busy}
+                title={!draftTranslationIds.length ? "전사 완료 작업을 선택하세요." : !translationPromptId ? "번역 프롬프트를 선택하세요." : "1차 초벌 번역 후 2차 검수·교정을 연속 실행합니다."}
                 onClick={() => void run(
-                  translationIds,
-                  (ids) => api.translateJobs(ids, translationPromptId, "review"),
-                  `${translationIds.length}건의 1차·2차 번역을 시작했습니다.`,
+                  draftTranslationIds,
+                  (ids) => api.translateJobs(ids, translationPromptId, "draft_and_review"),
+                  `${draftTranslationIds.length}건의 1+2차 번역을 시작했습니다.`,
                 )}
               >
                 <Icon name="play" size={13} />
-                2차 번역(1차 포함) {translationIds.length || ""}
+                1+2차 번역 {draftTranslationIds.length || ""}
               </button>
               <button type="button" className="btn sec sm" disabled={!retryIds.length || busy} onClick={() => void run(retryIds, api.retryJobs)}>
                 <Icon name="refresh" size={13} />

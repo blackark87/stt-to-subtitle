@@ -221,11 +221,18 @@ def translate_jobs(
     payload: TranslationSelectionRequest,
     request: Request,
 ) -> dict[str, Any]:
+    translation_mode = payload.translation_mode
+    if payload.target_stage is not None:
+        translation_mode = (
+            "draft_only"
+            if payload.target_stage == "draft"
+            else "draft_and_review"
+        )
     try:
         jobs = service_from_request(request).create_selected_translation_jobs(
             payload.job_ids,
             prompt_category_id=payload.prompt_category_id,
-            target_stage=payload.target_stage,
+            translation_mode=translation_mode,
         )
     except (OSError, UnicodeError, ValueError) as error:
         raise bad_request(error) from error

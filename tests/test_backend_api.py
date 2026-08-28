@@ -82,9 +82,13 @@ class BackendAPIBoundaryTests(unittest.TestCase):
         selection_schema = app.openapi()["components"]["schemas"][
             "TranslationSelectionRequest"
         ]
-        target_stage = selection_schema["properties"]["target_stage"]
-        self.assertEqual(target_stage["default"], "review")
-        self.assertEqual(target_stage["enum"], ["draft", "review"])
+        translation_mode = selection_schema["properties"]["translation_mode"]
+        self.assertEqual(translation_mode["default"], "draft_and_review")
+        self.assertEqual(
+            translation_mode["enum"],
+            ["draft_only", "review_existing", "draft_and_review"],
+        )
+        self.assertIn("target_stage", selection_schema["properties"])
 
     def test_health_and_job_list_run_without_html_application(self) -> None:
         from fastapi.testclient import TestClient

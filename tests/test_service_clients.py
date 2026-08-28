@@ -769,6 +769,53 @@ class TranslationResponseTests(unittest.TestCase):
         self.assertEqual(result, reviewed)
         self.assertEqual(client._review_batch_with_recovery.call_count, 2)
 
+    def test_reviews_an_existing_draft_without_running_the_draft_pass(
+        self,
+    ) -> None:
+        client = OpenAICompatibleClient(
+            "http://translation.test/v1",
+            "",
+            "model",
+        )
+        reviewed = [{"id": "segment-1", "text": "자연스럽게 교정"}]
+        client._translate_batch_with_recovery = Mock()
+        client._review_batch_with_recovery = Mock(return_value=reviewed)
+
+        result = client.translate(
+            [{"id": "segment-1", "text": "原文"}],
+            system_prompt="",
+            review_prompt="review",
+            review_rounds=1,
+            draft_pass=False,
+            draft_translations={"segment-1": "기존 1차 번역"},
+        )
+
+        self.assertEqual(result, reviewed)
+        client._translate_batch_with_recovery.assert_not_called()
+        self.assertEqual(
+            client._review_batch_with_recovery.call_args.args[2],
+            [{"id": "segment-1", "text": "기존 1차 번역"}],
+        )
+
+    def test_reviewing_an_existing_draft_requires_every_segment(self) -> None:
+        client = OpenAICompatibleClient(
+            "http://translation.test/v1",
+            "",
+            "model",
+        )
+
+        with self.assertRaisesRegex(ValueError, "complete draft"):
+            client.translate(
+                [
+                    {"id": "segment-1", "text": "一"},
+                    {"id": "segment-2", "text": "二"},
+                ],
+                review_prompt="review",
+                review_rounds=1,
+                draft_pass=False,
+                draft_translations={"segment-1": "하나"},
+            )
+
     def test_fails_the_logical_batch_when_review_fails(self) -> None:
         client = OpenAICompatibleClient(
             "http://translation.test/v1",
@@ -1374,7 +1421,7 @@ class TranslationResponseTests(unittest.TestCase):
         ):
             self.assertNotIn(metadata_marker, KOREAN_JAV_SYSTEM_PROMPT)
 
-    def test_sends_review_source_draft_and_review_only_prompt(self) -> None:
+    def test_sends_review_source_draft_and_review_prompt(self) -> None:
         calls: list[tuple[str, str, dict[str, object]]] = []
         response = Mock(status_code=200)
         response.json.return_value = {

@@ -665,15 +665,19 @@ class BackendTranslationRouting:
             )
         )
 
-    def worker_limit(self, mode: str) -> int:
-        """Return the usable draft concurrency for one translation job."""
-        candidates = self._candidates("draft", mode)
-        with self._lock:
-            usable = [
-                server
-                for server in candidates
-                if not self._review_priority_active_locked(server)
-            ]
+    def worker_limit(self, mode: str, *, stage: str = "draft") -> int:
+        """Return usable concurrency for one translation stage."""
+        resolved = translation_stage(stage)
+        candidates = self._candidates(resolved, mode)
+        if resolved == "draft":
+            with self._lock:
+                usable = [
+                    server
+                    for server in candidates
+                    if not self._review_priority_active_locked(server)
+                ]
+        else:
+            usable = candidates
         return max(1, min(8, sum(server.capacity for server in usable)))
 
     @contextmanager

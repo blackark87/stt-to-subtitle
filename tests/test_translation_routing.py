@@ -304,6 +304,24 @@ class BackendTranslationRoutingTests(unittest.TestCase):
             self.assertFalse(groups[1]["servers"][0]["enabled"])
             self.assertNotIn("token", groups[0]["servers"][0])
 
+    def test_worker_limit_uses_the_requested_translation_stage(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            routing = self.routing(root, review_enabled=True)
+            review = routing.stores["review"].get("builtin")
+            assert review is not None
+            routing.stores["review"].update(
+                "builtin",
+                name="2차 서버",
+                base_url="http://builtin.test/v1",
+                token=review.token,
+                enabled=True,
+                capacity=3,
+            )
+
+            self.assertEqual(routing.worker_limit("live", stage="draft"), 1)
+            self.assertEqual(routing.worker_limit("live", stage="review"), 3)
+
     def test_builtin_address_is_editable_per_group_and_survives_restart(self) -> None:
         with TemporaryDirectory() as directory, patch(
             "stt_to_subtitle.translation_routing.requests.get",

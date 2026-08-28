@@ -1626,6 +1626,11 @@ class SubtitleOrchestratorTests(unittest.TestCase):
             media_root = root / "media"
             media_root.mkdir()
             orchestrator = self.make_orchestrator(root, media_root)
+            orchestrator.update_translation_endpoint_routing(
+                "review",
+                "builtin",
+                {"enabled": True, "batch_preferred": False},
+            )
             jobs = {}
             try:
                 for target_stage in ("draft", "review"):
@@ -1692,9 +1697,126 @@ class SubtitleOrchestratorTests(unittest.TestCase):
             self.assertEqual(draft.status, "transcribed")
             self.assertEqual(draft_prompt["target_stage"], "draft")
             self.assertEqual(draft_prompt["review_rounds"], 0)
+            self.assertEqual(draft_prompt["translation_mode"], "draft_only")
             self.assertEqual(review.status, "transcribed")
             self.assertEqual(review_prompt["target_stage"], "review")
             self.assertEqual(review_prompt["review_rounds"], 1)
+            self.assertEqual(
+                review_prompt["translation_mode"],
+                "draft_and_review",
+            )
+
+    def test_selected_second_pass_reuses_completed_first_pass_translation(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            (media_root / "movie.mkv").write_bytes(b"media")
+            orchestrator = self.make_orchestrator(root, media_root)
+            orchestrator.update_translation_endpoint_routing(
+                "review",
+                "builtin",
+                {"enabled": True, "batch_preferred": False},
+            )
+            job = orchestrator.create_job(
+                "movie.mkv",
+                force_overwrite=False,
+                options={},
+            )
+            artifact_dir = root / "state" / "jobs" / job.id
+            artifact_dir.mkdir(parents=True)
+            transcript_path = artifact_dir / "transcript.json"
+            translation_path = artifact_dir / "translation.json"
+            transcript_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "job_id": "remote-job",
+                        "segments": [
+                            {
+                                "id": "segment-000001",
+                                "start": 0,
+                                "end": 1,
+                                "speaker": "SPEAKER_00",
+                                "text": "こんにちは",
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            translation_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "status": "completed",
+                        "transcript_job_id": "remote-job",
+                        "translations": [
+                            {
+                                "id": "segment-000001",
+                                "text": "기존 1차 번역",
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            orchestrator.store.update(
+                job.id,
+                status="completed",
+                operation="full",
+                transcript_path=str(transcript_path),
+                translation_path=str(translation_path),
+            )
+
+            translation_client = Mock()
+            translation_client.translate = Mock(
+                return_value=[
+                    {"id": "segment-000001", "text": "교정된 번역"}
+                ]
+            )
+            orchestrator._make_translation_client = Mock(
+                return_value=translation_client
+            )
+            try:
+                queued = orchestrator.create_selected_translation_jobs(
+                    [job.id],
+                    prompt_category_id="jav",
+                    translation_mode="review_existing",
+                )[0]
+                orchestrator.store.update(
+                    queued.id,
+                    status="translation_running",
+                )
+                running = orchestrator.store.get(queued.id)
+                orchestrator._translate(running)
+                generations = orchestrator.store.list_translation_generations(
+                    job.id
+                )
+            finally:
+                orchestrator.stop()
+
+            call = translation_client.translate.call_args.kwargs
+            self.assertFalse(call["draft_pass"])
+            self.assertEqual(call["review_rounds"], 1)
+            self.assertEqual(
+                call["draft_translations"],
+                {"segment-000001": "기존 1차 번역"},
+            )
+            self.assertEqual(call["existing"], {})
+            self.assertEqual(
+                queued.options["translation_prompt"]["translation_mode"],
+                "review_existing",
+            )
+            self.assertEqual(len(generations), 2)
+            self.assertEqual(
+                [generation["state"] for generation in generations],
+                ["completed", "completed"],
+            )
 
     def test_selects_a_historical_prompt_revision_for_a_new_job(self) -> None:
         with TemporaryDirectory() as directory:
@@ -3944,6 +4066,11 @@ class SubtitleOrchestratorTests(unittest.TestCase):
             (media_root / "movie.mkv").write_bytes(b"media")
             orchestrator = self.make_orchestrator(root, media_root)
             try:
+                orchestrator.update_translation_endpoint_routing(
+                    "review",
+                    "builtin",
+                    {"enabled": True, "batch_preferred": False},
+                )
                 orchestrator.stop()
                 job = orchestrator.create_job(
                     "movie.mkv",

@@ -1198,6 +1198,8 @@ class OpenAICompatibleClient(RetryingJSONClient):
         system_prompt: str = KOREAN_JAV_DRAFT_PROMPT,
         review_prompt: str = "",
         review_rounds: int = 0,
+        draft_pass: bool = True,
+        draft_translations: Mapping[str, str] | None = None,
         existing: Mapping[str, str] | None = None,
         on_batch: Callable[[list[dict[str, str]]], None] | None = None,
         on_batch_started: Callable[[int, list[str]], None] | None = None,
@@ -1213,7 +1215,7 @@ class OpenAICompatibleClient(RetryingJSONClient):
         max_workers: int = 1,
         execution_mode: str = "live",
     ) -> list[dict[str, str]]:
-        if not system_prompt.strip():
+        if draft_pass and not system_prompt.strip():
             raise ValueError("translation system prompt is required")
         if not 0 <= review_rounds <= 2:
             raise ValueError("review_rounds must be between 0 and 2")
@@ -1226,6 +1228,21 @@ class OpenAICompatibleClient(RetryingJSONClient):
         self.translation_execution_mode = execution_mode
         expected_ids = [str(segment["id"]) for segment in segments]
         expected_set = set(expected_ids)
+        source_drafts = {
+            str(segment_id): str(text).strip()
+            for segment_id, text in (draft_translations or {}).items()
+            if str(segment_id) in expected_set and str(text).strip()
+        }
+        if not draft_pass:
+            if review_rounds < 1:
+                raise ValueError(
+                    "existing-draft review requires at least one review round"
+                )
+            missing_draft_ids = expected_set - set(source_drafts)
+            if missing_draft_ids:
+                raise ValueError(
+                    "existing-draft review requires a complete draft"
+                )
         known = {
             str(segment_id): str(text).strip()
             for segment_id, text in (existing or {}).items()
@@ -1288,6 +1305,8 @@ class OpenAICompatibleClient(RetryingJSONClient):
                         system_prompt=system_prompt,
                         review_prompt=review_prompt,
                         review_rounds=review_rounds,
+                        draft_pass=draft_pass,
+                        draft_translations=source_drafts,
                     )
                 except Exception as error:
                     if on_batch_failed is not None:
@@ -1305,6 +1324,8 @@ class OpenAICompatibleClient(RetryingJSONClient):
                 system_prompt=system_prompt,
                 review_prompt=review_prompt,
                 review_rounds=review_rounds,
+                draft_pass=draft_pass,
+                draft_translations=source_drafts,
                 max_workers=max_workers,
                 accept_batch=accept_batch,
                 on_batch_started=on_batch_started,
@@ -1327,6 +1348,8 @@ class OpenAICompatibleClient(RetryingJSONClient):
         system_prompt: str,
         review_prompt: str,
         review_rounds: int,
+        draft_pass: bool,
+        draft_translations: Mapping[str, str],
         max_workers: int,
         accept_batch: Callable[
             [int, list[dict[str, str]], str | None], None
@@ -1366,6 +1389,8 @@ class OpenAICompatibleClient(RetryingJSONClient):
                     system_prompt=system_prompt,
                     review_prompt=review_prompt,
                     review_rounds=review_rounds,
+                    draft_pass=draft_pass,
+                    draft_translations=draft_translations,
                 )
                 in_flight[future] = batch_index
 
@@ -1423,6 +1448,8 @@ class OpenAICompatibleClient(RetryingJSONClient):
         system_prompt: str,
         review_prompt: str,
         review_rounds: int,
+        draft_pass: bool,
+        draft_translations: Mapping[str, str],
     ) -> tuple[list[dict[str, str]], str | None]:
         reference_context = self._reference_context(
             all_segments,
@@ -1430,12 +1457,21 @@ class OpenAICompatibleClient(RetryingJSONClient):
             before=5,
             after=3,
         )
-        draft = self._translate_batch_with_recovery(
-            batch,
-            reference_context,
-            system_prompt,
-            all_segments,
-        )
+        if draft_pass:
+            draft = self._translate_batch_with_recovery(
+                batch,
+                reference_context,
+                system_prompt,
+                all_segments,
+            )
+        else:
+            draft = [
+                {
+                    "id": str(segment["id"]),
+                    "text": draft_translations[str(segment["id"])],
+                }
+                for segment in batch
+            ]
         translated = draft
         if review_rounds:
             for _round in range(review_rounds):

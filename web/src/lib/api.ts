@@ -46,6 +46,7 @@ export interface RuntimeEndpoint {
 }
 
 export type TranslationStage = "draft" | "review";
+export type TranslationMode = "draft_only" | "review_existing" | "draft_and_review";
 
 export interface TranslationServer {
   id: string;
@@ -364,14 +365,14 @@ export const api = {
   translateJobs: (
     jobIds: string[],
     promptCategoryId: string,
-    targetStage: TranslationStage,
+    translationMode: TranslationMode,
   ) =>
     request<unknown>("/jobs/actions/translate", {
       method: "POST",
       ...json({
         job_ids: jobIds,
         prompt_category_id: promptCategoryId,
-        target_stage: targetStage,
+        translation_mode: translationMode,
       }),
     }),
   retryJob: (jobId: string) =>
