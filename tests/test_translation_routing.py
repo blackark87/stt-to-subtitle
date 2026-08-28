@@ -350,8 +350,17 @@ class BackendTranslationRoutingTests(unittest.TestCase):
                 timeout=(10.0, 30.0),
             )
             self.assertFalse(result["enabled"])
-            self.assertEqual(result["status"], "disabled")
+            self.assertEqual(result["status"], "ready")
             self.assertEqual(result["models"], ["disabled-server-model"])
+
+            disabled = routing.update_routing(
+                "review",
+                "builtin",
+                {"enabled": False, "batch_preferred": False},
+            )
+
+            self.assertFalse(disabled["enabled"])
+            self.assertEqual(disabled["status"], "ready")
 
     def test_draft_and_review_use_their_own_server_groups(self) -> None:
         with TemporaryDirectory() as directory:

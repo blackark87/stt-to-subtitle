@@ -199,9 +199,7 @@ class BackendTranslationRouting:
         with self._lock:
             current = dict(self._health.get(key, {}))
             running = self._active_requests.get(key, 0)
-        if not server.enabled:
-            status = "disabled"
-        elif not server.base_url:
+        if not server.base_url:
             status = "unconfigured"
         else:
             status = str(current.get("status", "unknown"))
