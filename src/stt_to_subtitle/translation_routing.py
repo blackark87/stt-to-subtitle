@@ -204,9 +204,7 @@ class BackendTranslationRouting:
         elif not server.base_url:
             status = "unconfigured"
         else:
-            status = str(
-                current.get("status", "ready" if server.models else "unknown")
-            )
+            status = str(current.get("status", "unknown"))
         return {
             "id": server.id,
             "stage": stage,

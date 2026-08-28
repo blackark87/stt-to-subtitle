@@ -202,6 +202,7 @@ class BackendTranslationRoutingTests(unittest.TestCase):
             builtin = restarted.group("draft")["servers"][0]
             self.assertEqual(builtin["name"], "로컬 API")
             self.assertEqual(builtin["base_url"], "http://127.0.0.1:11434/v1")
+            self.assertEqual(builtin["status"], "unknown")
 
     def test_renames_only_the_legacy_builtin_default(self) -> None:
         with TemporaryDirectory() as directory:
