@@ -302,6 +302,10 @@ class SubtitleOrchestratorTests(unittest.TestCase):
 
                 self.assertEqual(orchestrator.stt_gate_state, "lost")
                 self.assertEqual(
+                    orchestrator.store.get(running.id).status,
+                    "audio_ready",
+                )
+                self.assertEqual(
                     orchestrator.store.get(waiting.id).status,
                     "audio_ready",
                 )
@@ -324,7 +328,7 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                     }
                 )
                 resumed = orchestrator.activate_transcription_stt()
-                self.assertEqual(resumed, 1)
+                self.assertEqual(resumed, 0)
                 self.assertEqual(orchestrator.stt_gate_state, "ready")
                 orchestrator.stt_client.check_readiness.assert_called_once_with()
                 queue_measurements = {
@@ -725,6 +729,126 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                 self.assertEqual(
                     orchestrator._stt_executor.submit.call_count,
                     2,
+                )
+            finally:
+                orchestrator.stop()
+
+    def test_requeues_external_runtime_disconnect_to_available_runtime(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            orchestrator = self.make_orchestrator(root, media_root)
+            try:
+                endpoint = orchestrator.store.create_runtime_endpoint(
+                    name="GPU Runtime 02",
+                    base_url="http://runtime-02.test:8100",
+                    token="token-02",
+                    enabled=True,
+                    capacity=1,
+                )
+                orchestrator._install_runtime_endpoint(endpoint)
+                orchestrator._set_runtime_health(
+                    endpoint.id,
+                    "ready",
+                    readiness={"status": "ready", "queue": {}},
+                )
+                job = orchestrator.store.create(
+                    job_id="runtime-failover",
+                    source_rel="movie.mkv",
+                    force_overwrite=False,
+                    options={},
+                    status="audio_ready",
+                )
+                orchestrator.store.update(
+                    job.id,
+                    status="transcription_running",
+                    stt_runtime_id=endpoint.id,
+                    stt_job_id="remote-job-02",
+                    chunks_created=20,
+                    chunks_completed=10,
+                    transcription_stage="primary_transcription",
+                    transcription_stage_index=2,
+                    transcription_stage_total=7,
+                )
+
+                orchestrator._run_stage(
+                    job.id,
+                    "transcription",
+                    Mock(side_effect=ExternalServiceError("connection refused")),
+                )
+                requeued = orchestrator.store.get(job.id)
+
+                self.assertEqual(requeued.status, "audio_ready")
+                self.assertEqual(requeued.state, "waiting")
+                self.assertEqual(requeued.attempt, 2)
+                self.assertIsNone(requeued.stt_runtime_id)
+                self.assertIsNone(requeued.stt_job_id)
+                self.assertEqual(requeued.chunks_created, 0)
+                self.assertEqual(requeued.chunks_completed, 0)
+                self.assertIsNone(requeued.transcription_stage)
+                self.assertEqual(orchestrator.stt_gate_state, "ready")
+                self.assertEqual(
+                    orchestrator._runtime_view(endpoint.id)["status"],
+                    "unavailable",
+                )
+                failover_event = next(
+                    event
+                    for event in orchestrator.store.events(job.id)
+                    if event["event_code"]
+                    == "transcription.runtime_failover"
+                )
+                self.assertEqual(failover_event["from_state"], "running")
+                self.assertEqual(failover_event["to_state"], "waiting")
+                self.assertEqual(
+                    failover_event["payload"]["failed_runtime_id"],
+                    endpoint.id,
+                )
+
+                orchestrator._stt_executor.submit = Mock()
+                self.assertEqual(orchestrator._dispatch_transcriptions(), 1)
+                reassigned = orchestrator.store.get(job.id)
+                self.assertEqual(reassigned.status, "transcription_running")
+                self.assertEqual(reassigned.stt_runtime_id, "builtin")
+            finally:
+                orchestrator.stop()
+
+    def test_periodically_reprobes_unavailable_external_runtime(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            orchestrator = self.make_orchestrator(root, media_root)
+            try:
+                endpoint = orchestrator.store.create_runtime_endpoint(
+                    name="GPU Runtime 02",
+                    base_url="http://runtime-02.test:8100",
+                    token="token-02",
+                    enabled=True,
+                    capacity=1,
+                )
+                orchestrator._install_runtime_endpoint(endpoint)
+                orchestrator._set_runtime_health(
+                    endpoint.id,
+                    "unavailable",
+                    message="connection refused",
+                )
+                orchestrator._runtime_health[endpoint.id]["checked_at"] = (
+                    time.time() - 31
+                )
+                orchestrator._runtime_probe_executor.submit = Mock()
+
+                orchestrator._schedule_runtime_reprobes()
+
+                self.assertEqual(
+                    orchestrator._runtime_view(endpoint.id)["status"],
+                    "checking",
+                )
+                orchestrator._runtime_probe_executor.submit.assert_called_once_with(
+                    orchestrator.probe_runtime_endpoint,
+                    endpoint.id,
                 )
             finally:
                 orchestrator.stop()

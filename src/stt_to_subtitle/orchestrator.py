@@ -113,6 +113,7 @@ EVENT_PHASE_BY_STAGE = {
 JOB_LEASE_SECONDS = 60.0
 JOB_LEASE_HEARTBEAT_SECONDS = 15.0
 JOB_SHUTDOWN_GRACE_SECONDS = 5.0
+RUNTIME_REPROBE_INTERVAL_SECONDS = 30.0
 BUILTIN_RUNTIME_ID = "builtin"
 MAX_RUNTIME_ENDPOINTS = 32
 LEGACY_BUILTIN_RUNTIME_URLS = {
@@ -3402,6 +3403,7 @@ class SubtitleOrchestrator:
             self._stop_event.wait(1.0)
 
     def _scheduler_tick(self) -> None:
+        self._schedule_runtime_reprobes()
         if not self.store.ids_with_status("rendering"):
             self._dispatch_one(
                 "translated",
@@ -3423,6 +3425,33 @@ class SubtitleOrchestrator:
         if self.stt_gate_state == "ready":
             self._dispatch_transcriptions()
         self._dispatch_translations()
+
+    def _schedule_runtime_reprobes(self) -> None:
+        now = time.time()
+        with self._runtime_lock:
+            health = {
+                runtime_id: dict(value)
+                for runtime_id, value in self._runtime_health.items()
+            }
+        candidates = [
+            str(definition["id"])
+            for definition in self._runtime_definitions()
+            if definition["enabled"]
+            and not definition["builtin"]
+            and health.get(str(definition["id"]), {}).get("status")
+            == "unavailable"
+            and now
+            - float(
+                health.get(str(definition["id"]), {}).get("checked_at") or 0
+            )
+            >= RUNTIME_REPROBE_INTERVAL_SECONDS
+        ]
+        for runtime_id in candidates:
+            self._set_runtime_health(runtime_id, "checking")
+            self._runtime_probe_executor.submit(
+                self.probe_runtime_endpoint,
+                runtime_id,
+            )
 
     def _dispatch_transcriptions(self) -> int:
         with self._runtime_lock:
@@ -3606,6 +3635,33 @@ class SubtitleOrchestrator:
             self._mark_job_stopped(job, stage)
         except RemoteTranscriptionFailed as error:
             message = self._sanitize_error(str(error))
+            failed_runtime_id = job.stt_runtime_id or BUILTIN_RUNTIME_ID
+            if stage == "transcription" and (
+                error.failure_scope == "service"
+                or (
+                    (
+                        error.failure_scope == "configuration"
+                        or error.failure_code == "auth_required"
+                    )
+                    and self._has_alternate_ready_runtime(failed_runtime_id)
+                )
+            ):
+                self._set_runtime_health(
+                    failed_runtime_id,
+                    "unavailable",
+                    message=message,
+                    reason_code=(
+                        JobReason.AUTH_REQUIRED.value
+                        if error.failure_code == "auth_required"
+                        else JobReason.STT_UNAVAILABLE.value
+                    ),
+                )
+                self._requeue_transcription_after_runtime_failure(
+                    job,
+                    message=message,
+                    failure_code=error.failure_code,
+                )
+                return
             reason_by_failure_code = {
                 "invalid_input": JobReason.INVALID_INPUT.value,
                 "model_output_invalid": JobReason.MODEL_OUTPUT_INVALID.value,
@@ -3666,6 +3722,17 @@ class SubtitleOrchestrator:
             )
         except ExternalServiceError as error:
             message = self._sanitize_error(str(error))
+            if stage == "transcription":
+                self._set_runtime_health(
+                    job.stt_runtime_id or BUILTIN_RUNTIME_ID,
+                    "unavailable",
+                    message=message,
+                )
+                self._requeue_transcription_after_runtime_failure(
+                    job,
+                    message=message,
+                )
+                return
             if not self._update_stage_job(
                 job,
                 status="blocked",
@@ -3682,12 +3749,6 @@ class SubtitleOrchestrator:
                     "terminal_transition",
                 )
                 return
-            if stage == "transcription":
-                self._set_runtime_health(
-                    job.stt_runtime_id or BUILTIN_RUNTIME_ID,
-                    "unavailable",
-                    message=message,
-                )
             if stage == "translation":
                 self._set_translation_circuit(
                     "lost",
@@ -3793,6 +3854,70 @@ class SubtitleOrchestrator:
         current = self.store.get(job_id)
         if current is not None and current.job_stop_requested:
             raise OperationStopped("job stop requested")
+
+    def _requeue_transcription_after_runtime_failure(
+        self,
+        job: PipelineJob,
+        *,
+        message: str,
+        failure_code: str | None = None,
+    ) -> None:
+        current = self.store.get(job.id)
+        if current is not None and current.job_stop_requested:
+            self._mark_job_stopped(job, "transcription")
+            return
+        failed_runtime_id = job.stt_runtime_id or BUILTIN_RUNTIME_ID
+        remote_job_id = current.stt_job_id if current is not None else job.stt_job_id
+        attempt = (current.attempt if current is not None else job.attempt) + 1
+        if not self._update_stage_job(
+            job,
+            status="audio_ready",
+            attempt=attempt,
+            stt_job_id=None,
+            stt_runtime_id=None,
+            blocked_stage=None,
+            error=None,
+            chunks_created=0,
+            chunks_completed=0,
+            transcription_stage=None,
+            transcription_stage_index=0,
+            transcription_stage_total=0,
+            job_stop_requested=0,
+        ):
+            self._record_lease_fencing_rejection(
+                "transcription",
+                "runtime_failover",
+            )
+            return
+        self.store.add_event(
+            job.id,
+            "warning",
+            "transcription Runtime unavailable; queued for another Runtime",
+            event_code="transcription.runtime_failover",
+            from_state=JobState.RUNNING.value,
+            phase="transcription",
+            attempt=attempt,
+            payload={
+                "failed_runtime_id": failed_runtime_id,
+                "remote_job_id": remote_job_id,
+                "failure_code": failure_code,
+                "reason_code": JobReason.STT_UNAVAILABLE.value,
+            },
+        )
+        LOGGER.warning(
+            "job %s transcription Runtime %s unavailable; requeued: %s",
+            job.id,
+            failed_runtime_id,
+            message,
+        )
+
+    def _has_alternate_ready_runtime(self, failed_runtime_id: str) -> bool:
+        with self._runtime_lock:
+            return any(
+                runtime_id != failed_runtime_id
+                and current.get("status") == "ready"
+                for runtime_id, current in self._runtime_health.items()
+            )
 
     def _update_stage_job(self, job: PipelineJob, **fields: Any) -> bool:
         if job.lease_owner == self._worker_id and job.lease_token > 0:

@@ -231,6 +231,8 @@ function eventDescription(
       return `전사 서버 ${runtimeName(payload.runtime_id, runtimeNames)}에 작업이 접수되었습니다.`;
     case "transcription.reconnected":
       return `서비스 재시작 후 전사 서버 ${runtimeName(payload.runtime_id, runtimeNames)}의 작업에 다시 연결했습니다.`;
+    case "transcription.runtime_failover":
+      return `전사 서버 ${runtimeName(payload.failed_runtime_id, runtimeNames)}의 연결이 끊겨 다른 가용 서버에 자동 재배정합니다.`;
     case "stage.completed": {
       if (event.phase === "extraction") {
         return payload.reused ? "기존 음원을 재사용해 추출 단계를 완료했습니다." : "음원 추출을 완료했습니다.";
