@@ -1205,21 +1205,7 @@ class JobStore:
             "CREATE INDEX IF NOT EXISTS job_events_created_idx "
             "ON job_events(created_at, id)"
         )
-        legacy_server_table = connection.execute(
-            "SELECT 1 FROM sqlite_master "
-            "WHERE type = 'table' AND name = 'remote_server_settings'"
-        ).fetchone()
-        if legacy_server_table is not None:
-            connection.execute(
-                """
-                INSERT OR IGNORE INTO builtin_runtime_settings (
-                    id, stt_base_url, stt_token, updated_at
-                )
-                SELECT id, stt_base_url, stt_token, updated_at
-                FROM remote_server_settings
-                """
-            )
-            connection.execute("DROP TABLE remote_server_settings")
+        JobStore._migrate_runtime_settings_split(connection)
 
     @staticmethod
     def _migrate_structured_job_state(
@@ -1311,8 +1297,34 @@ class JobStore:
                     "runtime_batch_settings_v1",
                     self._migrate_runtime_batch_settings,
                 ),
+                Migration(
+                    55,
+                    "runtime_settings_split_v1",
+                    self._migrate_runtime_settings_split,
+                ),
             ),
         )
+
+    @staticmethod
+    def _migrate_runtime_settings_split(
+        connection: sqlite3.Connection,
+    ) -> None:
+        legacy_server_table = connection.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'remote_server_settings'"
+        ).fetchone()
+        if legacy_server_table is None:
+            return
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO builtin_runtime_settings (
+                id, stt_base_url, stt_token, updated_at
+            )
+            SELECT id, stt_base_url, stt_token, updated_at
+            FROM remote_server_settings
+            """
+        )
+        connection.execute("DROP TABLE remote_server_settings")
 
     @staticmethod
     def _migrate_runtime_batch_settings(
