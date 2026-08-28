@@ -35,7 +35,13 @@ TRANSLATION_STAGE_LABELS = {
     "review": "2차(검증) 번역",
 }
 OPENAI_COMPLETION_FIELDS = frozenset(
-    {"messages", "temperature", "reasoning_effort", "response_format"}
+    {
+        "max_tokens",
+        "messages",
+        "temperature",
+        "reasoning_effort",
+        "response_format",
+    }
 )
 HARD_BREAKER_MESSAGE = (
     "전사 모델의 메모리를 보호하기 위해 번역 서버를 일시 중지했습니다."

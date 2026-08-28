@@ -376,6 +376,7 @@ class BackendTranslationRoutingTests(unittest.TestCase):
                     "live",
                     {
                         "model": "placeholder",
+                        "max_tokens": 4096,
                         "messages": [],
                         "reasoning_effort": "none",
                         "runtime": "gpu-3080",
@@ -406,7 +407,7 @@ class BackendTranslationRoutingTests(unittest.TestCase):
             )
             self.assertEqual(
                 set(request.call_args.kwargs["json"]),
-                {"model", "messages", "reasoning_effort"},
+                {"model", "max_tokens", "messages", "reasoning_effort"},
             )
 
     def test_explicit_probe_checks_a_disabled_server(self) -> None:

@@ -18,6 +18,7 @@ from stt_to_subtitle.service_clients import (
     STTAPIClient,
     SubtitleValidationClient,
     TranslationPaused,
+    TranslationResponseFormatError,
     TranslationResponseIDError,
     batch_segments,
     list_openai_compatible_models,
@@ -1202,6 +1203,56 @@ class TranslationResponseTests(unittest.TestCase):
             ["segment-1", "segment-2", "segment-3"],
         )
 
+    def test_splits_a_malformed_batch_for_recovery(self) -> None:
+        client = LMStudioClient("http://lm.test/v1", "", "model")
+
+        def translate_batch(segments, *_args):
+            if len(segments) > 1:
+                raise TranslationResponseFormatError("truncated")
+            return [
+                {
+                    "id": str(segments[0]["id"]),
+                    "text": f"번역-{segments[0]['id']}",
+                }
+            ]
+
+        client._translate_batch = Mock(side_effect=translate_batch)
+        result = client._translate_batch_with_recovery(
+            [
+                {"id": "segment-1", "text": "一"},
+                {"id": "segment-2", "text": "二"},
+                {"id": "segment-3", "text": "三"},
+            ]
+        )
+
+        self.assertEqual(
+            [item["id"] for item in result],
+            ["segment-1", "segment-2", "segment-3"],
+        )
+
+    def test_classifies_an_output_limited_response_for_recovery(self) -> None:
+        client = OpenAICompatibleClient(
+            "http://translation.test/v1",
+            "",
+            "model",
+        )
+        response = Mock(status_code=200)
+        response.json.return_value = {
+            "choices": [
+                {
+                    "finish_reason": "length",
+                    "message": {"content": ""},
+                }
+            ]
+        }
+        client.request = Mock(return_value=response)
+
+        with self.assertRaisesRegex(
+            TranslationResponseFormatError,
+            "output limit",
+        ):
+            client._translate_batch([{"id": "segment-1", "text": "一"}])
+
     def test_sends_the_static_korean_jav_system_prompt(self) -> None:
         client = OpenAICompatibleClient(
             "http://translation.test/v1",
@@ -1237,6 +1288,7 @@ class TranslationResponseTests(unittest.TestCase):
         request_headers = client.request.call_args.kwargs["headers"]
         self.assertNotIn("X-Translation-Pass", request_headers)
         self.assertNotIn("X-Translation-Mode", request_headers)
+        self.assertEqual(request_payload["max_tokens"], 4096)
         self.assertEqual(request_payload["reasoning_effort"], "none")
         self.assertEqual(
             request_payload["messages"][0],

@@ -63,6 +63,10 @@ class TranslationResponseIDError(ExternalServiceError):
     """The translation server returned a different segment ID set."""
 
 
+class TranslationResponseFormatError(ExternalServiceError):
+    """The translation server returned a truncated or malformed payload."""
+
+
 class TranslationPaused(RuntimeError):
     """Translation stopped cleanly after a persisted logical batch."""
 
@@ -1491,12 +1495,12 @@ class OpenAICompatibleClient(RetryingJSONClient):
                 reference_context,
                 system_prompt,
             )
-        except TranslationResponseIDError:
+        except (TranslationResponseIDError, TranslationResponseFormatError):
             if len(segments) <= 1:
                 raise
             midpoint = len(segments) // 2
             LOGGER.warning(
-                "translation server returned mismatched translation IDs; "
+                "translation server returned a recoverable batch response; "
                 "retrying as %d and %d segment batches",
                 midpoint,
                 len(segments) - midpoint,
@@ -1528,7 +1532,7 @@ class OpenAICompatibleClient(RetryingJSONClient):
                 drafts,
                 review_prompt,
             )
-        except TranslationResponseIDError:
+        except (TranslationResponseIDError, TranslationResponseFormatError):
             if len(segments) <= 1:
                 raise
             midpoint = len(segments) // 2
@@ -1629,6 +1633,7 @@ class OpenAICompatibleClient(RetryingJSONClient):
         request_payload = {
             "model": self.model,
             "temperature": 0,
+            "max_tokens": 4096,
             # Translation needs the schema-constrained answer, not a hidden
             # reasoning trace. Thinking models can otherwise exhaust their
             # context window before emitting message.content.
@@ -1678,11 +1683,18 @@ class OpenAICompatibleClient(RetryingJSONClient):
                 f"HTTP {response.status_code}: {_safe_error(response)}"
             )
         try:
-            content = response.json()["choices"][0]["message"]["content"]
+            choice = response.json()["choices"][0]
+            content = choice["message"]["content"]
+            if str(choice.get("finish_reason", "")).strip().lower() == "length":
+                raise TranslationResponseFormatError(
+                    f"OpenAI-compatible {error_label} reached its output limit"
+                )
             decoded = json.loads(content) if isinstance(content, str) else content
             translations = decoded["translations"]
+        except TranslationResponseFormatError:
+            raise
         except (KeyError, IndexError, TypeError, ValueError) as error:
-            raise ExternalServiceError(
+            raise TranslationResponseFormatError(
                 f"OpenAI-compatible {error_label} server returned invalid "
                 "structured translation JSON"
             ) from error
