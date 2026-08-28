@@ -507,7 +507,16 @@ button:disabled, .btn:disabled {
 .empty-state strong { color: var(--text); font-size: .9rem; }
 .empty-state span { max-width: 44ch; font-size: .78rem; }
 .empty-state.compact { min-height: 92px; padding: 18px; }
-.load-more { display: flex; justify-content: center; padding: 14px; border-top: 1px solid var(--line); }
+.pagination { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 16px; border-top: 1px solid var(--line); }
+.pagination-summary { color: var(--muted); font-size: .76rem; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.pagination-pages { display: flex; align-items: center; justify-content: flex-end; gap: 5px; flex-wrap: wrap; }
+.pagination-page { min-width: var(--h-sm); padding-right: 7px; padding-left: 7px; font-variant-numeric: tabular-nums; }
+.pagination-page[aria-current="page"] { border-color: var(--accent); background: var(--accent-subtle); color: var(--accent); }
+.pagination-gap { min-width: 18px; color: var(--muted); text-align: center; }
+.job-translation-prompt .ctl { min-width: 170px; }
+.job-count { margin-left: 7px; }
+.job-action-notice { margin: 0; border-width: 0 0 1px; border-radius: 0; }
+.job-action-error { margin: 0; padding: 8px 12px; color: var(--bad); font-size: .82rem; }
 
 progress {
   width: 100%;
@@ -887,6 +896,9 @@ progress::-moz-progress-bar { background: var(--accent-solid); border-radius: 99
   .metrics-record { grid-template-columns: minmax(0, 1fr); gap: 10px; padding: 13px; }
   .metrics-values { grid-column: auto; grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .metrics-value { min-height: 62px; }
+  .pagination { align-items: stretch; flex-direction: column; }
+  .pagination-pages { justify-content: flex-start; }
+  .pagination-edge { flex: 1; }
 }
 
 @media (max-width: 360px) {

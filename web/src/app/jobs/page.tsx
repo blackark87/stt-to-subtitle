@@ -2,9 +2,10 @@
 
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { Icon } from "@/components/Icon";
 import { Freshness } from "@/components/Freshness";
+import { Pagination } from "@/components/Pagination";
 import { api } from "@/lib/api";
 import {
   JOB_PHASES,
@@ -27,6 +28,7 @@ import { jobStateLabel } from "@/lib/jobPresentation";
 import { useLiveQuery } from "@/lib/useLiveQuery";
 
 const JOBS_INTERVAL_MS = 5000;
+const PAGE_SIZE = 20;
 
 const BADGE_CLASS: Record<JobState, string> = {
   running: "b run dot",
@@ -63,35 +65,54 @@ export default function JobsPage() {
     searchParams.getAll("operation").filter((value): value is JobOperation => JOB_OPERATIONS.includes(value as JobOperation)),
     [searchParams],
   );
+  const pageValue = Number(searchParams.get("page") ?? "1");
+  const page = Number.isSafeInteger(pageValue) && pageValue > 0 ? pageValue : 1;
   const [selected, setSelected] = useState<ReadonlySet<string>>(new Set());
   const [busy, setBusy] = useState(false);
-  const [limit, setLimit] = useState(20);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [actionNotice, setActionNotice] = useState<string | null>(null);
+  const [translationPromptId, setTranslationPromptId] = useState("");
 
   const fetcher = useCallback(
     () => api.jobs({
-      limit,
+      limit: PAGE_SIZE,
+      offset: (page - 1) * PAGE_SIZE,
       state: stateFilter.length ? stateFilter : undefined,
       phase: phaseFilter.length ? phaseFilter : undefined,
       operation: operationFilter.length ? operationFilter : undefined,
     }),
-    [limit, operationFilter, phaseFilter, stateFilter],
+    [operationFilter, page, phaseFilter, stateFilter],
   );
   const { data, status, error, updatedAt, refreshing, refresh } = useLiveQuery(fetcher, JOBS_INTERVAL_MS);
   const runtimes = useLiveQuery(useCallback(() => api.runtimes(), []), 60000);
+  const prompts = useLiveQuery(useCallback(() => api.promptCategories(), []), 60000);
   const jobs = useMemo(() => data?.items ?? [], [data?.items]);
   const runtimeNames = useMemo(
     () => new Map((runtimes.data?.items ?? []).map((runtime) => [runtime.id, runtime.name])),
     [runtimes.data?.items],
   );
+  const activePrompts = useMemo(
+    () => (prompts.data?.items ?? []).filter((item) => !item.archived),
+    [prompts.data?.items],
+  );
+  const pageCount = Math.max(1, Math.ceil((data?.total ?? 0) / PAGE_SIZE));
+
+  useEffect(() => {
+    if (!data || page <= pageCount) return;
+    const params = new URLSearchParams(searchParams.toString());
+    if (pageCount <= 1) params.delete("page");
+    else params.set("page", String(pageCount));
+    const suffix = params.toString();
+    router.replace(suffix ? `/jobs?${suffix}` : "/jobs", { scroll: false });
+  }, [data, page, pageCount, router, searchParams]);
 
   const setFilter = (key: "state" | "phase" | "operation", next: readonly string[]) => {
     const params = new URLSearchParams(searchParams.toString());
     params.delete(key);
+    params.delete("page");
     next.forEach((value) => params.append(key, value));
     const suffix = params.toString();
     router.replace(suffix ? `/jobs?${suffix}` : "/jobs", { scroll: false });
-    setLimit(20);
   };
 
   const clearFilters = () => {
@@ -100,10 +121,20 @@ export default function JobsPage() {
     params.delete("phase");
     params.delete("operation");
     params.delete("reason_code");
+    params.delete("page");
     const suffix = params.toString();
     router.replace(suffix ? `/jobs?${suffix}` : "/jobs", { scroll: false });
     setSelected(new Set());
-    setLimit(20);
+  };
+
+  const goToPage = (nextPage: number) => {
+    const params = new URLSearchParams(searchParams.toString());
+    if (nextPage <= 1) params.delete("page");
+    else params.set("page", String(nextPage));
+    const suffix = params.toString();
+    router.push(suffix ? `/jobs?${suffix}` : "/jobs");
+    setSelected(new Set());
+    setActionNotice(null);
   };
 
   const activeFilterCount = stateFilter.length + phaseFilter.length + operationFilter.length;
@@ -119,6 +150,9 @@ export default function JobsPage() {
   const pauseIds = selectedJobs
     .filter((job) => canPauseTranslation(asJobState(job.state), job.phase))
     .map((job) => job.id);
+  const translationIds = selectedJobs
+    .filter((job) => job.status === "transcription_completed" && !job.options.comparison_id)
+    .map((job) => job.id);
   const stopIds = selectedJobs
     .filter((job) => canStopJob(asJobState(job.state)))
     .map((job) => job.id);
@@ -131,14 +165,20 @@ export default function JobsPage() {
       return next;
     });
 
-  const run = async (ids: string[], action: (ids: string[]) => Promise<unknown>) => {
+  const run = async (
+    ids: string[],
+    action: (ids: string[]) => Promise<unknown>,
+    successMessage?: string,
+  ) => {
     if (!ids.length) return;
     setBusy(true);
     setActionError(null);
+    setActionNotice(null);
     try {
       await action(ids);
       setSelected(new Set());
       await refresh();
+      if (successMessage) setActionNotice(successMessage);
     } catch (reason) {
       setActionError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -214,7 +254,7 @@ export default function JobsPage() {
           <div className="card-head">
             <h2>
               작업
-              <span className="n" style={{ marginLeft: 7 }}>
+              <span className="n job-count">
                 {data?.total ?? 0}
               </span>
             </h2>
@@ -230,6 +270,34 @@ export default function JobsPage() {
                 {pageSelected ? "페이지 선택 해제" : `현재 페이지 ${jobs.length}건 선택`}
               </button>
               <span className="selection-summary" aria-live="polite">{selectedJobs.length ? `${selectedJobs.length}건 선택` : "작업을 선택하세요"}</span>
+              <label className="compact-field job-translation-prompt">
+                <span>번역 프롬프트</span>
+                <select
+                  className="ctl sm"
+                  value={translationPromptId}
+                  disabled={busy || prompts.status === "loading"}
+                  onChange={(event) => setTranslationPromptId(event.target.value)}
+                >
+                  <option value="">{prompts.status === "loading" ? "불러오는 중" : "프롬프트 선택"}</option>
+                  {activePrompts.map((prompt) => (
+                    <option key={prompt.id} value={prompt.id}>{prompt.name}</option>
+                  ))}
+                </select>
+              </label>
+              <button
+                type="button"
+                className="btn sm"
+                disabled={!translationIds.length || !translationPromptId || busy}
+                title={!translationIds.length ? "전사 완료 작업을 선택하세요." : !translationPromptId ? "번역 프롬프트를 선택하세요." : undefined}
+                onClick={() => void run(
+                  translationIds,
+                  (ids) => api.translateJobs(ids, translationPromptId),
+                  `${translationIds.length}건의 번역을 시작했습니다.`,
+                )}
+              >
+                <Icon name="play" size={13} />
+                번역 시작 {translationIds.length || ""}
+              </button>
               <button type="button" className="btn sec sm" disabled={!retryIds.length || busy} onClick={() => void run(retryIds, api.retryJobs)}>
                 <Icon name="refresh" size={13} />
                 재시도 {retryIds.length || ""}
@@ -248,8 +316,11 @@ export default function JobsPage() {
             </span>
           </div>
           <div className="card-body flush">
+            {actionNotice ? (
+              <p className="notice success job-action-notice" role="status">{actionNotice}</p>
+            ) : null}
             {actionError ? (
-              <p role="alert" style={{ margin: 0, padding: "8px 12px", color: "var(--bad)", fontSize: ".82rem" }}>
+              <p role="alert" className="job-action-error">
                 {actionError}
               </p>
             ) : null}
@@ -320,13 +391,13 @@ export default function JobsPage() {
                 })
               )}
             </div>
-            {(data?.total ?? 0) > jobs.length ? (
-              <div className="load-more">
-                <button type="button" className="btn sec" onClick={() => setLimit((value) => value + 20)}>
-                  더 보기 · {jobs.length} / {data?.total ?? 0}
-                </button>
-              </div>
-            ) : null}
+            <Pagination
+              currentPage={page}
+              pageSize={PAGE_SIZE}
+              totalItems={data?.total ?? 0}
+              onPageChange={goToPage}
+              ariaLabel="작업 목록 페이지 이동"
+            />
           </div>
         </section>
       </div>
