@@ -1685,28 +1685,106 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                     ),
                     encoding="utf-8",
                 )
+                orchestrator.store.record_audio_revision(
+                    revision_id="audio-1",
+                    job_id=job.id,
+                    source_rel="movie.mkv",
+                    source_hash="source-hash",
+                    extraction_hash="extraction-hash",
+                    artifact_path=str(artifact_dir / "audio.wav"),
+                    content_hash="audio-hash",
+                    duration_seconds=16 * 60,
+                    status="audio_ready",
+                    chunks_total_estimate=1,
+                )
                 orchestrator.store.update(
                     job.id,
                     status="translation_running",
                     transcript_path=str(transcript_path),
                 )
+                observer_holder = {}
                 translation_client = Mock()
-                translation_client.translate = Mock(
-                    return_value=[
+
+                def translate_with_metrics(*_args, **_kwargs):
+                    observer = observer_holder["observer"]
+                    observer(
+                        {
+                            "service": "translation_lm",
+                            "operation": "translation",
+                            "outcome": "success",
+                            "attempt": 1,
+                            "elapsed_seconds": 2.0,
+                        }
+                    )
+                    observer(
+                        {
+                            "service": "translation_lm",
+                            "operation": "review",
+                            "outcome": "success",
+                            "attempt": 1,
+                            "elapsed_seconds": 3.0,
+                        }
+                    )
+                    return [
                         {"id": "segment-000001", "text": "안녕하세요"}
                     ]
+
+                translation_client.translate = Mock(
+                    side_effect=translate_with_metrics
                 )
+
+                def make_translation_client(_servers, *, request_observer):
+                    observer_holder["observer"] = request_observer
+                    return translation_client
+
                 orchestrator._make_translation_client = Mock(
-                    return_value=translation_client
+                    side_effect=make_translation_client
                 )
 
                 orchestrator._translate(orchestrator.store.get(job.id))
+                pass_measurements = [
+                    measurement
+                    for measurement in (
+                        orchestrator.store.operational_measurements()
+                    )
+                    if measurement["metric"]
+                    == "translation.pass.active_seconds"
+                ]
+                pass_events = [
+                    event
+                    for event in orchestrator.store.events(job.id)
+                    if event["event_code"] == "translation.pass.measured"
+                ]
             finally:
                 orchestrator.stop()
 
             self.assertEqual(
                 translation_client.translate.call_args.kwargs["max_workers"],
                 3,
+            )
+            self.assertEqual(len(pass_measurements), 2)
+            self.assertEqual(
+                {
+                    measurement["labels"]["pass"]: measurement["labels"]
+                    for measurement in pass_measurements
+                },
+                {
+                    "draft": {
+                        "media_duration_bucket_minutes": 15,
+                        "outcome": "completed",
+                        "pass": "draft",
+                    },
+                    "review": {
+                        "media_duration_bucket_minutes": 15,
+                        "outcome": "completed",
+                        "pass": "review",
+                    },
+                },
+            )
+            self.assertEqual(len(pass_events), 2)
+            self.assertEqual(
+                {event["payload"]["pass"] for event in pass_events},
+                {"draft", "review"},
             )
 
     def test_remote_transcription_contract_error_is_failed_not_blocked(

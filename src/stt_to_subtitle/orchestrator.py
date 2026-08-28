@@ -63,6 +63,7 @@ from .job_store import (
     RETRYABLE_STATUSES,
     SUCCESS_STATUSES,
     WorkerLeaseLost,
+    media_duration_bucket_minutes,
 )
 from .job_state import JobReason, JobState
 from .service_clients import (
@@ -4333,6 +4334,8 @@ class SubtitleOrchestrator:
     def _make_translation_client(
         self,
         servers: RemoteServerSettings,
+        *,
+        request_observer: Callable[[Mapping[str, Any]], None] | None = None,
     ) -> OpenAICompatibleClient:
         return OpenAICompatibleClient(
             servers.lm_base_url,
@@ -4341,7 +4344,9 @@ class SubtitleOrchestrator:
             max_segments=self.settings.translation_batch_segments,
             max_characters=self.settings.translation_batch_characters,
             request_limiter=self._translation_request_limiter,
-            request_observer=self.record_external_request,
+            request_observer=(
+                request_observer or self.record_external_request
+            ),
         )
 
     def _translation_generation_contract(
@@ -4630,7 +4635,120 @@ class SubtitleOrchestrator:
         servers = remote_runtime[2]
         if remote_runtime[1] is None:
             raise ExternalServiceError("translation server is not configured")
-        lm_client = self._make_translation_client(servers)
+        media_duration: float | None = None
+        if job.audio_revision_id:
+            audio_revision = self.store.get_audio_revision(
+                job.audio_revision_id
+            )
+            if audio_revision is not None:
+                media_duration = audio_revision["duration_seconds"]
+        duration_bucket = media_duration_bucket_minutes(media_duration)
+        pass_lock = threading.Lock()
+        pass_intervals: dict[str, list[tuple[float, float]]] = {
+            "draft": [],
+            "review": [],
+        }
+        pass_request_seconds = {"draft": 0.0, "review": 0.0}
+        pass_request_counts = {"draft": 0, "review": 0}
+
+        def observe_translation_request(
+            observation: Mapping[str, Any],
+        ) -> None:
+            self.record_external_request(observation)
+            pass_name = {
+                "translation": "draft",
+                "review": "review",
+            }.get(str(observation.get("operation", "")))
+            if pass_name is None:
+                return
+            elapsed = max(
+                0.0,
+                float(observation.get("elapsed_seconds", 0.0)),
+            )
+            finished = time.monotonic()
+            with pass_lock:
+                pass_intervals[pass_name].append(
+                    (finished - elapsed, finished)
+                )
+                pass_request_seconds[pass_name] += elapsed
+                pass_request_counts[pass_name] += 1
+
+        def active_seconds(intervals: Sequence[tuple[float, float]]) -> float:
+            if not intervals:
+                return 0.0
+            ordered = sorted(intervals)
+            active = 0.0
+            current_start, current_end = ordered[0]
+            for started_at, finished_at in ordered[1:]:
+                if started_at <= current_end:
+                    current_end = max(current_end, finished_at)
+                else:
+                    active += current_end - current_start
+                    current_start, current_end = started_at, finished_at
+            return active + current_end - current_start
+
+        def record_translation_pass_metrics(outcome: str) -> None:
+            with pass_lock:
+                snapshots = {
+                    pass_name: (
+                        tuple(pass_intervals[pass_name]),
+                        pass_request_seconds[pass_name],
+                        pass_request_counts[pass_name],
+                    )
+                    for pass_name in ("draft", "review")
+                }
+            for pass_name, (
+                intervals,
+                request_seconds,
+                request_count,
+            ) in snapshots.items():
+                if request_count == 0:
+                    continue
+                measured_active_seconds = active_seconds(intervals)
+                labels: dict[str, str | int | bool] = {
+                    "pass": pass_name,
+                    "outcome": outcome,
+                }
+                if duration_bucket is not None:
+                    labels["media_duration_bucket_minutes"] = (
+                        duration_bucket
+                    )
+                self._record_measurement(
+                    "translation.pass.active_seconds",
+                    measured_active_seconds,
+                    labels=labels,
+                )
+                self._record_measurement(
+                    "translation.pass.requests",
+                    request_count,
+                    labels=labels,
+                )
+                try:
+                    self.store.add_event(
+                        job.id,
+                        "info",
+                        f"translation {pass_name} timing measured",
+                        event_code="translation.pass.measured",
+                        phase="translation",
+                        payload={
+                            "pass": pass_name,
+                            "outcome": outcome,
+                            "active_seconds": measured_active_seconds,
+                            "request_seconds": request_seconds,
+                            "request_count": request_count,
+                            "media_duration_seconds": media_duration,
+                            "media_duration_bucket_minutes": duration_bucket,
+                        },
+                    )
+                except (OSError, RuntimeError, sqlite3.Error, ValueError):
+                    LOGGER.exception(
+                        "translation pass timing event write failed"
+                    )
+
+        lm_client = self._make_translation_client(
+            servers,
+            request_observer=observe_translation_request,
+        )
         prompt_snapshot = job.options.get(TRANSLATION_PROMPT_OPTION)
         if not isinstance(prompt_snapshot, Mapping):
             prompt_snapshot = self._legacy_prompt_snapshot()
@@ -4847,6 +4965,7 @@ class SubtitleOrchestrator:
                 f"{self._sanitize_error(message)}",
             )
 
+        translation_outcome = "failed"
         try:
             translations = lm_client.translate(
                 segments,
@@ -4864,7 +4983,9 @@ class SubtitleOrchestrator:
                 max_workers=servers.translation_workers,
             )
             self._raise_if_job_stop_requested(job.id)
+            translation_outcome = "completed"
         except TranslationPaused as error:
+            translation_outcome = "paused"
             self.store.mark_translation_generation(
                 generation["id"],
                 state="paused",
@@ -4873,6 +4994,7 @@ class SubtitleOrchestrator:
             )
             raise
         except ExternalServiceError as error:
+            translation_outcome = "blocked"
             self.store.mark_translation_generation(
                 generation["id"],
                 state="blocked",
@@ -4881,6 +5003,7 @@ class SubtitleOrchestrator:
             )
             raise
         except OperationStopped as error:
+            translation_outcome = "stopped"
             self.store.mark_translation_generation(
                 generation["id"],
                 state="stopped",
@@ -4889,6 +5012,7 @@ class SubtitleOrchestrator:
             )
             raise
         except Exception as error:
+            translation_outcome = "failed"
             self.store.mark_translation_generation(
                 generation["id"],
                 state="failed",
@@ -4896,6 +5020,8 @@ class SubtitleOrchestrator:
                 generation_attempt=generation_attempt,
             )
             raise
+        finally:
+            record_translation_pass_metrics(translation_outcome)
 
         final_changes = [
             item

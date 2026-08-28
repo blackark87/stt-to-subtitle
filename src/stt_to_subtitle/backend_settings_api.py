@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi import APIRouter, HTTPException, Query, Request, Response
 
 from .backend_common import (
     bad_request,
@@ -496,6 +496,19 @@ def cleanup_artifacts(
 @router.get("/operations/metrics")
 def operation_metrics(request: Request) -> dict[str, Any]:
     return service_from_request(request).store.operational_metrics()
+
+
+@router.get("/operations/metrics/media-durations")
+def operation_media_duration_metrics(
+    request: Request,
+    window_days: int = Query(default=30, ge=1, le=3650),
+) -> dict[str, Any]:
+    try:
+        return service_from_request(request).store.media_duration_metrics(
+            window_seconds=window_days * 24 * 60 * 60,
+        )
+    except ValueError as error:
+        raise bad_request(error) from error
 
 
 @router.get("/operations/metrics/prometheus")

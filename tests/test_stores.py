@@ -8,7 +8,11 @@ from tempfile import TemporaryDirectory
 import time
 import unittest
 
-from stt_to_subtitle.job_store import JobStore, WorkerLeaseLost
+from stt_to_subtitle.job_store import (
+    JobStore,
+    WorkerLeaseLost,
+    media_duration_bucket_minutes,
+)
 from stt_to_subtitle.transcription_store import TranscriptionStore
 
 
@@ -316,6 +320,14 @@ class TranscriptionStoreTests(unittest.TestCase):
 
 
 class JobStoreTests(unittest.TestCase):
+    def test_normalizes_media_duration_to_nearest_fifteen_minutes(self) -> None:
+        self.assertEqual(media_duration_bucket_minutes(14 * 60), 15)
+        self.assertEqual(media_duration_bucket_minutes(16 * 60), 15)
+        self.assertEqual(media_duration_bucket_minutes(28 * 60), 30)
+        self.assertEqual(media_duration_bucket_minutes(32 * 60), 30)
+        self.assertEqual(media_duration_bucket_minutes(58 * 60), 60)
+        self.assertIsNone(media_duration_bucket_minutes(None))
+
     def test_requires_explicit_structured_state_for_new_user_stops(self) -> None:
         with TemporaryDirectory() as directory:
             store = JobStore(Path(directory) / "jobs.sqlite3")
@@ -827,6 +839,199 @@ class JobStoreTests(unittest.TestCase):
                     1,
                     labels={"api_token": "must-not-be-stored"},
                 )
+
+    def test_aggregates_stage_durations_by_media_length_runtime_and_pass(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            store = JobStore(Path(directory) / "jobs.sqlite3")
+            job = store.create(
+                job_id="job-1",
+                source_rel="movie.mkv",
+                force_overwrite=False,
+                options={},
+            )
+            store.record_audio_revision(
+                revision_id="audio-1",
+                job_id=job.id,
+                source_rel="movie.mkv",
+                source_hash="source-hash",
+                extraction_hash="extraction-hash",
+                artifact_path=str(Path(directory) / "audio.wav"),
+                content_hash="audio-hash",
+                duration_seconds=880.0,
+                status="audio_ready",
+                chunks_total_estimate=1,
+            )
+            store.add_event(
+                job.id,
+                "info",
+                "transcription started",
+                event_code="stage.started",
+                phase="transcription",
+                attempt=1,
+                payload={"runtime_id": "runtime-a"},
+            )
+            store.add_event(
+                job.id,
+                "info",
+                "transcription completed",
+                event_code="stage.completed",
+                phase="transcription",
+                attempt=1,
+            )
+            store.add_event(
+                job.id,
+                "info",
+                "translation started",
+                event_code="stage.started",
+                phase="translation",
+                attempt=1,
+            )
+            store.add_event(
+                job.id,
+                "info",
+                "translation blocked",
+                event_code="stage.blocked",
+                phase="translation",
+                attempt=1,
+            )
+            store.add_event(
+                job.id,
+                "info",
+                "translation draft timing measured",
+                event_code="translation.pass.measured",
+                phase="translation",
+                attempt=1,
+                payload={
+                    "pass": "draft",
+                    "outcome": "completed",
+                    "active_seconds": 50.0,
+                    "request_seconds": 60.0,
+                    "request_count": 2,
+                    "media_duration_seconds": 880.0,
+                    "media_duration_bucket_minutes": 15,
+                },
+            )
+            with store._connect() as connection:
+                rows = connection.execute(
+                    """
+                    SELECT id, event_code, phase
+                    FROM job_events
+                    WHERE event_code IN ('stage.started', 'stage.completed',
+                                         'stage.blocked')
+                    ORDER BY id
+                    """
+                ).fetchall()
+                event_times = (100.0, 1000.0, 1100.0, 1300.0)
+                for row, created_at in zip(rows, event_times, strict=True):
+                    connection.execute(
+                        "UPDATE job_events SET created_at = ? WHERE id = ?",
+                        (created_at, int(row["id"])),
+                    )
+                connection.execute(
+                    """
+                    UPDATE job_events SET created_at = 1400
+                    WHERE event_code = 'translation.pass.measured'
+                    """
+                )
+
+            metrics = store.media_duration_metrics(
+                window_seconds=1800,
+                end_at=1800,
+            )
+
+            self.assertEqual(metrics["bucket_interval_minutes"], 15)
+            self.assertEqual(metrics["bucket_strategy"], "nearest")
+            self.assertEqual(metrics["unmatched_terminal_events"], 0)
+            self.assertEqual(
+                metrics["groups"],
+                [
+                    {
+                        "media_duration_bucket_minutes": 15,
+                        "phase": "transcription",
+                        "runtime_id": "runtime-a",
+                        "runtime_name": "runtime-a",
+                        "outcome": "completed",
+                        "sample_count": 1,
+                        "processing_total_seconds": 900.0,
+                        "processing_average_seconds": 900.0,
+                        "processing_minimum_seconds": 900.0,
+                        "processing_p50_seconds": 900.0,
+                        "processing_p95_seconds": 900.0,
+                        "processing_maximum_seconds": 900.0,
+                        "media_average_seconds": 880.0,
+                        "media_minimum_seconds": 880.0,
+                        "media_maximum_seconds": 880.0,
+                    },
+                    {
+                        "media_duration_bucket_minutes": 15,
+                        "phase": "translation",
+                        "runtime_id": None,
+                        "runtime_name": None,
+                        "outcome": "blocked",
+                        "sample_count": 1,
+                        "processing_total_seconds": 200.0,
+                        "processing_average_seconds": 200.0,
+                        "processing_minimum_seconds": 200.0,
+                        "processing_p50_seconds": 200.0,
+                        "processing_p95_seconds": 200.0,
+                        "processing_maximum_seconds": 200.0,
+                        "media_average_seconds": 880.0,
+                        "media_minimum_seconds": 880.0,
+                        "media_maximum_seconds": 880.0,
+                    },
+                ],
+            )
+            self.assertEqual(
+                metrics["translation_passes"],
+                [
+                    {
+                        "media_duration_bucket_minutes": 15,
+                        "pass": "draft",
+                        "outcome": "completed",
+                        "sample_count": 1,
+                        "active_total_seconds": 50.0,
+                        "active_average_seconds": 50.0,
+                        "active_minimum_seconds": 50.0,
+                        "active_p50_seconds": 50.0,
+                        "active_p95_seconds": 50.0,
+                        "active_maximum_seconds": 50.0,
+                        "request_total_seconds": 60.0,
+                        "request_count": 2,
+                        "media_average_seconds": 880.0,
+                        "media_minimum_seconds": 880.0,
+                        "media_maximum_seconds": 880.0,
+                    }
+                ],
+            )
+            stage_measurements = [
+                measurement
+                for measurement in store.operational_measurements()
+                if measurement["metric"]
+                == "pipeline.stage.duration_seconds"
+            ]
+            self.assertEqual(len(stage_measurements), 2)
+            self.assertEqual(
+                {
+                    measurement["labels"]["phase"]: measurement["labels"]
+                    for measurement in stage_measurements
+                },
+                {
+                    "transcription": {
+                        "outcome": "completed",
+                        "phase": "transcription",
+                        "runtime_id": "runtime-a",
+                        "runtime_name": "runtime-a",
+                        "media_duration_bucket_minutes": 15,
+                    },
+                    "translation": {
+                        "outcome": "blocked",
+                        "phase": "translation",
+                        "media_duration_bucket_minutes": 15,
+                    },
+                },
+            )
 
     def test_reports_remote_transcription_and_cancel_pending_ids(self) -> None:
         with TemporaryDirectory() as directory:

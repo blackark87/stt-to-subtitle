@@ -12,3 +12,11 @@ scrape_configs:
     static_configs:
       - targets:
           - dcgm-exporter:9400
+
+  - job_name: stt-to-subtitle-backend
+    scrape_interval: 15s
+    scrape_timeout: 10s
+    metrics_path: /api/v1/operations/metrics/prometheus
+    static_configs:
+      - targets:
+          - backend:8080

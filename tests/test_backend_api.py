@@ -58,6 +58,10 @@ class BackendAPIBoundaryTests(unittest.TestCase):
         self.assertIn("/api/v1/settings/prompt-categories", paths)
         self.assertIn("/api/v1/comparisons", paths)
         self.assertIn("/api/v1/operations/metrics", paths)
+        self.assertIn(
+            "/api/v1/operations/metrics/media-durations",
+            paths,
+        )
         self.assertGreaterEqual(
             len([path for path in paths if path.startswith("/api/v1/")]),
             35,

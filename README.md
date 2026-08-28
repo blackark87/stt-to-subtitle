@@ -441,8 +441,42 @@ checkpoint가 끝난 WAL 없는 DB는 immutable read-only로 열어 원본 디�
 통해 읽으며, WAL만 있고 shared-memory 파일이 없으면 원본 변경 대신 검사를
 중단합니다.
 
-운영 스냅샷은 `/api/operations/metrics` JSON과
-`/api/operations/metrics/prometheus` Prometheus text로 제공합니다.
+운영 스냅샷은 `/api/v1/operations/metrics` JSON과
+`/api/v1/operations/metrics/prometheus` Prometheus text로 제공합니다.
+전사·번역 단계 소요 시간은
+`/api/v1/operations/metrics/media-durations`에서 기본 최근 30일을 영상 길이별로
+조회할 수 있습니다. 실제 영상 길이는 가장 가까운 15분 단위로 정규화합니다.
+예를 들어 약 14분과 16분은 15분 구간, 약 28분과 32분은 30분 구간에
+집계됩니다. `window_days`로 조회 기간을 조정할 수 있습니다.
+
+전사는 영상 길이 구간과 `runtime_id`별로 분리합니다. 번역은 Runtime 구분 없이
+영상 길이 구간별 전체 소요 시간과 초벌(`draft`)·검증(`review`) 요청 활성 시간을
+각각 제공합니다. 병렬 번역 요청이 겹친 시간은 한 번만 계산합니다. 표본 수,
+최소, 평균, P50, P95, 최대를 함께 제공하며 완료, 실패, 중지, 일시정지, 차단 및
+Runtime 전환은 서로 다른 `outcome`으로 집계합니다.
+
+Prometheus는 새 단계 종료부터 누적
+`stt_to_subtitle_stage_duration_seconds_count`와
+`stt_to_subtitle_stage_duration_seconds_sum`을 수집합니다. 예를 들어 영상 길이
+구간 및 Runtime별 전사 완료 평균은 다음 PromQL로 계산합니다.
+
+```promql
+sum by (media_duration_bucket_minutes, runtime_id) (
+  stt_to_subtitle_stage_duration_seconds_sum{
+    phase="transcription", outcome="completed"
+  }
+)
+/
+sum by (media_duration_bucket_minutes, runtime_id) (
+  stt_to_subtitle_stage_duration_seconds_count{
+    phase="transcription", outcome="completed"
+  }
+)
+```
+
+초벌·검증 번역의 영상 길이 구간별 평균 활성 시간은
+`stt_to_subtitle_translation_pass_active_seconds_sum`을
+`stt_to_subtitle_translation_pass_active_seconds_count`로 나누어 계산합니다.
 
 애플리케이션 인증은 두지 않으므로 신뢰할 수 있는 내부망에서만 실행합니다.
 Web만 HTTPS reverse proxy에 연결하고 Backend와 Runtime 포트는 호스트에

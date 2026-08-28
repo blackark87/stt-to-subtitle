@@ -186,15 +186,53 @@ def prometheus_exposition(snapshot: Mapping[str, Any]) -> str:
         for measurement in measurements:
             if not isinstance(measurement, Mapping):
                 continue
+            measurement_labels = {
+                str(key): value
+                for key, value in _mapping(
+                    measurement.get("labels")
+                ).items()
+            }
             labels = {
                 "metric": measurement.get("metric", "unknown"),
-                **{
-                    str(key): value
-                    for key, value in _mapping(
-                        measurement.get("labels")
-                    ).items()
-                },
+                **measurement_labels,
             }
+            if (
+                measurement.get("metric")
+                == "pipeline.stage.duration_seconds"
+            ):
+                for suffix, key in (
+                    ("count", "sample_count"),
+                    ("sum", "total"),
+                    ("maximum", "maximum"),
+                ):
+                    _append(
+                        lines,
+                        f"stage_duration_seconds_{suffix}",
+                        measurement.get(key),
+                        measurement_labels,
+                    )
+            if (
+                measurement.get("metric")
+                == "translation.pass.active_seconds"
+            ):
+                for suffix, key in (
+                    ("count", "sample_count"),
+                    ("sum", "total"),
+                    ("maximum", "maximum"),
+                ):
+                    _append(
+                        lines,
+                        f"translation_pass_active_seconds_{suffix}",
+                        measurement.get(key),
+                        measurement_labels,
+                    )
+            if measurement.get("metric") == "translation.pass.requests":
+                _append(
+                    lines,
+                    "translation_pass_requests_total",
+                    measurement.get("total"),
+                    measurement_labels,
+                )
             for suffix, key in (
                 ("samples_total", "sample_count"),
                 ("sum", "total"),

@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 import hashlib
 import json
+import logging
 import math
 from pathlib import Path
 import re
@@ -124,6 +125,26 @@ SENSITIVE_EVENT_KEY_PARTS = frozenset(
         "apikey",
     }
 )
+LOGGER = logging.getLogger(__name__)
+STAGE_DURATION_OUTCOMES = {
+    "stage.completed": "completed",
+    "stage.blocked": "blocked",
+    "stage.failed": "failed",
+    "stage.paused": "paused",
+    "job.stopped": "stopped",
+    "transcription.runtime_failover": "runtime_failover",
+}
+
+
+def media_duration_bucket_minutes(duration_seconds: float | None) -> int | None:
+    """Return the nearest 15-minute nominal media-length bucket."""
+
+    if duration_seconds is None:
+        return None
+    duration = float(duration_seconds)
+    if not math.isfinite(duration) or duration <= 0:
+        return None
+    return max(15, int(math.floor(duration / (15 * 60) + 0.5)) * 15)
 
 
 class WorkerLeaseLost(RuntimeError):
@@ -5237,6 +5258,11 @@ class JobStore:
         ):
             raise ValueError("invalid event code")
         payload_json = self._event_payload_json(payload)
+        event_created_at = time.time()
+        stage_duration_observation: tuple[
+            float,
+            dict[str, str | int | bool],
+        ] | None = None
         with self._connect() as connection:
             current = connection.execute(
                 "SELECT phase, state, attempt FROM jobs WHERE id = ?",
@@ -5302,9 +5328,111 @@ class JobStore:
                     resolved_attempt,
                     resolved_correlation_id,
                     payload_json,
-                    time.time(),
+                    event_created_at,
                 ),
             )
+            outcome = STAGE_DURATION_OUTCOMES.get(normalized_code)
+            if (
+                outcome is not None
+                and resolved_phase is not None
+                and resolved_attempt is not None
+            ):
+                started_attempt = resolved_attempt - int(
+                    normalized_code == "transcription.runtime_failover"
+                )
+                started = connection.execute(
+                    """
+                    SELECT created_at, payload_json
+                    FROM job_events
+                    WHERE job_id = ?
+                      AND event_code = 'stage.started'
+                      AND phase = ?
+                      AND attempt = ?
+                      AND created_at <= ?
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """,
+                    (
+                        job_id,
+                        resolved_phase,
+                        started_attempt,
+                        event_created_at,
+                    ),
+                ).fetchone()
+                if started is not None:
+                    labels: dict[str, str | int | bool] = {
+                        "phase": resolved_phase,
+                        "outcome": outcome,
+                    }
+                    if resolved_phase == JobPhase.TRANSCRIPTION.value:
+                        started_payload = json.loads(
+                            str(started["payload_json"])
+                        )
+                        runtime_id = started_payload.get("runtime_id")
+                        if (
+                            runtime_id is None
+                            and normalized_code
+                            == "transcription.runtime_failover"
+                        ):
+                            runtime_id = json.loads(payload_json).get(
+                                "failed_runtime_id"
+                            )
+                        if runtime_id is not None:
+                            labels["runtime_id"] = str(runtime_id)
+                            runtime_row = connection.execute(
+                                "SELECT name FROM runtime_endpoints WHERE id = ?",
+                                (str(runtime_id),),
+                            ).fetchone()
+                            labels["runtime_name"] = (
+                                str(runtime_row["name"])
+                                if runtime_row is not None
+                                else (
+                                    "기본 Runtime"
+                                    if str(runtime_id) == "builtin"
+                                    else str(runtime_id)
+                                )
+                            )
+                    media_row = connection.execute(
+                        """
+                        SELECT audio.duration_seconds
+                        FROM jobs AS job
+                        LEFT JOIN audio_revisions AS audio
+                          ON audio.id = job.audio_revision_id
+                        WHERE job.id = ?
+                        """,
+                        (job_id,),
+                    ).fetchone()
+                    duration_bucket = media_duration_bucket_minutes(
+                        (
+                            float(media_row["duration_seconds"])
+                            if media_row is not None
+                            and media_row["duration_seconds"] is not None
+                            else None
+                        )
+                    )
+                    if duration_bucket is not None:
+                        labels["media_duration_bucket_minutes"] = (
+                            duration_bucket
+                        )
+                    stage_duration_observation = (
+                        max(
+                            0.0,
+                            event_created_at - float(started["created_at"]),
+                        ),
+                        labels,
+                    )
+        if stage_duration_observation is not None:
+            duration_seconds, labels = stage_duration_observation
+            try:
+                self.record_operational_measurement(
+                    "pipeline.stage.duration_seconds",
+                    duration_seconds,
+                    labels=labels,
+                )
+            except (OSError, RuntimeError, sqlite3.Error, ValueError):
+                LOGGER.exception(
+                    "pipeline stage duration measurement write failed"
+                )
         self._notify_change(job_id)
 
     def events(self, job_id: str, limit: int = 200) -> list[dict[str, Any]]:
@@ -5355,6 +5483,382 @@ class JobStore:
             }
             for row in reversed(rows)
         ]
+
+    def media_duration_metrics(
+        self,
+        *,
+        window_seconds: float = 30 * 24 * 60 * 60,
+        end_at: float | None = None,
+        phases: Collection[str] = ("transcription", "translation"),
+    ) -> dict[str, Any]:
+        """Group stage durations by nominal 15-minute media length."""
+
+        if window_seconds <= 0:
+            raise ValueError("metrics window must be positive")
+        resolved_end = time.time() if end_at is None else float(end_at)
+        if not math.isfinite(resolved_end):
+            raise ValueError("metrics end time must be finite")
+        resolved_start = resolved_end - window_seconds
+        resolved_phases = tuple(dict.fromkeys(str(phase) for phase in phases))
+        supported_phases = {
+            phase.value for phase in JobPhase if phase is not JobPhase.COMPLETE
+        }
+        if not resolved_phases or not set(resolved_phases) <= supported_phases:
+            raise ValueError("invalid metrics phase")
+
+        event_codes = tuple(STAGE_DURATION_OUTCOMES)
+        event_placeholders = ", ".join("?" for _ in event_codes)
+        phase_placeholders = ", ".join("?" for _ in resolved_phases)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT terminal.event_code, terminal.phase,
+                       terminal.payload_json, terminal.created_at,
+                       started.created_at AS started_at,
+                       started.payload_json AS started_payload_json,
+                       audio.duration_seconds AS media_duration_seconds
+                FROM job_events AS terminal
+                LEFT JOIN job_events AS started
+                  ON started.id = (
+                      SELECT candidate.id
+                      FROM job_events AS candidate
+                      WHERE candidate.job_id = terminal.job_id
+                        AND candidate.event_code = 'stage.started'
+                        AND candidate.phase = terminal.phase
+                        AND candidate.attempt = terminal.attempt - CASE
+                            WHEN terminal.event_code =
+                                 'transcription.runtime_failover'
+                            THEN 1 ELSE 0 END
+                        AND candidate.created_at <= terminal.created_at
+                      ORDER BY candidate.id DESC
+                      LIMIT 1
+                  )
+                LEFT JOIN jobs AS job ON job.id = terminal.job_id
+                LEFT JOIN audio_revisions AS audio
+                  ON audio.id = job.audio_revision_id
+                WHERE terminal.event_code IN ({event_placeholders})
+                  AND terminal.phase IN ({phase_placeholders})
+                  AND terminal.created_at >= ?
+                  AND terminal.created_at < ?
+                ORDER BY terminal.created_at, terminal.id
+                """,
+                (
+                    *event_codes,
+                    *resolved_phases,
+                    resolved_start,
+                    resolved_end,
+                ),
+            ).fetchall()
+            translation_pass_rows = connection.execute(
+                """
+                SELECT payload_json
+                FROM job_events
+                WHERE event_code = 'translation.pass.measured'
+                  AND created_at >= ?
+                  AND created_at < ?
+                ORDER BY created_at, id
+                """,
+                (resolved_start, resolved_end),
+            ).fetchall()
+            runtime_names = {
+                "builtin": "기본 Runtime",
+                **{
+                    str(row["id"]): str(row["name"])
+                    for row in connection.execute(
+                        "SELECT id, name FROM runtime_endpoints"
+                    ).fetchall()
+                },
+            }
+
+        groups: dict[
+            tuple[int, str, str | None, str],
+            dict[str, Any],
+        ] = {}
+        unmatched_terminal_events = 0
+        missing_media_duration_events = 0
+        for row in rows:
+            if row["started_at"] is None:
+                unmatched_terminal_events += 1
+                continue
+            media_duration = (
+                float(row["media_duration_seconds"])
+                if row["media_duration_seconds"] is not None
+                else None
+            )
+            duration_bucket = media_duration_bucket_minutes(media_duration)
+            if duration_bucket is None or media_duration is None:
+                missing_media_duration_events += 1
+                continue
+            phase = str(row["phase"])
+            event_code = str(row["event_code"])
+            outcome = STAGE_DURATION_OUTCOMES[event_code]
+            runtime_id: str | None = None
+            if phase == JobPhase.TRANSCRIPTION.value:
+                try:
+                    started_payload = json.loads(
+                        str(row["started_payload_json"])
+                    )
+                    runtime_value = started_payload.get("runtime_id")
+                    if (
+                        runtime_value is None
+                        and event_code == "transcription.runtime_failover"
+                    ):
+                        runtime_value = json.loads(
+                            str(row["payload_json"])
+                        ).get("failed_runtime_id")
+                    if runtime_value is not None:
+                        runtime_id = str(runtime_value)
+                except (AttributeError, json.JSONDecodeError, TypeError):
+                    runtime_id = None
+            processing_duration = max(
+                0.0,
+                float(row["created_at"]) - float(row["started_at"]),
+            )
+            key = (duration_bucket, phase, runtime_id, outcome)
+            values = groups.setdefault(
+                key,
+                {
+                    "sample_count": 0,
+                    "processing_total_seconds": 0.0,
+                    "processing_samples": [],
+                    "processing_minimum_seconds": processing_duration,
+                    "processing_maximum_seconds": 0.0,
+                    "media_total_seconds": 0.0,
+                    "media_minimum_seconds": media_duration,
+                    "media_maximum_seconds": media_duration,
+                },
+            )
+            values["sample_count"] = int(values["sample_count"]) + 1
+            values["processing_total_seconds"] = (
+                float(values["processing_total_seconds"])
+                + processing_duration
+            )
+            values["processing_samples"].append(processing_duration)
+            values["processing_minimum_seconds"] = min(
+                float(values["processing_minimum_seconds"]),
+                processing_duration,
+            )
+            values["processing_maximum_seconds"] = max(
+                float(values["processing_maximum_seconds"]),
+                processing_duration,
+            )
+            values["media_total_seconds"] = (
+                float(values["media_total_seconds"]) + media_duration
+            )
+            values["media_minimum_seconds"] = min(
+                float(values["media_minimum_seconds"]),
+                media_duration,
+            )
+            values["media_maximum_seconds"] = max(
+                float(values["media_maximum_seconds"]),
+                media_duration,
+            )
+
+        group_values = []
+        for (bucket, phase, runtime_id, outcome), values in sorted(
+            groups.items(),
+            key=lambda item: (
+                item[0][0],
+                item[0][1],
+                item[0][2] or "",
+                item[0][3],
+            ),
+        ):
+            sample_count = int(values["sample_count"])
+            processing_total = float(values["processing_total_seconds"])
+            media_total = float(values["media_total_seconds"])
+            processing_samples = sorted(values["processing_samples"])
+            group_values.append(
+                {
+                    "media_duration_bucket_minutes": bucket,
+                    "phase": phase,
+                    "runtime_id": runtime_id,
+                    "runtime_name": (
+                        runtime_names.get(runtime_id, runtime_id)
+                        if runtime_id is not None
+                        else None
+                    ),
+                    "outcome": outcome,
+                    "sample_count": sample_count,
+                    "processing_total_seconds": round(processing_total, 3),
+                    "processing_average_seconds": round(
+                        processing_total / sample_count,
+                        3,
+                    ),
+                    "processing_minimum_seconds": round(
+                        float(values["processing_minimum_seconds"]),
+                        3,
+                    ),
+                    "processing_p50_seconds": round(
+                        self._percentile(processing_samples, 0.50),
+                        3,
+                    ),
+                    "processing_p95_seconds": round(
+                        self._percentile(processing_samples, 0.95),
+                        3,
+                    ),
+                    "processing_maximum_seconds": round(
+                        float(values["processing_maximum_seconds"]),
+                        3,
+                    ),
+                    "media_average_seconds": round(
+                        media_total / sample_count,
+                        3,
+                    ),
+                    "media_minimum_seconds": round(
+                        float(values["media_minimum_seconds"]),
+                        3,
+                    ),
+                    "media_maximum_seconds": round(
+                        float(values["media_maximum_seconds"]),
+                        3,
+                    ),
+                }
+            )
+
+        translation_pass_groups: dict[
+            tuple[int, str, str],
+            dict[str, Any],
+        ] = {}
+        invalid_translation_pass_events = 0
+        for row in translation_pass_rows:
+            try:
+                payload = json.loads(str(row["payload_json"]))
+                pass_name = str(payload["pass"])
+                outcome = str(payload["outcome"])
+                duration_bucket = int(
+                    payload["media_duration_bucket_minutes"]
+                )
+                active_duration = max(
+                    0.0,
+                    float(payload["active_seconds"]),
+                )
+                request_seconds = max(
+                    0.0,
+                    float(payload["request_seconds"]),
+                )
+                request_count = max(0, int(payload["request_count"]))
+                media_duration = float(payload["media_duration_seconds"])
+                if pass_name not in {"draft", "review"}:
+                    raise ValueError("invalid translation pass")
+            except (
+                KeyError,
+                TypeError,
+                ValueError,
+                json.JSONDecodeError,
+            ):
+                invalid_translation_pass_events += 1
+                continue
+            values = translation_pass_groups.setdefault(
+                (duration_bucket, pass_name, outcome),
+                {
+                    "active_samples": [],
+                    "request_seconds": 0.0,
+                    "request_count": 0,
+                    "media_total_seconds": 0.0,
+                    "media_minimum_seconds": media_duration,
+                    "media_maximum_seconds": media_duration,
+                },
+            )
+            values["active_samples"].append(active_duration)
+            values["request_seconds"] += request_seconds
+            values["request_count"] += request_count
+            values["media_total_seconds"] += media_duration
+            values["media_minimum_seconds"] = min(
+                values["media_minimum_seconds"],
+                media_duration,
+            )
+            values["media_maximum_seconds"] = max(
+                values["media_maximum_seconds"],
+                media_duration,
+            )
+
+        translation_pass_values = []
+        for (bucket, pass_name, outcome), values in sorted(
+            translation_pass_groups.items(),
+            key=lambda item: item[0],
+        ):
+            active_samples = sorted(values["active_samples"])
+            sample_count = len(active_samples)
+            active_total = sum(active_samples)
+            translation_pass_values.append(
+                {
+                    "media_duration_bucket_minutes": bucket,
+                    "pass": pass_name,
+                    "outcome": outcome,
+                    "sample_count": sample_count,
+                    "active_total_seconds": round(active_total, 3),
+                    "active_average_seconds": round(
+                        active_total / sample_count,
+                        3,
+                    ),
+                    "active_minimum_seconds": round(
+                        active_samples[0],
+                        3,
+                    ),
+                    "active_p50_seconds": round(
+                        self._percentile(active_samples, 0.50),
+                        3,
+                    ),
+                    "active_p95_seconds": round(
+                        self._percentile(active_samples, 0.95),
+                        3,
+                    ),
+                    "active_maximum_seconds": round(
+                        active_samples[-1],
+                        3,
+                    ),
+                    "request_total_seconds": round(
+                        values["request_seconds"],
+                        3,
+                    ),
+                    "request_count": values["request_count"],
+                    "media_average_seconds": round(
+                        values["media_total_seconds"] / sample_count,
+                        3,
+                    ),
+                    "media_minimum_seconds": round(
+                        values["media_minimum_seconds"],
+                        3,
+                    ),
+                    "media_maximum_seconds": round(
+                        values["media_maximum_seconds"],
+                        3,
+                    ),
+                }
+            )
+        return {
+            "schema_version": 1,
+            "generated_at": time.time(),
+            "window_start": resolved_start,
+            "window_end": resolved_end,
+            "window_seconds": window_seconds,
+            "bucket_interval_minutes": 15,
+            "bucket_strategy": "nearest",
+            "phases": list(resolved_phases),
+            "unmatched_terminal_events": unmatched_terminal_events,
+            "missing_media_duration_events": missing_media_duration_events,
+            "groups": group_values,
+            "invalid_translation_pass_events": (
+                invalid_translation_pass_events
+            ),
+            "translation_passes": translation_pass_values,
+        }
+
+    @staticmethod
+    def _percentile(values: Sequence[float], quantile: float) -> float:
+        if not values:
+            raise ValueError("percentile requires at least one value")
+        position = (len(values) - 1) * quantile
+        lower = math.floor(position)
+        upper = math.ceil(position)
+        if lower == upper:
+            return float(values[lower])
+        fraction = position - lower
+        return (
+            float(values[lower]) * (1 - fraction)
+            + float(values[upper]) * fraction
+        )
 
     def operational_metrics(
         self,
@@ -5583,6 +6087,10 @@ class JobStore:
                 "by_code": dict(sorted(event_code_counts.items())),
                 "stages": summarized_stages,
             },
+            "media_duration_metrics": self.media_duration_metrics(
+                window_seconds=window_seconds,
+                end_at=now,
+            ),
             "measurements": self.operational_measurements(),
         }
 

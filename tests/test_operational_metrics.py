@@ -104,3 +104,70 @@ class PrometheusExpositionTests(unittest.TestCase):
         )
 
         self.assertIn('error_type="timeout"', output)
+
+    def test_renders_stage_duration_counters_with_runtime_labels(self) -> None:
+        output = prometheus_exposition(
+            {
+                "measurements": [
+                    {
+                        "metric": "pipeline.stage.duration_seconds",
+                        "labels": {
+                            "phase": "transcription",
+                            "outcome": "completed",
+                            "runtime_id": "external-a",
+                            "media_duration_bucket_minutes": 15,
+                        },
+                        "sample_count": 3,
+                        "total": 45.5,
+                        "maximum": 20.0,
+                        "last_value": 15.0,
+                        "updated_at": 123.0,
+                    },
+                    {
+                        "metric": "translation.pass.active_seconds",
+                        "labels": {
+                            "pass": "draft",
+                            "outcome": "completed",
+                            "media_duration_bucket_minutes": 15,
+                        },
+                        "sample_count": 2,
+                        "total": 30.0,
+                        "maximum": 18.0,
+                        "last_value": 12.0,
+                        "updated_at": 124.0,
+                    },
+                ]
+            }
+        )
+
+        labels = (
+            '{media_duration_bucket_minutes="15",outcome="completed",'
+            'phase="transcription",'
+            'runtime_id="external-a"}'
+        )
+        self.assertIn(
+            f"stt_to_subtitle_stage_duration_seconds_count{labels} 3",
+            output,
+        )
+        self.assertIn(
+            f"stt_to_subtitle_stage_duration_seconds_sum{labels} 45.5",
+            output,
+        )
+        self.assertIn(
+            f"stt_to_subtitle_stage_duration_seconds_maximum{labels} 20",
+            output,
+        )
+        translation_labels = (
+            '{media_duration_bucket_minutes="15",outcome="completed",'
+            'pass="draft"}'
+        )
+        self.assertIn(
+            "stt_to_subtitle_translation_pass_active_seconds_count"
+            f"{translation_labels} 2",
+            output,
+        )
+        self.assertIn(
+            "stt_to_subtitle_translation_pass_active_seconds_sum"
+            f"{translation_labels} 30",
+            output,
+        )
