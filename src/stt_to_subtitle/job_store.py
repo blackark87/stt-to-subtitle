@@ -1309,6 +1309,11 @@ class JobStore:
                     "builtin_translation_prompts_v2",
                     self._upgrade_builtin_translation_prompts,
                 ),
+                Migration(
+                    57,
+                    "builtin_translation_prompts_v3",
+                    self._upgrade_builtin_translation_prompts,
+                ),
             ),
         )
 
@@ -1316,7 +1321,7 @@ class JobStore:
     def _upgrade_builtin_translation_prompts(
         connection: sqlite3.Connection,
     ) -> None:
-        """Append v2 only when a built-in prompt pair is still untouched."""
+        """Append the latest built-in pair only when it is still untouched."""
 
         now = time.time()
         for category_id, (draft_prompt, review_prompt) in (

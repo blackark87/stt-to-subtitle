@@ -46,6 +46,10 @@ OPENAI_COMPLETION_FIELDS = frozenset(
 HARD_BREAKER_MESSAGE = (
     "전사 모델의 메모리를 보호하기 위해 번역 서버를 일시 중지했습니다."
 )
+REVIEW_PRIORITY_MESSAGE = (
+    "같은 서버의 2차 검수를 우선 처리하는 동안 1차 요청을 다른 "
+    "서버로 전환합니다."
+)
 
 
 def normalize_translation_url(value: str, setting: str = "base_url") -> str:
@@ -199,6 +203,7 @@ class BackendTranslationRouting:
         self._condition = threading.Condition(self._lock)
         self._health: dict[tuple[str, str], dict[str, Any]] = {}
         self._active_requests: dict[tuple[str, str], int] = {}
+        self._review_host_holders: dict[str, int] = {}
         self._stt_hard_breaker_active = stt_hard_breaker_active
         self._hard_breaker_holders = 0
 
@@ -213,6 +218,16 @@ class BackendTranslationRouting:
         return self._server_host(server) in set(
             self.defaults.stt_hard_breaker_hosts
         )
+
+    def _active_requests_on_host_locked(self, stage: str, host: str) -> int:
+        return sum(
+            self._active_requests.get((stage, server.id), 0)
+            for server in self.stores[stage].list()
+            if self._server_host(server) == host
+        )
+
+    def _review_priority_active_locked(self, server: TranslationServer) -> bool:
+        return self._review_host_holders.get(self._server_host(server), 0) > 0
 
     def _external_hard_breaker_active(self) -> bool:
         if self._stt_hard_breaker_active is None:
@@ -367,6 +382,10 @@ class BackendTranslationRouting:
         with self._lock:
             current = dict(self._health.get(key, {}))
             running = self._active_requests.get(key, 0)
+            review_priority = (
+                stage == "draft"
+                and self._review_priority_active_locked(server)
+            )
         hard_blocked = (
             bool(server.base_url)
             and self._uses_shared_stt_memory(server)
@@ -375,6 +394,9 @@ class BackendTranslationRouting:
         if hard_blocked:
             status = "suspended"
             current["message"] = HARD_BREAKER_MESSAGE
+        elif review_priority:
+            status = "suspended"
+            current["message"] = REVIEW_PRIORITY_MESSAGE
         elif not server.base_url:
             status = "unconfigured"
         else:
@@ -396,7 +418,9 @@ class BackendTranslationRouting:
             "checked_at": server.checked_at,
             "running_jobs": running,
             "available_slots": (
-                0 if hard_blocked else max(0, server.capacity - running)
+                0
+                if hard_blocked or review_priority
+                else max(0, server.capacity - running)
             ),
         }
 
@@ -615,7 +639,14 @@ class BackendTranslationRouting:
         stage: str = "draft",
         mode: str = "live",
     ) -> bool:
-        return bool(self._candidates(stage, mode))
+        candidates = self._candidates(stage, mode)
+        if stage != "draft":
+            return bool(candidates)
+        with self._lock:
+            return any(
+                not self._review_priority_active_locked(server)
+                for server in candidates
+            )
 
     def route_suspended_by_stt(
         self,
@@ -635,7 +666,13 @@ class BackendTranslationRouting:
     def worker_limit(self, mode: str) -> int:
         """Return the usable draft concurrency for one translation job."""
         candidates = self._candidates("draft", mode)
-        return max(1, min(8, sum(server.capacity for server in candidates)))
+        with self._lock:
+            usable = [
+                server
+                for server in candidates
+                if not self._review_priority_active_locked(server)
+            ]
+        return max(1, min(8, sum(server.capacity for server in usable)))
 
     def model_contract(self) -> str:
         return "+".join(
@@ -666,6 +703,83 @@ class BackendTranslationRouting:
             if server.token
         }
 
+    def _reserve_request_slot(
+        self,
+        stage: str,
+        server: TranslationServer,
+        *,
+        deadline: float,
+    ) -> bool:
+        """Reserve one server slot while giving same-host review priority."""
+
+        key = (stage, server.id)
+        host = self._server_host(server)
+        with self._condition:
+            if (
+                self._hard_breaker_holders > 0
+                and self._uses_shared_stt_memory(server)
+            ):
+                return False
+            running = self._active_requests.get(key, 0)
+            if running >= server.capacity:
+                return False
+            if stage == "draft" and self._review_host_holders.get(host, 0):
+                return False
+
+            self._active_requests[key] = running + 1
+            if stage != "review":
+                return True
+
+            # Reserving the host before waiting prevents new draft calls from
+            # racing in while existing draft calls drain. Reviews may share a
+            # host with other reviews up to their configured stage capacity.
+            self._review_host_holders[host] = (
+                self._review_host_holders.get(host, 0) + 1
+            )
+            while self._active_requests_on_host_locked("draft", host) > 0:
+                if (
+                    self._hard_breaker_holders > 0
+                    and self._uses_shared_stt_memory(server)
+                ):
+                    self._release_request_slot_locked(stage, server)
+                    raise TranslationDeferred(HARD_BREAKER_MESSAGE)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self._release_request_slot_locked(stage, server)
+                    raise ExternalServiceError(
+                        "같은 서버의 1차 번역이 끝나지 않아 2차 검수를 "
+                        "시작할 수 없습니다."
+                    )
+                self._condition.wait(timeout=min(1.0, remaining))
+            return True
+
+    def _release_request_slot_locked(
+        self,
+        stage: str,
+        server: TranslationServer,
+    ) -> None:
+        key = (stage, server.id)
+        self._active_requests[key] = max(
+            0,
+            self._active_requests.get(key, 1) - 1,
+        )
+        if stage == "review":
+            host = self._server_host(server)
+            holders = max(0, self._review_host_holders.get(host, 1) - 1)
+            if holders:
+                self._review_host_holders[host] = holders
+            else:
+                self._review_host_holders.pop(host, None)
+        self._condition.notify_all()
+
+    def _release_request_slot(
+        self,
+        stage: str,
+        server: TranslationServer,
+    ) -> None:
+        with self._condition:
+            self._release_request_slot_locked(stage, server)
+
     def request_completion(
         self,
         stage: str,
@@ -676,32 +790,60 @@ class BackendTranslationRouting:
         request_observer: RequestObserver | None = None,
     ) -> requests.Response:
         resolved = translation_stage(stage)
-        candidates = self._candidates(resolved, mode)
-        if not candidates:
-            configured = self._configured_candidates(resolved, mode)
-            if configured and any(
-                self._uses_shared_stt_memory(server)
-                for server in configured
-            ) and self.hard_breaker_active():
-                raise TranslationDeferred(HARD_BREAKER_MESSAGE)
+        configured = self._configured_candidates(resolved, mode)
+        if not configured:
             raise ExternalServiceError(
                 f"{TRANSLATION_STAGE_LABELS[resolved]} 서버가 설정되지 않았습니다."
             )
         last_response: requests.Response | None = None
-        attempted = False
-        for server in candidates:
-            key = (resolved, server.id)
-            with self._condition:
+        attempted_ids: set[str] = set()
+        deadline = time.monotonic() + self.defaults.read_timeout_seconds
+        while len(attempted_ids) < len(configured):
+            candidates = [
+                server
+                for server in self._candidates(resolved, mode)
+                if server.id not in attempted_ids
+            ]
+            if not candidates:
                 if (
-                    self._hard_breaker_holders > 0
-                    and self._uses_shared_stt_memory(server)
+                    not attempted_ids
+                    and self.hard_breaker_active()
+                    and all(
+                        self._uses_shared_stt_memory(server)
+                        for server in configured
+                    )
                 ):
-                    continue
-                running = self._active_requests.get(key, 0)
-                if running >= server.capacity:
-                    continue
-                self._active_requests[key] = running + 1
-            attempted = True
+                    raise TranslationDeferred(HARD_BREAKER_MESSAGE)
+                break
+            server: TranslationServer | None = None
+            for candidate in candidates:
+                if self._reserve_request_slot(
+                    resolved,
+                    candidate,
+                    deadline=deadline,
+                ):
+                    server = candidate
+                    break
+            if server is None:
+                if (
+                    all(
+                        self._uses_shared_stt_memory(candidate)
+                        for candidate in candidates
+                    )
+                    and self.hard_breaker_active()
+                ):
+                    raise TranslationDeferred(HARD_BREAKER_MESSAGE)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise ExternalServiceError(
+                        "모든 번역 서버의 동시 요청 수가 가득 찼습니다."
+                    )
+                with self._condition:
+                    self._condition.wait(timeout=min(1.0, remaining))
+                continue
+
+            attempted_ids.add(server.id)
+            key = (resolved, server.id)
             client = RetryingJSONClient(
                 token=server.token,
                 read_timeout=self.defaults.read_timeout_seconds,
@@ -740,12 +882,7 @@ class BackendTranslationRouting:
                 )
                 continue
             finally:
-                with self._condition:
-                    self._active_requests[key] = max(
-                        0,
-                        self._active_requests.get(key, 1) - 1,
-                    )
-                    self._condition.notify_all()
+                self._release_request_slot(resolved, server)
             if 200 <= response.status_code < 300:
                 with self._lock:
                     self._health[key] = {"status": "ready", "message": None}
@@ -757,12 +894,4 @@ class BackendTranslationRouting:
             last_response = response
         if last_response is not None:
             return last_response
-        if not attempted:
-            configured = self._configured_candidates(resolved, mode)
-            if configured and all(
-                self._uses_shared_stt_memory(server)
-                for server in configured
-            ) and self.hard_breaker_active():
-                raise TranslationDeferred(HARD_BREAKER_MESSAGE)
-            raise ExternalServiceError("모든 번역 서버의 동시 요청 수가 가득 찼습니다.")
         raise ExternalServiceError("번역 서버에 연결할 수 없습니다.")

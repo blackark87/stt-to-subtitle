@@ -64,6 +64,24 @@ function segmentSuffix(payload: Record<string, unknown>): string {
   return count == null ? "" : ` · ${count}개 구간`;
 }
 
+function measuredPassDetails(payload: Record<string, unknown>): string {
+  const details: string[] = [];
+  const requestCount = number(payload.request_count);
+  if (requestCount != null) details.push(`모델 요청 ${requestCount}회`);
+  const activeSeconds = number(payload.active_seconds);
+  if (activeSeconds != null) {
+    const total = Math.max(0, Math.round(activeSeconds));
+    const hours = Math.floor(total / 3600);
+    const minutes = Math.floor((total % 3600) / 60);
+    const seconds = total % 60;
+    const duration = hours > 0
+      ? `${hours}시간 ${minutes}분 ${seconds}초`
+      : `${minutes}분 ${seconds}초`;
+    details.push(`처리 시간 ${duration}`);
+  }
+  return details.length > 0 ? ` · ${details.join(" · ")}` : "";
+}
+
 function genericMessage(message: string, eventCode: string | undefined): string {
   if (message === "job queued") return "작업을 대기열에 등록했습니다.";
   const created = message.match(/^job created in (\S+)$/);
@@ -168,6 +186,10 @@ function genericMessage(message: string, eventCode: string | undefined): string 
 }
 
 function stateTransition(event: JobEvent): string {
+  // Pass measurements describe one sub-pass while the parent translation
+  // stage is still running. Showing that transient state on a completed pass
+  // makes historical records look contradictory after the job completes.
+  if (event.event_code === "translation.pass.measured") return "";
   const fromState = text(event.from_state);
   const toState = text(event.to_state);
   if (!toState || fromState === toState) return "";
@@ -265,6 +287,28 @@ function eventDescription(
       return generation == null
         ? "새 번역 결과 생성을 시작했습니다."
         : `새 번역 결과 ${generation}번 생성을 시작했습니다.`;
+    }
+    case "translation.route.selected": {
+      const executionMode = text(payload.execution_mode) === "batch" ? "배치" : "실시간";
+      const draft = payload.draft_pass === false ? "생략" : "사용";
+      const review = payload.local_review_pass === true ? "사용" : "생략";
+      return `번역 경로를 확정했습니다. 실행 방식: ${executionMode} · 1차 번역: ${draft} · 2차 검수: ${review}`;
+    }
+    case "translation.pass.measured": {
+      const pass = text(payload.pass);
+      const label = pass === "review"
+        ? "2차 번역 검수를"
+        : pass === "draft"
+          ? "1차 초벌 번역을"
+          : "번역 처리를";
+      const outcome = text(payload.outcome);
+      const action: Record<string, string> = {
+        completed: "완료했습니다",
+        paused: "일시 정지했습니다",
+        blocked: "중단됐습니다",
+        failed: "실패했습니다",
+      };
+      return `${label} ${action[outcome] ?? "측정했습니다"}${measuredPassDetails(payload)}`;
     }
     case "recovery.checkpoint_resumed":
       return `서비스 재시작 후 저장된 지점에서 ${phase} 작업을 재개했습니다.`;

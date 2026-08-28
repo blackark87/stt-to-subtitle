@@ -824,8 +824,8 @@ class JobStoreTests(unittest.TestCase):
             self.assertEqual(
                 snapshot["database"]["migrations"],
                 {
-                    "applied_count": 12,
-                    "latest_sequence": 56,
+                    "applied_count": 13,
+                    "latest_sequence": 57,
                     "unsequenced_count": 0,
                 },
             )
@@ -1303,7 +1303,7 @@ class JobStoreTests(unittest.TestCase):
                     )
                 connection.execute(
                     "DELETE FROM schema_migrations "
-                    "WHERE name = 'builtin_translation_prompts_v2'"
+                    "WHERE name = 'builtin_translation_prompts_v3'"
                 )
 
             upgraded = JobStore(database_path)
@@ -1344,7 +1344,7 @@ class JobStoreTests(unittest.TestCase):
             with sqlite3.connect(database_path) as connection:
                 connection.execute(
                     "DELETE FROM schema_migrations "
-                    "WHERE name = 'builtin_translation_prompts_v2'"
+                    "WHERE name = 'builtin_translation_prompts_v3'"
                 )
 
             restarted = JobStore(database_path)

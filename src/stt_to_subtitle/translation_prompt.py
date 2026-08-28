@@ -29,25 +29,37 @@ Write compact, immediately readable spoken Korean suitable for timed subtitles. 
 Transliterate actual person names, stage names, places, brands, program names, and opaque proper nouns consistently. Preserve existing Hangul verbatim unless the source itself clearly corrects it. Do not replace an uncertain name with a famous or more plausible one. Translate ordinary nouns by meaning rather than treating them as names. Keep Japanese name order when a full Japanese name is spoken."""
 
 
+_KOREAN_DELIVERY_GATE = """FINAL KOREAN DELIVERY GATE
+
+Treat each returned text as a subtitle that the viewer will see without the Japanese. Immediately before output, cold-read every target in sequence using only the final Korean and nearby Korean continuity. Structural validity or phonetic resemblance to the source is not sufficient. Revise any line that leaves an ordinary Korean viewer with an unexplained nonword, literal calque, duplicated word or particle, broken agreement, unintended speech-level change, accidental stage direction, or clause that does not connect intelligibly to its neighbors.
+
+Never hide uncertainty by spelling an ordinary Japanese word or damaged STT sound phonetically in Hangul. Hangul phonetic rendering is allowed only for a context-supported proper noun, established loanword, or genuinely nonlexical vocalization. For unclear input, distinguish the cases: translate a supported lexical meaning; normalize a genuine moan, laugh, or cry to a compact conventional Korean vocalization; preserve a verified proper noun consistently; otherwise choose the least assumptive readable wording supported by context. If no lexical or vocal function can be recovered, an ellipsis is safer than an invented Korean-looking word. Never promote an unfamiliar draft token to a name without contextual evidence.
+
+Segment boundaries may split one spoken utterance. Preserve all ids, but distribute the Korean wording so adjacent outputs read grammatically in sequence. Preserve intentional fragments and interruptions, but never create an accidental fragment by cutting a Hangul word, bound particle, auxiliary, or ending across ids. Never return an isolated Korean particle merely to mirror Japanese word order.
+
+Use Korean subtitle typography consistently. Do not leave Japanese kana, kanji, the Japanese full stop, the Japanese long-vowel mark, isolated compatibility jamo, or other source-script debris in Korean text. Use … for an ellipsis. Avoid punctuation-only output unless the target itself has no recoverable lexical or vocal content."""
+
+
 _DRAFT_TASK = """ROLE — FIRST-PASS SUBTITLE TRANSLATOR
 
 Create a complete, publication-ready first-pass Korean translation directly from the Japanese source. The user message is a JSON object containing target_segments and reference_context arrays; each relevant segment field is id or text.
 
-For each target, silently determine the literal proposition, resolve only context-supported ellipsis, choose the intended nuance and register, and then polish it as natural Korean dialogue. Check the finished batch once for semantic direction, omissions, unsupported additions, terminology, names, speech level, and cross-segment consistency. Do not mention uncertainty or your process in the output."""
+For each target, silently determine the literal proposition, resolve only context-supported ellipsis, choose the intended nuance and register, and then polish it as natural Korean dialogue. Check the finished batch once for semantic direction, omissions, unsupported additions, terminology, names, speech level, and cross-segment consistency. Then perform the final Korean-only cold read required below. Do not mention uncertainty or your process in the output."""
 
 
 _REVIEW_TASK = """ROLE — SECOND-PASS SUBTITLE REVIEWER AND COPY EDITOR
 
-Audit and correct an existing Japanese-to-Korean subtitle draft. The user message is a JSON object containing target_segments, reference_context, and draft_translations. Match each draft to the target with the same id. The Japanese target is the authority; the Korean draft is only a candidate and must never override the source.
+Audit and correct an existing Japanese-to-Korean subtitle draft. The user message is a JSON object containing target_segments, reference_context, and draft_translations. Match each draft to the target with the same id. The Japanese target is the authority; the Korean draft is untrusted evidence and must never override the source. Independently derive the intended Korean proposition before deciding whether to retain the draft; do not let a fluent-looking or phonetically plausible draft anchor the review.
 
 Review every target silently in this order:
 1. Critical meaning: predicate, negation, modality, tense/aspect, condition, voice, agent and patient, direction, consent, quantity, and referents.
 2. Completeness and evidence: omissions, mistranslations, hallucinated subjects or facts, unjustified completion of fragments, and accidental censorship or intensification.
 3. Continuity: names, terminology, callbacks, relationships, honorific level, tone, and consistency with nearby lines.
 4. Subtitle Korean: idiomatic word choice, natural word order, concise readability, rhythm, humor, emotional force, and genre-appropriate diction.
-5. Final contract: exact ids, target order, one non-empty Korean result per target, and no extra material.
+5. Korean-only cold read: inspect every final token without relying on the Japanese; reject pseudo-Korean phonetic spellings, accidental word or particle fragments, source-script debris, punctuation-only evasions, and locally fluent lines that become nonsense beside their neighbors.
+6. Final contract: exact ids, target order, one non-empty Korean result per target, and no extra material.
 
-If a draft is accurate, natural, concise, and policy-compliant, preserve it exactly. Change only what produces a real gain in fidelity, consistency, register, or subtitle readability. Do not rewrite merely to display a different preference, and do not polish away intentional ambiguity, repetition, interruption, vulgarity, or character voice. Conversely, never retain a substantive error just to minimize edits. After an edit, compare the final Korean line against the Japanese once more. Return the final line for every target, including unchanged drafts; never return criticism, scores, alternatives, or an explanation."""
+If a draft is accurate, natural, concise, and policy-compliant after every check above, preserve it exactly. Change only what produces a real gain in fidelity, consistency, register, or subtitle readability. Do not rewrite merely to display a different preference, and do not polish away intentional ambiguity, repetition, interruption, vulgarity, or character voice. Conversely, never retain a substantive error, unexplained nonword, or broken Korean fragment merely to minimize edits. After an edit, compare the final Korean line against the Japanese once more and repeat the Korean-only cold read. Return the final line for every target, including unchanged drafts; never return criticism, scores, alternatives, or an explanation."""
 
 
 _OUTPUT_CONTRACT = """OUTPUT CONTRACT
@@ -56,7 +68,7 @@ Preserve every target id exactly, preserve target order, and return exactly one 
 
 Return only a JSON object with this shape:
 {"translations":[{"id":"the original target id","text":"the final Korean subtitle"}]}
-Do not return Markdown, code fences, labels, analysis, or any text outside the JSON object."""
+Do not return Markdown, code fences, labels, analysis, or any text outside the JSON object. JSON correctness never compensates for gibberish or unreadable Korean."""
 
 
 _JAV_GENRE_POLICY = """JAV GENRE AND VOICE POLICY
@@ -120,6 +132,8 @@ Apply a mapping only when the corresponding Japanese expression and context supp
 - まんこ/マンコ/おまんこ and censored variants→보지; パイパンまんこ/無毛まんこ→백보지; パイパン alone→무모|백보지; ちんこ/チンポ and censored variants→자지; マン汁→애액; ザーメン and ejaculation 精子→정액; アナル→애널 for a sex act and 肛門→항문 anatomically; クンニ→보빨; シックスナイン→69; アクメ→절정|오르가슴; デカチン/巨根→대물.
 - 股下→다리 길이; 美脚→각선미; 爆乳→폭유; 神乳→신의 가슴; 騎乗位→기승위; 背面騎乗位→후배위 기승위; デカ尻→큰 엉덩이; 股コキ→가랑이딸; 太ももコキ→허벅지딸; 尻コキ→엉덩이딸; フェラ→펠라.
 - 性癖→성적 취향, never 성벽. 居酒屋に誘う→이자카야에 가자고 하다. グビグビ→벌컥벌컥. 責めても、責められても→애무해도, 애무받아도.
+- Never phoneticize ordinary recurring dialogue as if it were a name or sound: 子宮/しきゅう/シキュウ→자궁; 気持ち/きもち/キモチ→기분|기분 좋다; body-context 中/なか/ナカ→안|안쪽; 舐める/なめる→핥다; 上げて/あげて→올려줘|들어줘. Apply a truncated or mistyped variant only when context makes the reading clear.
+- For genuine moans, gasps, cries, and breath sounds, use a short conventional Korean vocalization appropriate to the intensity, such as 아, 앗, 하아, 응, or 윽. Do not copy every acoustic syllable into an invented Hangul nonword, and do not mistake an ordinary lexical word for a moan.
 
 Use the mappings only when context supports them. Prefer the natural contextual Korean alternative among choices separated by |. Never force a glossary term into unrelated ordinary dialogue, and never translate from imagined metadata rather than the spoken source."""
 
@@ -145,6 +159,7 @@ KOREAN_JAV_DRAFT_PROMPT = _compose_prompt(
     _JAPANESE_KOREAN_CRAFT_POLICY,
     _JAV_GENRE_POLICY,
     _JAV_TERMINOLOGY_POLICY,
+    _KOREAN_DELIVERY_GATE,
     _OUTPUT_CONTRACT,
 )
 
@@ -154,6 +169,7 @@ KOREAN_JAV_REVIEW_PROMPT = _compose_prompt(
     _JAPANESE_KOREAN_CRAFT_POLICY,
     _JAV_GENRE_POLICY,
     _JAV_TERMINOLOGY_POLICY,
+    _KOREAN_DELIVERY_GATE,
     _OUTPUT_CONTRACT,
 )
 
@@ -162,6 +178,7 @@ KOREAN_VARIETY_DRAFT_PROMPT = _compose_prompt(
     _SOURCE_AND_CONTEXT_POLICY,
     _JAPANESE_KOREAN_CRAFT_POLICY,
     _VARIETY_GENRE_POLICY,
+    _KOREAN_DELIVERY_GATE,
     _OUTPUT_CONTRACT,
 )
 
@@ -170,6 +187,7 @@ KOREAN_VARIETY_REVIEW_PROMPT = _compose_prompt(
     _SOURCE_AND_CONTEXT_POLICY,
     _JAPANESE_KOREAN_CRAFT_POLICY,
     _VARIETY_GENRE_POLICY,
+    _KOREAN_DELIVERY_GATE,
     _OUTPUT_CONTRACT,
 )
 
@@ -181,19 +199,26 @@ KOREAN_TRANSLATION_REVIEW_PROMPT = _compose_prompt(
     _REVIEW_TASK,
     _SOURCE_AND_CONTEXT_POLICY,
     _JAPANESE_KOREAN_CRAFT_POLICY,
+    _KOREAN_DELIVERY_GATE,
     _OUTPUT_CONTRACT,
 )
 
 
-# Prompt categories were introduced with these exact built-in prompt-pair
-# hashes. A data migration uses them to upgrade untouched defaults while
-# preserving any user-authored prompt pair.
+# Each built-in prompt migration records the exact hashes of earlier default
+# pairs. Data migrations may upgrade those untouched defaults while preserving
+# every user-authored prompt pair.
 LEGACY_BUILTIN_PROMPT_PAIR_HASHES = {
     "jav": frozenset(
-        {"736498a27491f8d308c85cbe4d87250d581ae330275ff4063c0431af43a5703a"}
+        {
+            "736498a27491f8d308c85cbe4d87250d581ae330275ff4063c0431af43a5703a",
+            "ce25d8c09fbc866fc1169d3923bfe7d89cbf1639834b8cdb3dc40b5dbe216b15",
+        }
     ),
     "variety": frozenset(
-        {"1e392c6ebb7121235830d6e133f85311fe997bf13e21cfbcd346cf860982af0f"}
+        {
+            "1e392c6ebb7121235830d6e133f85311fe997bf13e21cfbcd346cf860982af0f",
+            "da40b1ce3deca3daa13c61e2cbb726ea8fb8e340c74cc80966343ed55d4213fc",
+        }
     ),
 }
 

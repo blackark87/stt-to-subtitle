@@ -38,7 +38,19 @@ class TranslationPromptTests(unittest.TestCase):
             self.assertIn("Preserve every target id exactly", prompt)
             self.assertIn('"translations"', prompt)
             self.assertIn("Accuracy comes before surface fluency", prompt)
+            self.assertIn("FINAL KOREAN DELIVERY GATE", prompt)
+            self.assertIn("cold-read every target", prompt)
+            self.assertIn("Never hide uncertainty", prompt)
+            self.assertIn("Never return an isolated Korean particle", prompt)
+            self.assertIn("Japanese long-vowel mark", prompt)
             self.assertLessEqual(len(prompt), PROMPT_TEXT_MAX_LENGTH)
+
+    def test_review_pass_independently_rechecks_the_draft(self) -> None:
+        for prompt in (KOREAN_JAV_REVIEW_PROMPT, KOREAN_VARIETY_REVIEW_PROMPT):
+            self.assertIn("draft is untrusted evidence", prompt)
+            self.assertIn("do not let a fluent-looking", prompt)
+            self.assertIn("Korean-only cold read", prompt)
+            self.assertIn("unexplained nonword", prompt)
 
     def test_jav_passes_share_explicitness_and_terminology_policy(self) -> None:
         for prompt in (KOREAN_JAV_DRAFT_PROMPT, KOREAN_JAV_REVIEW_PROMPT):
@@ -46,6 +58,8 @@ class TranslationPromptTests(unittest.TestCase):
             self.assertIn("never reverse sexual direction", prompt)
             self.assertIn("生ハメ→노콘", prompt)
             self.assertIn("性癖→성적 취향, never 성벽", prompt)
+            self.assertIn("シキュウ→자궁", prompt)
+            self.assertIn("invented Hangul nonword", prompt)
 
     def test_variety_passes_share_humor_register_and_dialect_policy(self) -> None:
         for prompt in (
