@@ -452,10 +452,6 @@ button:disabled, .btn:disabled {
 .path-rule-pattern.target > code { color: var(--accent); font-weight: 650; }
 .path-rule-arrow { display: grid; place-items: center; color: var(--muted); }
 .path-rule-actions { flex-wrap: nowrap; justify-content: flex-end; }
-.path-rule-editor { display: grid; gap: 12px; padding: 14px; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--card); }
-.path-rule-editor-head { display: grid; gap: 3px; }
-.path-rule-editor-head > strong { font-size: .86rem; }
-.path-rule-editor-head > span { color: var(--muted); font-size: .74rem; }
 .path-rule-form { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto; align-items: end; gap: 12px; }
 .path-rule-editor-actions { flex-wrap: nowrap; }
 

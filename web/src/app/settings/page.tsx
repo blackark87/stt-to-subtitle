@@ -63,6 +63,7 @@ export default function SettingsPage() {
   const [promptForm, setPromptForm] = useState<PromptForm>(EMPTY_PROMPT);
   const [promptEditorOpen, setPromptEditorOpen] = useState(false);
   const [pathRuleForm, setPathRuleForm] = useState<PathRuleForm>(EMPTY_PATH_RULE);
+  const [pathRuleEditorOpen, setPathRuleEditorOpen] = useState(false);
 
   const servers = data?.servers;
   const lm = lmDraft ?? {
@@ -186,7 +187,10 @@ export default function SettingsPage() {
         : api.createPathDisplayRule(body),
       pathRuleForm.id ? "경로 표시 규칙을 수정했습니다." : "경로 표시 규칙을 추가했습니다.",
     );
-    if (ok) setPathRuleForm(EMPTY_PATH_RULE);
+    if (ok) {
+      setPathRuleForm(EMPTY_PATH_RULE);
+      setPathRuleEditorOpen(false);
+    }
   };
 
   const editPathRule = (rule: PathDisplayRule) => {
@@ -195,6 +199,7 @@ export default function SettingsPage() {
       source_pattern: rule.source_pattern,
       display_pattern: rule.display_pattern,
     });
+    setPathRuleEditorOpen(true);
   };
 
   const deletePathRule = async (rule: PathDisplayRule) => {
@@ -203,7 +208,10 @@ export default function SettingsPage() {
       () => api.deletePathDisplayRule(rule.id),
       "경로 표시 규칙을 삭제했습니다.",
     );
-    if (ok && pathRuleForm.id === rule.id) setPathRuleForm(EMPTY_PATH_RULE);
+    if (ok && pathRuleForm.id === rule.id) {
+      setPathRuleForm(EMPTY_PATH_RULE);
+      setPathRuleEditorOpen(false);
+    }
   };
 
   const field = "ctl";
@@ -461,15 +469,32 @@ export default function SettingsPage() {
           <div className="card-head">
             <div>
               <h2 id="path-display-title">폴더 경로 단축 표기</h2>
-              <span className="sub" title="{이름}은 경로 한 단계를 나타냅니다."><code>{"{이름}"}</code>은 경로 한 단계를 나타냅니다.</span>
+              <span className="sub" title={`${(data?.path_display_rules ?? []).length}개 규칙 · {이름}은 경로 한 단계를 나타냅니다.`}>
+                {(data?.path_display_rules ?? []).length}개 규칙 · <code>{"{이름}"}</code>은 경로 한 단계를 나타냅니다.
+              </span>
             </div>
-            <span className="sub m" title={`${(data?.path_display_rules ?? []).length}개 규칙`}>{(data?.path_display_rules ?? []).length}개 규칙</span>
+            {pathRuleEditorOpen ? (
+              <span className="b line">{pathRuleForm.id ? "수정 중" : "추가 중"}</span>
+            ) : (
+              <button
+                type="button"
+                className="btn sec sm"
+                aria-expanded="false"
+                aria-controls="path-rule-editor"
+                onClick={() => {
+                  setPathRuleForm(EMPTY_PATH_RULE);
+                  setPathRuleEditorOpen(true);
+                }}
+              >
+                <Icon name="plus" size={14} />규칙 추가
+              </button>
+            )}
           </div>
           <div className="card-body path-settings-body">
             {(data?.path_display_rules ?? []).length === 0 ? (
               <div className="empty-state compact">
                 <strong>등록된 경로 표시 규칙이 없습니다</strong>
-                <span>아래에서 첫 번째 단축 규칙을 추가하세요.</span>
+                <span>위의 규칙 추가 버튼으로 첫 번째 단축 규칙을 등록하세요.</span>
               </div>
             ) : (
               <div className="path-rule-list" aria-label="폴더 경로 단축 표기 규칙">
@@ -498,9 +523,10 @@ export default function SettingsPage() {
                 ))}
               </div>
             )}
-
-            <div className="path-rule-editor">
-              <div className="path-rule-editor-head">
+          </div>
+          {pathRuleEditorOpen ? (
+            <div className="card-body settings-editor" id="path-rule-editor">
+              <div className="settings-editor-head">
                 <strong>{pathRuleForm.id ? "규칙 수정" : "새 규칙 추가"}</strong>
                 <span>원본에서 생략할 경로 단계를 표시 패턴에서 제거하세요.</span>
               </div>
@@ -529,13 +555,21 @@ export default function SettingsPage() {
                 <button type="submit" className="btn" disabled={busy}>
                   {pathRuleForm.id ? "변경 저장" : "규칙 추가"}
                 </button>
-                {pathRuleForm.id ? (
-                  <button type="button" className="btn sec" disabled={busy} onClick={() => setPathRuleForm(EMPTY_PATH_RULE)}>취소</button>
-                ) : null}
+                <button
+                  type="button"
+                  className="btn sec"
+                  disabled={busy}
+                  onClick={() => {
+                    setPathRuleForm(EMPTY_PATH_RULE);
+                    setPathRuleEditorOpen(false);
+                  }}
+                >
+                  취소
+                </button>
               </div>
               </form>
             </div>
-          </div>
+          ) : null}
         </section>
       </div>
     </>
