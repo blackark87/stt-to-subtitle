@@ -64,10 +64,53 @@ function segmentSuffix(payload: Record<string, unknown>): string {
   return count == null ? "" : ` · ${count}개 구간`;
 }
 
-function genericMessage(message: string): string {
+function genericMessage(message: string, eventCode: string | undefined): string {
+  if (message === "job queued") return "작업을 대기열에 등록했습니다.";
+  const created = message.match(/^job created in (\S+)$/);
+  if (created) return `작업을 등록했습니다. 시작 지점: ${stateName(created[1])}`;
+
+  if (message === "audio extraction started") return "음원 추출을 시작했습니다.";
+  const extraction = message.match(
+    /^audio extraction completed \(\d+ bytes(?:; [\d.]+s; approximately (\d+) transcription chunk\(s\))?\)$/,
+  );
+  if (extraction) {
+    return extraction[1]
+      ? `음원 추출을 완료했습니다. 예상 전사 구간: ${extraction[1]}개`
+      : "음원 추출을 완료했습니다.";
+  }
+
+  const stageStarted = message.match(/^(transcription|translation|render) started$/);
+  if (stageStarted) {
+    const stage = stageStarted[1] ?? "";
+    const labels: Record<string, string> = {
+      transcription: "전사",
+      translation: "번역",
+      render: "자막 생성",
+    };
+    return `${labels[stage] ?? "작업"} 작업을 시작했습니다.`;
+  }
+  const stageCompleted = message.match(/^(transcription|translation) completed \((\d+) segments\)$/);
+  if (stageCompleted) {
+    const label = stageCompleted[1] === "transcription" ? "전사" : "번역";
+    return `${label}를 완료했습니다. ${stageCompleted[2]}개 구간`;
+  }
+  const remoteAccepted = message.match(/^remote transcription job accepted: (\S+)$/);
+  if (remoteAccepted) {
+    return `전사 서버에 작업이 접수되었습니다. 원격 작업 ID: ${remoteAccepted[1]}`;
+  }
+  if (message === "job stopped by user request") {
+    return "사용자 요청으로 작업을 정지했습니다.";
+  }
+  if (message.startsWith("subtitles written:")) {
+    return "SRT·ASS 자막 파일을 저장했습니다.";
+  }
+  if (message.startsWith("legacy translation job(s) merged:")) {
+    return "이전 번역 작업 기록을 현재 작업에 통합했습니다.";
+  }
+
   const noise = message.match(/noise filter removed (\d+) non-speech diarization span/);
   if (noise) return `잡음 필터가 비음성 화자 구간 ${noise[1]}개를 제거했습니다.`;
-  if (message === "translation review failed; using initial translation") {
+  if (message.startsWith("translation review failed; using initial translation")) {
     return "번역 검토에 실패해 최초 번역 결과를 사용했습니다.";
   }
   if (message.includes("transcription requested; reusing extracted audio")) {
@@ -79,10 +122,57 @@ function genericMessage(message: string): string {
   if (message.includes("translation requested; reusing validated transcript")) {
     return "검증된 전사 결과를 재사용해 번역을 요청했습니다.";
   }
+  if (message.includes("translation requested; continuing completed transcription")) {
+    return "완료된 전사 결과에 이어 같은 작업에서 번역을 요청했습니다.";
+  }
+  if (message.includes("selected completed transcription continued in translation queue")) {
+    return "선택한 전사 완료 작업을 번역 대기열로 보냈습니다.";
+  }
+  if (message.includes("selected translation requested; reusing completed transcript")) {
+    return "완료된 전사 결과를 재사용해 선택 번역을 요청했습니다.";
+  }
+  if (message.startsWith("translation requested from comparison transcript")) {
+    return "비교 전사 결과로 번역을 요청했습니다.";
+  }
+  if (message.startsWith("comparison rerun requested; reusing extracted audio")) {
+    return "추출된 음원을 재사용해 비교 전사를 다시 요청했습니다.";
+  }
+  if (message === "legacy WhisperX chunk length reduced to 30 seconds for retry") {
+    return "이전 WhisperX 작업의 재시도를 위해 구간 길이를 30초로 조정했습니다.";
+  }
+  if (message.startsWith("remote transcription cancellation is pending:")) {
+    return "전사 서버의 작업 취소 확인을 기다리고 있습니다.";
+  }
+  const ignoredCheckpoints = message.match(/^ignored (\d+) stale translation checkpoint id/);
+  if (ignoredCheckpoints) {
+    return `사용할 수 없는 이전 번역 저장 지점 ${ignoredCheckpoints[1]}개를 제외했습니다.`;
+  }
+  const repairedTimestamps = message.match(
+    /^repaired (\d+) legacy or abnormal subtitle timestamp/,
+  );
+  if (repairedTimestamps) {
+    return `이전 형식이거나 비정상적인 자막 시간 ${repairedTimestamps[1]}개를 보정했습니다.`;
+  }
+  if (message === "transcript JSON edited; subtitle regenerated") {
+    return "전사 JSON을 수정하고 자막을 다시 생성했습니다.";
+  }
+  if (message === "translation JSON edited; subtitle regenerated") {
+    return "번역 JSON을 수정하고 자막을 다시 생성했습니다.";
+  }
   if (message === "transcript JSON edited") return "전사 JSON을 수정했습니다.";
   if (message === "translation JSON edited") return "번역 JSON을 수정했습니다.";
   if (/[가-힣]/.test(message)) return message;
-  return "작업 상태가 갱신되었습니다.";
+  return eventCode && eventCode !== "job.message"
+    ? `지원되지 않는 작업 기록입니다. 기록 코드: ${eventCode}`
+    : "세부 정보가 없는 이전 형식의 작업 기록입니다.";
+}
+
+function stateTransition(event: JobEvent): string {
+  const fromState = text(event.from_state);
+  const toState = text(event.to_state);
+  if (!toState || fromState === toState) return "";
+  if (!fromState) return `작업 상태: ${stateName(toState)}`;
+  return `작업 상태: ${stateName(fromState)} → ${stateName(toState)}`;
 }
 
 export function jobProgressLabel(job: PipelineJob): string {
@@ -98,6 +188,15 @@ export function jobProgressLabel(job: PipelineJob): string {
 }
 
 export function eventText(
+  event: JobEvent,
+  runtimeNames: ReadonlyMap<string, string>,
+): string {
+  const description = eventDescription(event, runtimeNames);
+  const transition = stateTransition(event);
+  return transition ? `${description} · ${transition}` : description;
+}
+
+function eventDescription(
   event: JobEvent,
   runtimeNames: ReadonlyMap<string, string>,
 ): string {
@@ -172,6 +271,6 @@ export function eventText(
     case "subtitle.published":
       return "선택한 자막 결과를 게시했습니다.";
     default:
-      return genericMessage(event.message ?? "");
+      return genericMessage(event.message ?? "", event.event_code);
   }
 }
