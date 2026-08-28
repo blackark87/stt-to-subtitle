@@ -48,8 +48,6 @@ const ROW_CLASS: Record<JobState, string> = {
   done: "on-ok",
 };
 
-const GRID = "36px 156px minmax(240px, 1fr) 110px minmax(120px, 220px) 132px";
-
 export default function JobsPage() {
   const router = useRouter();
   const searchParams = useSearchParams();
@@ -256,7 +254,7 @@ export default function JobsPage() {
               </p>
             ) : null}
             <div className="tbl jobs-table" role="table" aria-label="작업 목록">
-              <div className="tr head" role="row" style={{ gridTemplateColumns: GRID }}>
+              <div className="tr head job-grid-row" role="row">
                 <span role="columnheader">
                   <input
                     type="checkbox"
@@ -272,7 +270,7 @@ export default function JobsPage() {
                 <span role="columnheader" className="r">최근 변경</span>
               </div>
               {jobs.length === 0 ? (
-                <div className="tr empty" role="row" style={{ gridTemplateColumns: "minmax(0, 1fr)" }}>
+                <div className="tr empty" role="row">
                   <span role="cell">{status === "loading" ? "불러오는 중" : "조건에 맞는 작업 없음"}</span>
                 </div>
               ) : (
@@ -288,10 +286,9 @@ export default function JobsPage() {
                   return (
                     <div
                       key={job.id}
-                      className={`tr job-table-row ${state ? ROW_CLASS[state] : ""}`}
+                      className={`tr job-grid-row job-table-row ${state ? ROW_CLASS[state] : ""}`}
                       role="row"
                       aria-selected={on}
-                      style={{ gridTemplateColumns: GRID }}
                     >
                       <span role="cell" className="job-select-cell"><input
                           type="checkbox"

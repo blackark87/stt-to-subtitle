@@ -164,6 +164,8 @@ a { color: var(--accent); text-decoration: none; }
 .t-name a:hover { color: var(--accent); }
 .t-name > span { color: var(--muted); font-size: .74rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .job-name-cell, .job-meta-cell { min-width: 0; }
+.jobs-table .job-grid-row { grid-template-columns: 36px 156px minmax(240px, 1fr) 110px minmax(120px, 220px) 132px; }
+.jobs-table .tr.empty { grid-template-columns: minmax(0, 1fr); }
 .job-meta-cell > .b { justify-self: start; }
 .job-state-cell > .b, .job-phase-cell > .b {
   max-width: 100%;
