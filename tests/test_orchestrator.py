@@ -2531,6 +2531,61 @@ class SubtitleOrchestratorTests(unittest.TestCase):
             finally:
                 orchestrator.stop()
 
+    def test_scheduler_recovers_job_whose_previous_worker_lease_expires(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            audio_path = root / "audio.wav"
+            audio_path.write_bytes(b"wav")
+            orchestrator = self.make_orchestrator(root, media_root)
+            try:
+                job = orchestrator.store.create(
+                    job_id="expired-runtime-worker",
+                    source_rel="movie.mkv",
+                    force_overwrite=False,
+                    options={},
+                    status="audio_ready",
+                )
+                orchestrator.store.update(job.id, audio_path=str(audio_path))
+                orchestrator.store.claim_for_dispatch(
+                    job.id,
+                    "audio_ready",
+                    "transcription_running",
+                    lease_owner="stopped-backend",
+                    lease_seconds=60,
+                    stt_runtime_id="builtin",
+                )
+                orchestrator.store.update(
+                    job.id,
+                    stt_job_id="remote-job",
+                    lease_expires_at=time.time() - 1,
+                )
+                orchestrator._stt_executor.submit = Mock()
+
+                orchestrator._scheduler_tick()
+
+                recovered = orchestrator.store.get(job.id)
+                self.assertEqual(recovered.status, "transcription_running")
+                self.assertEqual(recovered.lease_owner, orchestrator._worker_id)
+                orchestrator._stt_executor.submit.assert_called_once_with(
+                    orchestrator._run_stage,
+                    job.id,
+                    "transcription",
+                    orchestrator._transcribe,
+                    ANY,
+                )
+                self.assertTrue(
+                    any(
+                        event["event_code"] == "transcription.reconnected"
+                        for event in orchestrator.store.events(job.id)
+                    )
+                )
+            finally:
+                orchestrator.stop()
+
     def test_stops_only_selected_jobs(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -4033,7 +4088,14 @@ class SchedulerDispatchTests(unittest.TestCase):
                     force_overwrite=False,
                     options={},
                 )
-                orchestrator.store.update(rendering.id, status="rendering")
+                orchestrator.store.update(rendering.id, status="translated")
+                orchestrator.store.claim_for_dispatch(
+                    rendering.id,
+                    "translated",
+                    "rendering",
+                    lease_owner="active-render-worker",
+                    lease_seconds=60,
+                )
 
                 orchestrator._scheduler_tick()
 

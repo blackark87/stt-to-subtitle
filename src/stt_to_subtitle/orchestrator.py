@@ -3403,6 +3403,7 @@ class SubtitleOrchestrator:
             self._stop_event.wait(1.0)
 
     def _scheduler_tick(self) -> None:
+        self._reconcile_interrupted_jobs()
         self._schedule_runtime_reprobes()
         if not self.store.ids_with_status("rendering"):
             self._dispatch_one(
