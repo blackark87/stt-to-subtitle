@@ -169,11 +169,13 @@ class OpenAICompatibleModelTests(unittest.TestCase):
 
 
 class TranslationRouterAdminClientTests(unittest.TestCase):
-    def test_lists_translation_endpoints_without_changing_payload(self) -> None:
+    def test_lists_independent_translation_groups(self) -> None:
         response = Mock(status_code=200)
         response.json.return_value = {
-            "items": [{"id": "builtin", "name": "기본 번역 서버"}],
-            "total": 1,
+            "items": [
+                {"stage": "draft", "model": "draft-model", "servers": []},
+                {"stage": "review", "model": "review-model", "servers": []},
+            ],
         }
         client = TranslationRouterAdminClient(
             "http://translation.test/v1/",
@@ -181,12 +183,12 @@ class TranslationRouterAdminClientTests(unittest.TestCase):
         )
 
         with patch.object(client, "request", return_value=response) as request:
-            items = client.list_endpoints()
+            items = client.list_groups()
 
-        self.assertEqual(items[0]["id"], "builtin")
+        self.assertEqual([item["stage"] for item in items], ["draft", "review"])
         request.assert_called_once_with(
             "GET",
-            "http://translation.test/v1/router/endpoints",
+            "http://translation.test/v1/router/groups",
             metric_operation="endpoint_settings",
             headers={
                 "Accept": "application/json",

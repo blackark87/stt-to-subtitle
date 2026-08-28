@@ -53,9 +53,10 @@ class BackendAPIBoundaryTests(unittest.TestCase):
         self.assertIn("/api/v1/runtimes", paths)
         self.assertIn("/api/v1/runtimes/{runtime_id}", paths)
         self.assertIn("/api/v1/runtimes/{runtime_id}/probe", paths)
-        self.assertIn("/api/v1/translation-endpoints", paths)
+        self.assertIn("/api/v1/translation-groups/{stage}/model", paths)
+        self.assertIn("/api/v1/translation-groups/{stage}/servers", paths)
         self.assertIn(
-            "/api/v1/translation-endpoints/{endpoint_id}/routing",
+            "/api/v1/translation-groups/{stage}/servers/{endpoint_id}/routing",
             paths,
         )
         self.assertIn("/api/v1/settings/subtitle-validator", paths)

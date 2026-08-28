@@ -962,57 +962,70 @@ class TranslationRouterAdminClient(RetryingJSONClient):
             )
         return dict(result)
 
-    def list_endpoints(self) -> list[dict[str, Any]]:
-        payload = self._json_request("GET", "/router/endpoints")
+    def list_groups(self) -> list[dict[str, Any]]:
+        payload = self._json_request("GET", "/router/groups")
         items = payload.get("items")
         if not isinstance(items, list) or not all(
             isinstance(item, Mapping) for item in items
         ):
             raise ExternalServiceError(
-                "translation router returned an invalid endpoint list"
+                "translation router returned an invalid group list"
             )
         return [dict(item) for item in items]
 
-    def create_endpoint(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+    def update_group_model(self, stage: str, model: str) -> dict[str, Any]:
+        return self._json_request(
+            "PUT",
+            f"/router/groups/{stage}/model",
+            payload={"model": model},
+        )
+
+    def create_endpoint(
+        self,
+        stage: str,
+        payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
         return self._json_request(
             "POST",
-            "/router/endpoints",
+            f"/router/groups/{stage}/servers",
             payload=payload,
             expected_statuses={201},
         )
 
     def update_endpoint(
         self,
+        stage: str,
         endpoint_id: str,
         payload: Mapping[str, Any],
     ) -> dict[str, Any]:
         return self._json_request(
             "PUT",
-            f"/router/endpoints/{endpoint_id}",
+            f"/router/groups/{stage}/servers/{endpoint_id}",
             payload=payload,
         )
 
-    def delete_endpoint(self, endpoint_id: str) -> None:
+    def delete_endpoint(self, stage: str, endpoint_id: str) -> None:
         self._json_request(
             "DELETE",
-            f"/router/endpoints/{endpoint_id}",
+            f"/router/groups/{stage}/servers/{endpoint_id}",
             expected_statuses={204},
         )
 
-    def probe_endpoint(self, endpoint_id: str) -> dict[str, Any]:
+    def probe_endpoint(self, stage: str, endpoint_id: str) -> dict[str, Any]:
         return self._json_request(
             "POST",
-            f"/router/endpoints/{endpoint_id}/probe",
+            f"/router/groups/{stage}/servers/{endpoint_id}/probe",
         )
 
     def update_routing(
         self,
+        stage: str,
         endpoint_id: str,
         payload: Mapping[str, Any],
     ) -> dict[str, Any]:
         return self._json_request(
             "PUT",
-            f"/router/endpoints/{endpoint_id}/routing",
+            f"/router/groups/{stage}/servers/{endpoint_id}/routing",
             payload=payload,
         )
 

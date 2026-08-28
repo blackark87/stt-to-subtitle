@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 
 
 JobOperation = Literal["extract", "transcribe", "translate", "full", "compare"]
+TranslationStage = Literal["draft", "review"]
 
 
 class JobCreateRequest(BaseModel):
@@ -76,10 +77,12 @@ class TranslationEndpointUpdateRequest(BaseModel):
 
 
 class TranslationEndpointRoutingRequest(BaseModel):
-    draft_model: str = ""
-    review_model: str = ""
-    review_enabled: bool = False
+    enabled: bool = True
     batch_preferred: bool = False
+
+
+class TranslationGroupModelRequest(BaseModel):
+    model: str = Field(min_length=1)
 
 
 class RuntimeEndpointCreateRequest(BaseModel):

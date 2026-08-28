@@ -19,9 +19,9 @@ Docker Compose 프로젝트로 빌드하고 실행합니다. 애플리케이션 
                                   ├──▶ Runtime 풀 (HTTP + 진행 상태 SSE)
                                   │      ├─ runtime:8100 (기본)
                                   │      └─ 외부 GPU Runtime 1..N
-                                  ├──▶ translation:8200 (서버 레지스트리·라우터)
-                                  │      ├─ 기본 번역 서버
-                                  │      └─ 추가 번역 서버 1..N
+                                  ├──▶ translation:8200 (독립 서버 그룹·라우터)
+                                  │      ├─ 1차(초벌): 기본 + 추가 서버 1..N
+                                  │      └─ 2차(검증): 기본 + 추가 서버 1..N
                                   └──▶ 선택형 상용 검증 Provider
 ```
 
@@ -29,7 +29,7 @@ Compose 프로젝트에는 네 실행 컨테이너가 있습니다.
 
 - `web`: Nginx로 최소 정적 화면과 자산을 제공하고 `/api`만 프록시
 - `backend`: 작업 API, 상태 저장, FFmpeg 추출, 번역, SRT·ASS 렌더링
-- `translation`: 번역 서버 등록, 모델 조회, 초벌·검증 요청 라우팅
+- `translation`: 1차·2차 독립 서버 등록, 모델 조회, 단계별 요청 라우팅
 - `runtime`: WhisperJAV, Kotoba, WhisperX, 하이브리드 전사를 제공하는 CUDA
   FastAPI 서버
 
@@ -38,10 +38,11 @@ Backend와 Runtime은 Compose 내부 네트워크의 `http://runtime:8100`으로
 Traefik 외부 네트워크에 연결되고 HTTPS 라우터를 통해 제공됩니다.
 기본 Runtime을 포함한 All-in-One 구성이 기본값이며, 외부 호스트의 Runtime은
 Web UI에서 주소를 추가해 같은 전사 작업 풀로 확장할 수 있습니다. 번역 LLM
-서버는 전사 Runtime 풀과 분리됩니다. 기본 번역 서버는 배포 환경에서 등록하고,
-추가 번역 서버는 Web UI에서 Runtime과 같은 방식으로 이름·주소·토큰·동시 요청
-수를 설정합니다. Backend는 GPU나 호스트 역할을 알지 못하고 독립 번역 라우터에
-단계와 실행 모드만 전달합니다.
+서버는 전사 Runtime 풀과 분리됩니다. 1차(초벌)와 2차(검증) 번역도 서로 다른
+서버 레지스트리와 모델 설정을 가집니다. 각 그룹에서 기본 서버와 추가 서버를
+독립적으로 켜고 끄며 이름·주소·토큰·동시 요청 수·일괄 우선 서버를 설정합니다.
+Backend는 GPU나 호스트 역할을 알지 못하고 번역 라우터에 단계와 실행 모드만
+전달합니다.
 
 Kotoba, WhisperX, WhisperJAV는 요구하는 PyTorch·모델 의존성이 다르므로
 STT 이미지 안에서도 각각 `/opt/venvs/kotoba`, `/opt/venvs/whisperx`,
@@ -83,9 +84,11 @@ chmod 600 .env.compose
 - `HF_TOKEN`: Pyannote 접근 권한이 있는 Hugging Face read 토큰
 - `MEDIA_PATH`: 영상과 자막을 읽고 쓸 호스트 디렉터리
 - `TRAEFIK_HOST`: 웹 애플리케이션에 사용할 DNS 호스트명
-- `TRANSLATION_BUILTIN_BASE_URL`: 기본 OpenAI 호환 번역 서버 API 루트
-- `TRANSLATION_BUILTIN_DRAFT_MODEL`: 기본 서버의 초기 초벌 모델 ID
-- `TRANSLATION_BUILTIN_REVIEW_ENABLED`: 기본 서버를 검증 후보로 사용할지 여부
+- `TRANSLATION_BUILTIN_BASE_URL`: 1차·2차 그룹에 각각 생성되는 기본 서버의 OpenAI 호환 API 루트
+- `TRANSLATION_BUILTIN_DRAFT_MODEL`: 1차(초벌) 번역 그룹의 초기 모델 ID
+- `TRANSLATION_BUILTIN_REVIEW_MODEL`: 2차(검증) 번역 그룹의 초기 모델 ID
+- `TRANSLATION_BUILTIN_DRAFT_ENABLED`: 1차 그룹의 기본 서버 사용 여부
+- `TRANSLATION_BUILTIN_REVIEW_ENABLED`: 2차 그룹의 기본 서버 사용 여부
 - `TRANSLATION_STATE_PATH`: 추가 번역 서버와 모델 선택을 보존할 상태 디렉터리
 
 Compose는 경로 오타로 빈 호스트 디렉터리를 만들지 않습니다. 미디어, 상태,
@@ -351,17 +354,15 @@ SQLite에 저장합니다. 부분 JSON은 DB 결과에서 다시 만들 수 있�
 재번역과 JSON 직접 편집은 이전 결과를 보존한 새 generation으로 기록됩니다.
 작업 상세의 **번역 이력**에서 generation별 JSON을 내려받을 수 있습니다.
 
-**설정 → 번역 서버**에서 추가 OpenAI 호환 서버를 등록한 뒤 서버가 제공하는
-`/models` 목록을 갱신합니다. **초벌 번역**과 **검증 번역**은 서버마다 별도의
-모델 드롭다운을 사용합니다. 단건 초벌은 사용 가능한 서버의 여유 슬롯으로
-분산되고 실패 시 다음 서버로 전환됩니다. 여러 작업을 함께 등록한 일괄 번역은
-`일괄 처리 우선`으로 지정한 서버를 먼저 사용합니다.
+설정 화면의 **1차(초벌) 번역**과 **2차(검증) 번역**은 각각 모델 드롭다운과
+독립 서버 목록을 가집니다. 한 그룹에 등록한 서버는 다른 그룹이나 전사 Runtime에
+자동 등록되지 않습니다. 단건 번역은 해당 그룹에서 ON인 서버의 여유 슬롯으로
+분산되고 실패 시 같은 그룹의 다음 서버로 전환됩니다. 여러 작업을 함께 등록한
+일괄 번역은 해당 그룹에서 `일괄 작업 우선`으로 지정한 서버만 사용합니다.
 
-검증 단계는 서버별 **검증 서버 사용** 스위치가 켜져 있고 검증 모델이 선택된
-경우에만 후보에 포함됩니다. 따라서 큰 검증 모델을 적재할 수 없는 기본 서버는
-스위치를 끄면 모델 로드와 요청 자체가 발생하지 않습니다. 현재 예시 설정의 초벌
-모델은 `gemma-4-12b-coder-fable5-composer2.5-v1-uncensored-heretic`이며,
-추가 서버에서 조회되는 검증 모델로
+큰 검증 모델을 적재할 수 없는 기본 서버는 2차 그룹에서 OFF로 두면 모델 로드와
+요청 자체가 발생하지 않습니다. 현재 예시 설정의 1차 모델은
+`gemma-4-12b-coder-fable5-composer2.5-v1-uncensored-heretic`이며, 2차 모델은
 `gemma-4-26b-a4b-it-ultra-uncensored-heretic`를 선택할 수 있습니다. 상용 검증은
 이 로컬 2단계와 분리되어 있으며 설정된 경우에도 사용자가 명시적으로 요청할
 때만 실행합니다.

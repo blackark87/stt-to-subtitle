@@ -25,6 +25,7 @@ from .backend_contracts import (
     TranslationEndpointCreateRequest,
     TranslationEndpointRoutingRequest,
     TranslationEndpointUpdateRequest,
+    TranslationGroupModelRequest,
     TranslationModelLookupRequest,
 )
 from .job_state import JobPhase, JobReason, JobState
@@ -165,11 +166,11 @@ def capabilities() -> dict[str, Any]:
 @router.get("/settings")
 def settings(request: Request) -> dict[str, Any]:
     service = service_from_request(request)
-    translation_endpoints: list[dict[str, Any]] = []
+    translation_groups: list[dict[str, Any]] = []
     translation_router_error: str | None = None
     if service.settings.translation_service_base_url.strip():
         try:
-            translation_endpoints = service.translation_endpoints_view()
+            translation_groups = service.translation_groups_view()
         except (ExternalServiceError, ValueError) as error:
             translation_router_error = service.sanitize_external_error(
                 str(error)
@@ -177,7 +178,7 @@ def settings(request: Request) -> dict[str, Any]:
     return {
         "servers": service.remote_servers_view(),
         "runtimes": service.runtime_endpoints_view(),
-        "translation_endpoints": translation_endpoints,
+        "translation_groups": translation_groups,
         "translation_router_error": translation_router_error,
         "subtitle_validator": service.subtitle_validator_view(),
         "path_display_rules": public_value(service.path_display_rules),
@@ -295,27 +296,46 @@ def _translation_router_failure(error: Exception) -> HTTPException:
     )
 
 
-@router.post("/translation-endpoints", status_code=201)
+@router.put("/translation-groups/{stage}/model")
+def update_translation_group_model(
+    stage: str,
+    payload: TranslationGroupModelRequest,
+    request: Request,
+) -> dict[str, Any]:
+    try:
+        return service_from_request(request).update_translation_group_model(
+            stage,
+            payload.model,
+        )
+    except (ExternalServiceError, ValueError) as error:
+        raise _translation_router_failure(error) from error
+
+
+@router.post("/translation-groups/{stage}/servers", status_code=201)
 def create_translation_endpoint(
+    stage: str,
     payload: TranslationEndpointCreateRequest,
     request: Request,
 ) -> dict[str, Any]:
     try:
         return service_from_request(request).create_translation_endpoint(
+            stage,
             payload.model_dump()
         )
     except (ExternalServiceError, ValueError) as error:
         raise _translation_router_failure(error) from error
 
 
-@router.put("/translation-endpoints/{endpoint_id}")
+@router.put("/translation-groups/{stage}/servers/{endpoint_id}")
 def update_translation_endpoint(
+    stage: str,
     endpoint_id: str,
     payload: TranslationEndpointUpdateRequest,
     request: Request,
 ) -> dict[str, Any]:
     try:
         return service_from_request(request).update_translation_endpoint(
+            stage,
             endpoint_id,
             payload.model_dump(),
         )
@@ -323,33 +343,43 @@ def update_translation_endpoint(
         raise _translation_router_failure(error) from error
 
 
-@router.delete("/translation-endpoints/{endpoint_id}", status_code=204)
+@router.delete(
+    "/translation-groups/{stage}/servers/{endpoint_id}",
+    status_code=204,
+)
 def delete_translation_endpoint(
+    stage: str,
     endpoint_id: str,
     request: Request,
 ) -> Response:
     try:
-        service_from_request(request).delete_translation_endpoint(endpoint_id)
+        service_from_request(request).delete_translation_endpoint(
+            stage,
+            endpoint_id,
+        )
     except (ExternalServiceError, ValueError) as error:
         raise _translation_router_failure(error) from error
     return Response(status_code=204)
 
 
-@router.post("/translation-endpoints/{endpoint_id}/probe")
+@router.post("/translation-groups/{stage}/servers/{endpoint_id}/probe")
 def probe_translation_endpoint(
+    stage: str,
     endpoint_id: str,
     request: Request,
 ) -> dict[str, Any]:
     try:
         return service_from_request(request).probe_translation_endpoint(
+            stage,
             endpoint_id
         )
     except (ExternalServiceError, ValueError) as error:
         raise _translation_router_failure(error) from error
 
 
-@router.put("/translation-endpoints/{endpoint_id}/routing")
+@router.put("/translation-groups/{stage}/servers/{endpoint_id}/routing")
 def update_translation_endpoint_routing(
+    stage: str,
     endpoint_id: str,
     payload: TranslationEndpointRoutingRequest,
     request: Request,
@@ -358,6 +388,7 @@ def update_translation_endpoint_routing(
         return service_from_request(
             request
         ).update_translation_endpoint_routing(
+            stage,
             endpoint_id,
             payload.model_dump(),
         )

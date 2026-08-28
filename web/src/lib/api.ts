@@ -45,17 +45,17 @@ export interface RuntimeEndpoint {
   available_slots: number;
 }
 
-export interface TranslationEndpoint {
+export type TranslationStage = "draft" | "review";
+
+export interface TranslationServer {
   id: string;
+  stage: TranslationStage;
   name: string;
   base_url: string;
   token_configured: boolean;
   enabled: boolean;
   capacity: number;
   builtin: boolean;
-  draft_model: string;
-  review_model: string;
-  review_enabled: boolean;
   batch_preferred: boolean;
   models: string[];
   status: string;
@@ -63,6 +63,13 @@ export interface TranslationEndpoint {
   checked_at: number | null;
   running_jobs: number;
   available_slots: number;
+}
+
+export interface TranslationGroup {
+  stage: TranslationStage;
+  label: string;
+  model: string;
+  servers: TranslationServer[];
 }
 
 export interface GpuDevice {
@@ -169,7 +176,7 @@ export interface ServerSettings {
 export interface SettingsPayload {
   servers: ServerSettings;
   runtimes: RuntimeEndpoint[];
-  translation_endpoints: TranslationEndpoint[];
+  translation_groups: TranslationGroup[];
   translation_router_error: string | null;
   path_display_rules: PathDisplayRule[];
   prompt_categories: PromptCategory[];
@@ -424,17 +431,25 @@ export const api = {
     lm_model: string;
     translation_workers: number;
   }) => request<unknown>("/settings/servers", { method: "PUT", ...json(body) }),
-  createTranslationEndpoint: (body: {
+  updateTranslationGroupModel: (
+    stage: TranslationStage,
+    model: string,
+  ) => request<TranslationGroup>(
+    `/translation-groups/${stage}/model`,
+    { method: "PUT", ...json({ model }) },
+  ),
+  createTranslationEndpoint: (stage: TranslationStage, body: {
     name: string;
     base_url: string;
     token: string;
     enabled: boolean;
     capacity: number;
-  }) => request<TranslationEndpoint>("/translation-endpoints", {
+  }) => request<TranslationServer>(`/translation-groups/${stage}/servers`, {
     method: "POST",
     ...json(body),
   }),
   updateTranslationEndpoint: (
+    stage: TranslationStage,
     id: string,
     body: {
       name: string;
@@ -444,28 +459,27 @@ export const api = {
       enabled: boolean;
       capacity: number;
     },
-  ) => request<TranslationEndpoint>(
-    `/translation-endpoints/${encodeURIComponent(id)}`,
+  ) => request<TranslationServer>(
+    `/translation-groups/${stage}/servers/${encodeURIComponent(id)}`,
     { method: "PUT", ...json(body) },
   ),
-  deleteTranslationEndpoint: (id: string) => request<unknown>(
-    `/translation-endpoints/${encodeURIComponent(id)}`,
+  deleteTranslationEndpoint: (stage: TranslationStage, id: string) => request<unknown>(
+    `/translation-groups/${stage}/servers/${encodeURIComponent(id)}`,
     { method: "DELETE" },
   ),
-  probeTranslationEndpoint: (id: string) => request<TranslationEndpoint>(
-    `/translation-endpoints/${encodeURIComponent(id)}/probe`,
+  probeTranslationEndpoint: (stage: TranslationStage, id: string) => request<TranslationServer>(
+    `/translation-groups/${stage}/servers/${encodeURIComponent(id)}/probe`,
     { method: "POST" },
   ),
   updateTranslationEndpointRouting: (
+    stage: TranslationStage,
     id: string,
     body: {
-      draft_model: string;
-      review_model: string;
-      review_enabled: boolean;
+      enabled: boolean;
       batch_preferred: boolean;
     },
-  ) => request<TranslationEndpoint>(
-    `/translation-endpoints/${encodeURIComponent(id)}/routing`,
+  ) => request<TranslationServer>(
+    `/translation-groups/${stage}/servers/${encodeURIComponent(id)}/routing`,
     { method: "PUT", ...json(body) },
   ),
   createPathDisplayRule: (body: {

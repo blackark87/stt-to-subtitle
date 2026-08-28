@@ -492,40 +492,56 @@ class SubtitleOrchestrator:
             request_observer=self.record_external_request,
         )
 
-    def translation_endpoints_view(self) -> list[dict[str, Any]]:
-        return self._translation_router_admin().list_endpoints()
+    def translation_groups_view(self) -> list[dict[str, Any]]:
+        return self._translation_router_admin().list_groups()
+
+    def update_translation_group_model(
+        self,
+        stage: str,
+        model: str,
+    ) -> dict[str, Any]:
+        return self._translation_router_admin().update_group_model(stage, model)
 
     def create_translation_endpoint(
         self,
+        stage: str,
         payload: Mapping[str, Any],
     ) -> dict[str, Any]:
-        return self._translation_router_admin().create_endpoint(payload)
+        return self._translation_router_admin().create_endpoint(stage, payload)
 
     def update_translation_endpoint(
         self,
+        stage: str,
         endpoint_id: str,
         payload: Mapping[str, Any],
     ) -> dict[str, Any]:
         return self._translation_router_admin().update_endpoint(
+            stage,
             endpoint_id,
             payload,
         )
 
-    def delete_translation_endpoint(self, endpoint_id: str) -> None:
-        self._translation_router_admin().delete_endpoint(endpoint_id)
+    def delete_translation_endpoint(self, stage: str, endpoint_id: str) -> None:
+        self._translation_router_admin().delete_endpoint(stage, endpoint_id)
 
     def probe_translation_endpoint(
         self,
+        stage: str,
         endpoint_id: str,
     ) -> dict[str, Any]:
-        return self._translation_router_admin().probe_endpoint(endpoint_id)
+        return self._translation_router_admin().probe_endpoint(
+            stage,
+            endpoint_id,
+        )
 
     def update_translation_endpoint_routing(
         self,
+        stage: str,
         endpoint_id: str,
         payload: Mapping[str, Any],
     ) -> dict[str, Any]:
         return self._translation_router_admin().update_routing(
+            stage,
             endpoint_id,
             payload,
         )
