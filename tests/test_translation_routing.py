@@ -668,12 +668,106 @@ class BackendTranslationRoutingTests(unittest.TestCase):
             self.assertEqual(request.call_count, 2)
             sleep.assert_called_once_with(1.0)
 
-    def test_batch_requires_the_selected_server(self) -> None:
+    def test_batch_uses_an_enabled_server_without_a_preference(self) -> None:
         with TemporaryDirectory() as directory:
             routing = self.routing(Path(directory))
+            response = completion_response()
 
-            with self.assertRaisesRegex(ExternalServiceError, "설정되지"):
-                routing.request_completion("draft", "batch", {"messages": []})
+            with patch.object(
+                RetryingJSONClient,
+                "request",
+                return_value=response,
+            ) as request:
+                result = routing.request_completion(
+                    "draft",
+                    "batch",
+                    {"messages": []},
+                )
+
+            self.assertIs(result, response)
+            self.assertEqual(
+                request.call_args.args[1],
+                "http://builtin.test/v1/chat/completions",
+            )
+
+    def test_batch_prefers_selected_server_but_falls_back(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            stores = self.stores(root)
+            preferred = stores["draft"].create(
+                name="preferred",
+                base_url="http://preferred.test/v1",
+                token="",
+                enabled=True,
+                capacity=1,
+                batch_preferred=True,
+                selected_model="preferred-model",
+                models=("preferred-model",),
+            )
+            routing = self.routing(root, stores=stores)
+            response = completion_response()
+
+            with patch.object(
+                RetryingJSONClient,
+                "request",
+                side_effect=[ExternalServiceError("model unavailable"), response],
+            ) as request:
+                result = routing.request_completion(
+                    "draft",
+                    "batch",
+                    {"messages": []},
+                )
+
+            self.assertIs(result, response)
+            self.assertEqual(
+                [call.args[1] for call in request.call_args_list],
+                [
+                    f"{preferred.base_url}/chat/completions",
+                    "http://builtin.test/v1/chat/completions",
+                ],
+            )
+
+    def test_batch_falls_back_while_review_reserves_preferred_host(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            stores = self.stores(root)
+            stores["draft"].create(
+                name="shared draft",
+                base_url="http://shared.test:1234/v1",
+                token="",
+                enabled=True,
+                capacity=1,
+                batch_preferred=True,
+                selected_model="shared-draft-model",
+                models=("shared-draft-model",),
+            )
+            stores["review"].create(
+                name="shared review",
+                base_url="http://shared.test:1234/v1",
+                token="",
+                enabled=True,
+                capacity=1,
+                selected_model="shared-review-model",
+                models=("shared-review-model",),
+            )
+            routing = self.routing(root, stores=stores)
+
+            with patch.object(
+                RetryingJSONClient,
+                "request",
+                return_value=completion_response(),
+            ) as request, routing.review_priority("batch"):
+                result = routing.request_completion(
+                    "draft",
+                    "batch",
+                    {"messages": []},
+                )
+
+            self.assertEqual(result.status_code, 200)
+            self.assertEqual(
+                request.call_args.args[1],
+                "http://builtin.test/v1/chat/completions",
+            )
 
     def test_direct_request_fails_over_inside_one_group(self) -> None:
         with TemporaryDirectory() as directory:

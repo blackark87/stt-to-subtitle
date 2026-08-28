@@ -361,10 +361,18 @@ export const api = {
       method: "POST",
       ...json({ job_ids: jobIds }),
     }),
-  translateJobs: (jobIds: string[], promptCategoryId: string) =>
+  translateJobs: (
+    jobIds: string[],
+    promptCategoryId: string,
+    targetStage: TranslationStage,
+  ) =>
     request<unknown>("/jobs/actions/translate", {
       method: "POST",
-      ...json({ job_ids: jobIds, prompt_category_id: promptCategoryId }),
+      ...json({
+        job_ids: jobIds,
+        prompt_category_id: promptCategoryId,
+        target_stage: targetStage,
+      }),
     }),
   retryJob: (jobId: string) =>
     request<unknown>(`/jobs/${encodeURIComponent(jobId)}/retry`, { method: "POST" }),

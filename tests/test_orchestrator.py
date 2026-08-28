@@ -1620,6 +1620,82 @@ class SubtitleOrchestratorTests(unittest.TestCase):
             self.assertEqual(original.id, reused.id)
             self.assertEqual([job.id for job in all_jobs], [transcribed.id])
 
+    def test_selected_translation_target_stage_controls_review_pass(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            orchestrator = self.make_orchestrator(root, media_root)
+            jobs = {}
+            try:
+                for target_stage in ("draft", "review"):
+                    source_rel = f"{target_stage}.mkv"
+                    (media_root / source_rel).write_bytes(b"media")
+                    job = orchestrator.store.create(
+                        job_id=f"{target_stage}-job",
+                        source_rel=source_rel,
+                        force_overwrite=False,
+                        options={},
+                        operation="transcribe",
+                    )
+                    transcript_path = (
+                        root / "state" / "jobs" / job.id / "transcript.json"
+                    )
+                    transcript_path.parent.mkdir(parents=True)
+                    transcript_path.write_text(
+                        json.dumps(
+                            {
+                                "schema_version": 1,
+                                "job_id": f"remote-{target_stage}",
+                                "segments": [
+                                    {
+                                        "id": "segment-000001",
+                                        "start": 0,
+                                        "end": 1,
+                                        "speaker": "SPEAKER_00",
+                                        "text": "こんにちは",
+                                    }
+                                ],
+                            },
+                            ensure_ascii=False,
+                        ),
+                        encoding="utf-8",
+                    )
+                    orchestrator.store.update(
+                        job.id,
+                        status="transcription_completed",
+                        transcript_path=str(transcript_path),
+                    )
+                    jobs[target_stage] = job
+
+                draft = orchestrator.create_selected_translation_jobs(
+                    [jobs["draft"].id],
+                    prompt_category_id="jav",
+                    target_stage="draft",
+                )[0]
+                review = orchestrator.create_selected_translation_jobs(
+                    [jobs["review"].id],
+                    prompt_category_id="variety",
+                    target_stage="review",
+                )[0]
+                with self.assertRaisesRegex(ValueError, "지원하지 않는"):
+                    orchestrator.create_selected_translation_jobs(
+                        [],
+                        prompt_category_id="jav",
+                        target_stage="unknown",
+                    )
+            finally:
+                orchestrator.stop()
+
+            draft_prompt = draft.options["translation_prompt"]
+            review_prompt = review.options["translation_prompt"]
+            self.assertEqual(draft.status, "transcribed")
+            self.assertEqual(draft_prompt["target_stage"], "draft")
+            self.assertEqual(draft_prompt["review_rounds"], 0)
+            self.assertEqual(review.status, "transcribed")
+            self.assertEqual(review_prompt["target_stage"], "review")
+            self.assertEqual(review_prompt["review_rounds"], 1)
+
     def test_selects_a_historical_prompt_revision_for_a_new_job(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)

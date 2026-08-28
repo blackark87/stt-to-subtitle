@@ -285,17 +285,31 @@ export default function JobsPage() {
               </select>
               <button
                 type="button"
-                className="btn sm"
+                className="btn sec sm"
                 disabled={!translationIds.length || !translationPromptId || busy}
-                title={!translationIds.length ? "전사 완료 작업을 선택하세요." : !translationPromptId ? "번역 프롬프트를 선택하세요." : undefined}
+                title={!translationIds.length ? "전사 완료 작업을 선택하세요." : !translationPromptId ? "번역 프롬프트를 선택하세요." : "1차 초벌 번역까지만 실행합니다."}
                 onClick={() => void run(
                   translationIds,
-                  (ids) => api.translateJobs(ids, translationPromptId),
-                  `${translationIds.length}건의 번역을 시작했습니다.`,
+                  (ids) => api.translateJobs(ids, translationPromptId, "draft"),
+                  `${translationIds.length}건의 1차 번역을 시작했습니다.`,
                 )}
               >
                 <Icon name="play" size={13} />
-                번역 시작 {translationIds.length || ""}
+                1차 번역 {translationIds.length || ""}
+              </button>
+              <button
+                type="button"
+                className="btn sm"
+                disabled={!translationIds.length || !translationPromptId || busy}
+                title={!translationIds.length ? "전사 완료 작업을 선택하세요." : !translationPromptId ? "번역 프롬프트를 선택하세요." : "1차 초벌 번역 후 2차 검수·교정을 실행합니다."}
+                onClick={() => void run(
+                  translationIds,
+                  (ids) => api.translateJobs(ids, translationPromptId, "review"),
+                  `${translationIds.length}건의 1차·2차 번역을 시작했습니다.`,
+                )}
+              >
+                <Icon name="play" size={13} />
+                2차 번역(1차 포함) {translationIds.length || ""}
               </button>
               <button type="button" className="btn sec sm" disabled={!retryIds.length || busy} onClick={() => void run(retryIds, api.retryJobs)}>
                 <Icon name="refresh" size={13} />

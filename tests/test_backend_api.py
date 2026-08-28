@@ -39,6 +39,7 @@ class BackendAPIBoundaryTests(unittest.TestCase):
         self.assertNotIn("/api/jobs", paths)
         self.assertIn("/api/v1/jobs", paths)
         self.assertIn("/api/v1/jobs/actions/retry", paths)
+        self.assertIn("/api/v1/jobs/actions/translate", paths)
         self.assertIn("/api/v1/jobs/{job_id}/retry", paths)
         self.assertIn("/api/v1/jobs/{job_id}/reprocess", paths)
         self.assertIn("/api/v1/jobs/{job_id}/artifacts/{kind}", paths)
@@ -77,6 +78,13 @@ class BackendAPIBoundaryTests(unittest.TestCase):
         self.assertNotIn("/jobs", paths)
         self.assertNotIn("/settings", paths)
         self.assertNotIn("/static", paths)
+
+        selection_schema = app.openapi()["components"]["schemas"][
+            "TranslationSelectionRequest"
+        ]
+        target_stage = selection_schema["properties"]["target_stage"]
+        self.assertEqual(target_stage["default"], "review")
+        self.assertEqual(target_stage["enum"], ["draft", "review"])
 
     def test_health_and_job_list_run_without_html_application(self) -> None:
         from fastapi.testclient import TestClient

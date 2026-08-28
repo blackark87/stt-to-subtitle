@@ -602,7 +602,6 @@ class BackendTranslationRouting:
                 not server.models
                 or server.selected_model in server.models
             )
-            and (mode != "batch" or server.batch_preferred)
         ]
 
     def _candidates(self, stage: str, mode: str) -> list[TranslationServer]:
@@ -626,6 +625,7 @@ class BackendTranslationRouting:
             key=lambda server: (
                 statuses.get((resolved, server.id)) == "unavailable",
                 running.get((resolved, server.id), 0) >= server.capacity,
+                mode == "batch" and not server.batch_preferred,
                 running.get((resolved, server.id), 0) / server.capacity,
                 not server.builtin,
                 server.created_at,

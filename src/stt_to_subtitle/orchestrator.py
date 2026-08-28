@@ -2322,8 +2322,11 @@ class SubtitleOrchestrator:
         job_ids: Sequence[str],
         *,
         prompt_category_id: str,
+        target_stage: str = "review",
     ) -> list[PipelineJob]:
         """Move selected, latest completed transcripts into translation."""
+        if target_stage not in {"draft", "review"}:
+            raise ValueError("지원하지 않는 번역 단계입니다.")
         if not self.translation_server_configured:
             raise ValueError("번역 서버 설정이 필요합니다.")
         selected_ids = list(
@@ -2335,6 +2338,10 @@ class SubtitleOrchestrator:
             raise ValueError("한 번에 등록할 수 있는 파일 수를 초과했습니다.")
 
         prompt_snapshot = self._prompt_snapshot(prompt_category_id)
+        prompt_snapshot["target_stage"] = target_stage
+        prompt_snapshot["review_rounds"] = (
+            TRANSLATION_REVIEW_ROUNDS if target_stage == "review" else 0
+        )
         latest_jobs = self.store.latest_jobs_by_source()
         reusable_transcripts: list[PipelineJob] = []
         for job_id in selected_ids:

@@ -26,6 +26,7 @@ class JobIdsRequest(BaseModel):
 
 class TranslationSelectionRequest(JobIdsRequest):
     prompt_category_id: str
+    target_stage: TranslationStage = "review"
 
 
 class ReprocessRequest(BaseModel):

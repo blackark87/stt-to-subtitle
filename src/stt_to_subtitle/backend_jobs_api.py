@@ -225,6 +225,7 @@ def translate_jobs(
         jobs = service_from_request(request).create_selected_translation_jobs(
             payload.job_ids,
             prompt_category_id=payload.prompt_category_id,
+            target_stage=payload.target_stage,
         )
     except (OSError, UnicodeError, ValueError) as error:
         raise bad_request(error) from error
