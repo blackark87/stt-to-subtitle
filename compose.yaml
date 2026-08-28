@@ -123,8 +123,10 @@ services:
     tmpfs:
       - /tmp:size=256m,mode=1777
     networks:
-      - app
-      - runtime
+      app:
+        ipv4_address: ${BACKEND_APP_IPV4:-172.24.0.2}
+      runtime:
+        ipv4_address: ${BACKEND_RUNTIME_IPV4:-172.23.0.3}
 
   runtime:
     platform: linux/amd64
@@ -203,7 +205,13 @@ services:
 
 networks:
   app:
+    ipam:
+      config:
+        - subnet: ${APP_NETWORK_SUBNET:-172.24.0.0/16}
   runtime:
+    ipam:
+      config:
+        - subnet: ${RUNTIME_NETWORK_SUBNET:-172.23.0.0/16}
   traefik:
     name: ${TRAEFIK_NETWORK:-proxy}
     external: true
