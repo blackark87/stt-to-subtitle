@@ -3,15 +3,25 @@
 import { useCallback, useMemo, useState } from "react";
 import { Freshness } from "@/components/Freshness";
 import { Icon } from "@/components/Icon";
-import {
-  api,
-  type MediaDurationMetricGroup,
-  type TranslationPassMetric,
-} from "@/lib/api";
+import { api } from "@/lib/api";
 import { useLiveQuery } from "@/lib/useLiveQuery";
 
 const INTERVAL_MS = 60_000;
 const WINDOW_OPTIONS = [30, 90, 365] as const;
+
+interface MetricView {
+  key: string;
+  bucket: number;
+  mediaAverage: number;
+  contextLabel: string;
+  context: string;
+  sampleCount: number;
+  average: number;
+  p50: number;
+  p95: number;
+  minimum: number;
+  maximum: number;
+}
 
 function duration(seconds: number): string {
   if (!Number.isFinite(seconds)) return "—";
@@ -29,108 +39,65 @@ function mediaDuration(seconds: number): string {
   return `${Math.round(seconds / 60)}분`;
 }
 
-function bucketLabel(minutes: number): string {
-  return `약 ${minutes}분`;
-}
-
-function timingCells(metric: {
-  sample_count: number;
-  media_average_seconds: number;
-  average: number;
-  p50: number;
-  p95: number;
-  minimum: number;
-  maximum: number;
-}) {
+function MetricRecord({ row }: { row: MetricView }) {
+  const values = [
+    ["표본", `${row.sampleCount}건`],
+    ["평균", duration(row.average)],
+    ["P50", duration(row.p50)],
+    ["P95", duration(row.p95)],
+    ["최소", duration(row.minimum)],
+    ["최대", duration(row.maximum)],
+  ];
   return (
-    <>
-      <span className="metrics-number" role="cell" data-label="표본">{metric.sample_count}건</span>
-      <span className="metrics-number" role="cell" data-label="영상 평균">{mediaDuration(metric.media_average_seconds)}</span>
-      <span className="metrics-number metrics-primary" role="cell" data-label="평균">{duration(metric.average)}</span>
-      <span className="metrics-number" role="cell" data-label="P50">{duration(metric.p50)}</span>
-      <span className="metrics-number" role="cell" data-label="P95">{duration(metric.p95)}</span>
-      <span className="metrics-number metrics-range" role="cell" data-label="최소–최대">
-        <span>{duration(metric.minimum)} – {duration(metric.maximum)}</span>
-      </span>
-    </>
+    <article className="metrics-record" role="listitem">
+      <div className="metrics-scope">
+        <span className="eyebrow">영상 구간</span>
+        <strong>약 {row.bucket}분</strong>
+        <small>실제 평균 {mediaDuration(row.mediaAverage)}</small>
+      </div>
+      <div className="metrics-context">
+        <span className="eyebrow">{row.contextLabel}</span>
+        <strong title={row.context}>{row.context}</strong>
+      </div>
+      <div className="metrics-values">
+        {values.map(([label, value]) => (
+          <div className={label === "평균" ? "metrics-value primary" : "metrics-value"} key={label}>
+            <span>{label}</span>
+            <strong title={value}>{value}</strong>
+          </div>
+        ))}
+      </div>
+    </article>
   );
 }
 
-function StageTable({
+function MetricsSection({
   title,
   subtitle,
   rows,
-  secondColumn,
-  secondValue,
-  translation = false,
+  emptyTitle,
+  emptyText,
 }: {
   title: string;
   subtitle: string;
-  rows: MediaDurationMetricGroup[];
-  secondColumn: string;
-  secondValue: (row: MediaDurationMetricGroup) => string;
-  translation?: boolean;
+  rows: MetricView[];
+  emptyTitle: string;
+  emptyText: string;
 }) {
+  const samples = rows.reduce((sum, row) => sum + row.sampleCount, 0);
   return (
-    <section className="card">
-      <div className="card-head"><div><h2>{title}</h2><span className="sub">{subtitle}</span></div><span className="sub">{rows.reduce((sum, row) => sum + row.sample_count, 0)}건</span></div>
-      <div className="card-body flush">
-        <div className="tbl" role="table" aria-label={title}>
-          <div className={`tr head metrics-grid${translation ? " translation" : ""}`} role="row">
-            <span role="columnheader">영상 구간</span><span role="columnheader">{secondColumn}</span><span role="columnheader" className="r">표본</span><span role="columnheader" className="r">영상 평균</span><span role="columnheader" className="r">평균</span><span role="columnheader" className="r">P50</span><span role="columnheader" className="r">P95</span><span role="columnheader" className="r">최소–최대</span>
-          </div>
-          {rows.length === 0 ? (
-            <div className="empty-state compact metrics-empty"><strong>완료된 표본이 없습니다</strong><span>선택한 기간에 측정된 작업이 쌓이면 여기에 표시됩니다.</span></div>
-          ) : rows.map((row) => (
-            <div className={`tr tall metrics-grid${translation ? " translation" : ""}`} role="row" key={`${row.media_duration_bucket_minutes}-${row.runtime_id ?? "translation"}`}>
-              <strong role="cell" data-label="영상 구간">{bucketLabel(row.media_duration_bucket_minutes)}</strong>
-              <span role="cell" data-label={secondColumn}>{secondValue(row)}</span>
-              {timingCells({
-                sample_count: row.sample_count,
-                media_average_seconds: row.media_average_seconds,
-                average: row.processing_average_seconds,
-                p50: row.processing_p50_seconds,
-                p95: row.processing_p95_seconds,
-                minimum: row.processing_minimum_seconds,
-                maximum: row.processing_maximum_seconds,
-              })}
-            </div>
-          ))}
-        </div>
+    <section className="card metrics-section">
+      <div className="card-head metrics-section-head">
+        <div><h2>{title}</h2><span className="sub" title={subtitle}>{subtitle}</span></div>
+        <span className="b line">{samples}건</span>
       </div>
-    </section>
-  );
-}
-
-function TranslationPassTable({ rows }: { rows: TranslationPassMetric[] }) {
-  const passLabel = (pass: TranslationPassMetric["pass"]) => pass === "draft" ? "초벌 번역" : "검증 번역";
-  return (
-    <section className="card">
-      <div className="card-head"><div><h2>번역 단계별 활성 시간</h2><span className="sub">병렬 요청이 겹친 시간은 한 번만 계산합니다.</span></div><span className="sub">{rows.reduce((sum, row) => sum + row.sample_count, 0)}건</span></div>
-      <div className="card-body flush">
-        <div className="tbl" role="table" aria-label="번역 단계별 활성 시간">
-          <div className="tr head metrics-grid translation" role="row">
-            <span role="columnheader">영상 구간</span><span role="columnheader">번역 단계</span><span role="columnheader" className="r">표본</span><span role="columnheader" className="r">영상 평균</span><span role="columnheader" className="r">평균</span><span role="columnheader" className="r">P50</span><span role="columnheader" className="r">P95</span><span role="columnheader" className="r">최소–최대</span>
-          </div>
-          {rows.length === 0 ? (
-            <div className="empty-state compact metrics-empty"><strong>완료된 번역 표본이 없습니다</strong><span>새 번역 작업부터 초벌·검증 시간이 기록됩니다.</span></div>
-          ) : rows.map((row) => (
-            <div className="tr tall metrics-grid translation" role="row" key={`${row.media_duration_bucket_minutes}-${row.pass}`}>
-              <strong role="cell" data-label="영상 구간">{bucketLabel(row.media_duration_bucket_minutes)}</strong>
-              <span role="cell" data-label="번역 단계">{passLabel(row.pass)}</span>
-              {timingCells({
-                sample_count: row.sample_count,
-                media_average_seconds: row.media_average_seconds,
-                average: row.active_average_seconds,
-                p50: row.active_p50_seconds,
-                p95: row.active_p95_seconds,
-                minimum: row.active_minimum_seconds,
-                maximum: row.active_maximum_seconds,
-              })}
-            </div>
-          ))}
+      {rows.length === 0 ? (
+        <div className="empty-state compact metrics-empty"><strong>{emptyTitle}</strong><span>{emptyText}</span></div>
+      ) : (
+        <div className="metrics-records" role="list">
+          {rows.map((row) => <MetricRecord row={row} key={row.key} />)}
         </div>
-      </div>
+      )}
     </section>
   );
 }
@@ -145,26 +112,88 @@ export default function MetricsPage() {
   const translationPasses = (data?.translation_passes ?? []).filter((row) => row.outcome === "completed");
   const excluded = (data?.groups ?? []).filter((row) => row.outcome !== "completed").reduce((sum, row) => sum + row.sample_count, 0);
 
+  const transcriptionRows: MetricView[] = transcription.map((row) => ({
+    key: `${row.media_duration_bucket_minutes}-${row.runtime_id ?? "unknown"}`,
+    bucket: row.media_duration_bucket_minutes,
+    mediaAverage: row.media_average_seconds,
+    contextLabel: "전사 Runtime",
+    context: row.runtime_name ?? row.runtime_id ?? "Runtime 미확인",
+    sampleCount: row.sample_count,
+    average: row.processing_average_seconds,
+    p50: row.processing_p50_seconds,
+    p95: row.processing_p95_seconds,
+    minimum: row.processing_minimum_seconds,
+    maximum: row.processing_maximum_seconds,
+  }));
+  const translationRows: MetricView[] = translation.map((row) => ({
+    key: `${row.media_duration_bucket_minutes}-translation`,
+    bucket: row.media_duration_bucket_minutes,
+    mediaAverage: row.media_average_seconds,
+    contextLabel: "처리 범위",
+    context: "전체 번역",
+    sampleCount: row.sample_count,
+    average: row.processing_average_seconds,
+    p50: row.processing_p50_seconds,
+    p95: row.processing_p95_seconds,
+    minimum: row.processing_minimum_seconds,
+    maximum: row.processing_maximum_seconds,
+  }));
+  const passRows: MetricView[] = translationPasses.map((row) => ({
+    key: `${row.media_duration_bucket_minutes}-${row.pass}`,
+    bucket: row.media_duration_bucket_minutes,
+    mediaAverage: row.media_average_seconds,
+    contextLabel: "번역 단계",
+    context: row.pass === "draft" ? "초벌 번역" : "검증 번역",
+    sampleCount: row.sample_count,
+    average: row.active_average_seconds,
+    p50: row.active_p50_seconds,
+    p95: row.active_p95_seconds,
+    minimum: row.active_minimum_seconds,
+    maximum: row.active_maximum_seconds,
+  }));
+  const transcriptionSamples = transcription.reduce((sum, row) => sum + row.sample_count, 0);
+  const translationSamples = translation.reduce((sum, row) => sum + row.sample_count, 0);
+  const passSamples = translationPasses.reduce((sum, row) => sum + row.sample_count, 0);
+
   return (
     <>
       <header className="topbar">
         <div className="page-title"><h1>처리 시간 통계</h1><p>영상 길이 구간별 전사·번역 소요 시간을 비교합니다.</p></div>
         <span className="topbar-spacer" />
-        <label className="compact-field"><span>조회 기간</span><select className="ctl sm" value={windowDays} onChange={(event) => setWindowDays(Number(event.target.value))}>{WINDOW_OPTIONS.map((days) => <option value={days} key={days}>최근 {days}일</option>)}</select></label>
         <Freshness status={status} updatedAt={updatedAt} error={error} refreshing={refreshing} />
         <button type="button" className="btn sec" disabled={refreshing} onClick={() => void refresh()}><Icon name="refresh" size={14} />새로고침</button>
       </header>
 
-      <div className="content">
-        <section className="card"><div className="card-body metrics-note"><p><strong>완료된 작업만</strong> 시간 비교 표에 포함합니다. 영상 길이는 가장 가까운 15분 구간으로 묶으며, 정확한 15·30·45분 영상만 뜻하지 않습니다.</p><p className="muted">전사는 Runtime별로 구분합니다. 번역은 단일 번역 서비스 기준이며 Runtime 구분이 없습니다.{excluded > 0 ? ` 실패·중지·차단 표본 ${excluded}건은 완료 통계에서 제외했습니다.` : ""}</p></div></section>
+      <div className="content metrics-content">
+        <section className="card">
+          <div className="card-body metrics-toolbar">
+            <div className="metrics-note">
+              <strong>완료된 작업의 실제 처리 시간</strong>
+              <p>영상 길이는 가장 가까운 15분 구간으로 묶습니다. 전사는 Runtime별로, 번역은 전체·초벌·검증 단계별로 구분합니다.</p>
+              {excluded > 0 ? <small>실패·중지·차단 표본 {excluded}건은 완료 통계에서 제외했습니다.</small> : null}
+            </div>
+            <label className="compact-field metrics-window">
+              <span>조회 기간</span>
+              <select className="ctl" value={windowDays} onChange={(event) => setWindowDays(Number(event.target.value))}>
+                {WINDOW_OPTIONS.map((days) => <option value={days} key={days}>최근 {days}일</option>)}
+              </select>
+            </label>
+          </div>
+        </section>
 
         {!data ? (
           <section className="card"><div className="empty-state"><strong>{status === "error" ? "통계를 불러오지 못했습니다" : "처리 시간 통계를 불러오는 중입니다"}</strong><span>{status === "error" ? (error ?? "Backend 연결을 확인하세요.") : "잠시만 기다려 주세요."}</span></div></section>
         ) : (
           <>
-            <StageTable title="전사 소요 시간" subtitle="영상 구간 × 전사 Runtime" rows={transcription} secondColumn="전사 Runtime" secondValue={(row) => row.runtime_name ?? row.runtime_id ?? "Runtime 미확인"} />
-            <StageTable title="번역 전체 소요 시간" subtitle="초벌부터 검증 완료까지" rows={translation} secondColumn="범위" secondValue={() => "전체 번역"} translation />
-            <TranslationPassTable rows={translationPasses} />
+            <section className="summary-grid metrics-summary" aria-label="처리 시간 표본 요약">
+              <article className="summary-card"><span>전사 완료 표본</span><strong>{transcriptionSamples}</strong><small>Runtime별 집계</small></article>
+              <article className="summary-card"><span>번역 완료 표본</span><strong>{translationSamples}</strong><small>전체 번역 시간</small></article>
+              <article className="summary-card"><span>단계별 번역 표본</span><strong>{passSamples}</strong><small>초벌·검증 활성 시간</small></article>
+              <article className={excluded > 0 ? "summary-card attention" : "summary-card"}><span>완료 제외 표본</span><strong>{excluded}</strong><small>실패·중지·차단</small></article>
+            </section>
+            <MetricsSection title="전사 소요 시간" subtitle="영상 구간 × 전사 Runtime" rows={transcriptionRows} emptyTitle="완료된 전사 표본이 없습니다" emptyText="선택한 기간에 측정된 전사 작업이 쌓이면 여기에 표시됩니다." />
+            <MetricsSection title="번역 전체 소요 시간" subtitle="초벌 시작부터 검증 완료까지" rows={translationRows} emptyTitle="완료된 번역 표본이 없습니다" emptyText="선택한 기간에 완료된 번역 작업이 쌓이면 여기에 표시됩니다." />
+            <MetricsSection title="번역 단계별 활성 시간" subtitle="병렬 요청이 겹친 시간은 한 번만 계산" rows={passRows} emptyTitle="단계별 번역 표본이 없습니다" emptyText="새 번역 작업부터 초벌·검증 시간이 기록됩니다." />
           </>
         )}
       </div>

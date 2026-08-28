@@ -192,17 +192,16 @@ export default function SettingsPage() {
   return (
     <>
       <header className="topbar">
-        <h1>설정</h1>
-        <span style={{ marginLeft: "auto" }}>
-          <Freshness status={status} updatedAt={updatedAt} error={error} refreshing={refreshing} />
-        </span>
+        <div className="page-title"><h1>설정</h1><p>전사·번역 서버와 화면 표시 규칙을 관리합니다.</p></div>
+        <span className="topbar-spacer" />
+        <Freshness status={status} updatedAt={updatedAt} error={error} refreshing={refreshing} />
         <button type="button" className="btn sec sm" disabled={refreshing} onClick={() => void refresh()}>
           <Icon name="refresh" size={14} />
           새로고침
         </button>
       </header>
 
-      <div className="content">
+      <div className="content settings-content">
         {notice ? (
           <p role="status" style={{ margin: 0, color: "var(--ok)", fontSize: ".82rem" }}>{notice}</p>
         ) : null}
@@ -216,7 +215,7 @@ export default function SettingsPage() {
             <span className="sub m" title={`${runtimes.length}개 Runtime`}>{runtimes.length}개 Runtime</span>
           </div>
           <div className="card-body flush">
-            <div className="tbl" role="table" aria-label="전사 Runtime 목록">
+            <div className="tbl settings-runtime-table" role="table" aria-label="전사 Runtime 목록">
               <div className="tr head runtime-grid" role="row">
                 <span role="columnheader">Runtime</span>
                 <span role="columnheader">상태</span>
@@ -314,7 +313,7 @@ export default function SettingsPage() {
             </div>
           </div>
           <div className="card-body">
-            <form onSubmit={submitRuntime} className="fg">
+            <form onSubmit={submitRuntime} className="fg settings-form-grid">
               <label className="f">
                 <span className="lb">이름</span>
                 <input required maxLength={80} className={field} value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="GPU Runtime 02" />
@@ -353,7 +352,7 @@ export default function SettingsPage() {
             ) : null}
           </div>
           <div className="card-body">
-            <form onSubmit={submitServers} className="fg">
+            <form onSubmit={submitServers} className="fg settings-form-grid">
               <label className="f">
                 <span className="lb">API 주소</span>
                 <input type="url" className={field} value={lm.base_url} onChange={(e) => setLm({ ...lm, base_url: e.target.value })} placeholder="http://lm-host:8000/v1" />
@@ -383,14 +382,14 @@ export default function SettingsPage() {
             <span className="sub m" title={`${(data?.prompt_categories ?? []).length}개`}>{(data?.prompt_categories ?? []).length}개</span>
           </div>
           <div className="card-body flush">
-            <div className="tbl" role="table" aria-label="번역 프롬프트 목록">
+            <div className="tbl settings-prompt-table" role="table" aria-label="번역 프롬프트 목록">
               {(data?.prompt_categories ?? []).length === 0 ? (
                 <div className="tr empty" role="row" style={{ gridTemplateColumns: "minmax(0, 1fr)" }}><span role="cell">등록된 프롬프트 없음</span></div>
               ) : (
                 (data?.prompt_categories ?? []).map((category) => (
-                  <div key={category.id} className="tr" role="row" style={{ gridTemplateColumns: "minmax(0, 1fr) 220px" }}>
+                  <div key={category.id} className="tr settings-prompt-row" role="row">
                     <span role="cell" className="t-name" data-label="프롬프트" title={category.name}><b>{category.name}</b></span>
-                    <span role="cell" className="btns" data-label="관리" style={{ justifyContent: "flex-end" }}>
+                    <span role="cell" className="btns settings-prompt-actions" data-label="관리">
                       {category.archived ? <span className="b hold">보관</span> : <span className="b ok">사용</span>}
                       <button type="button" className="btn sec sm" disabled={busy} onClick={() => editPrompt(category)}>
                         <Icon name="pencil" size={13} />수정
@@ -413,7 +412,7 @@ export default function SettingsPage() {
             </div>
           </div>
           <div className="card-body">
-            <form className="prompt-form" onSubmit={submitPrompt}>
+            <form className="prompt-form settings-prompt-form" onSubmit={submitPrompt}>
               <label className="f">
                 <span className="lb">이름</span>
                 <input className="ctl" required maxLength={120} value={promptForm.name} onChange={(event) => setPromptForm({ ...promptForm, name: event.target.value })} />
