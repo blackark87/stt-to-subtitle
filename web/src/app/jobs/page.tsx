@@ -375,7 +375,7 @@ export default function JobsPage() {
                   />
                 </span>
                 <span role="columnheader">상태</span>
-                <span role="columnheader">작업</span>
+                <span role="columnheader">미디어</span>
                 <span role="columnheader">단계</span>
                 <span role="columnheader">사유</span>
                 <span role="columnheader" className="r">최근 변경</span>
@@ -420,7 +420,7 @@ export default function JobsPage() {
                       <label role="cell" htmlFor={selectionId} className="job-meta-cell job-state-cell" data-label="상태">
                         <span className={state ? BADGE_CLASS[state] : "b"} title={stateText}>{stateText}</span>
                       </label>
-                      <div role="cell" className="job-name-cell" data-label="작업">
+                      <div role="cell" className="job-name-cell" data-label="미디어">
                         <div className={job.poster_path ? "job-identity has-poster" : "job-identity"}>
                           {job.poster_path ? (
                             <Link

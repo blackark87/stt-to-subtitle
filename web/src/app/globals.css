@@ -164,7 +164,7 @@ a { color: var(--accent); text-decoration: none; }
 .t-name a:hover { color: var(--accent); }
 .t-name > span { color: var(--muted); font-size: .74rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .job-name-cell, .job-meta-cell { min-width: 0; }
-.jobs-table .job-grid-row { grid-template-columns: 44px 156px minmax(260px, 360px) 110px minmax(120px, 1fr) 132px; }
+.jobs-table .job-grid-row { grid-template-columns: 44px 156px minmax(340px, 1fr) 110px minmax(160px, 220px) 132px; }
 .jobs-table .tr.empty { grid-template-columns: minmax(0, 1fr); }
 .jobs-table input[type="checkbox"] { width: 18px; height: 18px; margin: 0; accent-color: var(--accent); cursor: pointer; }
 .job-select-cell { display: flex; align-self: stretch; align-items: center; cursor: pointer; }
@@ -297,7 +297,7 @@ a.brand, .primary-nav a, .t-name a { text-decoration: none; }
 /* 작업 상태를 글자 단위로 접지 않는다. 좁은 데스크톱에서는 표 자체를
    스크롤하고, 860px 이하에서는 아래의 카드형 레이아웃으로 전환한다. */
 @media (min-width: 861px) {
-  .jobs-table { min-width: 890px; }
+  .jobs-table { min-width: 1030px; }
   .jobs-table .tr.head > [role="columnheader"] { white-space: nowrap; }
 }
 
