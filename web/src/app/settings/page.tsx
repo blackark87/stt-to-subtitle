@@ -3,6 +3,7 @@
 import { useCallback, useState } from "react";
 import { Icon } from "@/components/Icon";
 import { Freshness } from "@/components/Freshness";
+import { LoadingOverlay } from "@/components/LoadingOverlay";
 import {
   api,
   type PathDisplayRule,
@@ -306,6 +307,10 @@ export default function SettingsPage() {
   );
   return (
     <>
+      <LoadingOverlay
+        active={refreshing || busy}
+        message={busy ? "설정 변경을 적용하는 중입니다" : "설정을 불러오는 중입니다"}
+      />
       <header className="topbar">
         <div className="page-title"><h1>설정</h1><p>전사·번역 서버와 화면 표시 규칙을 관리합니다.</p></div>
         <span className="topbar-spacer" />
@@ -336,7 +341,7 @@ export default function SettingsPage() {
               <div className="tr head runtime-grid" role="row">
                 <span role="columnheader">Runtime</span><span role="columnheader">상태</span><span role="columnheader" className="r">작업</span><span role="columnheader">Kotoba 배치</span><span role="columnheader">WhisperX 배치</span><span role="columnheader" className="r">관리</span>
               </div>
-              {runtimes.length === 0 && !runtimeEditorOpen ? <div className="tr empty" role="row" style={{ gridTemplateColumns: "minmax(0, 1fr)" }}><span role="cell">{status === "loading" ? "불러오는 중" : "등록된 Runtime 없음"}</span></div> : null}
+              {runtimes.length === 0 && !runtimeEditorOpen ? <div className="tr empty" role="row" style={{ gridTemplateColumns: "minmax(0, 1fr)" }}><span role="cell">등록된 Runtime 없음</span></div> : null}
               {runtimes.map((runtime: RuntimeEndpoint) => {
                 const parsed = asRuntimeStatus(runtime.status);
                 const tone = parsed ? RUNTIME_STATUS_TONE[parsed] : null;

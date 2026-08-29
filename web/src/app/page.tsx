@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useCallback, useMemo, useState } from "react";
 import { Freshness } from "@/components/Freshness";
 import { Icon } from "@/components/Icon";
+import { LoadingOverlay } from "@/components/LoadingOverlay";
 import { api, type GpuDevice, type LibraryProgressSegment, type PipelineJob } from "@/lib/api";
 import {
   JOB_PHASES,
@@ -173,6 +174,10 @@ export default function DashboardPage() {
 
   return (
     <>
+      <LoadingOverlay
+        active={refreshing || libraryProgress.refreshing || runtimes.refreshing || actingId != null}
+        message={actingId != null ? "작업 요청을 처리하는 중입니다" : "운영 현황을 불러오는 중입니다"}
+      />
       <header className="topbar">
         <div className="page-title">
           <h1>대시보드</h1>
@@ -187,12 +192,12 @@ export default function DashboardPage() {
       </header>
 
       <div className="content dashboard-content">
-        {!data ? (
+        {!data && status === "error" ? (
           <section className="card">
             <div className="empty-state">
-              <strong>{status === "error" ? "대시보드에 연결할 수 없습니다" : "운영 현황을 불러오는 중입니다"}</strong>
-              <span>{status === "error" ? (error ?? "Backend 연결을 확인하세요.") : "잠시만 기다려 주세요."}</span>
-              {status === "error" ? <button type="button" className="btn sec" onClick={() => void refresh()}><Icon name="refresh" size={14} />다시 시도</button> : null}
+              <strong>대시보드에 연결할 수 없습니다</strong>
+              <span>{error ?? "Backend 연결을 확인하세요."}</span>
+              <button type="button" className="btn sec" onClick={() => void refresh()}><Icon name="refresh" size={14} />다시 시도</button>
             </div>
           </section>
         ) : null}
@@ -405,7 +410,7 @@ export default function DashboardPage() {
               <div className="card-body flush">
                 {(libraryProgress.data?.items ?? []).length === 0 ? (
                   <div className="empty-state compact">
-                    <strong>{libraryProgress.status === "loading" ? "배우별 현황을 불러오는 중입니다" : "표시할 배우별 작업이 없습니다"}</strong>
+                    <strong>표시할 배우별 작업이 없습니다</strong>
                   </div>
                 ) : (
                   <div className="library-progress-list">

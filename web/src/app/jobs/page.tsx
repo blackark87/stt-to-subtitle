@@ -5,6 +5,7 @@ import { useRouter, useSearchParams } from "next/navigation";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Icon } from "@/components/Icon";
 import { Freshness } from "@/components/Freshness";
+import { LoadingOverlay } from "@/components/LoadingOverlay";
 import { Pagination } from "@/components/Pagination";
 import { api } from "@/lib/api";
 import {
@@ -196,6 +197,10 @@ export default function JobsPage() {
 
   return (
     <>
+      <LoadingOverlay
+        active={refreshing || runtimes.refreshing || prompts.refreshing || busy}
+        message={busy ? "선택한 작업을 처리하는 중입니다" : "작업 목록을 불러오는 중입니다"}
+      />
       <header className="topbar">
         <h1>작업 목록</h1>
         <span className="topbar-spacer" />
@@ -377,7 +382,7 @@ export default function JobsPage() {
               </div>
               {jobs.length === 0 ? (
                 <div className="tr empty" role="row">
-                  <span role="cell">{status === "loading" ? "불러오는 중" : "조건에 맞는 작업 없음"}</span>
+                  <span role="cell">조건에 맞는 작업 없음</span>
                 </div>
               ) : (
                 jobs.map((job) => {

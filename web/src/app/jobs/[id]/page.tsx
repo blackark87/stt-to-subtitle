@@ -4,6 +4,7 @@ import Link from "next/link";
 import { use, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Icon } from "@/components/Icon";
 import { Freshness } from "@/components/Freshness";
+import { LoadingOverlay } from "@/components/LoadingOverlay";
 import { api } from "@/lib/api";
 import {
   asJobState,
@@ -85,8 +86,9 @@ export default function JobDetailPage({ params }: { params: Promise<{ id: string
 
   const artifactVersion = `${id}:${job?.updated_at ?? "pending"}`;
   const [artifactResult, setArtifactResult] = useState<ArtifactResult | null>(null);
-  const currentArtifact = artifactResult?.version === artifactVersion ? artifactResult : null;
-  const artifactLoading = currentArtifact == null;
+  // 배경 갱신 때는 직전 산출물을 유지하고, 최초 로드만 화면 로딩으로 표시한다.
+  const currentArtifact = artifactResult;
+  const artifactLoading = artifactResult == null;
   const artifactError = currentArtifact?.error ?? null;
   const segments = useMemo(
     () => currentArtifact?.segments ?? [],
@@ -176,6 +178,10 @@ export default function JobDetailPage({ params }: { params: Promise<{ id: string
 
   return (
     <>
+      <LoadingOverlay
+        active={refreshing || runtimes.refreshing || artifactLoading || busy}
+        message={busy ? "작업 요청을 처리하는 중입니다" : artifactLoading ? "작업 산출물을 불러오는 중입니다" : "작업 정보를 불러오는 중입니다"}
+      />
       <header className="topbar">
         <Link className="btn sec" href="/jobs">
           <Icon name="chevron_left" size={14} />
@@ -269,7 +275,7 @@ export default function JobDetailPage({ params }: { params: Promise<{ id: string
                   <source src={api.mediaFileUrl(job.source_rel)} />
                   {hasSubtitle ? <track kind="subtitles" srcLang="ko" label="한국어" default src={api.subtitlesUrl(id)} /> : null}
                 </video>
-              ) : <div className="empty-state"><strong>작업을 불러오는 중입니다</strong></div>}
+              ) : <div className="empty-state"><strong>표시할 작업 정보가 없습니다</strong></div>}
             </div>
           </section>
 
@@ -286,7 +292,7 @@ export default function JobDetailPage({ params }: { params: Promise<{ id: string
               {artifactError ? <p className="notice error" role="alert">{artifactError}</p> : null}
               {segments.length === 0 ? (
                 <div className="empty-state">
-                  <strong>{artifactLoading ? "산출물을 불러오는 중입니다" : "아직 전사 결과가 없습니다"}</strong>
+                  <strong>아직 전사 결과가 없습니다</strong>
                   <span>작업이 진행 중이면 완료되는 대로 자동 갱신됩니다.</span>
                 </div>
               ) : (

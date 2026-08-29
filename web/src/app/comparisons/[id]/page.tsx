@@ -4,6 +4,7 @@ import Link from "next/link";
 import { use, useCallback, useEffect, useMemo, useState, type CSSProperties } from "react";
 import { Freshness } from "@/components/Freshness";
 import { Icon } from "@/components/Icon";
+import { LoadingOverlay } from "@/components/LoadingOverlay";
 import { api, type PipelineJob } from "@/lib/api";
 import { asJobState, canRetryJob } from "@/lib/domain";
 import { fileName } from "@/lib/format";
@@ -61,6 +62,10 @@ export default function ComparisonDetailPage({ params }: { params: Promise<{ id:
 
   const rowCount = Math.max(0, ...jobs.map((job) => transcripts[job.id]?.length ?? 0));
   const rows = Array.from({ length: rowCount }, (_, index) => index);
+  const artifactLoading = data != null
+    && jobs.length > 0
+    && Object.keys(transcripts).length === 0
+    && artifactError == null;
 
   const retry = async () => {
     setBusy(true);
@@ -77,6 +82,10 @@ export default function ComparisonDetailPage({ params }: { params: Promise<{ id:
 
   return (
     <>
+      <LoadingOverlay
+        active={refreshing || artifactLoading || busy}
+        message={busy ? "비교 작업을 다시 요청하는 중입니다" : artifactLoading ? "전사 산출물을 불러오는 중입니다" : "비교 결과를 불러오는 중입니다"}
+      />
       <header className="topbar">
         <Link className="btn sec" href="/comparisons"><Icon name="chevron_left" size={14} />비교 목록</Link>
         <div className="page-title">
@@ -118,7 +127,7 @@ export default function ComparisonDetailPage({ params }: { params: Promise<{ id:
         <section className="card comparison-result" aria-labelledby="comparison-result-title">
           <div className="card-head"><div><h2 id="comparison-result-title">순번별 전사</h2><span className="sub" title="엔진마다 구간 분할이 다를 수 있어 각 시작 시각을 함께 표시합니다.">엔진마다 구간 분할이 다를 수 있어 각 시작 시각을 함께 표시합니다.</span></div><span className="sub" title={`최대 ${rowCount}개 구간`}>최대 {rowCount}개 구간</span></div>
           {jobs.length === 0 || rowCount === 0 ? (
-            <div className="empty-state"><strong>{status === "loading" ? "비교 결과를 불러오는 중입니다" : "비교할 전사 결과가 없습니다"}</strong></div>
+            <div className="empty-state"><strong>비교할 전사 결과가 없습니다</strong></div>
           ) : (
             <div className="comparison-table" style={{ "--engine-count": jobs.length } as CSSProperties}>
               <div className="comparison-row comparison-head">

@@ -141,12 +141,16 @@ export interface MediaFile {
   display_paths?: string[];
   display_name?: string;
   size: number;
+  created_at: number | null;
+  modified_at: number | null;
   duration_seconds: number | null;
   has_subtitle: boolean;
   has_external_subtitle: boolean;
   external_subtitle_formats: string[];
   has_nfo: boolean;
   title: string;
+  nfo_title: string | null;
+  nfo_release_date: string | null;
   poster_path: string | null;
   actors: string[];
 }
@@ -393,6 +397,7 @@ export const api = {
     q?: string;
     actor?: string;
     folderSort?: string;
+    fileSort?: string;
     folderLimit?: number;
   } = {}) => {
     const query = new URLSearchParams();
@@ -400,6 +405,7 @@ export const api = {
     if (params.q) query.set("q", params.q);
     if (params.actor) query.set("actor", params.actor);
     if (params.folderSort) query.set("folder_sort", params.folderSort);
+    if (params.fileSort) query.set("file_sort", params.fileSort);
     if (params.folderLimit != null) query.set("folder_limit", String(params.folderLimit));
     const suffix = query.toString();
     return request<MediaListing>(`/media${suffix ? `?${suffix}` : ""}`);

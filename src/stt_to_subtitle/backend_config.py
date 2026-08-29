@@ -137,14 +137,36 @@ def group_multipart_media(
             else None
         )
         common_nfo_titles = {
-            str(item.get("title", "")).casefold(): str(item.get("title", ""))
+            str(item.get("nfo_title", "")).casefold(): str(
+                item.get("nfo_title", "")
+            )
             for item in members
-            if item.get("has_nfo") and str(item.get("title", "")).strip()
+            if item.get("has_nfo")
+            and str(item.get("nfo_title", "")).strip()
         }
-        title = (
+        nfo_title = (
             next(iter(common_nfo_titles.values()))
             if len(common_nfo_titles) == 1
-            else base
+            else None
+        )
+        title = nfo_title or base
+        created_values = [
+            float(value)
+            for item in members
+            if isinstance((value := item.get("created_at")), (int, float))
+        ]
+        modified_values = [
+            float(value)
+            for item in members
+            if isinstance((value := item.get("modified_at")), (int, float))
+        ]
+        nfo_release_date = next(
+            (
+                str(value)
+                for item in members
+                if (value := item.get("nfo_release_date"))
+            ),
+            None,
         )
         poster_path = next(
             (
@@ -161,7 +183,11 @@ def group_multipart_media(
                 "parts": members,
                 "name": display_name,
                 "title": title,
+                "nfo_title": nfo_title,
+                "nfo_release_date": nfo_release_date,
                 "size": sum(int(item.get("size", 0)) for item in members),
+                "created_at": min(created_values) if created_values else None,
+                "modified_at": max(modified_values) if modified_values else None,
                 "duration_seconds": duration,
                 "has_subtitle": all(
                     bool(item.get("has_subtitle")) for item in members
@@ -976,10 +1002,13 @@ class MediaLibrary:
         external_subtitles = discover_external_subtitles(path)
         nfo_path = self._find_nfo(path)
         title: str | None = None
+        release_date: str | None = None
         poster_path: str | None = None
         actors: list[str] = []
         if nfo_path is not None:
-            title, poster_references, actors = self._read_nfo(nfo_path)
+            title, poster_references, actors, release_date = self._read_nfo(
+                nfo_path
+            )
             poster = self._find_poster(path, nfo_path, poster_references)
             if poster is not None:
                 poster_path = poster.relative_to(self.root).as_posix()
@@ -987,6 +1016,10 @@ class MediaLibrary:
             "path": relative,
             "name": path.name,
             "size": file_stat.st_size,
+            "created_at": float(
+                getattr(file_stat, "st_birthtime", file_stat.st_ctime)
+            ),
+            "modified_at": float(file_stat.st_mtime),
             "duration_seconds": self._media_duration(path, file_stat),
             "has_subtitle": srt_subtitle.is_file() or ass_subtitle.is_file(),
             "has_external_subtitle": bool(external_subtitles),
@@ -1001,6 +1034,8 @@ class MediaLibrary:
             ),
             "has_nfo": nfo_path is not None,
             "title": title or path.stem,
+            "nfo_title": title,
+            "nfo_release_date": release_date,
             "poster_path": poster_path,
             "actors": actors,
         }
@@ -1008,7 +1043,7 @@ class MediaLibrary:
     def _media_title(self, path: Path) -> str:
         nfo_path = self._find_nfo(path)
         if nfo_path is not None:
-            title, _, _ = self._read_nfo(nfo_path)
+            title, _, _, _ = self._read_nfo(nfo_path)
             if title:
                 return title
         return path.stem
@@ -1075,19 +1110,21 @@ class MediaLibrary:
     def _read_nfo(
         self,
         nfo_path: Path,
-    ) -> tuple[str | None, list[str], list[str]]:
+    ) -> tuple[str | None, list[str], list[str], str | None]:
         try:
             if nfo_path.stat().st_size > MAX_NFO_BYTES:
-                return None, [], []
+                return None, [], [], None
             root = ElementTree.parse(nfo_path).getroot()
         except (ElementTree.ParseError, OSError):
-            return None, [], []
+            return None, [], [], None
 
         title: str | None = None
         poster_references: list[str] = []
         actors: list[str] = []
+        release_dates: dict[str, str] = {}
         for element in root.iter():
             tag = element.tag.rsplit("}", 1)[-1].lower()
+            normalized_tag = re.sub(r"[^a-z]", "", tag)
             if tag == "actor":
                 name = _nfo_actor_name(element)
                 if name and name not in actors:
@@ -1098,6 +1135,14 @@ class MediaLibrary:
                 continue
             if tag == "title" and title is None:
                 title = value
+            elif normalized_tag in {
+                "releasedate",
+                "premiered",
+            }:
+                release_dates.setdefault(
+                    normalized_tag,
+                    value,
+                )
             elif tag == "poster":
                 poster_references.append(value)
             elif (
@@ -1105,7 +1150,10 @@ class MediaLibrary:
                 and element.attrib.get("aspect", "").strip().lower() == "poster"
             ):
                 poster_references.append(value)
-        return title, poster_references, actors
+        release_date = release_dates.get("releasedate") or release_dates.get(
+            "premiered"
+        )
+        return title, poster_references, actors, release_date
 
     def _find_poster(
         self,

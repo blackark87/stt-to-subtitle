@@ -225,7 +225,8 @@ class MediaLibraryTests(unittest.TestCase):
             for part in (1, 2):
                 (show / f"movie-pt{part}.mkv").write_bytes(b"media")
             (show / "movie.nfo").write_text(
-                "<movie><title>그룹 제목</title></movie>",
+                "<movie><title>그룹 제목</title>"
+                "<releasedate>2022-08-09</releasedate></movie>",
                 encoding="utf-8",
             )
 
@@ -235,6 +236,10 @@ class MediaLibraryTests(unittest.TestCase):
             self.assertTrue(grouped["multipart"])
             self.assertTrue(grouped["has_nfo"])
             self.assertEqual(grouped["title"], "그룹 제목")
+            self.assertEqual(grouped["nfo_title"], "그룹 제목")
+            self.assertEqual(grouped["nfo_release_date"], "2022-08-09")
+            self.assertIsInstance(grouped["created_at"], float)
+            self.assertIsInstance(grouped["modified_at"], float)
 
     def test_part_level_nfo_takes_precedence_over_the_group_nfo(self) -> None:
         with TemporaryDirectory() as directory:
@@ -543,6 +548,10 @@ class MediaLibraryTests(unittest.TestCase):
             self.assertEqual(files[0]["path"], "folder/movie.mkv")
             self.assertTrue(files[0]["has_subtitle"])
             self.assertFalse(files[0]["has_nfo"])
+            self.assertIsNone(files[0]["nfo_title"])
+            self.assertIsNone(files[0]["nfo_release_date"])
+            self.assertIsInstance(files[0]["created_at"], float)
+            self.assertIsInstance(files[0]["modified_at"], float)
             self.assertIsNone(files[0]["poster_path"])
             self.assertNotIn("directory", files[0])
 
@@ -570,6 +579,7 @@ class MediaLibraryTests(unittest.TestCase):
                 """
                 <movie>
                   <title>테스트 영화</title>
+                  <releasedate>2024-02-03</releasedate>
                   <thumb aspect="poster">art/movie-poster.jpg</thumb>
                 </movie>
                 """,
@@ -584,6 +594,8 @@ class MediaLibraryTests(unittest.TestCase):
 
             self.assertTrue(files[0]["has_nfo"])
             self.assertEqual(files[0]["title"], "테스트 영화")
+            self.assertEqual(files[0]["nfo_title"], "테스트 영화")
+            self.assertEqual(files[0]["nfo_release_date"], "2024-02-03")
             self.assertEqual(
                 files[0]["poster_path"],
                 "folder/art/movie-poster.jpg",
@@ -592,6 +604,19 @@ class MediaLibraryTests(unittest.TestCase):
                 library.resolve_poster("folder/art/movie-poster.jpg"),
                 poster.resolve(),
             )
+
+    def test_uses_nfo_premiered_when_release_date_is_absent(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "movie.mkv").write_bytes(b"media")
+            (root / "movie.nfo").write_text(
+                "<movie><premiered>2023-11-08</premiered></movie>",
+                encoding="utf-8",
+            )
+
+            media = MediaLibrary(root).browse()["files"][0]
+
+            self.assertEqual(media["nfo_release_date"], "2023-11-08")
 
     def test_finds_actor_profile_in_actor_or_title_metadata_folder(self) -> None:
         with TemporaryDirectory() as directory:

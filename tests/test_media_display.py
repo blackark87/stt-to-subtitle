@@ -91,6 +91,69 @@ class MediaDisplayTests(unittest.TestCase):
                 ["recent"],
             )
 
+    def test_sorts_files_by_file_and_nfo_metadata(self) -> None:
+        with TemporaryDirectory() as directory:
+            library = MediaLibrary(Path(directory))
+            listing = {
+                "folders": [],
+                "files": [
+                    {
+                        "path": "c.mkv",
+                        "name": "c.mkv",
+                        "created_at": 10,
+                        "modified_at": 30,
+                        "nfo_title": "두 번째",
+                        "nfo_release_date": "2023-01-02",
+                    },
+                    {
+                        "path": "a.mkv",
+                        "name": "a.mkv",
+                        "created_at": 30,
+                        "modified_at": 10,
+                        "nfo_title": "첫 번째",
+                        "nfo_release_date": "2024/03/04",
+                    },
+                    {
+                        "path": "b.mkv",
+                        "name": "b.mkv",
+                        "created_at": 20,
+                        "modified_at": 20,
+                        "nfo_title": None,
+                        "nfo_release_date": None,
+                    },
+                ],
+            }
+
+            expected = {
+                "filename": ["a.mkv", "b.mkv", "c.mkv"],
+                "created_desc": ["a.mkv", "b.mkv", "c.mkv"],
+                "modified_desc": ["c.mkv", "b.mkv", "a.mkv"],
+                "nfo_title": ["c.mkv", "a.mkv", "b.mkv"],
+                "nfo_release_desc": ["a.mkv", "c.mkv", "b.mkv"],
+            }
+            for file_sort, names in expected.items():
+                with self.subTest(file_sort=file_sort):
+                    decorated = decorate_media_listing(
+                        library,
+                        listing,
+                        [],
+                        file_sort=file_sort,
+                    )
+                    self.assertEqual(
+                        [item["name"] for item in decorated["files"]],
+                        names,
+                    )
+
+    def test_rejects_unknown_file_sort(self) -> None:
+        with TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "media file sort"):
+                decorate_media_listing(
+                    MediaLibrary(Path(directory)),
+                    {"folders": [], "files": []},
+                    [],
+                    file_sort="unknown",
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -5,6 +5,7 @@ import { useRouter, useSearchParams } from "next/navigation";
 import { useCallback, useMemo, useState } from "react";
 import { Icon } from "@/components/Icon";
 import { Freshness } from "@/components/Freshness";
+import { LoadingOverlay } from "@/components/LoadingOverlay";
 import { api, type MediaFile, type MediaFolder } from "@/lib/api";
 import { useLiveQuery } from "@/lib/useLiveQuery";
 
@@ -12,6 +13,7 @@ const MEDIA_INTERVAL_MS = 15000;
 type SubtitleFilter = "all" | "none" | "done";
 type Operation = "full" | "compare";
 type FolderSort = "name" | "modified_desc" | "modified_asc";
+type FileSort = "filename" | "created_desc" | "modified_desc" | "nfo_title" | "nfo_release_desc";
 
 function duration(seconds: number | null): string {
   if (!seconds || seconds <= 0) return "재생 시간 미확인";
@@ -44,6 +46,13 @@ export default function MediaPage() {
   const folderSort: FolderSort = folderSortValue === "modified_desc" || folderSortValue === "modified_asc"
     ? folderSortValue
     : "name";
+  const fileSortValue = searchParams.get("file_sort");
+  const fileSort: FileSort = fileSortValue === "created_desc"
+    || fileSortValue === "modified_desc"
+    || fileSortValue === "nfo_title"
+    || fileSortValue === "nfo_release_desc"
+    ? fileSortValue
+    : "filename";
   const [selected, setSelected] = useState<ReadonlySet<string>>(new Set());
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
@@ -68,8 +77,8 @@ export default function MediaPage() {
   };
 
   const fetcher = useCallback(
-    () => api.media({ folder, q: query, folderSort, folderLimit: 20 }),
-    [folder, folderSort, query],
+    () => api.media({ folder, q: query, folderSort, fileSort, folderLimit: 20 }),
+    [fileSort, folder, folderSort, query],
   );
   const { data, status, error, updatedAt, refreshing, refresh } = useLiveQuery(fetcher, MEDIA_INTERVAL_MS);
   const prompts = useLiveQuery(useCallback(() => api.promptCategories(), []), 60000);
@@ -127,6 +136,11 @@ export default function MediaPage() {
 
   return (
     <>
+      <LoadingOverlay
+        active={refreshing || prompts.refreshing || busy}
+        message={busy ? "작업 요청을 처리하는 중입니다" : "미디어 파일을 스캔하는 중입니다"}
+        detail={busy ? "선택한 파일을 작업 목록에 등록하고 있습니다." : "폴더의 파일과 메타데이터를 확인하고 있습니다. 잠시만 기다려 주세요."}
+      />
       <header className="topbar">
         <div className="page-title">
           <h1>미디어</h1>
@@ -239,6 +253,22 @@ export default function MediaPage() {
             </div>
             <div className="btns">
               <label className="compact-field">
+                <span>정렬</span>
+                <select
+                  className="ctl"
+                  value={fileSort}
+                  onChange={(event) => updateLocation({
+                    file_sort: event.target.value === "filename" ? null : event.target.value,
+                  })}
+                >
+                  <option value="created_desc">미디어 생성일 최신순</option>
+                  <option value="modified_desc">미디어 수정일 최신순</option>
+                  <option value="nfo_title">NFO 제목순</option>
+                  <option value="filename">파일명순</option>
+                  <option value="nfo_release_desc">NFO 출시일 최신순</option>
+                </select>
+              </label>
+              <label className="compact-field">
                 <span>작업</span>
                 <select className="ctl" value={operation} onChange={(event) => updateLocation({ operation: event.target.value === "compare" ? "compare" : null })}>
                   <option value="full">자막 생성</option>
@@ -274,14 +304,16 @@ export default function MediaPage() {
             {files.length === 0 ? (
               <div className="empty-state">
                 <Icon name="folder" size={24} />
-                <strong>{status === "loading" ? "미디어를 불러오는 중입니다" : "표시할 파일이 없습니다"}</strong>
+                <strong>표시할 파일이 없습니다</strong>
                 <span>검색어나 자막 상태 필터를 변경해 보세요.</span>
               </div>
             ) : (
               <div className="board">
                 {files.map((file: MediaFile) => {
                   const on = selected.has(file.path);
-                  const title = file.title || file.name;
+                  const title = file.has_nfo && file.nfo_title
+                    ? file.nfo_title
+                    : (file.display_name ?? file.name);
                   return (
                     <button
                       key={file.path}
@@ -306,7 +338,8 @@ export default function MediaPage() {
                         </span>
                         <span className="media-meta">
                           <span title={duration(file.duration_seconds)}>{duration(file.duration_seconds)}</span>
-                          {file.actors.length ? <span title={file.actors.join(", ")}>{file.actors.slice(0, 2).join(" · ")}</span> : null}
+                          {file.has_nfo && file.nfo_release_date ? <span title={`NFO 출시일 ${file.nfo_release_date}`}>출시 {file.nfo_release_date}</span> : null}
+                          {file.has_nfo && file.actors.length ? <span title={file.actors.join(", ")}>{file.actors.slice(0, 2).join(" · ")}</span> : null}
                         </span>
                         <span className="ma">
                           {file.has_subtitle ? <span className="b ok">자막 있음</span>

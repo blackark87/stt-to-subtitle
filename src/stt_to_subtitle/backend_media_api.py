@@ -25,6 +25,7 @@ def browse_media(
     q: str = "",
     actor: str = "",
     folder_sort: str = "name",
+    file_sort: str = "filename",
     folder_limit: int | None = Query(default=None, ge=1, le=100),
 ) -> dict[str, Any]:
     service = service_from_request(request)
@@ -54,6 +55,7 @@ def browse_media(
             service.path_display_rules,
             folder_sort=folder_sort,
             folder_limit=folder_limit,
+            file_sort=file_sort,
         )
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error

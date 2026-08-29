@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useCallback, useState } from "react";
 import { Icon } from "@/components/Icon";
 import { Freshness } from "@/components/Freshness";
+import { LoadingOverlay } from "@/components/LoadingOverlay";
 import { api } from "@/lib/api";
 import { clock, fileName } from "@/lib/format";
 import { useLiveQuery } from "@/lib/useLiveQuery";
@@ -32,6 +33,10 @@ export default function ComparisonsPage() {
 
   return (
     <>
+      <LoadingOverlay
+        active={refreshing || busyId != null}
+        message={busyId != null ? "비교 작업을 다시 요청하는 중입니다" : "비교 기록을 불러오는 중입니다"}
+      />
       <header className="topbar">
         <div className="page-title">
           <h1>전사 비교</h1>
@@ -59,7 +64,7 @@ export default function ComparisonsPage() {
               {items.length === 0 ? (
                 <div className="empty-state">
                   <Icon name="compare" size={24} />
-                  <strong>{status === "loading" ? "비교 기록을 불러오는 중입니다" : "아직 비교 기록이 없습니다"}</strong>
+                  <strong>아직 비교 기록이 없습니다</strong>
                   <span>미디어 화면에서 전사 비교 작업을 시작할 수 있습니다.</span>
                 </div>
               ) : items.map((item) => {

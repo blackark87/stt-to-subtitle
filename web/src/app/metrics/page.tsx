@@ -3,6 +3,7 @@
 import { useCallback, useMemo, useState } from "react";
 import { Freshness } from "@/components/Freshness";
 import { Icon } from "@/components/Icon";
+import { LoadingOverlay } from "@/components/LoadingOverlay";
 import { api } from "@/lib/api";
 import { useLiveQuery } from "@/lib/useLiveQuery";
 
@@ -157,6 +158,7 @@ export default function MetricsPage() {
 
   return (
     <>
+      <LoadingOverlay active={refreshing} message="처리 시간 통계를 불러오는 중입니다" />
       <header className="topbar">
         <div className="page-title"><h1>처리 시간 통계</h1><p>영상 길이 구간별 전사·번역 소요 시간을 비교합니다.</p></div>
         <span className="topbar-spacer" />
@@ -181,8 +183,8 @@ export default function MetricsPage() {
           </div>
         </section>
 
-        {!data ? (
-          <section className="card"><div className="empty-state"><strong>{status === "error" ? "통계를 불러오지 못했습니다" : "처리 시간 통계를 불러오는 중입니다"}</strong><span>{status === "error" ? (error ?? "Backend 연결을 확인하세요.") : "잠시만 기다려 주세요."}</span></div></section>
+        {!data && status === "error" ? (
+          <section className="card"><div className="empty-state"><strong>통계를 불러오지 못했습니다</strong><span>{error ?? "Backend 연결을 확인하세요."}</span></div></section>
         ) : (
           <>
             <section className="summary-grid metrics-summary" aria-label="처리 시간 표본 요약">

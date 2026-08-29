@@ -61,7 +61,9 @@ export function useLiveQuery<T>(
       setError(reason instanceof Error ? reason.message : String(reason));
       setStatus("error");
     } finally {
-      if (!silent && mounted.current && version === requestVersion.current) {
+      if (mounted.current && version === requestVersion.current) {
+        // 표시 요청이 더 최신의 silent 갱신으로 대체돼도 로딩 상태가
+        // 고정되지 않도록, 마지막 요청이 끝날 때는 항상 해제한다.
         setRefreshing(false);
       }
     }

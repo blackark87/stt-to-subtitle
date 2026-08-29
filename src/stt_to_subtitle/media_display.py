@@ -2,11 +2,81 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 from .path_display import shorten_display_path
+
+
+FILE_SORTS = {
+    "filename",
+    "created_desc",
+    "modified_desc",
+    "nfo_title",
+    "nfo_release_desc",
+}
+
+
+def _timestamp(value: object) -> float:
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _nfo_release_value(value: object) -> int:
+    """Return a comparable YYYYMMDD value from common NFO date formats."""
+    parts = [int(part) for part in re.findall(r"\d+", str(value))]
+    if not parts:
+        return 0
+    year = parts[0]
+    month = parts[1] if len(parts) > 1 else 1
+    day = parts[2] if len(parts) > 2 else 1
+    if not 1 <= month <= 12 or not 1 <= day <= 31:
+        return 0
+    return year * 10_000 + month * 100 + day
+
+
+def _sort_media_files(files: list[dict[str, object]], file_sort: str) -> None:
+    if file_sort == "created_desc":
+        files.sort(
+            key=lambda media: (
+                -_timestamp(media.get("created_at")),
+                str(media.get("name", "")).casefold(),
+            )
+        )
+    elif file_sort == "modified_desc":
+        files.sort(
+            key=lambda media: (
+                -_timestamp(media.get("modified_at")),
+                str(media.get("name", "")).casefold(),
+            )
+        )
+    elif file_sort == "nfo_title":
+        files.sort(
+            key=lambda media: (
+                not bool(media.get("nfo_title")),
+                str(media.get("nfo_title") or "").casefold(),
+                str(media.get("name", "")).casefold(),
+            )
+        )
+    elif file_sort == "nfo_release_desc":
+        files.sort(
+            key=lambda media: (
+                not bool(media.get("nfo_release_date")),
+                -_nfo_release_value(media.get("nfo_release_date")),
+                str(media.get("name", "")).casefold(),
+            )
+        )
+    else:
+        files.sort(
+            key=lambda media: (
+                str(media.get("name", "")).casefold(),
+                str(media.get("path", "")).casefold(),
+            )
+        )
 
 
 def flatten_media_display_folders(
@@ -59,6 +129,7 @@ def decorate_media_listing(
     *,
     folder_sort: str = "name",
     folder_limit: int | None = None,
+    file_sort: str = "filename",
 ) -> dict[str, object]:
     """Add safe display paths and optional actor images without changing IDs."""
     raw_folders = [
@@ -68,6 +139,8 @@ def decorate_media_listing(
     ]
     if folder_sort not in {"name", "modified_desc", "modified_asc"}:
         raise ValueError("unsupported media folder sort")
+    if file_sort not in FILE_SORTS:
+        raise ValueError("unsupported media file sort")
     if folder_sort == "name":
         raw_folders.sort(
             key=lambda folder: str(folder.get("name", "")).casefold()
@@ -113,6 +186,7 @@ def decorate_media_listing(
                 shorten_display_path(str(path), rules) for path in paths
             ]
         files.append(media)
+    _sort_media_files(files, file_sort)
     return {
         **browser,
         "folders": folders,
