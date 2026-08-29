@@ -136,6 +136,19 @@ STAGE_DURATION_OUTCOMES = {
     "job.stopped": "stopped",
     "transcription.runtime_failover": "runtime_failover",
 }
+LEGACY_STAGE_START_MESSAGES = {
+    "audio extraction started": "extraction",
+    "transcription started": "transcription",
+    "translation started": "translation",
+    "render started": "render",
+}
+LEGACY_STAGE_COMPLETION_PREFIXES = {
+    "audio extraction completed": "extraction",
+    "transcription completed": "transcription",
+    "translation completed": "translation",
+    "translation generation ": "translation",
+    "subtitles written:": "render",
+}
 
 
 def media_duration_bucket_minutes(duration_seconds: float | None) -> int | None:
@@ -5719,6 +5732,151 @@ class JobStore:
             }
             for row in reversed(rows)
         ]
+
+    def job_completion_summaries(
+        self,
+        job_ids: Collection[str],
+    ) -> dict[str, dict[str, Any]]:
+        """Return model and processing timing for completed jobs."""
+
+        normalized_ids = tuple(
+            dict.fromkeys(job_id.strip() for job_id in job_ids if job_id.strip())
+        )
+        if not normalized_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in normalized_ids)
+        with self._connect() as connection:
+            revision_rows = connection.execute(
+                f"""
+                SELECT job.id AS job_id, job.created_at,
+                       job.status_updated_at, revision.backend,
+                       revision.model_revision
+                FROM jobs AS job
+                LEFT JOIN transcript_revisions AS revision
+                  ON revision.id = job.transcript_revision_id
+                WHERE job.id IN ({placeholders})
+                """,
+                normalized_ids,
+            ).fetchall()
+            event_rows = connection.execute(
+                f"""
+                SELECT job_id, event_code, message, phase, attempt, created_at
+                FROM job_events
+                WHERE job_id IN ({placeholders})
+                ORDER BY id
+                """,
+                normalized_ids,
+            ).fetchall()
+
+        summaries = {
+            job_id: {
+                "transcription_backend": None,
+                "transcription_model_revision": None,
+                "started_at": None,
+                "ended_at": None,
+                "processing_seconds": None,
+                "timing_source": "job",
+            }
+            for job_id in normalized_ids
+        }
+        for row in revision_rows:
+            summary = summaries[str(row["job_id"])]
+            summary["transcription_backend"] = (
+                str(row["backend"]) if row["backend"] is not None else None
+            )
+            summary["transcription_model_revision"] = (
+                str(row["model_revision"])
+                if row["model_revision"] is not None
+                else None
+            )
+            summary["started_at"] = float(row["created_at"])
+            summary["ended_at"] = float(row["status_updated_at"])
+
+        active_starts: dict[tuple[str, str, int], float] = {}
+        intervals: dict[str, list[tuple[float, float]]] = {
+            job_id: [] for job_id in normalized_ids
+        }
+        first_starts: dict[str, float] = {}
+        last_terminals: dict[str, float] = {}
+        terminal_codes = set(STAGE_DURATION_OUTCOMES)
+        for row in event_rows:
+            job_id = str(row["job_id"])
+            event_code = str(row["event_code"])
+            message = str(row["message"]).strip().lower()
+            phase_value = row["phase"]
+            if event_code == "job.message":
+                if message in LEGACY_STAGE_START_MESSAGES:
+                    event_code = "stage.started"
+                    phase_value = LEGACY_STAGE_START_MESSAGES[message]
+                else:
+                    for prefix, legacy_phase in (
+                        LEGACY_STAGE_COMPLETION_PREFIXES.items()
+                    ):
+                        if message.startswith(prefix) and (
+                            legacy_phase != "translation"
+                            or " completed " in f" {message} "
+                        ):
+                            event_code = "stage.completed"
+                            phase_value = legacy_phase
+                            break
+            attempt_value = row["attempt"]
+            if phase_value is None:
+                continue
+            phase = str(phase_value)
+            attempt = int(attempt_value) if attempt_value is not None else 1
+            created_at = float(row["created_at"])
+            if event_code == "stage.started":
+                active_starts[(job_id, phase, attempt)] = created_at
+                first_starts[job_id] = min(
+                    first_starts.get(job_id, created_at),
+                    created_at,
+                )
+                continue
+            if event_code not in terminal_codes:
+                continue
+            started_attempt = attempt - int(
+                event_code == "transcription.runtime_failover"
+            )
+            started_at = active_starts.pop(
+                (job_id, phase, started_attempt),
+                None,
+            )
+            if started_at is not None and created_at >= started_at:
+                intervals[job_id].append((started_at, created_at))
+                last_terminals[job_id] = max(
+                    last_terminals.get(job_id, created_at),
+                    created_at,
+                )
+
+        for job_id, job_intervals in intervals.items():
+            if not job_intervals:
+                summary = summaries[job_id]
+                started_at = summary["started_at"]
+                ended_at = summary["ended_at"]
+                if isinstance(started_at, float) and isinstance(ended_at, float):
+                    summary["processing_seconds"] = round(
+                        max(0.0, ended_at - started_at),
+                        3,
+                    )
+                continue
+            merged: list[list[float]] = []
+            for started_at, ended_at in sorted(job_intervals):
+                if merged and started_at <= merged[-1][1]:
+                    merged[-1][1] = max(merged[-1][1], ended_at)
+                else:
+                    merged.append([started_at, ended_at])
+            started_at = min(first_starts[job_id], merged[0][0])
+            ended_at = last_terminals[job_id]
+            processing_seconds = sum(end - start for start, end in merged)
+            summaries[job_id].update(
+                {
+                    "started_at": started_at,
+                    "ended_at": ended_at,
+                    "processing_seconds": round(processing_seconds, 3),
+                    "timing_source": "events",
+                }
+            )
+        return summaries
 
     def media_duration_metrics(
         self,

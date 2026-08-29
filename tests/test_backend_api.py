@@ -274,6 +274,113 @@ class BackendAPIBoundaryTests(unittest.TestCase):
             ["subtitle"],
         )
 
+    def test_dashboard_describes_completed_job_models_prompt_and_timing(
+        self,
+    ) -> None:
+        from fastapi.testclient import TestClient
+
+        from stt_to_subtitle.backend_api import create_backend_app
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            settings = BackendSettings(
+                state_dir=root / "state",
+                media_root=media_root,
+                stt_base_url="http://runtime:8100",
+                stt_token="",
+            )
+            with TestClient(create_backend_app(settings)) as client:
+                orchestrator = client.app.state.orchestrator
+                orchestrator.stop()
+                store = orchestrator.store
+                job = store.create(
+                    job_id="subtitle",
+                    source_rel="subtitle.mkv",
+                    force_overwrite=False,
+                    options={
+                        "backend": "whisperjav",
+                        "translation_prompt": {
+                            "category_id": "variety",
+                            "category_name": "이 이름 대신 분류 ID를 사용",
+                            "revision_number": 4,
+                        },
+                    },
+                    operation="full",
+                )
+                store.record_transcript_revision(
+                    revision_id="transcript-1",
+                    job_id=job.id,
+                    audio_revision_id=None,
+                    remote_job_id="remote-1",
+                    backend="whisperjav",
+                    model_revision="ensemble-v2",
+                    options_hash="options-hash",
+                    artifact_path=str(root / "transcript.json"),
+                    content_hash="transcript-hash",
+                    origin="automatic",
+                    status=None,
+                    chunks_total=1,
+                )
+                for phase, event_code in (
+                    ("transcription", "stage.started"),
+                    ("transcription", "stage.completed"),
+                    ("translation", "stage.started"),
+                    ("translation", "stage.completed"),
+                    ("render", "stage.started"),
+                    ("render", "stage.completed"),
+                ):
+                    store.add_event(
+                        job.id,
+                        "info",
+                        event_code,
+                        event_code=event_code,
+                        phase=phase,
+                        attempt=1,
+                    )
+                with store._connect() as connection:
+                    rows = connection.execute(
+                        """
+                        SELECT id FROM job_events
+                        WHERE event_code IN ('stage.started', 'stage.completed')
+                        ORDER BY id
+                        """
+                    ).fetchall()
+                    for row, created_at in zip(
+                        rows,
+                        (100.0, 130.0, 200.0, 220.0, 300.0, 310.0),
+                        strict=True,
+                    ):
+                        connection.execute(
+                            "UPDATE job_events SET created_at = ? WHERE id = ?",
+                            (created_at, int(row["id"])),
+                        )
+                store.update(job.id, status="completed")
+                dashboard = client.get("/api/v1/dashboard")
+
+        self.assertEqual(dashboard.status_code, 200)
+        summary = dashboard.json()["recent_completed"][0][
+            "completion_summary"
+        ]
+        self.assertEqual(summary["transcription_backend"], "whisperjav")
+        self.assertEqual(
+            summary["transcription_model_revision"],
+            "ensemble-v2",
+        )
+        self.assertEqual(summary["translation_prompt_name"], "버라이어티")
+        self.assertEqual(summary["translation_prompt_version"], 4)
+        self.assertEqual(
+            summary["started_at"],
+            "1970-01-01T09:01:40.000+09:00",
+        )
+        self.assertEqual(
+            summary["ended_at"],
+            "1970-01-01T09:05:10.000+09:00",
+        )
+        self.assertEqual(summary["processing_seconds"], 60.0)
+        self.assertEqual(summary["timing_source"], "events")
+
     def test_manages_external_runtime_without_exposing_its_token(self) -> None:
         from fastapi.testclient import TestClient
 

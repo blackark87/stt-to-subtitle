@@ -271,7 +271,9 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                 orchestrator.stop()
 
             self.assertEqual(dispatched, 0)
-            self.assertEqual(server["status"], "suspended")
+            self.assertEqual(server["status"], "unknown")
+            self.assertEqual(server["routing_state"], "suspended")
+            self.assertEqual(server["routing_reason"], "stt_hard_breaker")
             orchestrator._translation_executor.submit.assert_not_called()
 
     def test_builtin_stt_stage_holds_hard_breaker_around_operation(self) -> None:

@@ -17,7 +17,7 @@ import {
   type JobPhase,
   type JobState,
 } from "@/lib/domain";
-import { clock, elapsed, fileName, parentPath, percent } from "@/lib/format";
+import { clock, duration, fileName, parentPath, percent } from "@/lib/format";
 import { useLiveQuery } from "@/lib/useLiveQuery";
 
 const DASHBOARD_INTERVAL_MS = 5000;
@@ -128,6 +128,25 @@ function gpuMemory(device: GpuDevice): {
     percent: memoryPercent,
     percentLabel,
     detail: `${used} / ${totalGib.toFixed(1)} GiB`,
+  };
+}
+
+function completedModel(job: PipelineJob): { backend: string; revision: string | null } {
+  const backend = job.completion_summary?.transcription_backend
+    ?? String(job.options?.backend ?? "기본");
+  const revision = job.completion_summary?.transcription_model_revision ?? null;
+  return {
+    backend,
+    revision: revision && revision !== backend ? revision : null,
+  };
+}
+
+function completedPrompt(job: PipelineJob): { name: string; version: string } {
+  const name = job.completion_summary?.translation_prompt_name ?? "JAV";
+  const revision = job.completion_summary?.translation_prompt_version;
+  return {
+    name,
+    version: revision == null ? "[기존]" : `[v${revision}]`,
   };
 }
 
@@ -337,19 +356,45 @@ export default function DashboardPage() {
               <div className="card-body flush">
                 {completed.length === 0 ? <div className="empty-state compact"><strong>자막이 완료된 작업이 없습니다</strong></div> : (
                   <div className="job-list">
-                    {visibleCompleted.map((job) => (
-                      <Link href={`/jobs/${encodeURIComponent(job.id)}`} className="job-row completed-row" key={job.id}>
-                        <span className="job-state-line complete" />
-                        <span className="t-name" title={job.source_rel}><b>{fileName(job.source_rel)}</b><span>{parentPath(job.source_rel)}</span></span>
-                        <span>{String(job.options?.backend ?? "기본")}</span>
-                        <strong className="m">{elapsed(job.created_at, job.updated_at)}</strong>
-                        <time className="m">{clock(job.updated_at)}</time>
-                      </Link>
-                    ))}
+                    {visibleCompleted.map((job) => {
+                      const model = completedModel(job);
+                      const prompt = completedPrompt(job);
+                      const summary = job.completion_summary;
+                      const startedAt = summary?.started_at ?? job.created_at;
+                      const endedAt = summary?.ended_at ?? job.updated_at;
+                      const timingDetail = `처리 ${duration(summary?.processing_seconds)}`;
+                      return (
+                        <Link
+                          href={`/jobs/${encodeURIComponent(job.id)}`}
+                          className="job-row completed-row"
+                          key={job.id}
+                          aria-label={[
+                            fileName(job.source_rel),
+                            `전사 모델 ${model.backend}${model.revision ? ` ${model.revision}` : ""}`,
+                            `번역 프롬프트 ${prompt.name} ${prompt.version}`,
+                            `시작 ${clock(startedAt)}`,
+                            `종료 ${clock(endedAt)}`,
+                            timingDetail,
+                            `작업 수정 ${clock(job.updated_at)}`,
+                          ].join(", ")}
+                        >
+                          <span className="job-state-line complete" />
+                          <span className="t-name" title={job.source_rel}><b>{fileName(job.source_rel)}</b><span>{parentPath(job.source_rel)}</span></span>
+                          <span className="completed-model"><small>전사 모델</small><strong>{model.backend}</strong>{model.revision ? <em title={model.revision}>{model.revision}</em> : null}</span>
+                          <span className="completed-prompt"><small>번역 프롬프트</small><strong title={`${prompt.name} ${prompt.version}`}>{prompt.name} {prompt.version}</strong></span>
+                          <span className="completed-timing">
+                            <small>작업 시간</small>
+                            <span className="completed-time-range"><time>{clock(startedAt)}</time><span aria-hidden>~</span><time>{clock(endedAt)}</time><strong>({timingDetail})</strong></span>
+                          </span>
+                          <span className="completed-updated"><small>작업 수정 시간</small><time>{clock(job.updated_at)}</time></span>
+                        </Link>
+                      );
+                    })}
                   </div>
                 )}
               </div>
             </section>
+
           </div>
 
           <aside className="dashboard-aside">

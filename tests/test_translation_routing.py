@@ -557,7 +557,12 @@ class BackendTranslationRoutingTests(unittest.TestCase):
                     for server in routing.group("draft")["servers"]
                     if server["id"] == draft_shared.id
                 )
-                self.assertEqual(shared_public["status"], "suspended")
+                self.assertEqual(shared_public["status"], "unknown")
+                self.assertEqual(shared_public["routing_state"], "suspended")
+                self.assertEqual(
+                    shared_public["routing_reason"],
+                    "review_priority",
+                )
                 self.assertEqual(shared_public["available_slots"], 0)
 
                 with routing._condition:
@@ -631,7 +636,12 @@ class BackendTranslationRoutingTests(unittest.TestCase):
                         for server in routing.group("draft")["servers"]
                         if server["id"] == shared.id
                     )
-                    self.assertEqual(suspended["status"], "suspended")
+                    self.assertEqual(suspended["status"], "unknown")
+                    self.assertEqual(suspended["routing_state"], "suspended")
+                    self.assertEqual(
+                        suspended["routing_reason"],
+                        "review_priority",
+                    )
                     routing.request_completion(
                         "draft",
                         "live",
@@ -654,7 +664,7 @@ class BackendTranslationRoutingTests(unittest.TestCase):
                     routing._active_requests[("draft", "builtin")] = 0
                     routing._condition.notify_all()
 
-            self.assertNotEqual(restored["status"], "suspended")
+            self.assertEqual(restored["routing_state"], "available")
             self.assertEqual(
                 calls,
                 [
@@ -830,6 +840,31 @@ class BackendTranslationRoutingTests(unittest.TestCase):
                 "fallback-model",
             )
 
+    def test_connection_error_names_translation_stage(self) -> None:
+        cases = (
+            ("draft", "1차(초벌) 번역 서버에 연결할 수 없습니다."),
+            ("review", "2차(검증) 번역 서버에 연결할 수 없습니다."),
+        )
+        for stage, expected in cases:
+            with self.subTest(stage=stage), TemporaryDirectory() as directory:
+                routing = self.routing(
+                    Path(directory),
+                    review_enabled=True,
+                )
+                with patch.object(
+                    RetryingJSONClient,
+                    "request",
+                    side_effect=ExternalServiceError("offline"),
+                ):
+                    with self.assertRaises(ExternalServiceError) as raised:
+                        routing.request_completion(
+                            stage,
+                            "live",
+                            {"messages": []},
+                        )
+
+                self.assertEqual(str(raised.exception), expected)
+
     def test_hard_breaker_routes_away_from_shared_stt_host(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -862,9 +897,11 @@ class BackendTranslationRoutingTests(unittest.TestCase):
 
             builtin = routing.group("draft")["servers"][0]
             self.assertEqual(response.status_code, 200)
-            self.assertEqual(builtin["status"], "suspended")
+            self.assertEqual(builtin["status"], "unknown")
+            self.assertEqual(builtin["routing_state"], "suspended")
+            self.assertEqual(builtin["routing_reason"], "stt_hard_breaker")
             self.assertEqual(builtin["available_slots"], 0)
-            self.assertIn("전사 모델", builtin["message"])
+            self.assertIn("전사 모델", builtin["routing_message"])
             self.assertEqual(
                 request.call_args.args[1],
                 f"{fallback.base_url}/chat/completions",
@@ -909,7 +946,12 @@ class BackendTranslationRoutingTests(unittest.TestCase):
 
             self.assertTrue(result["enabled"])
             self.assertEqual(result["unloaded_models"], [DRAFT_MODEL])
-            self.assertEqual(suspended["status"], "suspended")
+            self.assertEqual(suspended["status"], "unknown")
+            self.assertEqual(suspended["routing_state"], "suspended")
+            self.assertEqual(
+                suspended["routing_reason"],
+                "stt_hard_breaker",
+            )
             self.assertEqual(get.call_count, 2)
             post.assert_called_once_with(
                 "http://builtin.test/api/generate",

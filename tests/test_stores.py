@@ -332,6 +332,136 @@ class JobStoreTests(unittest.TestCase):
         self.assertEqual(media_duration_bucket_minutes(58 * 60), 60)
         self.assertIsNone(media_duration_bucket_minutes(None))
 
+    def test_summarizes_completed_job_model_and_processing_time(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            store = JobStore(Path(directory) / "jobs.sqlite3")
+            job = store.create(
+                job_id="job-1",
+                source_rel="movie.mkv",
+                force_overwrite=False,
+                options={"backend": "whisperjav"},
+            )
+            store.record_transcript_revision(
+                revision_id="transcript-1",
+                job_id=job.id,
+                audio_revision_id=None,
+                remote_job_id="remote-1",
+                backend="whisperjav",
+                model_revision="ensemble-v2",
+                options_hash="options-hash",
+                artifact_path=str(Path(directory) / "transcript.json"),
+                content_hash="transcript-hash",
+                origin="automatic",
+                status=None,
+                chunks_total=1,
+            )
+            for phase, event_code in (
+                ("extraction", "stage.started"),
+                ("extraction", "stage.completed"),
+                ("transcription", "stage.started"),
+                ("transcription", "stage.completed"),
+                ("translation", "stage.started"),
+                ("translation", "stage.paused"),
+                ("translation", "stage.started"),
+                ("translation", "stage.completed"),
+                ("render", "stage.started"),
+                ("render", "stage.completed"),
+            ):
+                store.add_event(
+                    job.id,
+                    "info",
+                    event_code,
+                    event_code=event_code,
+                    phase=phase,
+                    attempt=1,
+                )
+            with store._connect() as connection:
+                rows = connection.execute(
+                    """
+                    SELECT id FROM job_events
+                    WHERE event_code IN ('stage.started', 'stage.completed',
+                                         'stage.paused')
+                    ORDER BY id
+                    """
+                ).fetchall()
+                event_times = (
+                    100.0,
+                    110.0,
+                    200.0,
+                    230.0,
+                    300.0,
+                    320.0,
+                    500.0,
+                    530.0,
+                    600.0,
+                    610.0,
+                )
+                for row, created_at in zip(rows, event_times, strict=True):
+                    connection.execute(
+                        "UPDATE job_events SET created_at = ? WHERE id = ?",
+                        (created_at, int(row["id"])),
+                    )
+
+            summary = store.job_completion_summaries([job.id])[job.id]
+
+            self.assertEqual(summary["transcription_backend"], "whisperjav")
+            self.assertEqual(
+                summary["transcription_model_revision"],
+                "ensemble-v2",
+            )
+            self.assertEqual(summary["started_at"], 100.0)
+            self.assertEqual(summary["ended_at"], 610.0)
+            self.assertEqual(summary["processing_seconds"], 100.0)
+            self.assertEqual(summary["timing_source"], "events")
+
+    def test_summarizes_legacy_message_events_as_processing_time(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = JobStore(Path(directory) / "jobs.sqlite3")
+            job = store.create(
+                job_id="legacy-job",
+                source_rel="movie.mkv",
+                force_overwrite=False,
+                options={},
+            )
+            messages = (
+                "audio extraction started",
+                "audio extraction completed (1 byte)",
+                "transcription started",
+                "transcription completed (1 segment)",
+                "translation started",
+                "translation completed (1 segment)",
+                "render started",
+                "subtitles written: movie.srt, movie.ass",
+            )
+            for message in messages:
+                store.add_event(job.id, "info", message)
+            with store._connect() as connection:
+                rows = connection.execute(
+                    """
+                    SELECT id FROM job_events
+                    WHERE event_code = 'job.message'
+                    ORDER BY id
+                    """
+                ).fetchall()
+                for row, created_at in zip(
+                    rows,
+                    (100.0, 110.0, 200.0, 230.0, 300.0, 330.0, 400.0, 410.0),
+                    strict=True,
+                ):
+                    connection.execute(
+                        "UPDATE job_events SET created_at = ? WHERE id = ?",
+                        (created_at, int(row["id"])),
+                    )
+
+            summary = store.job_completion_summaries([job.id])[job.id]
+
+            self.assertEqual(summary["started_at"], 100.0)
+            self.assertEqual(summary["ended_at"], 410.0)
+            self.assertEqual(summary["processing_seconds"], 80.0)
+            self.assertEqual(summary["timing_source"], "events")
+
     def test_requires_explicit_structured_state_for_new_user_stops(self) -> None:
         with TemporaryDirectory() as directory:
             store = JobStore(Path(directory) / "jobs.sqlite3")

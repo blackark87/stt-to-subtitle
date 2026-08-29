@@ -393,16 +393,28 @@ class BackendTranslationRouting:
             and self._uses_shared_stt_memory(server)
             and self.hard_breaker_active()
         )
-        if hard_blocked:
-            status = "suspended"
-            current["message"] = HARD_BREAKER_MESSAGE
-        elif review_priority:
-            status = "suspended"
-            current["message"] = REVIEW_PRIORITY_MESSAGE
-        elif not server.base_url:
+        if not server.base_url:
             status = "unconfigured"
+            routing_state = "unconfigured"
+            routing_reason = "unconfigured"
+            routing_message = "번역 서버 API 주소가 설정되지 않았습니다."
         else:
             status = str(current.get("status", "unknown"))
+            routing_state = "available"
+            routing_reason = None
+            routing_message = None
+        if not server.enabled:
+            routing_state = "disabled"
+            routing_reason = "disabled"
+            routing_message = "번역 요청 라우팅에서 제외되어 있습니다."
+        elif hard_blocked:
+            routing_state = "suspended"
+            routing_reason = "stt_hard_breaker"
+            routing_message = HARD_BREAKER_MESSAGE
+        elif review_priority:
+            routing_state = "suspended"
+            routing_reason = "review_priority"
+            routing_message = REVIEW_PRIORITY_MESSAGE
         return {
             "id": server.id,
             "stage": stage,
@@ -417,11 +429,14 @@ class BackendTranslationRouting:
             "models": list(server.models),
             "status": status,
             "message": current.get("message"),
+            "routing_state": routing_state,
+            "routing_reason": routing_reason,
+            "routing_message": routing_message,
             "checked_at": server.checked_at,
             "running_jobs": running,
             "available_slots": (
                 0
-                if hard_blocked or review_priority
+                if routing_state != "available"
                 else max(0, server.capacity - running)
             ),
         }
@@ -961,4 +976,6 @@ class BackendTranslationRouting:
             last_response = response
         if last_response is not None:
             return last_response
-        raise ExternalServiceError("번역 서버에 연결할 수 없습니다.")
+        raise ExternalServiceError(
+            f"{TRANSLATION_STAGE_LABELS[resolved]} 서버에 연결할 수 없습니다."
+        )

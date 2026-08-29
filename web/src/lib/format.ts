@@ -60,3 +60,25 @@ export function elapsed(from: string | null | undefined, to: string | null | und
   if (h > 0) return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
   return `${m}분 ${String(s).padStart(2, "0")}초`;
 }
+
+/** 초 단위 실행 시간을 일·시간·분·초 중 의미 있는 두 단위로 표시한다. */
+export function duration(value: number | null | undefined): string {
+  if (value == null || !Number.isFinite(value) || value < 0) return "기록 없음";
+  let remaining = Math.round(value);
+  const units: [string, number][] = [
+    ["일", 86400],
+    ["시간", 3600],
+    ["분", 60],
+    ["초", 1],
+  ];
+  const parts: string[] = [];
+  for (const [label, seconds] of units) {
+    const amount = Math.floor(remaining / seconds);
+    if (amount > 0 || (label === "초" && parts.length === 0)) {
+      parts.push(`${amount}${label}`);
+      remaining %= seconds;
+    }
+    if (parts.length === 2) break;
+  }
+  return parts.join(" ");
+}

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
-from typing import Any
+from typing import Any, Mapping, Sequence
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response
 
@@ -28,11 +28,13 @@ from .backend_contracts import (
     TranslationServerModelRequest,
 )
 from .job_state import JobPhase, JobReason, JobState
+from .job_store import PipelineJob
 from .gpu_monitoring import gpu_snapshot_payload
 from .library_progress import summarize_library_progress
 from .operational_metrics import prometheus_exposition
-from .orchestrator import DEFAULT_ARTIFACT_CLEANUP_AGE_DAYS
+from .orchestrator import DEFAULT_ARTIFACT_CLEANUP_AGE_DAYS, SubtitleOrchestrator
 from .service_clients import ExternalServiceError
+from .time_display import format_kst_iso
 from .backend_config import (
     RemoteServerSettings,
     SubtitleValidatorSettings,
@@ -40,6 +42,63 @@ from .backend_config import (
 
 
 router = APIRouter(prefix="/api/v1")
+
+
+def _completed_jobs_payload(
+    service: SubtitleOrchestrator,
+    jobs: Sequence[PipelineJob],
+) -> list[dict[str, Any]]:
+    summaries = service.store.job_completion_summaries([job.id for job in jobs])
+    payloads = jobs_payload(jobs)
+    for job, payload in zip(jobs, payloads, strict=True):
+        summary = summaries.get(job.id, {})
+        prompt_snapshot = job.options.get("translation_prompt")
+        if not isinstance(prompt_snapshot, Mapping):
+            prompt_snapshot = {}
+        revision_number = prompt_snapshot.get("revision_number")
+        if not isinstance(revision_number, int) or isinstance(
+            revision_number,
+            bool,
+        ):
+            revision_number = None
+        category_id = str(prompt_snapshot.get("category_id", "")).strip()
+        prompt_name = {
+            "jav": "JAV",
+            "variety": "버라이어티",
+        }.get(category_id, job.prompt_category_name)
+        started_at = summary.get("started_at")
+        ended_at = summary.get("ended_at")
+        processing_seconds = summary.get("processing_seconds")
+        transcription_backend = summary.get("transcription_backend")
+        payload["completion_summary"] = {
+            "transcription_backend": str(
+                transcription_backend
+                or job.options.get("backend")
+                or "기본"
+            ),
+            "transcription_model_revision": summary.get(
+                "transcription_model_revision"
+            ),
+            "translation_prompt_name": prompt_name,
+            "translation_prompt_version": revision_number,
+            "started_at": format_kst_iso(
+                started_at
+                if isinstance(started_at, int | float)
+                else job.created_at
+            ),
+            "ended_at": format_kst_iso(
+                ended_at
+                if isinstance(ended_at, int | float)
+                else job.status_updated_at
+            ),
+            "processing_seconds": (
+                processing_seconds
+                if isinstance(processing_seconds, int | float)
+                else max(0.0, job.status_updated_at - job.created_at)
+            ),
+            "timing_source": summary.get("timing_source", "job"),
+        }
+    return payloads
 
 
 @router.get("/dashboard")
@@ -65,6 +124,11 @@ def dashboard(request: Request) -> dict[str, Any]:
         "transcription": "transcription_completed",
         "subtitle": "completed",
     }
+    recent_completed = service.store.list_jobs(
+        statuses={completion_statuses["subtitle"]},
+        limit=10,
+        include_comparison_transcriptions=False,
+    )
     return {
         "state_counts": {
             state.value: service.store.count_jobs(
@@ -100,13 +164,7 @@ def dashboard(request: Request) -> dict[str, Any]:
                 include_comparison_transcriptions=False,
             )
         ),
-        "recent_completed": jobs_payload(
-            service.store.list_jobs(
-                statuses={completion_statuses["subtitle"]},
-                limit=10,
-                include_comparison_transcriptions=False,
-            )
-        ),
+        "recent_completed": _completed_jobs_payload(service, recent_completed),
         "state_samples": {
             state.value: jobs_payload(
                 service.store.list_jobs(

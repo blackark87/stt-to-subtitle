@@ -26,6 +26,18 @@ export interface PipelineJob {
   job_stop_requested: boolean;
   created_at: string;
   updated_at: string;
+  completion_summary?: JobCompletionSummary;
+}
+
+export interface JobCompletionSummary {
+  transcription_backend: string;
+  transcription_model_revision: string | null;
+  translation_prompt_name: string;
+  translation_prompt_version: number | null;
+  started_at: string;
+  ended_at: string;
+  processing_seconds: number;
+  timing_source: "events" | "job";
 }
 
 export interface JobListItem extends PipelineJob {
@@ -67,6 +79,9 @@ export interface TranslationServer {
   models: string[];
   status: string;
   message: string | null;
+  routing_state: "available" | "suspended" | "disabled" | "unconfigured";
+  routing_reason: "stt_hard_breaker" | "review_priority" | "disabled" | "unconfigured" | null;
+  routing_message: string | null;
   checked_at: number | null;
   running_jobs: number;
   available_slots: number;
