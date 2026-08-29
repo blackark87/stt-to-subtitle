@@ -395,6 +395,14 @@ export default function JobsPage() {
                     : null;
                   const phase = PHASE_LABEL[job.phase as JobPhase] ?? job.phase;
                   const stateText = jobStateLabel(job);
+                  const filename = fileName(job.source_rel);
+                  const nfoTitle = job.nfo_title?.trim() || null;
+                  const displayTitle = nfoTitle ?? filename;
+                  const location = parentPath(job.source_rel);
+                  const identityDetail = [
+                    nfoTitle ? filename : location,
+                    runtime ? `전사 서버 · ${runtime}` : null,
+                  ].filter((value): value is string => Boolean(value)).join(" · ");
                   return (
                     <div
                       key={job.id}
@@ -413,10 +421,23 @@ export default function JobsPage() {
                         <span className={state ? BADGE_CLASS[state] : "b"} title={stateText}>{stateText}</span>
                       </label>
                       <div role="cell" className="job-name-cell" data-label="작업">
-                        <div className="t-name" title={job.source_rel}>
-                          <b><Link href={`/jobs/${encodeURIComponent(job.id)}`}>{fileName(job.source_rel)}</Link></b>
-                          <span>{parentPath(job.source_rel)}</span>
-                          {runtime ? <span title={`전사 서버: ${runtime}`}>전사 서버 · {runtime}</span> : null}
+                        <div className={job.poster_path ? "job-identity has-poster" : "job-identity"}>
+                          {job.poster_path ? (
+                            <Link
+                              href={`/jobs/${encodeURIComponent(job.id)}`}
+                              className="job-poster"
+                              aria-label={`${displayTitle} 작업 상세`}
+                            >
+                              {/* eslint-disable-next-line @next/next/no-img-element */}
+                              <img src={api.posterUrl(job.poster_path)} alt="" loading="lazy" />
+                            </Link>
+                          ) : null}
+                          <div className="t-name">
+                            <b title={displayTitle}>
+                              <Link href={`/jobs/${encodeURIComponent(job.id)}`}>{displayTitle}</Link>
+                            </b>
+                            {identityDetail ? <span title={`${job.source_rel}${runtime ? ` · 전사 서버: ${runtime}` : ""}`}>{identityDetail}</span> : null}
+                          </div>
                         </div>
                       </div>
                       <div role="cell" className="job-meta-cell job-phase-cell" data-label="단계">

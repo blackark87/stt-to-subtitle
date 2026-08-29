@@ -46,6 +46,17 @@ from .translation_comparison import compare_translation_items
 router = APIRouter(prefix="/api/v1")
 
 
+def _job_list_payloads(service: Any, jobs: list[Any]) -> list[dict[str, Any]]:
+    items = jobs_payload(jobs)
+    for item, job in zip(items, jobs, strict=True):
+        try:
+            metadata = service.library.media_display_metadata(job.source_rel)
+        except (OSError, ValueError):
+            metadata = {"nfo_title": None, "poster_path": None}
+        item.update(metadata)
+    return items
+
+
 def _job_artifact(job: Any, kind: str) -> tuple[Path, str, str]:
     fields = {
         "transcript": (job.transcript_path, "application/json"),
@@ -145,7 +156,7 @@ def list_jobs(
     }
     jobs = service.store.list_jobs(limit=limit, offset=offset, **filters)
     return {
-        "items": jobs_payload(jobs),
+        "items": _job_list_payloads(service, jobs),
         "total": service.store.count_jobs(**filters),
         "limit": limit,
         "offset": offset,

@@ -639,6 +639,18 @@ class MediaLibrary:
         media_path = self.resolve_file(relative_media_path)
         return discover_external_subtitles(media_path)
 
+    def media_display_metadata(
+        self,
+        relative_media_path: str,
+    ) -> dict[str, str | None]:
+        """Return the lightweight title artwork used outside media browsing."""
+        media_path = self.resolve_file(relative_media_path)
+        metadata = self._media_metadata(media_path)
+        return {
+            "nfo_title": metadata["nfo_title"],
+            "poster_path": metadata["poster_path"],
+        }
+
     def actor_library_entries(
         self,
         relative_directory: str = "av/japan",
@@ -1000,18 +1012,7 @@ class MediaLibrary:
         srt_subtitle = path.with_name(f"{path.stem}.ko.srt")
         ass_subtitle = path.with_name(f"{path.stem}.ko.ass")
         external_subtitles = discover_external_subtitles(path)
-        nfo_path = self._find_nfo(path)
-        title: str | None = None
-        release_date: str | None = None
-        poster_path: str | None = None
-        actors: list[str] = []
-        if nfo_path is not None:
-            title, poster_references, actors, release_date = self._read_nfo(
-                nfo_path
-            )
-            poster = self._find_poster(path, nfo_path, poster_references)
-            if poster is not None:
-                poster_path = poster.relative_to(self.root).as_posix()
+        metadata = self._media_metadata(path)
         return {
             "path": relative,
             "name": path.name,
@@ -1032,11 +1033,30 @@ class MediaLibrary:
                 if external_subtitles
                 else None
             ),
+            **metadata,
+        }
+
+    def _media_metadata(self, path: Path) -> dict[str, object]:
+        nfo_path = self._find_nfo(path)
+        title: str | None = None
+        release_date: str | None = None
+        poster_references: list[str] = []
+        actors: list[str] = []
+        if nfo_path is not None:
+            title, poster_references, actors, release_date = self._read_nfo(
+                nfo_path
+            )
+        poster = self._find_poster(path, nfo_path, poster_references)
+        return {
             "has_nfo": nfo_path is not None,
             "title": title or path.stem,
             "nfo_title": title,
             "nfo_release_date": release_date,
-            "poster_path": poster_path,
+            "poster_path": (
+                poster.relative_to(self.root).as_posix()
+                if poster is not None
+                else None
+            ),
             "actors": actors,
         }
 
@@ -1158,21 +1178,27 @@ class MediaLibrary:
     def _find_poster(
         self,
         source_path: Path,
-        nfo_path: Path,
+        nfo_path: Path | None,
         poster_references: list[str],
     ) -> Path | None:
-        for reference in poster_references:
-            poster = self._resolve_local_poster(nfo_path.parent, reference)
-            if poster is not None:
-                return poster
+        if nfo_path is not None:
+            for reference in poster_references:
+                poster = self._resolve_local_poster(nfo_path.parent, reference)
+                if poster is not None:
+                    return poster
 
-        for stem in (
-            f"{source_path.stem}-poster",
-            source_path.stem,
+        media_stems = [source_path.stem]
+        multipart = MULTIPART_STEM_PATTERN.fullmatch(source_path.stem)
+        if multipart is not None:
+            media_stems.append(multipart.group("base"))
+        poster_stems = [
+            *(f"{stem}-poster" for stem in media_stems),
+            *media_stems,
             "poster",
             "folder",
             "cover",
-        ):
+        ]
+        for stem in dict.fromkeys(poster_stems):
             for extension in POSTER_EXTENSIONS:
                 candidate = source_path.parent / f"{stem}{extension}"
                 if candidate.is_file() and not candidate.is_symlink():

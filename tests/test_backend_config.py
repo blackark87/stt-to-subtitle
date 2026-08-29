@@ -554,6 +554,10 @@ class MediaLibraryTests(unittest.TestCase):
             self.assertIsInstance(files[0]["modified_at"], float)
             self.assertIsNone(files[0]["poster_path"])
             self.assertNotIn("directory", files[0])
+            self.assertEqual(
+                MediaLibrary(root).media_display_metadata("folder/movie.mkv"),
+                {"nfo_title": None, "poster_path": None},
+            )
 
     def test_ass_file_alone_marks_media_as_subtitled(self) -> None:
         with TemporaryDirectory() as directory:
@@ -603,6 +607,46 @@ class MediaLibraryTests(unittest.TestCase):
             self.assertEqual(
                 library.resolve_poster("folder/art/movie-poster.jpg"),
                 poster.resolve(),
+            )
+            self.assertEqual(
+                library.media_display_metadata("folder/movie.mkv"),
+                {
+                    "nfo_title": "테스트 영화",
+                    "poster_path": "folder/art/movie-poster.jpg",
+                },
+            )
+
+    def test_finds_conventional_poster_without_nfo(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "movie.mkv").write_bytes(b"media")
+            (root / "poster.jpg").write_bytes(b"poster")
+
+            library = MediaLibrary(root)
+            media = library.browse()["files"][0]
+
+            self.assertFalse(media["has_nfo"])
+            self.assertIsNone(media["nfo_title"])
+            self.assertEqual(media["poster_path"], "poster.jpg")
+            self.assertEqual(
+                library.media_display_metadata("movie.mkv"),
+                {"nfo_title": None, "poster_path": "poster.jpg"},
+            )
+
+    def test_exposes_nfo_title_without_reserving_missing_poster(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "movie.mkv").write_bytes(b"media")
+            (root / "movie.nfo").write_text(
+                "<movie><title>제목만 있는 작품</title></movie>",
+                encoding="utf-8",
+            )
+
+            metadata = MediaLibrary(root).media_display_metadata("movie.mkv")
+
+            self.assertEqual(
+                metadata,
+                {"nfo_title": "제목만 있는 작품", "poster_path": None},
             )
 
     def test_uses_nfo_premiered_when_release_date_is_absent(self) -> None:

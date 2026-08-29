@@ -142,6 +142,53 @@ class BackendAPIBoundaryTests(unittest.TestCase):
             settings_response.json()["servers"],
         )
 
+    def test_job_list_includes_optional_nfo_title_and_poster(self) -> None:
+        from fastapi.testclient import TestClient
+
+        from stt_to_subtitle.backend_api import create_backend_app
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            (media_root / "with-metadata.mkv").write_bytes(b"media")
+            (media_root / "with-metadata.nfo").write_text(
+                "<movie><title>작업 목록 제목</title></movie>",
+                encoding="utf-8",
+            )
+            (media_root / "with-metadata-poster.jpg").write_bytes(b"poster")
+            settings = BackendSettings(
+                state_dir=root / "state",
+                media_root=media_root,
+                stt_base_url="http://runtime:8100",
+                stt_token="",
+            )
+            with TestClient(create_backend_app(settings)) as client:
+                service = client.app.state.orchestrator
+                service.store.create(
+                    job_id="with-metadata",
+                    source_rel="with-metadata.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                service.store.create(
+                    job_id="missing-media",
+                    source_rel="missing-media.mkv",
+                    force_overwrite=False,
+                    options={},
+                )
+                response = client.get("/api/v1/jobs")
+
+        self.assertEqual(response.status_code, 200)
+        jobs = {item["id"]: item for item in response.json()["items"]}
+        self.assertEqual(jobs["with-metadata"]["nfo_title"], "작업 목록 제목")
+        self.assertEqual(
+            jobs["with-metadata"]["poster_path"],
+            "with-metadata-poster.jpg",
+        )
+        self.assertIsNone(jobs["missing-media"]["nfo_title"])
+        self.assertIsNone(jobs["missing-media"]["poster_path"])
+
     def test_dashboard_returns_recent_samples_for_each_large_state(self) -> None:
         from fastapi.testclient import TestClient
 

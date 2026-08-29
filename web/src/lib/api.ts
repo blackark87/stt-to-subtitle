@@ -28,6 +28,11 @@ export interface PipelineJob {
   updated_at: string;
 }
 
+export interface JobListItem extends PipelineJob {
+  nfo_title: string | null;
+  poster_path: string | null;
+}
+
 export interface RuntimeEndpoint {
   id: string;
   name: string;
@@ -354,7 +359,7 @@ export const api = {
     for (const value of params.operation ?? []) query.append("operation", value);
     for (const value of params.reasonCode ?? []) query.append("reason_code", value);
     const suffix = query.toString();
-    return request<ListPayload<PipelineJob>>(`/jobs${suffix ? `?${suffix}` : ""}`);
+    return request<ListPayload<JobListItem>>(`/jobs${suffix ? `?${suffix}` : ""}`);
   },
 
   retryJobs: (jobIds: string[]) =>
