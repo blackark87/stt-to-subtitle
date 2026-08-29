@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { Icon } from "@/components/Icon";
 import { Freshness } from "@/components/Freshness";
 import { LoadingOverlay } from "@/components/LoadingOverlay";
@@ -89,6 +89,19 @@ export default function MediaPage() {
     if (subtitle === "done") return list.filter((file) => file.has_subtitle);
     return list;
   }, [data, subtitle]);
+  const hasNfoTitles = files.some((file) => Boolean(file.nfo_title));
+  const hasNfoReleaseDates = files.some((file) => Boolean(file.nfo_release_date));
+
+  useEffect(() => {
+    if (!data) return;
+    const unavailable = (fileSort === "nfo_title" && !hasNfoTitles)
+      || (fileSort === "nfo_release_desc" && !hasNfoReleaseDates);
+    if (!unavailable) return;
+    const params = new URLSearchParams(searchParams.toString());
+    params.delete("file_sort");
+    const suffix = params.toString();
+    router.replace(suffix ? `/media?${suffix}` : "/media", { scroll: false });
+  }, [data, fileSort, hasNfoReleaseDates, hasNfoTitles, router, searchParams]);
 
   const selectedFiles = useMemo(
     () => files.filter((file) => selected.has(file.path)),
@@ -263,9 +276,9 @@ export default function MediaPage() {
                 >
                   <option value="created_desc">미디어 생성일 최신순</option>
                   <option value="modified_desc">미디어 수정일 최신순</option>
-                  <option value="nfo_title">NFO 제목순</option>
+                  {hasNfoTitles ? <option value="nfo_title">NFO 제목순</option> : null}
                   <option value="filename">파일명순</option>
-                  <option value="nfo_release_desc">NFO 출시일 최신순</option>
+                  {hasNfoReleaseDates ? <option value="nfo_release_desc">NFO 출시일 최신순</option> : null}
                 </select>
               </label>
               <label className="compact-field">
@@ -311,9 +324,7 @@ export default function MediaPage() {
               <div className="board">
                 {files.map((file: MediaFile) => {
                   const on = selected.has(file.path);
-                  const title = file.has_nfo && file.nfo_title
-                    ? file.nfo_title
-                    : (file.display_name ?? file.name);
+                  const title = file.title || file.name;
                   return (
                     <button
                       key={file.path}
@@ -338,8 +349,8 @@ export default function MediaPage() {
                         </span>
                         <span className="media-meta">
                           <span title={duration(file.duration_seconds)}>{duration(file.duration_seconds)}</span>
-                          {file.has_nfo && file.nfo_release_date ? <span title={`NFO 출시일 ${file.nfo_release_date}`}>출시 {file.nfo_release_date}</span> : null}
-                          {file.has_nfo && file.actors.length ? <span title={file.actors.join(", ")}>{file.actors.slice(0, 2).join(" · ")}</span> : null}
+                          {file.nfo_release_date ? <span title={`NFO 출시일 ${file.nfo_release_date}`}>출시 {file.nfo_release_date}</span> : null}
+                          {file.actors.length ? <span title={file.actors.join(", ")}>{file.actors.slice(0, 2).join(" · ")}</span> : null}
                         </span>
                         <span className="ma">
                           {file.has_subtitle ? <span className="b ok">자막 있음</span>
