@@ -134,16 +134,6 @@ export const OPERATION_LABEL: Record<JobOperation, string> = {
   external_review: "외부 모델 검토",
 };
 
-export const OPERATION_COMPLETION_LABEL: Record<JobOperation, string> = {
-  extract: "음원 추출 완료",
-  transcribe: "전사 완료",
-  translate: "번역·자막 생성 완료",
-  full: "자막 생성 완료",
-  draft_translate: "1차 번역 완료",
-  review_translate: "2차 번역 완료",
-  external_review: "외부 모델 검토 완료",
-};
-
 export const TRANSCRIPTION_STAGE_LABEL: Record<string, string> = {
   model_loading: "모델 준비",
   scene_detection: "장면 분석",
@@ -232,16 +222,16 @@ export function phaseLabel(value: string): string {
   return phase ? PHASE_LABEL[phase] : value;
 }
 
+export function jobStageLabel(phaseValue: string, operationValue: string): string {
+  const phase = asJobPhase(phaseValue);
+  if (phase === "complete") return operationLabel(operationValue);
+  return phase ? PHASE_LABEL[phase] : phaseValue;
+}
+
 export function operationLabel(value: string): string {
   return (JOB_OPERATIONS as readonly string[]).includes(value)
     ? OPERATION_LABEL[value as JobOperation]
     : value;
-}
-
-export function operationCompletionLabel(value: string): string {
-  return (JOB_OPERATIONS as readonly string[]).includes(value)
-    ? OPERATION_COMPLETION_LABEL[value as JobOperation]
-    : "작업 완료";
 }
 
 export function transcriptionStageLabel(value: string | null): string | null {

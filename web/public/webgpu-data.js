@@ -18,8 +18,19 @@
     extraction: "추출",
     transcription: "전사",
     translation: "번역",
+    draft_translation: "1차 번역",
+    review_translation: "2차 번역",
+    external_review: "외부 모델 검토",
     render: "렌더",
-    complete: "작업 종료",
+  };
+  const OPERATION_LABEL = {
+    extract: "음원 추출",
+    transcribe: "전사",
+    translate: "번역·자막 생성",
+    full: "전체 자막 생성",
+    draft_translate: "1차 번역",
+    review_translate: "2차 번역",
+    external_review: "외부 모델 검토",
   };
   const STATE_LABEL = {
     running: "진행 중",
@@ -42,15 +53,11 @@
     transcription_merge: "전사 결과 병합",
     subtitle_normalization: "자막 구간 구성",
   };
-  const COMPLETION_LABEL = {
-    audio_completed: "음원 추출 완료",
-    transcription_completed: "전사 완료",
-    completed: "자막 완료",
-  };
+  const stageLabel = (job) => job.phase === "complete"
+    ? OPERATION_LABEL[job.operation] || job.operation
+    : PHASE_LABEL[job.phase] || job.phase;
 
-  const statusLabel = (job) => job.state === "done"
-    ? COMPLETION_LABEL[job.status] || "작업 완료"
-    : STATE_LABEL[job.state] || job.state;
+  const statusLabel = (job) => STATE_LABEL[job.state] || job.state;
 
   const percent = (job) => {
     if (job.phase === "transcription") {
@@ -67,15 +74,15 @@
     id: job.id,
     source_rel: job.source_rel,
     title: String(job.source_rel || "").split("/").pop() || job.source_rel,
-    phase: PHASE_LABEL[job.phase] || job.phase,
-    stage: PHASE_LABEL[job.phase] || job.phase,
+    phase: stageLabel(job),
+    stage: stageLabel(job),
     state: job.state,
     status: statusLabel(job),
     status_label: statusLabel(job),
     reason_code: job.reason_code,
     error: job.error || "",
     detail: [
-      PHASE_LABEL[job.phase] || job.phase,
+      stageLabel(job),
       job.phase === "transcription" && job.transcription_stage
         ? TRANSCRIPTION_STAGE_LABEL[job.transcription_stage] || job.transcription_stage
         : null,
@@ -154,7 +161,7 @@
           stage: label,
           job: job?.source_rel || null,
           detail: job ? [
-            PHASE_LABEL[job.phase],
+            stageLabel(job),
             phase === "transcription" && job.transcription_stage
               ? TRANSCRIPTION_STAGE_LABEL[job.transcription_stage] || job.transcription_stage
               : null,

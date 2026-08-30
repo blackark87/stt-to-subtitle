@@ -21,6 +21,7 @@ import {
   canPauseTranslation,
   canRetryJob,
   canStopJob,
+  jobStageLabel,
   reasonLabel,
   type JobPhase,
   type JobOperation,
@@ -438,7 +439,7 @@ export default function JobsPage() {
                   const runtime = job.stt_runtime_id
                     ? runtimeNames.get(job.stt_runtime_id) ?? job.stt_runtime_id
                     : null;
-                  const phase = PHASE_LABEL[job.phase as JobPhase] ?? job.phase;
+                  const phase = jobStageLabel(job.phase, job.operation);
                   const stateText = state ? STATE_LABEL[state] : job.state;
                   const filename = fileName(job.source_rel);
                   const nfoTitle = job.nfo_title?.trim() || null;
