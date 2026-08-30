@@ -222,12 +222,6 @@ export function phaseLabel(value: string): string {
   return phase ? PHASE_LABEL[phase] : value;
 }
 
-export function jobStageLabel(phaseValue: string, operationValue: string): string {
-  const phase = asJobPhase(phaseValue);
-  if (phase === "complete") return operationLabel(operationValue);
-  return phase ? PHASE_LABEL[phase] : phaseValue;
-}
-
 export function operationLabel(value: string): string {
   return (JOB_OPERATIONS as readonly string[]).includes(value)
     ? OPERATION_LABEL[value as JobOperation]

@@ -53,9 +53,21 @@
     transcription_merge: "전사 결과 병합",
     subtitle_normalization: "자막 구간 구성",
   };
-  const stageLabel = (job) => job.phase === "complete"
-    ? OPERATION_LABEL[job.operation] || job.operation
-    : PHASE_LABEL[job.phase] || job.phase;
+  const translationMode = (job) => {
+    const prompt = job.options?.translation_prompt || {};
+    const explicit = prompt.translation_mode;
+    if (["draft_only", "review_existing", "draft_and_review"].includes(explicit)) return explicit;
+    if (prompt.target_stage === "draft" || prompt.review_rounds === 0) return "draft_only";
+    return "draft_and_review";
+  };
+
+  const stageLabel = (job) => {
+    if (job.phase !== "complete") return PHASE_LABEL[job.phase] || job.phase;
+    if (job.operation === "translate" || job.operation === "full") {
+      return translationMode(job) === "draft_only" ? "1차 번역" : "2차 번역";
+    }
+    return OPERATION_LABEL[job.operation] || job.operation;
+  };
 
   const statusLabel = (job) => STATE_LABEL[job.state] || job.state;
 

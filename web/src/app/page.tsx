@@ -13,11 +13,11 @@ import {
   asJobState,
   canResumeTranslation,
   canRetryJob,
-  jobStageLabel,
   reasonLabel,
   type JobState,
 } from "@/lib/domain";
 import { clock, duration, fileName, parentPath, percent } from "@/lib/format";
+import { jobStageLabel } from "@/lib/jobPresentation";
 import { useLiveQuery } from "@/lib/useLiveQuery";
 
 const DASHBOARD_INTERVAL_MS = 5000;
@@ -302,7 +302,7 @@ export default function DashboardPage() {
                         <Link href={`/jobs/${encodeURIComponent(job.id)}`} className="job-row" key={job.id}>
                           <span className="job-state-line running" />
                           <span className="t-name" title={job.source_rel}><b>{fileName(job.source_rel)}</b><span>{parentPath(job.source_rel)}</span></span>
-                          <span className="b line">{jobStageLabel(job.phase, job.operation)}{job.phase === "transcription" && runtimeLabel(job) ? ` · ${runtimeLabel(job)}` : ""}</span>
+                          <span className="b line">{jobStageLabel(job)}{job.phase === "transcription" && runtimeLabel(job) ? ` · ${runtimeLabel(job)}` : ""}</span>
                           <span className="job-progress"><progress max={100} value={pct ?? undefined} aria-label="작업 진행률" /><b>{pct == null ? "—" : `${pct}%`}</b></span>
                           <time className="m">{clock(job.updated_at)}</time>
                         </Link>
@@ -338,7 +338,7 @@ export default function DashboardPage() {
                         return (
                           <div className="job-row attention-row" key={job.id}>
                             <span className={`job-state-line ${interruptedState}`} />
-                            <span className="t-name" title={job.source_rel}><b><Link href={`/jobs/${encodeURIComponent(job.id)}`}>{fileName(job.source_rel)}</Link></b><span>{jobStageLabel(job.phase, job.operation)} · {clock(job.updated_at)}</span></span>
+                            <span className="t-name" title={job.source_rel}><b><Link href={`/jobs/${encodeURIComponent(job.id)}`}>{fileName(job.source_rel)}</Link></b><span>{jobStageLabel(job)} · {clock(job.updated_at)}</span></span>
                             <span className={jobState ? BADGE_CLASS[jobState] : "b"}>{jobState ? STATE_LABEL[jobState] : job.state}</span>
                             <span className="reason-text" title={reason}>{reason}</span>
                             <span className="btns">
@@ -501,7 +501,7 @@ export default function DashboardPage() {
                 {waiting.length === 0 ? <div className="empty-state compact"><strong>대기 작업이 없습니다</strong></div> : (
                   <div className="queue-list">
                     {waiting.slice(0, 8).map((job) => (
-                      <Link href={`/jobs/${encodeURIComponent(job.id)}`} key={job.id}><span className="t-name" title={job.source_rel}><b>{fileName(job.source_rel)}</b><span>{jobStageLabel(job.phase, job.operation)}</span></span><Icon name="chevron_right" size={14} /></Link>
+                      <Link href={`/jobs/${encodeURIComponent(job.id)}`} key={job.id}><span className="t-name" title={job.source_rel}><b>{fileName(job.source_rel)}</b><span>{jobStageLabel(job)}</span></span><Icon name="chevron_right" size={14} /></Link>
                     ))}
                   </div>
                 )}

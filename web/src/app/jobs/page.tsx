@@ -21,14 +21,13 @@ import {
   canPauseTranslation,
   canRetryJob,
   canStopJob,
-  jobStageLabel,
   reasonLabel,
   type JobPhase,
   type JobOperation,
   type JobState,
 } from "@/lib/domain";
 import { clock, fileName, parentPath } from "@/lib/format";
-import { jobTranslationMode } from "@/lib/jobPresentation";
+import { jobStageLabel, jobTranslationMode } from "@/lib/jobPresentation";
 import { useLiveQuery } from "@/lib/useLiveQuery";
 
 const JOBS_INTERVAL_MS = 5000;
@@ -439,7 +438,7 @@ export default function JobsPage() {
                   const runtime = job.stt_runtime_id
                     ? runtimeNames.get(job.stt_runtime_id) ?? job.stt_runtime_id
                     : null;
-                  const phase = jobStageLabel(job.phase, job.operation);
+                  const phase = jobStageLabel(job);
                   const stateText = state ? STATE_LABEL[state] : job.state;
                   const filename = fileName(job.source_rel);
                   const nfoTitle = job.nfo_title?.trim() || null;

@@ -4,7 +4,6 @@ import {
   STATE_LABEL,
   asJobPhase,
   asJobState,
-  jobStageLabel,
   operationLabel,
   reasonLabel,
   transcriptionStageLabel,
@@ -58,6 +57,15 @@ export function jobTranslationMode(job: PipelineJob): TranslationMode {
     return "draft_only";
   }
   return "draft_and_review";
+}
+
+export function jobStageLabel(job: PipelineJob): string {
+  const phase = asJobPhase(job.phase);
+  if (phase !== "complete") return phase ? PHASE_LABEL[phase] : job.phase;
+  if (job.operation === "translate" || job.operation === "full") {
+    return jobTranslationMode(job) === "draft_only" ? "1차 번역" : "2차 번역";
+  }
+  return operationLabel(job.operation);
 }
 
 export function jobStateLabel(job: PipelineJob): string {
@@ -215,7 +223,7 @@ function stateTransition(event: JobEvent): string {
 }
 
 export function jobProgressLabel(job: PipelineJob): string {
-  const phase = jobStageLabel(job.phase, job.operation);
+  const phase = jobStageLabel(job);
   if (job.state === "done") return phase;
   if (job.phase !== "transcription") return phase;
   const stage = transcriptionStageLabel(job.transcription_stage);
