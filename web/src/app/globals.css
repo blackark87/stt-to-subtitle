@@ -164,7 +164,7 @@ a { color: var(--accent); text-decoration: none; }
 .t-name a:hover { color: var(--accent); }
 .t-name > span { color: var(--muted); font-size: .74rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .job-name-cell, .job-meta-cell { min-width: 0; }
-.jobs-table .job-grid-row { grid-template-columns: 44px minmax(280px, 360px) 132px minmax(300px, 1fr) minmax(160px, 220px) 132px; }
+.jobs-table .job-grid-row { grid-template-columns: 44px 110px 156px minmax(340px, 1fr) minmax(160px, 220px) 132px; }
 .jobs-table .tr.empty { grid-template-columns: minmax(0, 1fr); }
 .jobs-table input[type="checkbox"] { width: 18px; height: 18px; margin: 0; accent-color: var(--accent); cursor: pointer; }
 .job-select-cell { display: flex; align-self: stretch; align-items: center; cursor: pointer; }
@@ -174,9 +174,6 @@ a { color: var(--accent); text-decoration: none; }
 .job-poster { display: block; width: 36px; height: 50px; overflow: hidden; border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--sunken); }
 .job-poster img { display: block; width: 100%; height: 100%; object-fit: cover; }
 .job-meta-cell > .b { justify-self: start; }
-.job-workflow-stage-list { display: flex; flex-wrap: wrap; gap: 5px; min-width: 0; }
-.job-workflow-stage-list > .b { height: auto; min-height: var(--h-badge); padding-top: 4px; padding-bottom: 4px; line-height: 1.25; }
-.workflow-history-count { border-style: dashed; }
 .job-state-cell > .b, .job-phase-cell > .b {
   max-width: 100%;
   min-height: var(--h-badge);
@@ -903,11 +900,6 @@ progress::-moz-progress-bar { background: var(--accent-solid); border-radius: 99
   .settings-form-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .metrics-record { grid-template-columns: 120px minmax(0, 1fr); }
   .metrics-values { grid-column: 1 / -1; }
-}
-
-@media (min-width: 861px) {
-  .jobs-table { overflow-x: auto; }
-  .jobs-table .job-grid-row { min-width: 1120px; }
 }
 
 @media (max-width: 860px) {

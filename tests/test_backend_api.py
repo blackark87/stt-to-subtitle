@@ -301,7 +301,7 @@ class BackendAPIBoundaryTests(unittest.TestCase):
         self.assertEqual(payload["child_jobs"], [])
         self.assertEqual(payload["workflow_history_jobs"], [])
 
-    def test_job_list_groups_phases_before_filtering_and_pagination(self) -> None:
+    def test_job_list_groups_phases_and_filters_by_current_job(self) -> None:
         from fastapi.testclient import TestClient
 
         from stt_to_subtitle.backend_api import create_backend_app
@@ -350,6 +350,10 @@ class BackendAPIBoundaryTests(unittest.TestCase):
                 response = client.get("/api/v1/jobs")
                 filtered = client.get(
                     "/api/v1/jobs",
+                    params={"operation": "review_translate"},
+                )
+                historical = client.get(
+                    "/api/v1/jobs",
                     params={"operation": "draft_translate"},
                 )
                 paged = client.get("/api/v1/jobs", params={"limit": 1})
@@ -361,16 +365,13 @@ class BackendAPIBoundaryTests(unittest.TestCase):
             item["workflow_root_job_id"]: item for item in payload["items"]
         }
         self.assertEqual(set(workflows), {"workflow-root", "separate-root"})
-        self.assertEqual(
-            [
-                stage["id"]
-                for stage in workflows["workflow-root"]["workflow_stages"]
-            ],
-            ["workflow-root", "workflow-draft", "workflow-review"],
-        )
+        self.assertEqual(workflows["workflow-root"]["id"], "workflow-review")
+        self.assertNotIn("workflow_stages", workflows["workflow-root"])
         self.assertEqual(filtered.status_code, 200)
         self.assertEqual(filtered.json()["total"], 1)
-        self.assertEqual(filtered.json()["items"][0]["id"], "workflow-draft")
+        self.assertEqual(filtered.json()["items"][0]["id"], "workflow-review")
+        self.assertEqual(historical.status_code, 200)
+        self.assertEqual(historical.json()["total"], 0)
         self.assertEqual(paged.status_code, 200)
         self.assertEqual(paged.json()["total"], 2)
         self.assertEqual(len(paged.json()["items"]), 1)

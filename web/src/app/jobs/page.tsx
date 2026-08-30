@@ -438,10 +438,8 @@ export default function JobsPage() {
                   const runtime = job.stt_runtime_id
                     ? runtimeNames.get(job.stt_runtime_id) ?? job.stt_runtime_id
                     : null;
+                  const phase = PHASE_LABEL[job.phase as JobPhase] ?? job.phase;
                   const stateText = jobStateLabel(job);
-                  const workflowStages = job.workflow_stages?.length
-                    ? job.workflow_stages
-                    : [job];
                   const filename = fileName(job.source_rel);
                   const nfoTitle = job.nfo_title?.trim() || null;
                   const displayTitle = nfoTitle ?? filename;
@@ -465,34 +463,7 @@ export default function JobsPage() {
                           aria-label={`${fileName(job.source_rel)} 선택`}
                         /></label>
                       <div role="cell" className="job-meta-cell job-phase-cell" data-label="단계">
-                        <div className="job-workflow-stage-list" aria-label="워크플로 단계별 상태">
-                          {workflowStages.map((stage) => {
-                            const stageState = asJobState(stage.state);
-                            const operation = OPERATION_LABEL[stage.operation as JobOperation]
-                              ?? PHASE_LABEL[stage.phase as JobPhase]
-                              ?? stage.operation;
-                            const stageStateText = stageState
-                              ? STATE_LABEL[stageState]
-                              : stage.state;
-                            return (
-                              <span
-                                key={stage.id}
-                                className={stageState ? BADGE_CLASS[stageState] : "b line"}
-                                title={`${operation}: ${stageStateText}`}
-                              >
-                                {operation} · {stageStateText}
-                              </span>
-                            );
-                          })}
-                          {job.workflow_history_count ? (
-                            <span
-                              className="b line workflow-history-count"
-                              title={`본 계보에서 제외된 과거 분기 ${job.workflow_history_count}건`}
-                            >
-                              과거 분기 {job.workflow_history_count}
-                            </span>
-                          ) : null}
-                        </div>
+                        <span className="b line" title={phase}>{phase}</span>
                       </div>
                       <label role="cell" htmlFor={selectionId} className="job-meta-cell job-state-cell" data-label="상태">
                         <span className={state ? BADGE_CLASS[state] : "b"} title={stateText}>{stateText}</span>
@@ -521,9 +492,7 @@ export default function JobsPage() {
                         <span className="m job-reason-value" title={reason}>{reason}</span>
                       </div>
                       <div role="cell" className="job-meta-cell job-updated-cell" data-label="최근 변경">
-                        <time className="m" dateTime={job.workflow_updated_at ?? job.updated_at}>
-                          {clock(job.workflow_updated_at ?? job.updated_at)}
-                        </time>
+                        <time className="m" dateTime={job.updated_at}>{clock(job.updated_at)}</time>
                       </div>
                     </div>
                   );

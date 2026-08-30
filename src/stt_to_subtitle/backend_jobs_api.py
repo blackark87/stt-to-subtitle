@@ -239,49 +239,18 @@ def _workflow_primary_path(workflow_jobs: list[Any]) -> list[Any]:
     return list(reversed(lineage))
 
 
-def _workflow_stage_payload(job: Any) -> dict[str, Any]:
-    payload = job_payload(job)
-    return {
-        key: payload[key]
-        for key in (
-            "id",
-            "operation",
-            "phase",
-            "state",
-            "status",
-            "reason_code",
-            "updated_at",
-        )
-    }
-
-
 def _workflow_list_payloads(
     service: Any,
-    projections: list[tuple[Any, str, list[Any], list[Any], float]],
+    projections: list[tuple[Any, str]],
 ) -> list[dict[str, Any]]:
     representatives = [projection[0] for projection in projections]
     items = _job_list_payloads(service, representatives)
-    for item, (_, root_id, primary_path, history, _updated_at) in zip(
+    for item, (_, root_id) in zip(
         items,
         projections,
         strict=True,
     ):
-        item.update(
-            {
-                "workflow_root_job_id": root_id,
-                "workflow_stages": [
-                    _workflow_stage_payload(candidate)
-                    for candidate in primary_path
-                ],
-                "workflow_history_count": len(history),
-                "workflow_updated_at": job_payload(
-                    max(
-                        (*primary_path, *history),
-                        key=lambda candidate: candidate.updated_at,
-                    )
-                )["updated_at"],
-            }
-        )
+        item["workflow_root_job_id"] = root_id
     return items
 
 
@@ -311,49 +280,21 @@ def list_jobs(
     jobs_by_id = {str(job.id): job for job in all_jobs}
     matching_jobs = service.store.list_jobs(limit=None, **filters)
     matching_ids = {str(job.id) for job in matching_jobs}
-    matching_roots = {
-        _workflow_root_id(job, jobs_by_id) for job in matching_jobs
-    }
     grouped: dict[str, list[Any]] = {}
     for job in all_jobs:
         root_id = _workflow_root_id(job, jobs_by_id)
         grouped.setdefault(root_id, []).append(job)
 
-    projections: list[tuple[Any, str, list[Any], list[Any], float]] = []
-    for root_id in matching_roots:
-        workflow_jobs = grouped[root_id]
+    projections: list[tuple[Any, str]] = []
+    for root_id, workflow_jobs in grouped.items():
         primary_path = _workflow_primary_path(workflow_jobs)
-        primary_ids = {str(candidate.id) for candidate in primary_path}
-        history = sorted(
-            (
-                candidate
-                for candidate in workflow_jobs
-                if str(candidate.id) not in primary_ids
-            ),
-            key=lambda candidate: (candidate.created_at, str(candidate.id)),
-        )
-        preferred = [
-            candidate
-            for candidate in primary_path
-            if str(candidate.id) in matching_ids
-        ]
-        if not preferred:
-            preferred = [
-                candidate
-                for candidate in workflow_jobs
-                if str(candidate.id) in matching_ids
-            ]
-        representative = max(
-            preferred or primary_path,
-            key=lambda candidate: _workflow_job_rank(candidate, jobs_by_id),
-        )
-        updated_at = max(candidate.updated_at for candidate in workflow_jobs)
-        projections.append(
-            (representative, root_id, primary_path, history, updated_at)
-        )
+        representative = primary_path[-1]
+        if str(representative.id) not in matching_ids:
+            continue
+        projections.append((representative, root_id))
     projections.sort(
         key=lambda projection: (
-            projection[4],
+            projection[0].updated_at,
             projection[0].created_at,
             str(projection[0].id),
         ),
