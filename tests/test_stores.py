@@ -1557,9 +1557,7 @@ class JobStoreTests(unittest.TestCase):
                 "av/japan/{actress}/{filename}",
             )
 
-    def test_lists_jobs_by_latest_status_change_without_progress_reordering(
-        self,
-    ) -> None:
+    def test_lists_jobs_by_latest_update(self) -> None:
         with TemporaryDirectory() as directory:
             store = JobStore(Path(directory) / "jobs.sqlite3")
             for index in range(3):
@@ -1582,7 +1580,7 @@ class JobStoreTests(unittest.TestCase):
             store.update("job-0", chunks_completed=1)
             self.assertEqual(
                 [job.id for job in store.list_jobs(limit=3)],
-                ["job-2", "job-1", "job-0"],
+                ["job-0", "job-2", "job-1"],
             )
             store.update("job-0", status="blocked")
             self.assertEqual(

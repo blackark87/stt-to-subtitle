@@ -201,7 +201,8 @@ class ReleaseConfigurationTests(unittest.TestCase):
         self.assertIn("build_service_package.py", backend_dockerfile)
         self.assertIn("build_service_package.py", runtime_dockerfile)
         self.assertEqual(compose.count("cap_drop:"), 3)
-        self.assertIn("condition: service_healthy", compose)
+        self.assertNotIn("depends_on:", compose)
+        self.assertNotIn("condition: service_healthy", compose)
 
     def test_standalone_runtime_compose_publishes_only_the_runtime_api(self) -> None:
         compose = (ROOT / "compose.runtime.yaml").read_text(encoding="utf-8")

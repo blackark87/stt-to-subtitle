@@ -299,6 +299,148 @@ class BackendAPIBoundaryTests(unittest.TestCase):
         )
         self.assertEqual(payload["parent_job"]["id"], "draft-phase")
         self.assertEqual(payload["child_jobs"], [])
+        self.assertEqual(payload["workflow_history_jobs"], [])
+
+    def test_job_list_groups_phases_before_filtering_and_pagination(self) -> None:
+        from fastapi.testclient import TestClient
+
+        from stt_to_subtitle.backend_api import create_backend_app
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            settings = BackendSettings(
+                state_dir=root / "state",
+                media_root=media_root,
+                stt_base_url="http://runtime:8100",
+                stt_token="",
+            )
+            with TestClient(create_backend_app(settings)) as client:
+                service = client.app.state.orchestrator
+                service.stop()
+                service.store.create(
+                    job_id="workflow-root",
+                    source_rel="workflow.mp4",
+                    force_overwrite=False,
+                    options={},
+                    operation="transcribe",
+                )
+                service.store.create(
+                    job_id="workflow-draft",
+                    source_rel="workflow.mp4",
+                    force_overwrite=False,
+                    options={"pipeline_parent_job_id": "workflow-root"},
+                    operation="draft_translate",
+                )
+                service.store.create(
+                    job_id="workflow-review",
+                    source_rel="workflow.mp4",
+                    force_overwrite=False,
+                    options={"pipeline_parent_job_id": "workflow-draft"},
+                    operation="review_translate",
+                )
+                service.store.create(
+                    job_id="separate-root",
+                    source_rel="workflow.mp4",
+                    force_overwrite=False,
+                    options={},
+                    operation="transcribe",
+                )
+                response = client.get("/api/v1/jobs")
+                filtered = client.get(
+                    "/api/v1/jobs",
+                    params={"operation": "draft_translate"},
+                )
+                paged = client.get("/api/v1/jobs", params={"limit": 1})
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["total"], 2)
+        workflows = {
+            item["workflow_root_job_id"]: item for item in payload["items"]
+        }
+        self.assertEqual(set(workflows), {"workflow-root", "separate-root"})
+        self.assertEqual(
+            [
+                stage["id"]
+                for stage in workflows["workflow-root"]["workflow_stages"]
+            ],
+            ["workflow-root", "workflow-draft", "workflow-review"],
+        )
+        self.assertEqual(filtered.status_code, 200)
+        self.assertEqual(filtered.json()["total"], 1)
+        self.assertEqual(filtered.json()["items"][0]["id"], "workflow-draft")
+        self.assertEqual(paged.status_code, 200)
+        self.assertEqual(paged.json()["total"], 2)
+        self.assertEqual(len(paged.json()["items"]), 1)
+
+    def test_job_detail_separates_duplicate_branch_from_primary_lineage(self) -> None:
+        from fastapi.testclient import TestClient
+
+        from stt_to_subtitle.backend_api import create_backend_app
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            (media_root / "sample.mp4").write_bytes(b"media")
+            settings = BackendSettings(
+                state_dir=root / "state",
+                media_root=media_root,
+                stt_base_url="http://runtime:8100",
+                stt_token="",
+            )
+            with TestClient(create_backend_app(settings)) as client:
+                service = client.app.state.orchestrator
+                service.stop()
+                service.store.create(
+                    job_id="root",
+                    source_rel="sample.mp4",
+                    force_overwrite=False,
+                    options={},
+                    operation="transcribe",
+                )
+                service.store.create(
+                    job_id="draft",
+                    source_rel="sample.mp4",
+                    force_overwrite=False,
+                    options={"pipeline_parent_job_id": "root"},
+                    operation="draft_translate",
+                )
+                service.store.create(
+                    job_id="review-used",
+                    source_rel="sample.mp4",
+                    force_overwrite=False,
+                    options={"pipeline_parent_job_id": "draft"},
+                    operation="review_translate",
+                )
+                service.store.create(
+                    job_id="external",
+                    source_rel="sample.mp4",
+                    force_overwrite=False,
+                    options={"pipeline_parent_job_id": "review-used"},
+                    operation="external_review",
+                )
+                service.store.create(
+                    job_id="review-orphan",
+                    source_rel="sample.mp4",
+                    force_overwrite=False,
+                    options={"pipeline_parent_job_id": "draft"},
+                    operation="review_translate",
+                )
+                response = client.get("/api/v1/jobs/root")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(
+            [item["id"] for item in payload["workflow_jobs"]],
+            ["root", "draft", "review-used", "external"],
+        )
+        self.assertEqual(
+            [item["id"] for item in payload["workflow_history_jobs"]],
+            ["review-orphan"],
+        )
 
     def test_dashboard_returns_recent_samples_for_each_large_state(self) -> None:
         from fastapi.testclient import TestClient

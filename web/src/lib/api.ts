@@ -43,6 +43,20 @@ export interface JobCompletionSummary {
 export interface JobListItem extends PipelineJob {
   nfo_title: string | null;
   poster_path: string | null;
+  workflow_root_job_id?: string;
+  workflow_stages?: WorkflowStage[];
+  workflow_history_count?: number;
+  workflow_updated_at?: string;
+}
+
+export interface WorkflowStage {
+  id: string;
+  operation: string;
+  phase: string;
+  state: string;
+  status: string;
+  reason_code: string | null;
+  updated_at: string;
 }
 
 export interface RuntimeEndpoint {
@@ -257,6 +271,7 @@ export interface JobDetailPayload {
   child_jobs: PipelineJob[];
   workflow_root_job_id: string;
   workflow_jobs: PipelineJob[];
+  workflow_history_jobs: PipelineJob[];
   events: JobEvent[];
   transcript_revisions: Record<string, unknown>[];
   translation_generations: Record<string, unknown>[];

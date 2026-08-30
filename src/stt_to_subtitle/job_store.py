@@ -1239,6 +1239,10 @@ class JobStore:
             "ON jobs(status_updated_at DESC, created_at DESC)"
         )
         connection.execute(
+            "CREATE INDEX IF NOT EXISTS jobs_updated_idx "
+            "ON jobs(updated_at DESC, created_at DESC)"
+        )
+        connection.execute(
             "CREATE INDEX IF NOT EXISTS jobs_state_phase_idx "
             "ON jobs(state, phase, created_at)"
         )
@@ -3492,7 +3496,7 @@ class JobStore:
             return []
         where, parameters = filtered
         query = "SELECT * FROM jobs" + where
-        query += " ORDER BY status_updated_at DESC, created_at DESC"
+        query += " ORDER BY updated_at DESC, created_at DESC"
         if limit is not None:
             query += " LIMIT ? OFFSET ?"
             parameters.extend((limit, offset))

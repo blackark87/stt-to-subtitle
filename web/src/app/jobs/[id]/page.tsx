@@ -548,6 +548,7 @@ export default function JobDetailPage({ params }: { params: Promise<{ id: string
   const [externalProvider = "", externalModel = ""] =
     effectiveExternalModelKey.split("\u0000");
   const workflowJobs = detail?.workflow_jobs ?? (job ? [job] : []);
+  const workflowHistoryJobs = detail?.workflow_history_jobs ?? [];
   const jobExternalModel = job?.options.external_model;
   const jobExternalSelection = (
     jobExternalModel
@@ -729,6 +730,42 @@ export default function JobDetailPage({ params }: { params: Promise<{ id: string
             </div>
             <div className="workflow-stage-list">
               {workflowJobs.map((workflowJob) => {
+                const workflowState = asJobState(workflowJob.state);
+                const isCurrentJob = workflowJob.id === id;
+                return (
+                  <Link
+                    key={workflowJob.id}
+                    href={`/jobs/${workflowJob.id}`}
+                    className={isCurrentJob ? "workflow-stage-link is-current" : "workflow-stage-link"}
+                    aria-current={isCurrentJob ? "page" : undefined}
+                    title={`${operationLabel(workflowJob.operation)} · ${workflowJob.id}`}
+                  >
+                    <span className="workflow-stage-copy">
+                      <strong>{operationLabel(workflowJob.operation)}</strong>
+                      <span className="code">{workflowJob.id.slice(0, 8)}</span>
+                    </span>
+                    <span className={workflowState ? BADGE_CLASS[workflowState] : "b"}>
+                      {jobStateLabel(workflowJob)}
+                    </span>
+                  </Link>
+                );
+              })}
+            </div>
+          </section>
+        ) : null}
+
+        {workflowHistoryJobs.length ? (
+          <section className="card" aria-labelledby="lineage-history-title">
+            <div className="card-head">
+              <div>
+                <h2 id="lineage-history-title">과거 분기 이력</h2>
+                <span className="sub">
+                  현재 계보와 이어지지 않아 단계 집계에서 제외된 실행 · {workflowHistoryJobs.length}건
+                </span>
+              </div>
+            </div>
+            <div className="workflow-stage-list">
+              {workflowHistoryJobs.map((workflowJob) => {
                 const workflowState = asJobState(workflowJob.state);
                 const isCurrentJob = workflowJob.id === id;
                 return (

@@ -54,6 +54,17 @@ from .translation_comparison import compare_translation_items
 router = APIRouter(prefix="/api/v1")
 
 
+_WORKFLOW_OPERATION_ORDER = {
+    "extract": 0,
+    "transcribe": 1,
+    "full": 1,
+    "translate": 2,
+    "draft_translate": 2,
+    "review_translate": 3,
+    "external_review": 4,
+}
+
+
 def _job_list_payloads(service: Any, jobs: list[Any]) -> list[dict[str, Any]]:
     items = jobs_payload(jobs)
     for item, job in zip(items, jobs, strict=True):
@@ -161,6 +172,119 @@ def _workflow_root_id(job: Any, jobs_by_id: dict[str, Any]) -> str:
         current = parent
 
 
+def _workflow_parent_id(job: Any) -> str:
+    return str(job.options.get("pipeline_parent_job_id", "") or "")
+
+
+def _workflow_depth(job: Any, jobs_by_id: dict[str, Any]) -> int:
+    depth = 0
+    current = job
+    seen = {str(job.id)}
+    while True:
+        parent_id = _workflow_parent_id(current)
+        if not parent_id or parent_id in seen:
+            return depth
+        parent = jobs_by_id.get(parent_id)
+        if parent is None:
+            return depth
+        seen.add(parent_id)
+        current = parent
+        depth += 1
+
+
+def _workflow_job_rank(job: Any, jobs_by_id: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        job.state != "done",
+        _workflow_depth(job, jobs_by_id),
+        _WORKFLOW_OPERATION_ORDER.get(job.operation, 0),
+        job.updated_at,
+        job.created_at,
+        str(job.id),
+    )
+
+
+def _workflow_primary_path(workflow_jobs: list[Any]) -> list[Any]:
+    """Select the current/deepest branch and return its root-to-leaf lineage."""
+
+    if not workflow_jobs:
+        return []
+    jobs_by_id = {str(candidate.id): candidate for candidate in workflow_jobs}
+    parent_ids = {
+        parent_id
+        for candidate in workflow_jobs
+        if (parent_id := _workflow_parent_id(candidate)) in jobs_by_id
+    }
+    leaves = [
+        candidate
+        for candidate in workflow_jobs
+        if str(candidate.id) not in parent_ids
+    ]
+    leaf = max(
+        leaves or workflow_jobs,
+        key=lambda candidate: _workflow_job_rank(candidate, jobs_by_id),
+    )
+    lineage = [leaf]
+    seen = {str(leaf.id)}
+    current = leaf
+    while True:
+        parent_id = _workflow_parent_id(current)
+        if not parent_id or parent_id in seen:
+            break
+        parent = jobs_by_id.get(parent_id)
+        if parent is None:
+            break
+        lineage.append(parent)
+        seen.add(parent_id)
+        current = parent
+    return list(reversed(lineage))
+
+
+def _workflow_stage_payload(job: Any) -> dict[str, Any]:
+    payload = job_payload(job)
+    return {
+        key: payload[key]
+        for key in (
+            "id",
+            "operation",
+            "phase",
+            "state",
+            "status",
+            "reason_code",
+            "updated_at",
+        )
+    }
+
+
+def _workflow_list_payloads(
+    service: Any,
+    projections: list[tuple[Any, str, list[Any], list[Any], float]],
+) -> list[dict[str, Any]]:
+    representatives = [projection[0] for projection in projections]
+    items = _job_list_payloads(service, representatives)
+    for item, (_, root_id, primary_path, history, _updated_at) in zip(
+        items,
+        projections,
+        strict=True,
+    ):
+        item.update(
+            {
+                "workflow_root_job_id": root_id,
+                "workflow_stages": [
+                    _workflow_stage_payload(candidate)
+                    for candidate in primary_path
+                ],
+                "workflow_history_count": len(history),
+                "workflow_updated_at": job_payload(
+                    max(
+                        (*primary_path, *history),
+                        key=lambda candidate: candidate.updated_at,
+                    )
+                )["updated_at"],
+            }
+        )
+    return items
+
+
 @router.get("/jobs")
 def list_jobs(
     request: Request,
@@ -180,10 +304,65 @@ def list_jobs(
         "reason_codes": reason_code,
         "include_comparison_transcriptions": include_comparisons,
     }
-    jobs = service.store.list_jobs(limit=limit, offset=offset, **filters)
+    all_jobs = service.store.list_jobs(
+        limit=None,
+        include_comparison_transcriptions=True,
+    )
+    jobs_by_id = {str(job.id): job for job in all_jobs}
+    matching_jobs = service.store.list_jobs(limit=None, **filters)
+    matching_ids = {str(job.id) for job in matching_jobs}
+    matching_roots = {
+        _workflow_root_id(job, jobs_by_id) for job in matching_jobs
+    }
+    grouped: dict[str, list[Any]] = {}
+    for job in all_jobs:
+        root_id = _workflow_root_id(job, jobs_by_id)
+        grouped.setdefault(root_id, []).append(job)
+
+    projections: list[tuple[Any, str, list[Any], list[Any], float]] = []
+    for root_id in matching_roots:
+        workflow_jobs = grouped[root_id]
+        primary_path = _workflow_primary_path(workflow_jobs)
+        primary_ids = {str(candidate.id) for candidate in primary_path}
+        history = sorted(
+            (
+                candidate
+                for candidate in workflow_jobs
+                if str(candidate.id) not in primary_ids
+            ),
+            key=lambda candidate: (candidate.created_at, str(candidate.id)),
+        )
+        preferred = [
+            candidate
+            for candidate in primary_path
+            if str(candidate.id) in matching_ids
+        ]
+        if not preferred:
+            preferred = [
+                candidate
+                for candidate in workflow_jobs
+                if str(candidate.id) in matching_ids
+            ]
+        representative = max(
+            preferred or primary_path,
+            key=lambda candidate: _workflow_job_rank(candidate, jobs_by_id),
+        )
+        updated_at = max(candidate.updated_at for candidate in workflow_jobs)
+        projections.append(
+            (representative, root_id, primary_path, history, updated_at)
+        )
+    projections.sort(
+        key=lambda projection: (
+            projection[4],
+            projection[0].created_at,
+            str(projection[0].id),
+        ),
+        reverse=True,
+    )
+    selected = projections[offset : offset + limit]
     return {
-        "items": _job_list_payloads(service, jobs),
-        "total": service.store.count_jobs(**filters),
+        "items": _workflow_list_payloads(service, selected),
+        "total": len(projections),
         "limit": limit,
         "offset": offset,
     }
@@ -368,11 +547,18 @@ def get_job(job_id: str, request: Request) -> dict[str, Any]:
         if candidate.options.get("pipeline_parent_job_id") == job.id
     ]
     workflow_root_id = _workflow_root_id(job, jobs_by_id)
-    workflow_jobs = sorted(
+    grouped_workflow_jobs = [
+        candidate
+        for candidate in all_jobs
+        if _workflow_root_id(candidate, jobs_by_id) == workflow_root_id
+    ]
+    workflow_jobs = _workflow_primary_path(grouped_workflow_jobs)
+    workflow_job_ids = {str(candidate.id) for candidate in workflow_jobs}
+    workflow_history_jobs = sorted(
         (
             candidate
-            for candidate in all_jobs
-            if _workflow_root_id(candidate, jobs_by_id) == workflow_root_id
+            for candidate in grouped_workflow_jobs
+            if str(candidate.id) not in workflow_job_ids
         ),
         key=lambda candidate: (candidate.created_at, candidate.id),
     )
@@ -382,6 +568,7 @@ def get_job(job_id: str, request: Request) -> dict[str, Any]:
         "child_jobs": jobs_payload(children),
         "workflow_root_job_id": workflow_root_id,
         "workflow_jobs": jobs_payload(workflow_jobs),
+        "workflow_history_jobs": jobs_payload(workflow_history_jobs),
         "events": public_value(service.store.events(job.id)),
         "transcript_revisions": public_value(
             service.store.transcript_revisions(job.id)
