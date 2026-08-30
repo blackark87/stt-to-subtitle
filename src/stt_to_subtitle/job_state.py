@@ -14,6 +14,9 @@ class JobPhase(StrEnum):
     EXTRACTION = "extraction"
     TRANSCRIPTION = "transcription"
     TRANSLATION = "translation"
+    DRAFT_TRANSLATION = "draft_translation"
+    REVIEW_TRANSLATION = "review_translation"
+    EXTERNAL_REVIEW = "external_review"
     RENDER = "render"
     COMPLETE = "complete"
 
@@ -31,6 +34,9 @@ class JobState(StrEnum):
 class JobReason(StrEnum):
     USER_STOP = "user_stop"
     LM_UNAVAILABLE = "lm_unavailable"
+    DRAFT_TRANSLATION_UNAVAILABLE = "draft_translation_unavailable"
+    REVIEW_TRANSLATION_UNAVAILABLE = "review_translation_unavailable"
+    EXTERNAL_MODEL_UNAVAILABLE = "external_model_unavailable"
     STT_UNAVAILABLE = "stt_unavailable"
     SERVICE_RESTARTED = "service_restarted"
     ARTIFACT_MISSING = "artifact_missing"
@@ -81,12 +87,22 @@ _LEGACY_STAGE_PHASES = {
     "render": JobPhase.RENDER,
 }
 
+_INDEPENDENT_OPERATION_PHASES = {
+    "transcribe": JobPhase.TRANSCRIPTION,
+    "draft_translate": JobPhase.DRAFT_TRANSLATION,
+    "review_translate": JobPhase.REVIEW_TRANSLATION,
+    "external_review": JobPhase.EXTERNAL_REVIEW,
+}
+
 
 def phase_from_legacy_stage(
     stage: str | None,
     *,
     operation: str,
 ) -> JobPhase:
+    independent_phase = _INDEPENDENT_OPERATION_PHASES.get(operation)
+    if independent_phase is not None:
+        return independent_phase
     normalized = str(stage or "").strip().lower()
     if normalized in _LEGACY_STAGE_PHASES:
         return _LEGACY_STAGE_PHASES[normalized]
@@ -104,16 +120,29 @@ def structured_state_from_legacy(
     detect_legacy_user_stop: bool = True,
 ) -> StructuredJobState:
     """Project a legacy scheduler status into the stable domain contract."""
+    independent_phase = _INDEPENDENT_OPERATION_PHASES.get(operation)
     if status in _RUNNING_PHASES:
-        return StructuredJobState(_RUNNING_PHASES[status], JobState.RUNNING)
+        return StructuredJobState(
+            independent_phase or _RUNNING_PHASES[status],
+            JobState.RUNNING,
+        )
     if status in _WAITING_PHASES:
-        return StructuredJobState(_WAITING_PHASES[status], JobState.WAITING)
+        return StructuredJobState(
+            independent_phase or _WAITING_PHASES[status],
+            JobState.WAITING,
+        )
     if status in _DONE_STATUSES:
-        return StructuredJobState(JobPhase.COMPLETE, JobState.DONE)
+        return StructuredJobState(
+            independent_phase or JobPhase.COMPLETE,
+            JobState.DONE,
+        )
     if status == "translation_paused":
-        return StructuredJobState(JobPhase.TRANSLATION, JobState.PAUSED)
+        return StructuredJobState(
+            independent_phase or JobPhase.TRANSLATION,
+            JobState.PAUSED,
+        )
     if status == "queued":
-        phase = (
+        phase = independent_phase or (
             JobPhase.TRANSLATION
             if operation == "translate"
             else JobPhase.EXTRACTION
@@ -133,6 +162,12 @@ def structured_state_from_legacy(
             )
         if str(error or "") == "service restarted during this stage":
             reason = JobReason.SERVICE_RESTARTED
+        elif phase == JobPhase.DRAFT_TRANSLATION:
+            reason = JobReason.DRAFT_TRANSLATION_UNAVAILABLE
+        elif phase == JobPhase.REVIEW_TRANSLATION:
+            reason = JobReason.REVIEW_TRANSLATION_UNAVAILABLE
+        elif phase == JobPhase.EXTERNAL_REVIEW:
+            reason = JobReason.EXTERNAL_MODEL_UNAVAILABLE
         elif phase == JobPhase.TRANSLATION:
             reason = JobReason.LM_UNAVAILABLE
         elif phase == JobPhase.TRANSCRIPTION:

@@ -6,6 +6,8 @@ import { Freshness } from "@/components/Freshness";
 import { LoadingOverlay } from "@/components/LoadingOverlay";
 import {
   api,
+  type ExternalModelProfile,
+  type ExternalModelProvider,
   type PathDisplayRule,
   type PromptCategory,
   type RuntimeEndpoint,
@@ -55,6 +57,7 @@ interface TranslationEndpointForm {
   token: string;
   capacity: number;
   enabled: boolean;
+  thinking_enabled: boolean;
   batch_preferred: boolean;
 }
 const EMPTY_TRANSLATION_ENDPOINT: TranslationEndpointForm = {
@@ -64,6 +67,7 @@ const EMPTY_TRANSLATION_ENDPOINT: TranslationEndpointForm = {
   token: "",
   capacity: 1,
   enabled: true,
+  thinking_enabled: false,
   batch_preferred: false,
 };
 
@@ -164,6 +168,7 @@ export default function SettingsPage() {
               token: translationForm.token || null,
               enabled: translationForm.enabled,
               capacity: translationForm.capacity,
+              thinking_enabled: translationForm.thinking_enabled,
             })
           : await api.createTranslationEndpoint(stage, {
               name: translationForm.name,
@@ -171,6 +176,7 @@ export default function SettingsPage() {
               token: translationForm.token,
               enabled: translationForm.enabled,
               capacity: translationForm.capacity,
+              thinking_enabled: translationForm.thinking_enabled,
             });
         if (
           saved.enabled !== translationForm.enabled
@@ -230,6 +236,7 @@ export default function SettingsPage() {
       token: "",
       capacity: endpoint.capacity,
       enabled: endpoint.enabled,
+      thinking_enabled: endpoint.thinking_enabled,
       batch_preferred: endpoint.batch_preferred,
     });
     setTranslationEditorStage(stage);
@@ -251,6 +258,21 @@ export default function SettingsPage() {
     );
   };
 
+  const updateTranslationThinking = (
+    stage: TranslationStage,
+    endpoint: TranslationServer,
+    thinkingEnabled: boolean,
+  ) => guard(
+    () => api.updateTranslationEndpoint(stage, endpoint.id, {
+      name: endpoint.name,
+      base_url: endpoint.base_url,
+      enabled: endpoint.enabled,
+      capacity: endpoint.capacity,
+      thinking_enabled: thinkingEnabled,
+    }),
+    `Thinking을 ${thinkingEnabled ? "사용" : "미사용"}으로 저장했습니다.`,
+  );
+
   const editPrompt = (category: PromptCategory) => {
     setPromptForm({
       id: category.id,
@@ -259,6 +281,25 @@ export default function SettingsPage() {
       review_prompt: category.review_prompt ?? "",
     });
     setPromptEditorOpen(true);
+  };
+
+  const submitExternalModel = async (
+    event: React.FormEvent<HTMLFormElement>,
+    profile: ExternalModelProfile,
+  ) => {
+    event.preventDefault();
+    const values = new FormData(event.currentTarget);
+    await guard(
+      async () => {
+        await api.updateExternalModel(profile.provider, {
+          base_url: String(values.get("base_url") ?? ""),
+          credential: String(values.get("credential") ?? "") || null,
+          region: String(values.get("region") ?? ""),
+        });
+        await api.probeExternalModel(profile.provider);
+      },
+      `${profile.provider} 인증과 모델 목록을 확인했습니다.`,
+    );
   };
 
   const submitPathRule = async (event: React.FormEvent) => {
@@ -397,11 +438,12 @@ export default function SettingsPage() {
             </div>
             <div className="card-body flush">
               <div className="tbl settings-translation-table" role="table" aria-label={`${group.label} 서버 목록`}>
-                <div className="tr head translation-server-grid" role="row"><span role="columnheader">서버</span><span role="columnheader">모델 선택</span><span role="columnheader">연결 / 라우팅</span><span role="columnheader" className="r">요청</span><span role="columnheader">사용</span><span role="columnheader">일괄 처리 우선</span><span role="columnheader" className="r">관리</span></div>
+                <div className="tr head translation-server-grid" role="row"><span role="columnheader">서버</span><span role="columnheader">모델 선택</span><span role="columnheader">Thinking</span><span role="columnheader">연결 / 라우팅</span><span role="columnheader" className="r">요청</span><span role="columnheader">사용</span><span role="columnheader">일괄 처리 우선</span><span role="columnheader" className="r">관리</span></div>
                 {group.servers.map((server) => {
                   if (translationEditorStage === group.stage && translationForm.id === server.id) return <form key={server.id} className="tr translation-server-grid inline-edit-row" role="row" onSubmit={submitTranslationEndpoint}>
                     <div role="cell" data-label="서버" className="inline-server-fields"><input required maxLength={80} className={field} aria-label="서버 이름" value={translationForm.name} onChange={(event) => setTranslationForm({ ...translationForm, name: event.target.value })} /><input required type="url" className={field} aria-label="API 주소" value={translationForm.base_url} onChange={(event) => setTranslationForm({ ...translationForm, base_url: event.target.value })} /><input type="password" autoComplete="new-password" className={field} aria-label="API 토큰" value={translationForm.token} onChange={(event) => setTranslationForm({ ...translationForm, token: event.target.value })} placeholder={editingServer?.token_configured ? "토큰: 비우면 유지" : "API 토큰"} /></div>
                     <label role="cell" data-label="모델 선택"><select className="ctl translation-model-select" aria-label={`${server.name} 모델 선택`} value={server.selected_model} disabled={busy || server.models.length === 0} onChange={(event) => void guard(() => api.updateTranslationServerModel(group.stage, server.id, event.target.value), "번역 모델을 저장했습니다.")}><option value="" disabled>{server.models.length ? "모델 선택" : "확인 후 선택"}</option>{server.models.map((model) => <option value={model} key={model}>{model}</option>)}</select></label>
+                    <label role="cell" data-label="Thinking" className="translation-toggle"><input type="checkbox" checked={translationForm.thinking_enabled} onChange={(event) => setTranslationForm({ ...translationForm, thinking_enabled: event.target.checked })} /><span>{translationForm.thinking_enabled ? "사용" : "미사용"}</span></label>
                     <span role="cell" data-label="연결 상태"><span className="b line">수정 중</span></span>
                     <label role="cell" data-label="요청" className="inline-number-field"><input type="number" min={1} max={8} className={field} aria-label="동시 요청" value={translationForm.capacity} onChange={(event) => setTranslationForm({ ...translationForm, capacity: Number(event.target.value) })} /></label>
                     <label role="cell" data-label="사용" className="translation-toggle"><input type="checkbox" checked={translationForm.enabled} onChange={(event) => setTranslationForm({ ...translationForm, enabled: event.target.checked, batch_preferred: event.target.checked && translationForm.batch_preferred })} /><span>{translationForm.enabled ? "ON" : "OFF"}</span></label>
@@ -413,6 +455,7 @@ export default function SettingsPage() {
                   return <div key={server.id} className="tr translation-server-grid" role="row">
                     <div className="t-name" role="cell" data-label="서버" title={`${server.name}\n${server.base_url}`}><div className="runtime-title"><strong>{server.name}</strong>{server.builtin ? <span className="b line">기본</span> : null}</div><span className="m">{server.base_url || "API 주소 미설정"}</span></div>
                     <label role="cell" data-label="모델 선택"><select className="ctl translation-model-select" aria-label={`${server.name} 모델 선택`} value={server.selected_model} disabled={busy || server.models.length === 0} onChange={(event) => void guard(() => api.updateTranslationServerModel(group.stage, server.id, event.target.value), "번역 모델을 저장했습니다.")}><option value="" disabled>{server.models.length ? "모델 선택" : "확인 후 선택"}</option>{server.models.map((model) => <option value={model} key={model}>{model}</option>)}</select></label>
+                    <label role="cell" data-label="Thinking" className="translation-toggle"><input type="checkbox" checked={server.thinking_enabled} disabled={busy} onChange={(event) => void updateTranslationThinking(group.stage, server, event.target.checked)} /><span>{server.thinking_enabled ? "사용" : "미사용"}</span></label>
                     <span role="cell" data-label="연결 / 라우팅" className="translation-server-state"><span title={server.message ?? undefined} className={server.status === "ready" ? "b ok dot" : server.status === "unavailable" ? "b bad dot" : "b wait dot"}>{statusLabel}</span>{routingLabel ? <span className="b hold" title={server.routing_message ?? undefined}>{routingLabel}</span> : null}</span>
                     <span role="cell" data-label="요청" className="r m">{server.running_jobs} / {server.capacity}</span>
                     <label role="cell" data-label="사용" className="translation-toggle"><input type="checkbox" checked={server.enabled} disabled={busy} onChange={(event) => void updateTranslationRouting(group.stage, server, { enabled: event.target.checked })} /><span>{server.enabled ? "ON" : "OFF"}</span></label>
@@ -423,6 +466,7 @@ export default function SettingsPage() {
                 {translationEditorStage === group.stage && !translationForm.id ? <form className="tr translation-server-grid inline-edit-row" role="row" onSubmit={submitTranslationEndpoint}>
                   <div role="cell" data-label="서버" className="inline-server-fields"><input required maxLength={80} className={field} aria-label="서버 이름" value={translationForm.name} onChange={(event) => setTranslationForm({ ...translationForm, name: event.target.value })} placeholder="서버 이름" /><input required type="url" className={field} aria-label="API 주소" value={translationForm.base_url} onChange={(event) => setTranslationForm({ ...translationForm, base_url: event.target.value })} placeholder="http://model-server:1234/v1" /><input type="password" autoComplete="new-password" className={field} aria-label="API 토큰" value={translationForm.token} onChange={(event) => setTranslationForm({ ...translationForm, token: event.target.value })} placeholder="API 토큰" /></div>
                   <span role="cell" data-label="모델 선택" className="m">추가 후 선택</span>
+                  <label role="cell" data-label="Thinking" className="translation-toggle"><input type="checkbox" checked={translationForm.thinking_enabled} onChange={(event) => setTranslationForm({ ...translationForm, thinking_enabled: event.target.checked })} /><span>{translationForm.thinking_enabled ? "사용" : "미사용"}</span></label>
                   <span role="cell" data-label="연결 상태"><span className="b line">추가 중</span></span>
                   <label role="cell" data-label="요청" className="inline-number-field"><input type="number" min={1} max={8} className={field} aria-label="동시 요청" value={translationForm.capacity} onChange={(event) => setTranslationForm({ ...translationForm, capacity: Number(event.target.value) })} /></label>
                   <label role="cell" data-label="사용" className="translation-toggle"><input type="checkbox" checked={translationForm.enabled} onChange={(event) => setTranslationForm({ ...translationForm, enabled: event.target.checked })} /><span>{translationForm.enabled ? "ON" : "OFF"}</span></label>
@@ -433,6 +477,101 @@ export default function SettingsPage() {
             </div>
           </section>;
         })}
+
+        <section className="card" aria-labelledby="external-models-title">
+          <div className="card-head">
+            <div>
+              <h2 id="external-models-title">외부 모델</h2>
+              <span className="sub m">자격 증명 확인 후 검토 모델을 선택합니다.</span>
+            </div>
+          </div>
+          <div className="card-body settings-external-models">
+            {(data?.external_models ?? []).map((profile) => {
+              const providerLabel: Record<ExternalModelProvider, string> = {
+                openrouter: "OpenRouter",
+                bedrock: "AWS Bedrock",
+                nvidia_build: "NVIDIA Build",
+              };
+              const statusClass = profile.status === "ready"
+                ? "b ok dot"
+                : profile.status === "failed"
+                  ? "b bad dot"
+                  : "b wait dot";
+              return (
+                <form
+                  key={`${profile.provider}-${profile.updated_at}`}
+                  className="settings-editor"
+                  onSubmit={(event) => void submitExternalModel(event, profile)}
+                >
+                  <div className="settings-editor-head">
+                    <strong>{providerLabel[profile.provider]}</strong>
+                    <span className={statusClass} title={profile.message ?? undefined}>
+                      {profile.status === "ready" ? "인증 완료" : profile.status === "failed" ? "점검 실패" : "점검 필요"}
+                    </span>
+                  </div>
+                  {profile.provider === "nvidia_build" ? (
+                    <label className="f">
+                      <span className="lb">API 주소</span>
+                      <input name="base_url" type="url" required className="ctl" defaultValue={profile.base_url} />
+                    </label>
+                  ) : <input name="base_url" type="hidden" value={profile.base_url} />}
+                  {profile.provider === "bedrock" ? (
+                    <label className="f">
+                      <span className="lb">리전</span>
+                      <input name="region" required className="ctl" defaultValue={profile.region} placeholder="ap-northeast-2" />
+                    </label>
+                  ) : <input name="region" type="hidden" value="" />}
+                  <label className="f">
+                    <span className="lb">API 키 또는 credential</span>
+                    <input
+                      name="credential"
+                      type="password"
+                      autoComplete="new-password"
+                      className="ctl"
+                      placeholder={profile.credential_configured ? "비우면 기존 값 유지" : "자격 증명 입력"}
+                    />
+                  </label>
+                  <label className="f">
+                    <span className="lb">검토 모델</span>
+                    <select
+                      className="ctl"
+                      value={profile.selected_model}
+                      disabled={busy || profile.status !== "ready" || profile.models.length === 0}
+                      onChange={(event) => void guard(
+                        () => api.selectExternalModel(profile.provider, event.target.value),
+                        `${providerLabel[profile.provider]} 모델을 저장했습니다.`,
+                      )}
+                    >
+                      <option value="">{profile.models.length ? "모델 선택" : "연결 점검 후 선택"}</option>
+                      {profile.models.map((model) => <option key={model} value={model}>{model}</option>)}
+                    </select>
+                  </label>
+                  <p className="external-model-current" aria-live="polite">
+                    <span>현재 사용 모델</span>
+                    <strong className="code">
+                      {profile.selected_model || "선택되지 않음"}
+                    </strong>
+                  </p>
+                  {profile.message ? <p className="m" role={profile.status === "failed" ? "alert" : "status"}>{profile.message}</p> : null}
+                  <div className="btns">
+                    <button type="submit" className="btn" disabled={busy}>저장 및 연결 점검</button>
+                    <button
+                      type="button"
+                      className="btn sec"
+                      disabled={busy || !profile.credential_configured}
+                      onClick={() => void guard(
+                        () => api.probeExternalModel(profile.provider),
+                        `${providerLabel[profile.provider]} 인증과 모델 목록을 확인했습니다.`,
+                      )}
+                    >
+                      다시 점검
+                    </button>
+                  </div>
+                </form>
+              );
+            })}
+          </div>
+        </section>
 
         <section className="card">
           <div className="card-head">

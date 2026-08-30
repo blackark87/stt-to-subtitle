@@ -22,6 +22,7 @@ class TranslationServer:
     token: str
     enabled: bool
     capacity: int
+    thinking_enabled: bool
     builtin: bool
     batch_preferred: bool
     selected_model: str
@@ -47,6 +48,7 @@ class TranslationServerGroupStore:
                     token TEXT NOT NULL DEFAULT '',
                     enabled INTEGER NOT NULL DEFAULT 1,
                     capacity INTEGER NOT NULL DEFAULT 1,
+                    thinking_enabled INTEGER NOT NULL DEFAULT 0,
                     builtin INTEGER NOT NULL DEFAULT 0,
                     batch_preferred INTEGER NOT NULL DEFAULT 0,
                     selected_model TEXT NOT NULL DEFAULT '',
@@ -55,6 +57,7 @@ class TranslationServerGroupStore:
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL,
                     CHECK (enabled IN (0, 1)),
+                    CHECK (thinking_enabled IN (0, 1)),
                     CHECK (builtin IN (0, 1)),
                     CHECK (batch_preferred IN (0, 1)),
                     CHECK (capacity BETWEEN 1 AND 8)
@@ -78,6 +81,12 @@ class TranslationServerGroupStore:
                     "ADD COLUMN selected_model TEXT NOT NULL DEFAULT ''"
                 )
                 self._migrate_group_model(connection)
+            if "thinking_enabled" not in columns:
+                connection.execute(
+                    "ALTER TABLE translation_servers "
+                    "ADD COLUMN thinking_enabled INTEGER NOT NULL DEFAULT 0 "
+                    "CHECK (thinking_enabled IN (0, 1))"
+                )
             connection.execute("DROP TABLE IF EXISTS translation_group_settings")
 
     def _connect(self) -> sqlite3.Connection:
@@ -141,6 +150,7 @@ class TranslationServerGroupStore:
             token=str(row["token"]),
             enabled=bool(row["enabled"]),
             capacity=int(row["capacity"]),
+            thinking_enabled=bool(row["thinking_enabled"]),
             builtin=bool(row["builtin"]),
             batch_preferred=bool(row["batch_preferred"]),
             selected_model=str(row["selected_model"]),
@@ -170,6 +180,7 @@ class TranslationServerGroupStore:
         enabled: bool,
         capacity: int,
         batch_preferred: bool,
+        thinking_enabled: bool = False,
         legacy_names: Sequence[str] = (),
     ) -> None:
         now = time.time()
@@ -179,8 +190,8 @@ class TranslationServerGroupStore:
                 """
                 INSERT INTO translation_servers (
                     id, name, base_url, token, enabled, capacity, builtin,
-                    batch_preferred, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+                    batch_preferred, thinking_enabled, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
                 ON CONFLICT(id) DO NOTHING
                 """,
                 (
@@ -191,6 +202,7 @@ class TranslationServerGroupStore:
                     int(enabled),
                     capacity,
                     int(resolved_batch_preferred),
+                    int(thinking_enabled),
                     now,
                     now,
                 ),
@@ -239,6 +251,7 @@ class TranslationServerGroupStore:
         capacity: int,
         server_id: str | None = None,
         batch_preferred: bool = False,
+        thinking_enabled: bool = False,
         selected_model: str = "",
         models: tuple[str, ...] = (),
         checked_at: float | None = None,
@@ -259,9 +272,9 @@ class TranslationServerGroupStore:
                 """
                 INSERT INTO translation_servers (
                     id, name, base_url, token, enabled, capacity, builtin,
-                    batch_preferred, selected_model, models_json, checked_at,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
+                    batch_preferred, thinking_enabled, selected_model,
+                    models_json, checked_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     resolved_id,
@@ -271,6 +284,7 @@ class TranslationServerGroupStore:
                     int(enabled),
                     capacity,
                     int(resolved_batch_preferred),
+                    int(thinking_enabled),
                     resolved_selected_model,
                     json.dumps(list(models), ensure_ascii=False),
                     checked_at,
@@ -292,6 +306,7 @@ class TranslationServerGroupStore:
         token: str,
         enabled: bool,
         capacity: int,
+        thinking_enabled: bool | None = None,
     ) -> TranslationServer:
         with self._connect() as connection:
             cursor = connection.execute(
@@ -303,7 +318,9 @@ class TranslationServerGroupStore:
                     checked_at = CASE WHEN base_url != ? THEN NULL ELSE checked_at END,
                     base_url = ?, token = ?, enabled = ?,
                     batch_preferred = CASE WHEN ? THEN batch_preferred ELSE 0 END,
-                    capacity = ?, updated_at = ?
+                    capacity = ?,
+                    thinking_enabled = COALESCE(?, thinking_enabled),
+                    updated_at = ?
                 WHERE id = ?
                 """,
                 (
@@ -316,6 +333,11 @@ class TranslationServerGroupStore:
                     int(enabled),
                     int(enabled),
                     capacity,
+                    (
+                        int(thinking_enabled)
+                        if thinking_enabled is not None
+                        else None
+                    ),
                     time.time(),
                     server_id,
                 ),

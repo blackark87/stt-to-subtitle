@@ -23,15 +23,23 @@ from .backend_contracts import (
     ArtifactUpdateRequest,
     ComparisonRerunRequest,
     ComparisonTranslationRequest,
+    ExternalReviewSelectionRequest,
     JobCreateRequest,
     JobIdsRequest,
     ReprocessRequest,
     RestartTranslationRequest,
     SubtitleGenerationPublishRequest,
+    TranslationItemUpdateRequest,
     TranslationSelectionRequest,
 )
 from .files import sha256_file
-from .media_preview import guess_media_type, iter_file_range, parse_byte_range, srt_to_webvtt
+from .media_preview import (
+    guess_media_type,
+    iter_file_range,
+    parse_byte_range,
+    read_subtitle_text,
+    srt_to_webvtt,
+)
 from .orchestrator import COMPARISON_AUDIO_SOURCE_JOB_ID_OPTION
 from .service_clients import ExternalServiceError
 from .subtitle_validation import (
@@ -135,6 +143,24 @@ def _current_subtitle_validation(service: Any, job: Any) -> dict[str, Any] | Non
         return None
 
 
+def _workflow_root_id(job: Any, jobs_by_id: dict[str, Any]) -> str:
+    """Return the transcription/root execution that owns a phase-job chain."""
+
+    current = job
+    seen = {str(job.id)}
+    while True:
+        parent_id = str(
+            current.options.get("pipeline_parent_job_id", "") or ""
+        )
+        if not parent_id or parent_id in seen:
+            return str(current.id)
+        parent = jobs_by_id.get(parent_id)
+        if parent is None:
+            return str(current.id)
+        seen.add(parent_id)
+        current = parent
+
+
 @router.get("/jobs")
 def list_jobs(
     request: Request,
@@ -166,6 +192,29 @@ def list_jobs(
 @router.post("/jobs", status_code=201)
 def create_jobs(payload: JobCreateRequest, request: Request) -> dict[str, Any]:
     service = service_from_request(request)
+    if payload.operation in {
+        "full",
+        "translate",
+        "draft_translate",
+        "review_translate",
+        "external_review",
+    }:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "통합 작업 생성은 지원하지 않습니다. 전사를 만든 뒤 "
+                "각 단계 작업 버튼을 사용하세요."
+            ),
+        )
+    job_options = dict(payload.options)
+    if payload.operation == "transcribe":
+        backend = str(job_options.get("backend", "hybrid")).strip().lower()
+        if backend not in {"whisperjav", "hybrid", "whisperx"}:
+            raise HTTPException(
+                status_code=400,
+                detail="전사 모델은 WhisperJAV, Hybrid, WhisperX 중 하나여야 합니다.",
+            )
+        job_options["backend"] = backend
     try:
         sources, skipped = service.expand_job_sources(
             payload.source_rels,
@@ -176,14 +225,14 @@ def create_jobs(payload: JobCreateRequest, request: Request) -> dict[str, Any]:
         if payload.operation == "compare":
             comparison_id, jobs = service.create_transcription_comparison(
                 sources,
-                options=payload.options,
+                options=job_options,
             )
         else:
             comparison_id = None
             jobs = service.create_jobs(
                 sources,
                 force_overwrite=payload.force_overwrite,
-                options=payload.options,
+                options=job_options,
                 operation=payload.operation,
                 prompt_category_id=payload.prompt_category_id,
             )
@@ -237,13 +286,68 @@ def translate_jobs(
         translation_mode = (
             "draft_only"
             if payload.target_stage == "draft"
-            else "draft_and_review"
+            else "review_existing"
+        )
+    if translation_mode == "draft_and_review":
+        raise HTTPException(
+            status_code=409,
+            detail="1차와 2차 번역은 각각 별도 작업으로 요청하세요.",
         )
     try:
-        jobs = service_from_request(request).create_selected_translation_jobs(
+        jobs = service_from_request(request).create_phase_translation_jobs(
             payload.job_ids,
             prompt_category_id=payload.prompt_category_id,
-            translation_mode=translation_mode,
+            stage=(
+                "draft" if translation_mode == "draft_only" else "review"
+            ),
+        )
+    except (OSError, UnicodeError, ValueError) as error:
+        raise bad_request(error) from error
+    return {"items": jobs_payload(jobs), "created": len(jobs)}
+
+
+@router.post("/jobs/actions/draft-translate", status_code=201)
+def draft_translate_jobs(
+    payload: TranslationSelectionRequest,
+    request: Request,
+) -> dict[str, Any]:
+    try:
+        jobs = service_from_request(request).create_phase_translation_jobs(
+            payload.job_ids,
+            prompt_category_id=payload.prompt_category_id,
+            stage="draft",
+        )
+    except (OSError, UnicodeError, ValueError) as error:
+        raise bad_request(error) from error
+    return {"items": jobs_payload(jobs), "created": len(jobs)}
+
+
+@router.post("/jobs/actions/review-translate", status_code=201)
+def review_translate_jobs(
+    payload: TranslationSelectionRequest,
+    request: Request,
+) -> dict[str, Any]:
+    try:
+        jobs = service_from_request(request).create_phase_translation_jobs(
+            payload.job_ids,
+            prompt_category_id=payload.prompt_category_id,
+            stage="review",
+        )
+    except (OSError, UnicodeError, ValueError) as error:
+        raise bad_request(error) from error
+    return {"items": jobs_payload(jobs), "created": len(jobs)}
+
+
+@router.post("/jobs/actions/external-review", status_code=201)
+def external_review_jobs(
+    payload: ExternalReviewSelectionRequest,
+    request: Request,
+) -> dict[str, Any]:
+    try:
+        jobs = service_from_request(request).create_external_review_jobs(
+            payload.job_ids,
+            provider=payload.provider,
+            model=payload.model,
         )
     except (OSError, UnicodeError, ValueError) as error:
         raise bad_request(error) from error
@@ -254,8 +358,30 @@ def translate_jobs(
 def get_job(job_id: str, request: Request) -> dict[str, Any]:
     service = service_from_request(request)
     job = require_job(service, job_id)
+    all_jobs = service.store.list_jobs(limit=None)
+    jobs_by_id = {candidate.id: candidate for candidate in all_jobs}
+    parent_id = str(job.options.get("pipeline_parent_job_id", "") or "")
+    parent = jobs_by_id.get(parent_id) if parent_id else None
+    children = [
+        candidate
+        for candidate in all_jobs
+        if candidate.options.get("pipeline_parent_job_id") == job.id
+    ]
+    workflow_root_id = _workflow_root_id(job, jobs_by_id)
+    workflow_jobs = sorted(
+        (
+            candidate
+            for candidate in all_jobs
+            if _workflow_root_id(candidate, jobs_by_id) == workflow_root_id
+        ),
+        key=lambda candidate: (candidate.created_at, candidate.id),
+    )
     return {
         "job": job_payload(job),
+        "parent_job": job_payload(parent) if parent is not None else None,
+        "child_jobs": jobs_payload(children),
+        "workflow_root_job_id": workflow_root_id,
+        "workflow_jobs": jobs_payload(workflow_jobs),
         "events": public_value(service.store.events(job.id)),
         "transcript_revisions": public_value(
             service.store.transcript_revisions(job.id)
@@ -431,10 +557,21 @@ def playback_subtitles(job_id: str, request: Request) -> Response:
     job = require_job(service, job_id)
     try:
         external = service.library.external_subtitles(job.source_rel)
+        published = service.store.published_subtitle_generation(job.id)
         if external:
-            content = render_webvtt(parse_subtitle(external[0]))
+            content = (
+                srt_to_webvtt(read_subtitle_text(external[0]))
+                if external[0].suffix.lower() == ".srt"
+                else render_webvtt(parse_subtitle(external[0]))
+            )
+        elif published is not None and Path(
+            str(published["srt_artifact_path"])
+        ).is_file():
+            content = srt_to_webvtt(
+                read_subtitle_text(Path(str(published["srt_artifact_path"])))
+            )
         elif job.srt_path and Path(job.srt_path).is_file():
-            content = srt_to_webvtt(Path(job.srt_path).read_text(encoding="utf-8-sig"))
+            content = srt_to_webvtt(read_subtitle_text(Path(job.srt_path)))
         else:
             raise FileNotFoundError("subtitle not found")
     except (OSError, UnicodeError, ValueError) as error:
@@ -448,8 +585,14 @@ def subtitle_file(
     subtitle_format: Literal["srt", "ass"],
     request: Request,
 ) -> FileResponse:
-    job = require_job(service_from_request(request), job_id)
-    raw_path = job.srt_path if subtitle_format == "srt" else job.ass_path
+    service = service_from_request(request)
+    job = require_job(service, job_id)
+    published = service.store.published_subtitle_generation(job.id)
+    raw_path = (
+        published.get(f"{subtitle_format}_artifact_path")
+        if published is not None
+        else job.srt_path if subtitle_format == "srt" else job.ass_path
+    )
     if not raw_path or not Path(raw_path).is_file():
         raise HTTPException(status_code=404, detail="subtitle not found")
     media_type = "application/x-subrip" if subtitle_format == "srt" else "text/x-ssa"
@@ -621,6 +764,28 @@ def translation_generation_items(
         "items": public_value(service.store.translation_items(generation_id)),
         "batches": public_value(service.store.translation_batches(generation_id)),
     }
+
+
+@router.put(
+    "/jobs/{job_id}/translation-generations/{generation_id}/items/{segment_id}"
+)
+def update_translation_generation_item(
+    job_id: str,
+    generation_id: str,
+    segment_id: str,
+    payload: TranslationItemUpdateRequest,
+    request: Request,
+) -> dict[str, Any]:
+    try:
+        result = service_from_request(request).edit_translation_item(
+            job_id,
+            generation_id=generation_id,
+            segment_id=segment_id,
+            text=payload.text,
+        )
+    except (OSError, UnicodeError, ValueError) as error:
+        raise bad_request(error) from error
+    return public_value(result)
 
 
 @router.get("/jobs/{job_id}/transcript-revisions/{revision_id}")

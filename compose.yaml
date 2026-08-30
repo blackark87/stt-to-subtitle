@@ -50,8 +50,9 @@ services:
       # (이미지 최적화는 next.config.ts 에서 껐다).
       - /tmp:size=64m,mode=1777
     networks:
-      - app
-      - traefik
+      app:
+        ipv4_address: ${WEB_APP_IPV4:-172.24.0.3}
+      traefik:
 
   backend:
     platform: linux/amd64
@@ -66,18 +67,16 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
-    depends_on:
-      runtime:
-        condition: service_healthy
-        restart: true
     expose:
       - "8080"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       MEDIA_ROOT: /media
       BACKEND_STATE_DIR: /var/lib/stt
       BACKEND_WORK_DIR: /var/lib/stt-work
       BACKEND_FORWARDED_ALLOW_IPS: "${BACKEND_FORWARDED_ALLOW_IPS:-*}"
-      STT_BASE_URL: http://runtime:8100
+      STT_BASE_URL: ${STT_BASE_URL:-http://runtime:8100}
       STT_API_TOKEN: ${STT_API_TOKEN:-}
       TRANSLATION_STATE_DIR: /var/lib/stt-translation
       TRANSLATION_BUILTIN_NAME: ${TRANSLATION_BUILTIN_NAME:-기본 서버}
@@ -125,8 +124,6 @@ services:
     networks:
       app:
         ipv4_address: ${BACKEND_APP_IPV4:-172.24.0.2}
-      runtime:
-        ipv4_address: ${BACKEND_RUNTIME_IPV4:-172.23.0.3}
 
   runtime:
     platform: linux/amd64
@@ -201,17 +198,14 @@ services:
               capabilities:
                 - gpu
     networks:
-      - runtime
+      app:
+        ipv4_address: ${RUNTIME_APP_IPV4:-172.24.0.4}
 
 networks:
   app:
     ipam:
       config:
         - subnet: ${APP_NETWORK_SUBNET:-172.24.0.0/16}
-  runtime:
-    ipam:
-      config:
-        - subnet: ${RUNTIME_NETWORK_SUBNET:-172.23.0.0/16}
   traefik:
     name: ${TRAEFIK_NETWORK:-proxy}
     external: true

@@ -128,6 +128,7 @@ def decorate_media_listing(
     rules: Sequence[object],
     *,
     folder_sort: str = "name",
+    folder_offset: int = 0,
     folder_limit: int | None = None,
     file_sort: str = "filename",
 ) -> dict[str, object]:
@@ -139,6 +140,8 @@ def decorate_media_listing(
     ]
     if folder_sort not in {"name", "modified_desc", "modified_asc"}:
         raise ValueError("unsupported media folder sort")
+    if folder_offset < 0:
+        raise ValueError("media folder offset must not be negative")
     if file_sort not in FILE_SORTS:
         raise ValueError("unsupported media file sort")
     if folder_sort == "name":
@@ -155,7 +158,11 @@ def decorate_media_listing(
         )
     folder_total = len(raw_folders)
     if folder_limit is not None:
-        raw_folders = raw_folders[:folder_limit]
+        raw_folders = raw_folders[
+            folder_offset : folder_offset + folder_limit
+        ]
+    elif folder_offset:
+        raw_folders = raw_folders[folder_offset:]
 
     folders = []
     for folder in raw_folders:
@@ -191,5 +198,7 @@ def decorate_media_listing(
         **browser,
         "folders": folders,
         "folder_total": folder_total,
+        "folder_offset": folder_offset,
+        "folder_limit": folder_limit,
         "files": files,
     }

@@ -83,7 +83,10 @@ class ReleaseConfigurationTests(unittest.TestCase):
             ),
         )
         self.assertIn("nvidia/npp/lib", runtime_base_dockerfile)
-        self.assertIn("STT_BASE_URL: http://runtime:8100", compose)
+        self.assertIn(
+            "STT_BASE_URL: ${STT_BASE_URL:-http://runtime:8100}",
+            compose,
+        )
         self.assertNotIn("container_name:", compose)
         self.assertIn(
             "BACKEND_STATE_DIR: /var/lib/stt", compose
@@ -98,7 +101,7 @@ class ReleaseConfigurationTests(unittest.TestCase):
         self.assertNotIn("target: /var/lib/stt/incoming", compose)
         self.assertEqual(compose.count("create_host_path: false"), 7)
         self.assertIn("target: /var/cache/stt", compose)
-        self.assertNotIn("${STT_BASE_URL", compose)
+        self.assertEqual(compose.count("${STT_BASE_URL:-"), 1)
         self.assertEqual(compose.count("\n      STT_API_TOKEN:"), 2)
         self.assertIn("${BACKEND_PUID:-${WEB_PUID:-1026}}", compose)
         self.assertIn("${BACKEND_PGID:-${WEB_PGID:-100}}", compose)
@@ -224,24 +227,37 @@ class ReleaseConfigurationTests(unittest.TestCase):
         self.assertIn('export PUID="$runtime_uid"', launcher)
         self.assertIn('export PGID="$runtime_gid"', launcher)
 
-    def test_gpu_compose_launcher_requires_shared_network_and_overlay(self) -> None:
-        launcher = (ROOT / "scripts/compose-gpu.sh").read_text(encoding="utf-8")
-        overlay = (ROOT / "compose.gpu-monitoring.yaml").read_text(
-            encoding="utf-8"
-        )
+    def test_backend_and_gpu_monitoring_compose_are_independent(self) -> None:
+        compose = (ROOT / "compose.yaml").read_text(encoding="utf-8")
         observability = (ROOT / "gpu-observability/compose.yaml").read_text(
             encoding="utf-8"
         )
 
-        self.assertIn('docker network inspect "$monitoring_network"', launcher)
-        self.assertIn("No Prometheus container is attached", launcher)
-        self.assertTrue((ROOT / "scripts/compose-gpu.sh").stat().st_mode & stat.S_IXUSR)
-        self.assertIn("compose.gpu-monitoring.yaml", launcher)
-        self.assertIn("GPU_PROMETHEUS_URL:", overlay)
-        self.assertIn("external: true", overlay)
-        self.assertIn("${GPU_MONITORING_NETWORK:-gpu-monitoring}", overlay)
+        web = compose.split("\n  web:\n    platform:", 1)[1].split(
+            "\n  backend:\n    platform:", 1
+        )[0]
+        backend = compose.split("\n  backend:\n    platform:", 1)[1].split(
+            "\n  runtime:\n    platform:", 1
+        )[0]
+        runtime = compose.split("\n  runtime:\n    platform:", 1)[1].split(
+            "\nnetworks:\n", 1
+        )[0]
+        networks = compose.rsplit("\nnetworks:\n", 1)[1]
+        self.assertNotIn("depends_on:", backend)
+        self.assertIn("host.docker.internal:host-gateway", backend)
         self.assertIn(
-            "${GPU_MONITORING_NETWORK:-gpu-monitoring}", observability
+            "STT_BASE_URL: ${STT_BASE_URL:-http://runtime:8100}",
+            backend,
+        )
+        self.assertIn("WEB_APP_IPV4", web)
+        self.assertIn("RUNTIME_APP_IPV4", runtime)
+        self.assertNotIn("BACKEND_RUNTIME_IPV4", backend)
+        self.assertNotIn("RUNTIME_NETWORK_SUBNET", networks)
+        self.assertNotIn("  runtime:\n", networks)
+        self.assertFalse((ROOT / "compose.gpu-monitoring.yaml").exists())
+        self.assertFalse((ROOT / "scripts/compose-gpu.sh").exists())
+        self.assertIn(
+            "${DOCKER_HOST_BIND_ADDRESS:-172.17.0.1}", observability
         )
 
     def test_runtime_requirements_have_no_platform_wrapper_files(self) -> None:
@@ -249,12 +265,40 @@ class ReleaseConfigurationTests(unittest.TestCase):
         self.assertTrue((ROOT / "requirements-kotoba.txt").is_file())
         self.assertFalse((ROOT / "requirements-cuda.txt").exists())
 
-    def test_project_and_package_versions_are_4_1_0(self) -> None:
+    def test_job_detail_preserves_same_page_monocular_vr180_preview(self) -> None:
+        job_detail = (
+            ROOT / "web" / "src" / "app" / "jobs" / "[id]" / "page.tsx"
+        ).read_text(encoding="utf-8")
+        player_component = (
+            ROOT / "web" / "src" / "components" / "ResultPlayer.tsx"
+        ).read_text(encoding="utf-8")
+        renderer = (ROOT / "web" / "public" / "vr180-player.js").read_text(
+            encoding="utf-8"
+        )
+        proxy = (ROOT / "web" / "src" / "proxy.ts").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("<ResultPlayer", job_detail)
+        self.assertNotIn("href={`/vr?", job_detail)
+        self.assertFalse(
+            (ROOT / "web" / "src" / "app" / "vr" / "page.tsx").exists()
+        )
+        self.assertIn("180° 단안 미리보기", player_component)
+        self.assertIn("video_u = u_eye_offset + eye_u * 0.5", renderer)
+        self.assertIn("eyeOffset: 0,", renderer)
+        self.assertIn(
+            'eyeOffset: view.eye === "right" ? 0.5 : 0,',
+            renderer,
+        )
+        self.assertIn("xr-spatial-tracking=(self)", proxy)
+
+    def test_project_and_package_versions_are_5_0_0(self) -> None:
         project = tomllib.loads(
             (ROOT / "pyproject.toml").read_text(encoding="utf-8")
         )
-        self.assertEqual(project["project"]["version"], "4.1.0")
-        self.assertEqual(__version__, "4.1.0")
+        self.assertEqual(project["project"]["version"], "5.0.0")
+        self.assertEqual(__version__, "5.0.0")
 
 
 if __name__ == "__main__":

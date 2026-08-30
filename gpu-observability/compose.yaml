@@ -24,6 +24,9 @@ services:
       - --storage.tsdb.path=/prometheus
       - --storage.tsdb.retention.time=30d
       - --web.enable-lifecycle
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${PROMETHEUS_PORT:-9090}:9090"
+      - "${DOCKER_HOST_BIND_ADDRESS:-172.17.0.1}:${PROMETHEUS_PORT:-9090}:9090"
     expose:
       - "9090"
     volumes:
@@ -63,5 +66,4 @@ volumes:
 
 networks:
   monitoring:
-    name: ${GPU_MONITORING_NETWORK:-gpu-monitoring}
     driver: bridge

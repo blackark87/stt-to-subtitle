@@ -66,14 +66,17 @@ class MediaDisplayTests(unittest.TestCase):
                 "av/japan/Actor/.actors/Actor.jpg",
             )
 
-    def test_sorts_and_limits_folders_while_reporting_the_total(self) -> None:
+    def test_sorts_and_pages_folders_while_reporting_the_total(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
             old = root / "old"
+            middle = root / "middle"
             recent = root / "recent"
             old.mkdir()
+            middle.mkdir()
             recent.mkdir()
             os.utime(old, (10, 10))
+            os.utime(middle, (15, 15))
             os.utime(recent, (20, 20))
             library = MediaLibrary(root)
 
@@ -82,13 +85,16 @@ class MediaDisplayTests(unittest.TestCase):
                 library.browse(),
                 [],
                 folder_sort="modified_desc",
+                folder_offset=1,
                 folder_limit=1,
             )
 
-            self.assertEqual(decorated["folder_total"], 2)
+            self.assertEqual(decorated["folder_total"], 3)
+            self.assertEqual(decorated["folder_offset"], 1)
+            self.assertEqual(decorated["folder_limit"], 1)
             self.assertEqual(
                 [folder["name"] for folder in decorated["folders"]],
-                ["recent"],
+                ["middle"],
             )
 
     def test_sorts_files_by_file_and_nfo_metadata(self) -> None:

@@ -7,8 +7,8 @@ import { Icon } from "@/components/Icon";
 import { LoadingOverlay } from "@/components/LoadingOverlay";
 import { api, type GpuDevice, type LibraryProgressSegment, type PipelineJob } from "@/lib/api";
 import {
-  JOB_PHASES,
   PHASE_LABEL,
+  PUBLIC_JOB_PHASES,
   STATE_LABEL,
   asJobState,
   canResumeTranslation,
@@ -21,7 +21,14 @@ import { clock, duration, fileName, parentPath, percent } from "@/lib/format";
 import { useLiveQuery } from "@/lib/useLiveQuery";
 
 const DASHBOARD_INTERVAL_MS = 5000;
-const PIPELINE_PHASES = JOB_PHASES.filter((phase) => phase !== "complete");
+const PIPELINE_PHASES = PUBLIC_JOB_PHASES;
+const COMPLETED_PHASE_QUERY = [
+  "operation=draft_translate",
+  "operation=review_translate",
+  "operation=external_review",
+  "operation=translate",
+  "operation=full",
+].join("&");
 const INTERRUPTED_STATES: readonly {
   state: Extract<JobState, "paused" | "blocked" | "stopped" | "failed">;
   description: string;
@@ -62,7 +69,7 @@ function jobPercent(job: PipelineJob): number | null {
   if (job.phase === "transcription") {
     return percent(job.chunks_completed, Math.max(job.chunks_created, job.chunks_total_estimate));
   }
-  if (job.phase === "translation") {
+  if (["translation", "draft_translation", "review_translation", "external_review"].includes(job.phase)) {
     return percent(job.translation_chunks_completed, job.translation_chunks_total);
   }
   return null;
@@ -242,8 +249,8 @@ export default function DashboardPage() {
           <Link href="/jobs?state=done&operation=transcribe" className="summary-card complete">
             <span>전사 완료</span><strong>{completionCounts.transcription}</strong><small>전사만 완료된 작업</small>
           </Link>
-          <Link href="/jobs?state=done&operation=translate&operation=full" className="summary-card complete">
-            <span>자막 완료</span><strong>{completionCounts.subtitle}</strong><small>번역·자막 생성 완료</small>
+          <Link href={`/jobs?state=done&${COMPLETED_PHASE_QUERY}`} className="summary-card complete">
+            <span>후속 단계 완료</span><strong>{completionCounts.subtitle}</strong><small>번역·검토 작업 완료</small>
           </Link>
         </section>
 
@@ -352,7 +359,7 @@ export default function DashboardPage() {
             })}
 
             <section className="card" aria-labelledby="completed-title">
-              <div className="card-head"><div><h2 id="completed-title">최근 자막 완료</h2><span className="sub" title={`최근 ${visibleCompleted.length}건 · 전체 ${completionCounts.subtitle}건`}>최근 {visibleCompleted.length}건 · 전체 {completionCounts.subtitle}건</span></div><Link href="/jobs?state=done&operation=translate&operation=full" className="text-link">전체 보기<Icon name="chevron_right" size={13} /></Link></div>
+              <div className="card-head"><div><h2 id="completed-title">최근 번역·검토 완료</h2><span className="sub" title={`최근 ${visibleCompleted.length}건 · 전체 ${completionCounts.subtitle}건`}>최근 {visibleCompleted.length}건 · 전체 {completionCounts.subtitle}건</span></div><Link href={`/jobs?state=done&${COMPLETED_PHASE_QUERY}`} className="text-link">전체 보기<Icon name="chevron_right" size={13} /></Link></div>
               <div className="card-body flush">
                 {completed.length === 0 ? <div className="empty-state compact"><strong>자막이 완료된 작업이 없습니다</strong></div> : (
                   <div className="job-list">

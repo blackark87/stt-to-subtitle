@@ -1,6 +1,6 @@
 # GPU Observability
 
-STT 애플리케이션과 독립적으로 배포하는 NVIDIA GPU 관측 프로젝트입니다. DCGM Exporter가 GPU 메트릭을 노출하고 Prometheus가 15초 간격으로 저장하며, Grafana는 프로비저닝된 **GPU Overview** 대시보드를 제공합니다. 이 디렉터리는 애플리케이션 코드에 의존하지 않아 그대로 별도 저장소로 분리할 수 있습니다. STT 내부 표시 기능을 사용할 때에만 이름이 고정된 Docker 네트워크를 공유합니다.
+STT 애플리케이션과 독립적으로 배포하는 NVIDIA GPU 관측 프로젝트입니다. DCGM Exporter가 GPU 메트릭을 노출하고 Prometheus가 15초 간격으로 저장하며, Grafana는 프로비저닝된 **GPU Overview** 대시보드를 제공합니다. 이 디렉터리는 애플리케이션 코드와 Docker 네트워크에 의존하지 않아 그대로 별도 저장소로 분리할 수 있습니다.
 
 ## 구성
 
@@ -28,14 +28,17 @@ docker compose config
 docker compose up -d
 ```
 
-Grafana만 로컬 호스트에 게시됩니다.
+Grafana는 로컬 호스트에, Prometheus는 로컬 호스트와 Docker host gateway에
+각각 게시됩니다.
 
 - Grafana: `http://127.0.0.1:3000`
-- Prometheus: 공유 Docker 네트워크의 `http://prometheus:9090`
-- DCGM Exporter: 공유 Docker 네트워크의 `http://dcgm-exporter:9400/metrics`
+- Prometheus 로컬 확인: `http://127.0.0.1:9090`
+- Prometheus 컨테이너 접근: `http://host.docker.internal:9090`
+- DCGM Exporter: 관측 프로젝트 내부의 `http://dcgm-exporter:9400/metrics`
 
-Prometheus와 DCGM Exporter는 호스트 포트를 공개하지 않습니다. STT 웹은
-`gpu-monitoring` Docker 네트워크로 Prometheus에 직접 연결합니다. Grafana
+`DOCKER_HOST_BIND_ADDRESS`는 Docker Engine의 host gateway 주소로 제한하십시오.
+임의의 LAN 주소나 `0.0.0.0`에 Prometheus를 게시하지 마십시오. 다른 Docker
+브리지 대역을 사용한다면 이 값과 호스트 방화벽 규칙을 함께 조정합니다. Grafana
 원격 접근이 필요하면 `BIND_ADDRESS`를 직접 공개하기보다 인증과 TLS가 설정된
 신뢰할 수 있는 리버스 프록시를 사용하십시오.
 
@@ -81,21 +84,17 @@ Prometheus에는 다음 경보가 포함됩니다. 알림 전송은 Alertmanager
 
 ## STT 대시보드 연결
 
-이 프로젝트를 먼저 시작하면 이름이 고정된 `gpu-monitoring` 네트워크가
-생성됩니다. 메인 STT 프로젝트에서는 다음과 같이 GPU 연결 오버레이를 함께
-적용합니다.
+메인 STT 프로젝트는 이 프로젝트의 Docker 네트워크에 참가하지 않습니다.
+Prometheus를 시작한 뒤 메인 프로젝트의 `.env.compose`에 URL을 설정합니다.
 
 메인 프로젝트 루트에서 실행합니다.
 
 ```bash
-./scripts/compose-gpu.sh up -d --build web backend
+GPU_PROMETHEUS_URL=http://host.docker.internal:9090
+./scripts/compose.sh --env-file .env.compose up -d backend
 ```
 
-이 래퍼는 `GPU_MONITORING_NETWORK`에 지정한 공유 네트워크가 없으면 배포 전에
-중단하므로, 오버레이 누락이나 서로 다른 네트워크 이름으로 인한 DNS 장애를
-즉시 확인할 수 있습니다.
-
-STT 대시보드는 `http://prometheus:9090`의 현재 DCGM 메트릭을 직접 표시합니다.
-Grafana 로그인, API 토큰 또는 외부 페이지 이동은 필요하지 않습니다. 두
-프로젝트의 이미지와 데이터 볼륨은 계속 분리되며 내부 Docker 네트워크만
-공유합니다.
+GPU 관측 프로젝트가 중지되어 있어도 Backend 빌드와 기동은 차단되지 않습니다.
+STT 대시보드는 현재 DCGM 메트릭을 직접 표시하며 Grafana 로그인, API 토큰 또는
+외부 페이지 이동은 필요하지 않습니다. 두 프로젝트의 컨테이너, 네트워크,
+이미지와 데이터 볼륨은 모두 분리됩니다.

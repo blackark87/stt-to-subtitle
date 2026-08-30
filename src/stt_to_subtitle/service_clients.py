@@ -930,8 +930,108 @@ def list_openai_compatible_models(
     return sorted(model_ids, key=str.casefold)
 
 
+EXTERNAL_MODEL_DEFAULT_URLS = {
+    "openrouter": "https://openrouter.ai/api/v1",
+    "bedrock": "",
+    "nvidia_build": "https://integrate.api.nvidia.com/v1",
+}
+
+
+def list_external_models(
+    *,
+    provider: str,
+    base_url: str,
+    credential: str,
+    region: str = "",
+    request_observer: RequestObserver | None = None,
+) -> list[str]:
+    """Authenticate an external model profile and return usable model IDs."""
+
+    if provider not in EXTERNAL_MODEL_DEFAULT_URLS:
+        raise ValueError("지원하지 않는 외부 모델 제공자입니다.")
+    if not credential.strip():
+        raise ValueError("API 키 또는 credential을 입력하세요.")
+    client = RetryingJSONClient(
+        token=credential,
+        read_timeout=30.0,
+        attempts=1,
+        service_name=f"external_model_{provider}",
+        request_observer=request_observer,
+    )
+    if provider == "openrouter":
+        root = EXTERNAL_MODEL_DEFAULT_URLS[provider]
+        authentication = client.request(
+            "GET",
+            f"{root}/key",
+            headers=client.headers,
+            metric_operation="authentication",
+        )
+        if authentication.status_code != 200:
+            raise ExternalServiceError(
+                "OpenRouter 인증 실패: "
+                f"HTTP {authentication.status_code}: "
+                f"{_safe_error(authentication)}"
+            )
+        return list_openai_compatible_models(
+            root,
+            credential,
+            attempts=1,
+            request_observer=request_observer,
+        )
+    if provider == "nvidia_build":
+        root = base_url.strip().rstrip("/") or (
+            EXTERNAL_MODEL_DEFAULT_URLS[provider]
+        )
+        return list_openai_compatible_models(
+            root,
+            credential,
+            attempts=1,
+            request_observer=request_observer,
+        )
+
+    normalized_region = region.strip().lower()
+    if not normalized_region:
+        raise ValueError("Amazon Bedrock 리전을 입력하세요.")
+    response = client.request(
+        "GET",
+        f"https://bedrock.{normalized_region}.amazonaws.com/foundation-models",
+        headers=client.headers,
+        params={"byOutputModality": "TEXT"},
+        metric_operation="models",
+    )
+    if response.status_code != 200:
+        raise ExternalServiceError(
+            "Amazon Bedrock 인증 또는 모델 조회 실패: "
+            f"HTTP {response.status_code}: {_safe_error(response)}"
+        )
+    try:
+        summaries = response.json()["modelSummaries"]
+    except (KeyError, TypeError, ValueError) as error:
+        raise ExternalServiceError(
+            "Amazon Bedrock가 올바르지 않은 모델 목록을 반환했습니다."
+        ) from error
+    if not isinstance(summaries, list):
+        raise ExternalServiceError(
+            "Amazon Bedrock가 올바르지 않은 모델 목록을 반환했습니다."
+        )
+    model_ids: set[str] = set()
+    for item in summaries:
+        if not isinstance(item, Mapping):
+            continue
+        lifecycle = item.get("modelLifecycle")
+        status = (
+            str(lifecycle.get("status", "ACTIVE"))
+            if isinstance(lifecycle, Mapping)
+            else "ACTIVE"
+        )
+        model_id = str(item.get("modelId", "")).strip()
+        if model_id and status == "ACTIVE":
+            model_ids.add(model_id)
+    return sorted(model_ids, key=str.casefold)
+
+
 class SubtitleValidationClient(RetryingJSONClient):
-    """Run one explicit structured subtitle review against a paid LLM."""
+    """Run one explicit structured subtitle review against a configured model."""
 
     def __init__(
         self,
@@ -1219,6 +1319,7 @@ class OpenAICompatibleClient(RetryingJSONClient):
         review_rounds: int = 0,
         draft_pass: bool = True,
         draft_translations: Mapping[str, str] | None = None,
+        comparison_translations: Mapping[str, str] | None = None,
         existing: Mapping[str, str] | None = None,
         on_batch: Callable[[list[dict[str, str]]], None] | None = None,
         on_batch_started: Callable[[int, list[str]], None] | None = None,
@@ -1252,6 +1353,11 @@ class OpenAICompatibleClient(RetryingJSONClient):
             for segment_id, text in (draft_translations or {}).items()
             if str(segment_id) in expected_set and str(text).strip()
         }
+        source_comparisons = {
+            str(segment_id): str(text).strip()
+            for segment_id, text in (comparison_translations or {}).items()
+            if str(segment_id) in expected_set and str(text).strip()
+        }
         if not draft_pass:
             if review_rounds < 1:
                 raise ValueError(
@@ -1262,6 +1368,14 @@ class OpenAICompatibleClient(RetryingJSONClient):
                 raise ValueError(
                     "existing-draft review requires a complete draft"
                 )
+            if comparison_translations is not None:
+                missing_comparison_ids = expected_set - set(
+                    source_comparisons
+                )
+                if missing_comparison_ids:
+                    raise ValueError(
+                        "comparison review requires a complete prior draft"
+                    )
         known = {
             str(segment_id): str(text).strip()
             for segment_id, text in (existing or {}).items()
@@ -1326,6 +1440,7 @@ class OpenAICompatibleClient(RetryingJSONClient):
                         review_rounds=review_rounds,
                         draft_pass=draft_pass,
                         draft_translations=source_drafts,
+                        comparison_translations=source_comparisons,
                     )
                 except Exception as error:
                     if on_batch_failed is not None:
@@ -1345,6 +1460,7 @@ class OpenAICompatibleClient(RetryingJSONClient):
                 review_rounds=review_rounds,
                 draft_pass=draft_pass,
                 draft_translations=source_drafts,
+                comparison_translations=source_comparisons,
                 max_workers=max_workers,
                 accept_batch=accept_batch,
                 on_batch_started=on_batch_started,
@@ -1369,6 +1485,7 @@ class OpenAICompatibleClient(RetryingJSONClient):
         review_rounds: int,
         draft_pass: bool,
         draft_translations: Mapping[str, str],
+        comparison_translations: Mapping[str, str],
         max_workers: int,
         accept_batch: Callable[
             [int, list[dict[str, str]], str | None], None
@@ -1410,6 +1527,7 @@ class OpenAICompatibleClient(RetryingJSONClient):
                     review_rounds=review_rounds,
                     draft_pass=draft_pass,
                     draft_translations=draft_translations,
+                    comparison_translations=comparison_translations,
                 )
                 in_flight[future] = batch_index
 
@@ -1469,6 +1587,7 @@ class OpenAICompatibleClient(RetryingJSONClient):
         review_rounds: int,
         draft_pass: bool,
         draft_translations: Mapping[str, str],
+        comparison_translations: Mapping[str, str],
     ) -> tuple[list[dict[str, str]], str | None]:
         reference_context = self._reference_context(
             all_segments,
@@ -1500,6 +1619,8 @@ class OpenAICompatibleClient(RetryingJSONClient):
                     translated,
                     review_prompt,
                     all_segments,
+                    all_draft_translations=draft_translations,
+                    comparison_translations=comparison_translations,
                 )
                 if reviewed == translated:
                     break
@@ -1596,6 +1717,9 @@ class OpenAICompatibleClient(RetryingJSONClient):
         drafts: Sequence[Mapping[str, str]],
         review_prompt: str,
         all_segments: Sequence[Mapping[str, Any]] | None = None,
+        *,
+        all_draft_translations: Mapping[str, str] | None = None,
+        comparison_translations: Mapping[str, str] | None = None,
     ) -> list[dict[str, str]]:
         try:
             return self._review_batch(
@@ -1603,6 +1727,8 @@ class OpenAICompatibleClient(RetryingJSONClient):
                 reference_context,
                 drafts,
                 review_prompt,
+                all_draft_translations=all_draft_translations,
+                comparison_translations=comparison_translations,
             )
         except ExternalServiceError as error:
             if (
@@ -1643,6 +1769,8 @@ class OpenAICompatibleClient(RetryingJSONClient):
                     [draft_by_id[str(segment["id"])] for segment in left],
                     review_prompt,
                     all_segments,
+                    all_draft_translations=all_draft_translations,
+                    comparison_translations=comparison_translations,
                 ),
                 *self._review_batch_with_recovery(
                     right,
@@ -1650,8 +1778,43 @@ class OpenAICompatibleClient(RetryingJSONClient):
                     [draft_by_id[str(segment["id"])] for segment in right],
                     review_prompt,
                     all_segments,
+                    all_draft_translations=all_draft_translations,
+                    comparison_translations=comparison_translations,
                 ),
             ]
+
+    @staticmethod
+    def _source_segment_payload(
+        segment: Mapping[str, Any],
+        *,
+        current_translations: Mapping[str, str] | None = None,
+        prior_translations: Mapping[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Expose only source fields useful for subtitle-boundary reasoning."""
+
+        segment_id = str(segment["id"])
+        payload: dict[str, Any] = {
+            "id": segment_id,
+            "text": str(segment["text"]),
+        }
+        for field in ("start", "end"):
+            value = segment.get(field)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                payload[field] = float(value)
+        speaker = str(segment.get("speaker", "")).strip()
+        if speaker:
+            payload["speaker_hint"] = speaker
+        current = str(
+            (current_translations or {}).get(segment_id, "")
+        ).strip()
+        if current:
+            payload["current_translation"] = current
+        prior = str(
+            (prior_translations or {}).get(segment_id, "")
+        ).strip()
+        if prior:
+            payload["prior_translation"] = prior
+        return payload
 
     def _translate_batch(
         self,
@@ -1666,11 +1829,11 @@ class OpenAICompatibleClient(RetryingJSONClient):
             expected_ids=[str(segment["id"]) for segment in segments],
             user_payload={
                 "target_segments": [
-                    {"id": str(segment["id"]), "text": str(segment["text"])}
+                    self._source_segment_payload(segment)
                     for segment in segments
                 ],
                 "reference_context": [
-                    {"text": str(segment["text"])}
+                    self._source_segment_payload(segment)
                     for segment in reference_context
                 ],
             },
@@ -1682,23 +1845,53 @@ class OpenAICompatibleClient(RetryingJSONClient):
         reference_context: Sequence[Mapping[str, Any]],
         drafts: Sequence[Mapping[str, str]],
         review_prompt: str,
+        *,
+        all_draft_translations: Mapping[str, str] | None = None,
+        comparison_translations: Mapping[str, str] | None = None,
     ) -> list[dict[str, str]]:
+        target_ids = {str(segment["id"]) for segment in segments}
+        prior_items = [
+            {
+                "id": str(segment["id"]),
+                "text": str(
+                    (comparison_translations or {}).get(
+                        str(segment["id"]),
+                        "",
+                    )
+                ).strip(),
+            }
+            for segment in segments
+            if str(
+                (comparison_translations or {}).get(
+                    str(segment["id"]),
+                    "",
+                )
+            ).strip()
+        ]
+        user_payload: dict[str, Any] = {
+            "target_segments": [
+                self._source_segment_payload(segment)
+                for segment in segments
+            ],
+            "reference_context": [
+                self._source_segment_payload(
+                    segment,
+                    current_translations=all_draft_translations,
+                    prior_translations=comparison_translations,
+                )
+                for segment in reference_context
+                if str(segment["id"]) not in target_ids
+            ],
+            "draft_translations": [dict(item) for item in drafts],
+        }
+        if prior_items:
+            user_payload["prior_translations"] = prior_items
         return self._request_translation_items(
             system_prompt=review_prompt,
             schema_name="subtitle_translation_review",
             error_label="translation review",
             expected_ids=[str(segment["id"]) for segment in segments],
-            user_payload={
-                "target_segments": [
-                    {"id": str(segment["id"]), "text": str(segment["text"])}
-                    for segment in segments
-                ],
-                "reference_context": [
-                    {"text": str(segment["text"])}
-                    for segment in reference_context
-                ],
-                "draft_translations": [dict(item) for item in drafts],
-            },
+            user_payload=user_payload,
         )
 
     def _request_translation_items(
@@ -1798,6 +1991,168 @@ class OpenAICompatibleClient(RetryingJSONClient):
                 "structured translation JSON"
             ) from error
         return normalize_translation_response(translations, expected_ids)
+
+
+class ExternalBedrockReviewClient(OpenAICompatibleClient):
+    """Expose Bedrock Converse through the translation-review interface."""
+
+    def __init__(
+        self,
+        credential: str,
+        model: str,
+        region: str,
+        *,
+        max_segments: int = 30,
+        max_characters: int = 6000,
+        request_observer: RequestObserver | None = None,
+    ) -> None:
+        super().__init__(
+            "https://bedrock.invalid",
+            credential,
+            model,
+            max_segments=max_segments,
+            max_characters=max_characters,
+            attempts=1,
+            request_observer=request_observer,
+        )
+        self.region = region.strip().lower()
+        if not self.region:
+            raise ValueError("Amazon Bedrock 리전이 필요합니다.")
+        self.service_name = "external_model_bedrock"
+
+    def _request_translation_items(
+        self,
+        *,
+        system_prompt: str,
+        schema_name: str,
+        error_label: str,
+        expected_ids: list[str],
+        user_payload: Mapping[str, Any],
+    ) -> list[dict[str, str]]:
+        schema = {
+            "type": "object",
+            "properties": {
+                "translations": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string"},
+                            "text": {"type": "string"},
+                        },
+                        "required": ["id", "text"],
+                        "additionalProperties": False,
+                    },
+                }
+            },
+            "required": ["translations"],
+            "additionalProperties": False,
+        }
+        model_path = quote(self.model, safe="")
+        response = self.request(
+            "POST",
+            (
+                f"https://bedrock-runtime.{self.region}.amazonaws.com/"
+                f"model/{model_path}/converse"
+            ),
+            headers={**self.headers, "Content-Type": "application/json"},
+            json={
+                "system": [{"text": system_prompt}],
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "text": json.dumps(
+                                    user_payload,
+                                    ensure_ascii=False,
+                                )
+                            }
+                        ],
+                    }
+                ],
+                "inferenceConfig": {"temperature": 0, "maxTokens": 4096},
+                "outputConfig": {
+                    "textFormat": {
+                        "type": "json_schema",
+                        "structure": {
+                            "jsonSchema": {
+                                "name": schema_name,
+                                "schema": json.dumps(
+                                    schema,
+                                    ensure_ascii=False,
+                                    separators=(",", ":"),
+                                ),
+                            }
+                        },
+                    }
+                },
+            },
+            metric_operation="external_review",
+        )
+        if response.status_code != 200:
+            raise ExternalServiceError(
+                "Amazon Bedrock 외부 모델 검토 실패: "
+                f"HTTP {response.status_code}: {_safe_error(response)}"
+            )
+        try:
+            blocks = response.json()["output"]["message"]["content"]
+            content = next(
+                block["text"]
+                for block in blocks
+                if isinstance(block, Mapping) and "text" in block
+            )
+            decoded = json.loads(content) if isinstance(content, str) else content
+            translations = decoded["translations"]
+        except (KeyError, StopIteration, TypeError, ValueError) as error:
+            raise TranslationResponseFormatError(
+                "Amazon Bedrock 외부 모델 검토가 올바르지 않은 JSON을 "
+                "반환했습니다."
+            ) from error
+        return normalize_translation_response(translations, expected_ids)
+
+
+def external_review_client(
+    *,
+    provider: str,
+    base_url: str,
+    credential: str,
+    model: str,
+    region: str,
+    max_segments: int,
+    max_characters: int,
+    request_observer: RequestObserver | None = None,
+) -> OpenAICompatibleClient:
+    """Build the selected external model client without exposing credentials."""
+
+    if provider == "bedrock":
+        return ExternalBedrockReviewClient(
+            credential,
+            model,
+            region,
+            max_segments=max_segments,
+            max_characters=max_characters,
+            request_observer=request_observer,
+        )
+    if provider not in {"openrouter", "nvidia_build"}:
+        raise ValueError("지원하지 않는 외부 모델 제공자입니다.")
+    root = (
+        EXTERNAL_MODEL_DEFAULT_URLS[provider]
+        if provider == "openrouter"
+        else base_url.strip().rstrip("/")
+        or EXTERNAL_MODEL_DEFAULT_URLS[provider]
+    )
+    client = OpenAICompatibleClient(
+        root,
+        credential,
+        model,
+        max_segments=max_segments,
+        max_characters=max_characters,
+        attempts=1,
+        request_observer=request_observer,
+    )
+    client.service_name = f"external_model_{provider}"
+    return client
 
 
 # Backward-compatible import for callers that used the former product-specific

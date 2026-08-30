@@ -63,7 +63,15 @@ RUNNING_JOB_STATUSES = {
     "translation_running",
     "rendering",
 }
-JOB_OPERATIONS = {"extract", "transcribe", "translate", "full"}
+JOB_OPERATIONS = {
+    "extract",
+    "transcribe",
+    "translate",
+    "full",
+    "draft_translate",
+    "review_translate",
+    "external_review",
+}
 JOB_STATUSES = {
     "queued",
     "extracting",
@@ -289,7 +297,13 @@ class PipelineJob:
     @property
     def can_pause_translation(self) -> bool:
         return (
-            self.operation in {"translate", "full"}
+            self.operation in {
+                "translate",
+                "full",
+                "draft_translate",
+                "review_translate",
+                "external_review",
+            }
             and self.status in TRANSLATION_PAUSABLE_STATUSES
             and not self.translation_pause_requested
             and not self.job_stop_requested
@@ -669,7 +683,8 @@ class JobStore:
                     )),
                     CHECK (phase IS NULL OR phase IN (
                         'extraction', 'transcription', 'translation',
-                        'render', 'complete'
+                        'draft_translation', 'review_translation',
+                        'external_review', 'render', 'complete'
                     )),
                     CHECK (attempt IS NULL OR attempt >= 1)
                 );
@@ -731,6 +746,25 @@ class JobStore:
                     model TEXT NOT NULL,
                     region TEXT NOT NULL DEFAULT '',
                     updated_at REAL NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS external_model_profiles (
+                    provider TEXT PRIMARY KEY,
+                    base_url TEXT NOT NULL,
+                    credential TEXT NOT NULL,
+                    region TEXT NOT NULL DEFAULT '',
+                    selected_model TEXT NOT NULL DEFAULT '',
+                    models_json TEXT NOT NULL DEFAULT '[]',
+                    status TEXT NOT NULL DEFAULT 'unchecked',
+                    message TEXT,
+                    checked_at REAL,
+                    updated_at REAL NOT NULL,
+                    CHECK (provider IN (
+                        'openrouter', 'bedrock', 'nvidia_build'
+                    )),
+                    CHECK (status IN (
+                        'unchecked', 'checking', 'ready', 'failed'
+                    ))
                 );
 
                 CREATE TABLE IF NOT EXISTS prompt_categories (
@@ -1327,7 +1361,108 @@ class JobStore:
                     "builtin_translation_prompts_v3",
                     self._upgrade_builtin_translation_prompts,
                 ),
+                Migration(
+                    58,
+                    "independent_pipeline_phases_v1",
+                    self._migrate_independent_pipeline_phases,
+                ),
+                Migration(
+                    59,
+                    "builtin_translation_prompts_v4",
+                    self._upgrade_builtin_translation_prompts,
+                ),
             ),
+        )
+
+    @staticmethod
+    def _migrate_independent_pipeline_phases(
+        connection: sqlite3.Connection,
+    ) -> None:
+        """Allow the four public phases and persist external model profiles."""
+
+        execute_sql_statements(
+            connection,
+            """
+            DROP TRIGGER IF EXISTS jobs_domain_insert_guard;
+            DROP TRIGGER IF EXISTS jobs_domain_update_guard;
+            DROP TRIGGER IF EXISTS jobs_projection_insert_guard;
+            DROP TRIGGER IF EXISTS jobs_projection_update_guard;
+
+            ALTER TABLE job_events RENAME TO job_events_legacy_v4;
+            CREATE TABLE job_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id TEXT NOT NULL,
+                level TEXT NOT NULL,
+                message TEXT NOT NULL,
+                event_code TEXT NOT NULL DEFAULT 'job.message',
+                from_state TEXT,
+                to_state TEXT,
+                phase TEXT,
+                attempt INTEGER,
+                correlation_id TEXT,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                created_at REAL NOT NULL,
+                FOREIGN KEY (job_id) REFERENCES jobs(id),
+                CHECK (from_state IS NULL OR from_state IN (
+                    'waiting', 'running', 'paused', 'blocked',
+                    'stopped', 'failed', 'done'
+                )),
+                CHECK (to_state IS NULL OR to_state IN (
+                    'waiting', 'running', 'paused', 'blocked',
+                    'stopped', 'failed', 'done'
+                )),
+                CHECK (phase IS NULL OR phase IN (
+                    'extraction', 'transcription', 'translation',
+                    'draft_translation', 'review_translation',
+                    'external_review', 'render', 'complete'
+                )),
+                CHECK (attempt IS NULL OR attempt >= 1)
+            );
+            INSERT INTO job_events (
+                id, job_id, level, message, event_code, from_state,
+                to_state, phase, attempt, correlation_id, payload_json,
+                created_at
+            )
+            SELECT
+                id, job_id, level, message, event_code, from_state,
+                to_state, phase, attempt, correlation_id, payload_json,
+                created_at
+            FROM job_events_legacy_v4;
+            DROP TABLE job_events_legacy_v4;
+            CREATE INDEX job_events_job_idx ON job_events(job_id, id);
+            CREATE INDEX job_events_code_idx
+                ON job_events(event_code, created_at);
+            CREATE INDEX job_events_created_idx
+                ON job_events(created_at, id);
+
+            CREATE TABLE IF NOT EXISTS external_model_profiles (
+                provider TEXT PRIMARY KEY,
+                base_url TEXT NOT NULL,
+                credential TEXT NOT NULL,
+                region TEXT NOT NULL DEFAULT '',
+                selected_model TEXT NOT NULL DEFAULT '',
+                models_json TEXT NOT NULL DEFAULT '[]',
+                status TEXT NOT NULL DEFAULT 'unchecked',
+                message TEXT,
+                checked_at REAL,
+                updated_at REAL NOT NULL,
+                CHECK (provider IN (
+                    'openrouter', 'bedrock', 'nvidia_build'
+                )),
+                CHECK (status IN (
+                    'unchecked', 'checking', 'ready', 'failed'
+                ))
+            );
+            INSERT OR IGNORE INTO external_model_profiles (
+                provider, base_url, credential, region, selected_model,
+                models_json, status, message, checked_at, updated_at
+            )
+            SELECT
+                provider, base_url, token, region, model, '[]',
+                'unchecked', NULL, NULL, updated_at
+            FROM subtitle_validator_settings
+            WHERE id = 1 AND provider IN ('openrouter', 'bedrock');
+            """,
         )
 
     @staticmethod
@@ -1845,7 +1980,10 @@ class JobStore:
             """
             CREATE TRIGGER IF NOT EXISTS jobs_domain_insert_guard
             BEFORE INSERT ON jobs
-            WHEN NEW.operation NOT IN ('extract', 'transcribe', 'translate', 'full')
+            WHEN NEW.operation NOT IN (
+                  'extract', 'transcribe', 'translate', 'full',
+                  'draft_translate', 'review_translate', 'external_review'
+              )
               OR NEW.status NOT IN (
                   'queued', 'extracting', 'audio_ready',
                   'transcription_running', 'transcribed',
@@ -1855,7 +1993,8 @@ class JobStore:
               )
               OR NEW.phase NOT IN (
                   'extraction', 'transcription', 'translation',
-                  'render', 'complete'
+                  'draft_translation', 'review_translation',
+                  'external_review', 'render', 'complete'
               )
               OR NEW.state NOT IN (
                   'waiting', 'running', 'paused', 'blocked',
@@ -1865,6 +2004,9 @@ class JobStore:
                   NEW.reason_code IS NOT NULL
                   AND NEW.reason_code NOT IN (
                       'user_stop', 'lm_unavailable', 'stt_unavailable',
+                      'draft_translation_unavailable',
+                      'review_translation_unavailable',
+                      'external_model_unavailable',
                       'service_restarted', 'artifact_missing',
                       'model_output_invalid', 'invalid_input',
                       'auth_required', 'resource_exhausted',
@@ -1895,7 +2037,10 @@ class JobStore:
                              force_overwrite, translation_pause_requested,
                              job_stop_requested
             ON jobs
-            WHEN NEW.operation NOT IN ('extract', 'transcribe', 'translate', 'full')
+            WHEN NEW.operation NOT IN (
+                  'extract', 'transcribe', 'translate', 'full',
+                  'draft_translate', 'review_translate', 'external_review'
+              )
               OR NEW.status NOT IN (
                   'queued', 'extracting', 'audio_ready',
                   'transcription_running', 'transcribed',
@@ -1905,7 +2050,8 @@ class JobStore:
               )
               OR NEW.phase NOT IN (
                   'extraction', 'transcription', 'translation',
-                  'render', 'complete'
+                  'draft_translation', 'review_translation',
+                  'external_review', 'render', 'complete'
               )
               OR NEW.state NOT IN (
                   'waiting', 'running', 'paused', 'blocked',
@@ -1915,6 +2061,9 @@ class JobStore:
                   NEW.reason_code IS NOT NULL
                   AND NEW.reason_code NOT IN (
                       'user_stop', 'lm_unavailable', 'stt_unavailable',
+                      'draft_translation_unavailable',
+                      'review_translation_unavailable',
+                      'external_model_unavailable',
                       'service_restarted', 'artifact_missing',
                       'model_output_invalid', 'invalid_input',
                       'auth_required', 'resource_exhausted',
@@ -1939,7 +2088,15 @@ class JobStore:
             CREATE TRIGGER IF NOT EXISTS jobs_projection_insert_guard
             BEFORE INSERT ON jobs
             WHEN NOT (
-                (NEW.status = 'queued' AND NEW.state = 'waiting'
+                (NEW.operation = 'transcribe'
+                    AND NEW.phase = 'transcription')
+                OR (NEW.operation = 'draft_translate'
+                    AND NEW.phase = 'draft_translation')
+                OR (NEW.operation = 'review_translate'
+                    AND NEW.phase = 'review_translation')
+                OR (NEW.operation = 'external_review'
+                    AND NEW.phase = 'external_review')
+                OR (NEW.status = 'queued' AND NEW.state = 'waiting'
                  AND NEW.phase = CASE WHEN NEW.operation = 'translate'
                                       THEN 'translation' ELSE 'extraction' END)
                 OR (NEW.status = 'extracting' AND NEW.phase = 'extraction'
@@ -1979,7 +2136,15 @@ class JobStore:
             BEFORE UPDATE OF operation, status, phase, state, reason_code
             ON jobs
             WHEN NOT (
-                (NEW.status = 'queued' AND NEW.state = 'waiting'
+                (NEW.operation = 'transcribe'
+                    AND NEW.phase = 'transcription')
+                OR (NEW.operation = 'draft_translate'
+                    AND NEW.phase = 'draft_translation')
+                OR (NEW.operation = 'review_translate'
+                    AND NEW.phase = 'review_translation')
+                OR (NEW.operation = 'external_review'
+                    AND NEW.phase = 'external_review')
+                OR (NEW.status = 'queued' AND NEW.state = 'waiting'
                  AND NEW.phase = CASE WHEN NEW.operation = 'translate'
                                       THEN 'translation' ELSE 'extraction' END)
                 OR (NEW.status = 'extracting' AND NEW.phase = 'extraction'
@@ -2934,6 +3099,124 @@ class JobStore:
                 """,
                 (provider, base_url, token, model, region, time.time()),
             )
+
+    @staticmethod
+    def _external_model_profile_from_row(
+        row: sqlite3.Row,
+    ) -> dict[str, Any]:
+        try:
+            models = json.loads(str(row["models_json"]))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            models = []
+        if not isinstance(models, list):
+            models = []
+        return {
+            "provider": str(row["provider"]),
+            "base_url": str(row["base_url"]),
+            "credential": str(row["credential"]),
+            "region": str(row["region"]),
+            "selected_model": str(row["selected_model"]),
+            "models": [str(model) for model in models if str(model).strip()],
+            "status": str(row["status"]),
+            "message": str(row["message"]) if row["message"] else None,
+            "checked_at": (
+                float(row["checked_at"])
+                if row["checked_at"] is not None
+                else None
+            ),
+            "updated_at": float(row["updated_at"]),
+        }
+
+    def list_external_model_profiles(self) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM external_model_profiles
+                ORDER BY CASE provider
+                    WHEN 'openrouter' THEN 1
+                    WHEN 'bedrock' THEN 2
+                    ELSE 3
+                END
+                """
+            ).fetchall()
+        return [
+            self._external_model_profile_from_row(row) for row in rows
+        ]
+
+    def get_external_model_profile(
+        self,
+        provider: str,
+    ) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM external_model_profiles "
+                "WHERE provider = ?",
+                (provider,),
+            ).fetchone()
+        return (
+            self._external_model_profile_from_row(row)
+            if row is not None
+            else None
+        )
+
+    def save_external_model_profile(
+        self,
+        *,
+        provider: str,
+        base_url: str,
+        credential: str,
+        region: str,
+        selected_model: str,
+        models: Sequence[str] = (),
+        status: str = "unchecked",
+        message: str | None = None,
+        checked_at: float | None = None,
+    ) -> dict[str, Any]:
+        if provider not in {"openrouter", "bedrock", "nvidia_build"}:
+            raise ValueError("unsupported external model provider")
+        if status not in {"unchecked", "checking", "ready", "failed"}:
+            raise ValueError("invalid external model status")
+        normalized_models = list(
+            dict.fromkeys(
+                str(model).strip() for model in models if str(model).strip()
+            )
+        )
+        now = time.time()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO external_model_profiles (
+                    provider, base_url, credential, region, selected_model,
+                    models_json, status, message, checked_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(provider) DO UPDATE SET
+                    base_url = excluded.base_url,
+                    credential = excluded.credential,
+                    region = excluded.region,
+                    selected_model = excluded.selected_model,
+                    models_json = excluded.models_json,
+                    status = excluded.status,
+                    message = excluded.message,
+                    checked_at = excluded.checked_at,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    provider,
+                    base_url,
+                    credential,
+                    region,
+                    selected_model,
+                    json.dumps(normalized_models, ensure_ascii=False),
+                    status,
+                    message[:1000] if message else None,
+                    checked_at,
+                    now,
+                ),
+            )
+        saved = self.get_external_model_profile(provider)
+        if saved is None:
+            raise RuntimeError("external model profile was not saved")
+        return saved
 
     @staticmethod
     def _from_row(row: sqlite3.Row | None) -> PipelineJob | None:
@@ -5012,6 +5295,9 @@ class JobStore:
                 FROM subtitle_generations AS generation
                 JOIN jobs AS job ON job.id = generation.job_id
                 WHERE job.status = 'rendering'
+                  AND job.operation NOT IN (
+                      'draft_translate', 'external_review'
+                  )
                   AND (
                       job.lease_expires_at IS NULL
                       OR job.lease_expires_at <= ?
@@ -5031,6 +5317,81 @@ class JobStore:
             candidate["source_rel"] = str(row["recovery_source_rel"])
             candidates.append(candidate)
         return candidates
+
+    def complete_unpublished_subtitle_generation(
+        self,
+        generation_id: str,
+        *,
+        lease_owner: str | None = None,
+        lease_token: int | None = None,
+    ) -> dict[str, Any]:
+        """Complete a non-publishing phase without changing media subtitles."""
+
+        if (lease_owner is None) != (lease_token is None):
+            raise ValueError("lease owner and token must be provided together")
+        now = time.time()
+        with self._connect() as connection:
+            generation = connection.execute(
+                """
+                SELECT generation.*, job.operation
+                FROM subtitle_generations AS generation
+                JOIN jobs AS job ON job.id = generation.job_id
+                WHERE generation.id = ?
+                """,
+                (generation_id,),
+            ).fetchone()
+            operation = (
+                str(generation["operation"])
+                if generation is not None
+                else ""
+            )
+            if operation not in {
+                "translate",
+                "full",
+                "draft_translate",
+                "review_translate",
+                "external_review",
+            }:
+                raise ValueError("unpublished subtitle generation not found")
+            job_id = str(generation["job_id"])
+            if lease_owner is not None and lease_token is not None:
+                owned = connection.execute(
+                    """
+                    SELECT 1 FROM jobs
+                    WHERE id = ? AND status = 'rendering'
+                      AND lease_owner = ? AND lease_token = ?
+                      AND lease_expires_at > ?
+                    """,
+                    (job_id, lease_owner, lease_token, now),
+                ).fetchone()
+                if owned is None:
+                    raise WorkerLeaseLost("worker lease was superseded")
+            projected = structured_state_from_legacy(
+                status="completed",
+                operation=operation,
+            )
+            connection.execute(
+                """
+                UPDATE jobs
+                SET status = 'completed', phase = ?, state = ?,
+                    reason_code = NULL, srt_path = ?, ass_path = ?,
+                    blocked_stage = NULL, error = NULL,
+                    lease_owner = NULL, lease_expires_at = NULL,
+                    status_updated_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    projected.phase.value,
+                    projected.state.value,
+                    str(generation["srt_artifact_path"]),
+                    str(generation["ass_artifact_path"]),
+                    now,
+                    now,
+                    job_id,
+                ),
+            )
+        self._notify_change(job_id)
+        return self._subtitle_generation_from_row(generation)
 
     def publish_subtitle_generation(
         self,

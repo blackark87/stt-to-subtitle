@@ -65,6 +65,22 @@ export interface RuntimeEndpoint {
 export type TranslationStage = "draft" | "review";
 export type TranslationMode = "draft_only" | "review_existing" | "draft_and_review";
 
+export type ExternalModelProvider = "openrouter" | "bedrock" | "nvidia_build";
+
+export interface ExternalModelProfile {
+  provider: ExternalModelProvider;
+  base_url: string;
+  credential_configured: boolean;
+  region: string;
+  selected_model: string;
+  models: string[];
+  status: "unchecked" | "checking" | "ready" | "failed";
+  message: string | null;
+  checked_at: number | null;
+  updated_at: number;
+  configured: boolean;
+}
+
 export interface TranslationServer {
   id: string;
   stage: TranslationStage;
@@ -73,6 +89,7 @@ export interface TranslationServer {
   token_configured: boolean;
   enabled: boolean;
   capacity: number;
+  thinking_enabled: boolean;
   builtin: boolean;
   batch_preferred: boolean;
   selected_model: string;
@@ -181,6 +198,8 @@ export interface MediaListing {
   breadcrumbs: { name: string; path: string }[];
   folders: MediaFolder[];
   folder_total?: number;
+  folder_offset?: number;
+  folder_limit?: number | null;
   files: MediaFile[];
 }
 
@@ -199,6 +218,7 @@ export interface SettingsPayload {
   runtimes: RuntimeEndpoint[];
   translation_groups: TranslationGroup[];
   translation_groups_error: string | null;
+  external_models: ExternalModelProfile[];
   path_display_rules: PathDisplayRule[];
   prompt_categories: PromptCategory[];
 }
@@ -233,12 +253,35 @@ export interface JobEvent {
 
 export interface JobDetailPayload {
   job: PipelineJob;
+  parent_job: PipelineJob | null;
+  child_jobs: PipelineJob[];
+  workflow_root_job_id: string;
+  workflow_jobs: PipelineJob[];
   events: JobEvent[];
   transcript_revisions: Record<string, unknown>[];
   translation_generations: Record<string, unknown>[];
   subtitle_generations: Record<string, unknown>[];
   subtitle_validation: Record<string, unknown> | null;
   external_subtitles: string[];
+}
+
+export interface TranslationGenerationItem {
+  id: string;
+  text: string;
+  segment_index?: number;
+  batch_index?: number;
+}
+
+export interface TranslationGenerationItemsPayload {
+  generation: Record<string, unknown>;
+  items: TranslationGenerationItem[];
+  batches: Record<string, unknown>[];
+}
+
+export interface TranslationItemUpdatePayload {
+  generation: Record<string, unknown>;
+  subtitle_generation: Record<string, unknown> | null;
+  item: TranslationGenerationItem;
 }
 
 export interface ListPayload<T> {
@@ -399,6 +442,24 @@ export const api = {
         translation_mode: translationMode,
       }),
     }),
+  draftTranslateJobs: (jobIds: string[], promptCategoryId: string) =>
+    request<unknown>("/jobs/actions/draft-translate", {
+      method: "POST",
+      ...json({ job_ids: jobIds, prompt_category_id: promptCategoryId, translation_mode: "draft_only" }),
+    }),
+  reviewTranslateJobs: (jobIds: string[], promptCategoryId: string) =>
+    request<unknown>("/jobs/actions/review-translate", {
+      method: "POST",
+      ...json({ job_ids: jobIds, prompt_category_id: promptCategoryId, translation_mode: "review_existing" }),
+    }),
+  externalReviewJobs: (
+    jobIds: string[],
+    provider: ExternalModelProvider,
+    model: string,
+  ) => request<unknown>("/jobs/actions/external-review", {
+    method: "POST",
+    ...json({ job_ids: jobIds, provider, model }),
+  }),
   retryJob: (jobId: string) =>
     request<unknown>(`/jobs/${encodeURIComponent(jobId)}/retry`, { method: "POST" }),
   stopJob: (jobId: string) =>
@@ -411,6 +472,11 @@ export const api = {
     }),
   deleteJob: (jobId: string) =>
     request<unknown>(`/jobs/${encodeURIComponent(jobId)}`, { method: "DELETE" }),
+  publishSubtitleGeneration: (jobId: string, generationId: string) =>
+    request<unknown>(`/jobs/${encodeURIComponent(jobId)}/subtitle-generations/publish`, {
+      method: "POST",
+      ...json({ generation_id: generationId }),
+    }),
 
   media: (params: {
     folder?: string;
@@ -418,6 +484,7 @@ export const api = {
     actor?: string;
     folderSort?: string;
     fileSort?: string;
+    folderOffset?: number;
     folderLimit?: number;
   } = {}) => {
     const query = new URLSearchParams();
@@ -426,6 +493,7 @@ export const api = {
     if (params.actor) query.set("actor", params.actor);
     if (params.folderSort) query.set("folder_sort", params.folderSort);
     if (params.fileSort) query.set("file_sort", params.fileSort);
+    if (params.folderOffset != null) query.set("folder_offset", String(params.folderOffset));
     if (params.folderLimit != null) query.set("folder_limit", String(params.folderLimit));
     const suffix = query.toString();
     return request<MediaListing>(`/media${suffix ? `?${suffix}` : ""}`);
@@ -454,6 +522,7 @@ export const api = {
     operation?: string;
     prompt_category_id?: string | null;
     force_overwrite?: boolean;
+    options?: Record<string, unknown>;
   }) => request<unknown>("/jobs", { method: "POST", ...json(body) }),
 
   settings: () => request<SettingsPayload>("/settings"),
@@ -463,6 +532,30 @@ export const api = {
     stt_base_url: string;
     stt_token?: string | null;
   }) => request<unknown>("/settings/servers", { method: "PUT", ...json(body) }),
+  updateExternalModel: (
+    provider: ExternalModelProvider,
+    body: {
+      base_url: string;
+      credential?: string | null;
+      clear_credential?: boolean;
+      region: string;
+    },
+  ) => request<ExternalModelProfile>(
+    `/settings/external-models/${provider}`,
+    { method: "PUT", ...json(body) },
+  ),
+  probeExternalModel: (provider: ExternalModelProvider) =>
+    request<ExternalModelProfile>(
+      `/settings/external-models/${provider}/probe`,
+      { method: "POST" },
+    ),
+  selectExternalModel: (
+    provider: ExternalModelProvider,
+    model: string,
+  ) => request<ExternalModelProfile>(
+    `/settings/external-models/${provider}/model`,
+    { method: "PUT", ...json({ model }) },
+  ),
   updateTranslationServerModel: (
     stage: TranslationStage,
     id: string,
@@ -477,6 +570,7 @@ export const api = {
     token: string;
     enabled: boolean;
     capacity: number;
+    thinking_enabled: boolean;
   }) => request<TranslationServer>(`/translation-groups/${stage}/servers`, {
     method: "POST",
     ...json(body),
@@ -491,6 +585,7 @@ export const api = {
       clear_token?: boolean;
       enabled: boolean;
       capacity: number;
+      thinking_enabled: boolean;
     },
   ) => request<TranslationServer>(
     `/translation-groups/${stage}/servers/${encodeURIComponent(id)}`,
@@ -535,6 +630,20 @@ export const api = {
   ),
 
   job: (id: string) => request<JobDetailPayload>(`/jobs/${encodeURIComponent(id)}`),
+
+  translationGenerationItems: (jobId: string, generationId: string) =>
+    request<TranslationGenerationItemsPayload>(
+      `/jobs/${encodeURIComponent(jobId)}/translation-generations/${encodeURIComponent(generationId)}/items`,
+    ),
+  updateTranslationItem: (
+    jobId: string,
+    generationId: string,
+    segmentId: string,
+    text: string,
+  ) => request<TranslationItemUpdatePayload>(
+    `/jobs/${encodeURIComponent(jobId)}/translation-generations/${encodeURIComponent(generationId)}/items/${encodeURIComponent(segmentId)}`,
+    { method: "PUT", ...json({ text }) },
+  ),
 
   jobEvents: (id: string) =>
     request<{ items: JobEvent[] }>(

@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
-from html import escape
+from html import escape, unescape
 import mimetypes
 from pathlib import Path
 import re
+
+from .subtitle import SPEAKER_COLORS
 
 
 _SRT_TIMING = re.compile(
@@ -14,6 +16,15 @@ _SRT_TIMING = re.compile(
     r"\s*-->\s*"
     r"(?P<end>\d+:\d{2}:\d{2})[,.](?P<end_ms>\d{3})"
 )
+_SRT_FONT_LINE = re.compile(
+    r'^\s*<font\s+color=["\'](?P<color>#[0-9a-fA-F]{6})["\']>'
+    r"(?P<text>.*)</font>\s*$",
+    re.IGNORECASE,
+)
+_SPEAKER_CLASS_BY_COLOR = {
+    color.casefold(): f"speaker-{index + 1}"
+    for index, color in enumerate(SPEAKER_COLORS)
+}
 MEDIA_TYPE_OVERRIDES = {
     ".mkv": "video/x-matroska",
     ".mp4": "video/mp4",
@@ -85,8 +96,20 @@ def iter_file_range(
             yield chunk
 
 
+def read_subtitle_text(path: Path) -> str:
+    """Read a browser subtitle using the encodings accepted by the library."""
+
+    data = path.read_bytes()
+    for encoding in ("utf-8-sig", "utf-8", "cp949"):
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    raise ValueError("자막 파일 인코딩은 UTF-8 또는 CP949여야 합니다.")
+
+
 def srt_to_webvtt(srt_text: str) -> str:
-    """Convert generated SRT cues to escaped WebVTT for an HTML track."""
+    """Convert generated SRT cues to safe, speaker-styled WebVTT."""
     normalized = (
         srt_text.removeprefix("\ufeff")
         .replace("\r\n", "\n")
@@ -116,9 +139,19 @@ def srt_to_webvtt(srt_text: str) -> str:
             f"{match.group('start')}.{match.group('start_ms')} --> "
             f"{match.group('end')}.{match.group('end_ms')}"
         )
-        cue_text = "\n".join(
-            escape(line, quote=False)
-            for line in lines[timing_index + 1 :]
-        )
+        cue_lines = []
+        for line in lines[timing_index + 1 :]:
+            font_line = _SRT_FONT_LINE.match(line)
+            if font_line is None:
+                cue_lines.append(escape(line, quote=False))
+                continue
+            text = escape(unescape(font_line.group("text")), quote=False)
+            speaker_class = _SPEAKER_CLASS_BY_COLOR.get(
+                font_line.group("color").casefold()
+            )
+            cue_lines.append(
+                f"<c.{speaker_class}>{text}</c>" if speaker_class else text
+            )
+        cue_text = "\n".join(cue_lines)
         cues.append(f"{timing}\n{cue_text}")
     return "WEBVTT\n\n" + "\n\n".join(cues) + ("\n" if cues else "")

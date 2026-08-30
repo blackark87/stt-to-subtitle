@@ -15,6 +15,8 @@ from .backend_common import (
 )
 from .backend_contracts import (
     ArtifactCleanupRequest,
+    ExternalModelProfileRequest,
+    ExternalModelSelectionRequest,
     PathDisplayRuleRequest,
     PromptCategoryRequest,
     PromptCategoryStateRequest,
@@ -206,8 +208,14 @@ def dashboard_library_progress(request: Request) -> dict[str, Any]:
 def capabilities() -> dict[str, Any]:
     return {
         "api_version": "v1",
-        "operations": ["extract", "transcribe", "translate", "full", "compare"],
-        "transcription_backends": ["whisperjav", "kotoba", "whisperx", "hybrid"],
+        "operations": [
+            "transcribe",
+            "draft_translate",
+            "review_translate",
+            "external_review",
+            "compare",
+        ],
+        "transcription_backends": ["whisperjav", "hybrid", "whisperx"],
         "phases": [phase.value for phase in JobPhase],
         "states": [state.value for state in JobState],
         "reason_codes": [reason.value for reason in JobReason],
@@ -215,6 +223,11 @@ def capabilities() -> dict[str, Any]:
             "openai_compatible",
             "openrouter",
             "bedrock",
+        ],
+        "external_model_providers": [
+            "openrouter",
+            "bedrock",
+            "nvidia_build",
         ],
     }
 
@@ -234,6 +247,7 @@ def settings(request: Request) -> dict[str, Any]:
         "translation_groups": translation_groups,
         "translation_groups_error": translation_groups_error,
         "subtitle_validator": service.subtitle_validator_view(),
+        "external_models": service.external_model_profiles_view(),
         "path_display_rules": public_value(service.path_display_rules),
         "prompt_categories": public_value(service.all_prompt_categories()),
     }
@@ -483,6 +497,58 @@ def update_subtitle_validator(
     except ValueError as error:
         raise bad_request(error) from error
     return service.subtitle_validator_view()
+
+
+@router.get("/settings/external-models")
+def external_models(request: Request) -> dict[str, Any]:
+    items = service_from_request(request).external_model_profiles_view()
+    return {"items": items, "total": len(items)}
+
+
+@router.put("/settings/external-models/{provider}")
+def update_external_model(
+    provider: str,
+    payload: ExternalModelProfileRequest,
+    request: Request,
+) -> dict[str, Any]:
+    try:
+        return service_from_request(request).update_external_model_profile(
+            provider,
+            base_url=payload.base_url,
+            credential=payload.credential,
+            clear_credential=payload.clear_credential,
+            region=payload.region,
+        )
+    except ValueError as error:
+        raise bad_request(error) from error
+
+
+@router.post("/settings/external-models/{provider}/probe")
+def probe_external_model(
+    provider: str,
+    request: Request,
+) -> dict[str, Any]:
+    try:
+        return service_from_request(request).probe_external_model_profile(
+            provider
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=502, detail=str(error)) from error
+
+
+@router.put("/settings/external-models/{provider}/model")
+def select_external_model(
+    provider: str,
+    payload: ExternalModelSelectionRequest,
+    request: Request,
+) -> dict[str, Any]:
+    try:
+        return service_from_request(request).select_external_model(
+            provider,
+            payload.model,
+        )
+    except ValueError as error:
+        raise bad_request(error) from error
 
 
 @router.get("/settings/path-display-rules")

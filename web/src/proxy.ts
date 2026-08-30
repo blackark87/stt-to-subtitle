@@ -37,6 +37,7 @@ export function proxy(request: NextRequest) {
   response.headers.set("X-Content-Type-Options", "nosniff");
   response.headers.set("Referrer-Policy", "no-referrer");
   response.headers.set("X-Frame-Options", "DENY");
+  response.headers.set("Permissions-Policy", "xr-spatial-tracking=(self)");
   return response;
 }
 

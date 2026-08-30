@@ -68,6 +68,7 @@ from .job_store import (
 )
 from .job_state import JobReason, JobState
 from .service_clients import (
+    EXTERNAL_MODEL_DEFAULT_URLS,
     ExternalServiceError,
     OpenAICompatibleClient,
     OperationStopped,
@@ -76,12 +77,17 @@ from .service_clients import (
     SubtitleValidationClient,
     TranslationDeferred,
     TranslationPaused,
+    external_review_client,
+    list_external_models,
 )
 from .subtitle import write_styled_subtitles_atomic
 from .subtitle_validation import build_subtitle_validator_payload
 from .translation_prompt import (
+    KOREAN_EXTERNAL_EDITOR_PROMPT,
     KOREAN_JAV_DRAFT_PROMPT,
+    KOREAN_JAV_EXTERNAL_EDITOR_PROMPT,
     KOREAN_JAV_REVIEW_PROMPT,
+    KOREAN_VARIETY_EXTERNAL_EDITOR_PROMPT,
 )
 from .translation_routing import (
     BackendTranslationRouting,
@@ -114,6 +120,7 @@ EVENT_PHASE_BY_STAGE = {
     "extraction": "extraction",
     "transcription": "transcription",
     "translation": "translation",
+    "external review": "external_review",
     "render": "render",
 }
 JOB_LEASE_SECONDS = 60.0
@@ -173,8 +180,28 @@ TRANSLATION_MODES = frozenset({
     "draft_and_review",
 })
 SUBTITLE_RENDERER_VERSION = "1"
-SUPPORTED_OPERATIONS = {"extract", "transcribe", "translate", "full"}
-TRANSLATION_OPERATIONS = {"translate", "full"}
+SUPPORTED_OPERATIONS = {
+    "extract",
+    "transcribe",
+    "translate",
+    "full",
+    "draft_translate",
+    "review_translate",
+    "external_review",
+}
+TRANSLATION_OPERATIONS = {
+    "translate",
+    "full",
+    "draft_translate",
+    "review_translate",
+    "external_review",
+}
+LOCAL_TRANSLATION_OPERATIONS = {
+    "translate",
+    "full",
+    "draft_translate",
+    "review_translate",
+}
 TRANSCRIPTION_COMPARISON_BACKENDS = (
     "whisperjav",
     "hybrid",
@@ -378,6 +405,7 @@ class SubtitleOrchestrator:
         self._runtime_health: dict[str, dict[str, Any]] = {}
         self._runtime_dispatch_cursor = 0
         self._translation_circuit_lock = threading.RLock()
+        self._phase_creation_lock = threading.RLock()
         self._subtitle_publication_lock = threading.RLock()
         self._stage_futures_lock = threading.RLock()
         self._stage_futures: set[Future[Any]] = set()
@@ -458,9 +486,9 @@ class SubtitleOrchestrator:
             thread_name_prefix="runtime-probe",
         )
         self._translation_executor = ThreadPoolExecutor(
-            # Keep translation files serial. Parallel batch requests inside
-            # one file are bounded by the selected translation group.
-            max_workers=1,
+            # Draft and review use separate job lanes but share host locks.
+            # External validation has its own lane and no local GPU lock.
+            max_workers=3,
             thread_name_prefix="pipeline-translation",
         )
 
@@ -1090,6 +1118,174 @@ class SubtitleOrchestrator:
         )
         self._subtitle_validator = normalized
         return normalized
+
+    @staticmethod
+    def _external_model_defaults(provider: str) -> str:
+        try:
+            return EXTERNAL_MODEL_DEFAULT_URLS[provider]
+        except KeyError as error:
+            raise ValueError("지원하지 않는 외부 모델 제공자입니다.") from error
+
+    @staticmethod
+    def _external_model_public(
+        profile: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "provider": str(profile["provider"]),
+            "base_url": str(profile["base_url"]),
+            "credential_configured": bool(profile.get("credential")),
+            "region": str(profile["region"]),
+            "selected_model": str(profile["selected_model"]),
+            "models": list(profile.get("models", [])),
+            "status": str(profile["status"]),
+            "message": profile.get("message"),
+            "checked_at": profile.get("checked_at"),
+            "updated_at": profile.get("updated_at"),
+            "configured": bool(
+                profile.get("credential")
+                and profile.get("selected_model")
+                and profile.get("status") == "ready"
+            ),
+        }
+
+    def external_model_profiles_view(self) -> list[dict[str, Any]]:
+        stored = {
+            str(profile["provider"]): profile
+            for profile in self.store.list_external_model_profiles()
+        }
+        now = time.time()
+        return [
+            self._external_model_public(
+                stored.get(provider)
+                or {
+                    "provider": provider,
+                    "base_url": self._external_model_defaults(provider),
+                    "credential": "",
+                    "region": "",
+                    "selected_model": "",
+                    "models": [],
+                    "status": "unchecked",
+                    "message": None,
+                    "checked_at": None,
+                    "updated_at": now,
+                }
+            )
+            for provider in ("openrouter", "bedrock", "nvidia_build")
+        ]
+
+    def update_external_model_profile(
+        self,
+        provider: str,
+        *,
+        base_url: str,
+        credential: str | None,
+        clear_credential: bool,
+        region: str,
+    ) -> dict[str, Any]:
+        default_url = self._external_model_defaults(provider)
+        current = self.store.get_external_model_profile(provider) or {}
+        stored_credential = (
+            ""
+            if clear_credential
+            else credential
+            if credential is not None
+            else str(current.get("credential", ""))
+        )
+        normalized_base_url = (
+            ""
+            if provider == "bedrock"
+            else default_url
+            if provider == "openrouter"
+            else normalize_server_url(
+                base_url.strip() or default_url,
+                "EXTERNAL_MODEL_BASE_URL",
+            )
+        )
+        normalized_region = region.strip().lower() if provider == "bedrock" else ""
+        profile = self.store.save_external_model_profile(
+            provider=provider,
+            base_url=normalized_base_url,
+            credential=stored_credential,
+            region=normalized_region,
+            selected_model=str(current.get("selected_model", "")),
+            models=current.get("models", ()),
+            status="unchecked",
+            message="연결 점검 후 저장된 모델을 다시 확인합니다.",
+        )
+        return self._external_model_public(profile)
+
+    def probe_external_model_profile(
+        self,
+        provider: str,
+    ) -> dict[str, Any]:
+        profile = self.store.get_external_model_profile(provider)
+        if profile is None:
+            raise ValueError("외부 모델 제공자 설정을 먼저 저장하세요.")
+        try:
+            models = list_external_models(
+                provider=provider,
+                base_url=str(profile["base_url"]),
+                credential=str(profile["credential"]),
+                region=str(profile["region"]),
+                request_observer=self.record_external_request,
+            )
+            if not models:
+                raise ExternalServiceError(
+                    "인증은 성공했지만 사용할 수 있는 텍스트 모델이 없습니다."
+                )
+        except (ExternalServiceError, ValueError) as error:
+            sanitized = self._sanitize_error(str(error))
+            self.store.save_external_model_profile(
+                provider=provider,
+                base_url=str(profile["base_url"]),
+                credential=str(profile["credential"]),
+                region=str(profile["region"]),
+                selected_model="",
+                models=(),
+                status="failed",
+                message=sanitized,
+                checked_at=time.time(),
+            )
+            raise ValueError(sanitized) from error
+        selected = str(profile.get("selected_model", ""))
+        if selected not in models:
+            selected = ""
+        ready = self.store.save_external_model_profile(
+            provider=provider,
+            base_url=str(profile["base_url"]),
+            credential=str(profile["credential"]),
+            region=str(profile["region"]),
+            selected_model=selected,
+            models=models,
+            status="ready",
+            message=f"인증 완료 · {len(models)}개 모델 사용 가능",
+            checked_at=time.time(),
+        )
+        return self._external_model_public(ready)
+
+    def select_external_model(
+        self,
+        provider: str,
+        model: str,
+    ) -> dict[str, Any]:
+        profile = self.store.get_external_model_profile(provider)
+        selected = model.strip()
+        if profile is None or profile["status"] != "ready":
+            raise ValueError("먼저 외부 모델 제공자의 연결을 점검하세요.")
+        if selected not in profile["models"]:
+            raise ValueError("연결 점검에서 확인된 모델만 선택할 수 있습니다.")
+        saved = self.store.save_external_model_profile(
+            provider=provider,
+            base_url=str(profile["base_url"]),
+            credential=str(profile["credential"]),
+            region=str(profile["region"]),
+            selected_model=selected,
+            models=profile["models"],
+            status="ready",
+            message=str(profile.get("message") or "인증 완료"),
+            checked_at=profile.get("checked_at"),
+        )
+        return self._external_model_public(saved)
 
     def validate_subtitles_with_llm(
         self,
@@ -2546,6 +2742,411 @@ class SubtitleOrchestrator:
                 )
         return transitioned_jobs
 
+    def _create_independent_translation_job(
+        self,
+        source_job: PipelineJob,
+        *,
+        operation: str,
+        prompt_snapshot: Mapping[str, Any],
+        execution_mode: str,
+        input_translation_generation_id: str | None = None,
+        comparison_translation_generation_id: str | None = None,
+        comparison_translation_job_id: str | None = None,
+        external_model: Mapping[str, str] | None = None,
+    ) -> PipelineJob:
+        if not source_job.transcript_path:
+            raise ValueError("입력 작업에 전사 결과가 없습니다.")
+        source_transcript = Path(source_job.transcript_path)
+        transcript_payload, segments, _transcript_job_id = (
+            self._load_translation_transcript(source_transcript)
+        )
+        options = dict(source_job.options)
+        options[TRANSLATION_PROMPT_OPTION] = dict(prompt_snapshot)
+        options[TRANSLATION_EXECUTION_MODE_OPTION] = execution_mode
+        options["pipeline_parent_job_id"] = source_job.id
+        options["input_transcript_revision_id"] = (
+            source_job.transcript_revision_id
+        )
+        options["input_translation_generation_id"] = (
+            input_translation_generation_id
+        )
+        options["comparison_translation_generation_id"] = (
+            comparison_translation_generation_id
+        )
+        options["comparison_translation_job_id"] = (
+            comparison_translation_job_id
+        )
+        source_subtitles = self.store.list_subtitle_generations(source_job.id)
+        options["input_subtitle_generation_id"] = (
+            str(source_subtitles[-1]["id"]) if source_subtitles else None
+        )
+        if external_model is not None:
+            options["external_model"] = dict(external_model)
+
+        created = self.store.create(
+            job_id=uuid4().hex,
+            source_rel=source_job.source_rel,
+            force_overwrite=True,
+            options=options,
+            operation=operation,
+            audio_path=source_job.audio_path,
+            audio_sha256=source_job.audio_sha256,
+            audio_revision_id=source_job.audio_revision_id,
+        )
+        revision_id = uuid4().hex
+        transcript_path = (
+            self.settings.jobs_dir
+            / created.id
+            / "transcript-revisions"
+            / revision_id
+            / artifact_filename(created.source_rel, "transcript")
+        )
+        copy_files_atomic(
+            ((source_transcript, transcript_path),),
+            overwrite=False,
+        )
+        persisted = self.store.record_transcript_revision(
+            revision_id=revision_id,
+            job_id=created.id,
+            audio_revision_id=source_job.audio_revision_id,
+            remote_job_id=source_job.stt_job_id,
+            backend=str(source_job.options.get("backend", "imported")),
+            model_revision="imported",
+            options_hash=_canonical_payload_hash(source_job.options),
+            artifact_path=str(transcript_path),
+            content_hash=sha256_file(transcript_path),
+            origin="imported",
+            status="transcribed",
+            chunks_total=len(segments),
+        )
+        if not persisted:
+            raise RuntimeError("단계 입력 전사 리비전을 저장하지 못했습니다.")
+        self.store.add_event(
+            created.id,
+            "info",
+            f"independent {operation} job created from {source_job.id}",
+            event_code="pipeline.phase.created",
+            phase={
+                "draft_translate": "draft_translation",
+                "review_translate": "review_translation",
+                "external_review": "external_review",
+            }[operation],
+            payload={
+                "parent_job_id": source_job.id,
+                "input_transcript_revision_id": (
+                    source_job.transcript_revision_id
+                ),
+                "input_translation_generation_id": (
+                    input_translation_generation_id
+                ),
+                "comparison_translation_generation_id": (
+                    comparison_translation_generation_id
+                ),
+            },
+        )
+        refreshed = self.store.get(created.id)
+        if refreshed is None:
+            raise RuntimeError("생성한 단계 작업을 읽지 못했습니다.")
+        return refreshed
+
+    def create_phase_translation_jobs(
+        self,
+        job_ids: Sequence[str],
+        *,
+        prompt_category_id: str,
+        stage: str,
+    ) -> list[PipelineJob]:
+        """Create independent draft or review jobs from strict predecessors."""
+
+        if stage not in {"draft", "review"}:
+            raise ValueError("지원하지 않는 번역 단계입니다.")
+        if not self.translation_server_configured:
+            raise ValueError("번역 서버 설정이 필요합니다.")
+        selected_ids = list(dict.fromkeys(value for value in job_ids if value))
+        if not selected_ids:
+            raise ValueError("처리할 이전 단계 작업을 하나 이상 선택하세요.")
+        execution_mode = "batch" if len(selected_ids) > 1 else "live"
+        mode = "draft_only" if stage == "draft" else "review_existing"
+        self._require_translation_mode_routes(mode, execution_mode)
+        base_prompt = self._prompt_snapshot(prompt_category_id)
+        prepared: list[tuple[PipelineJob, str | None]] = []
+        for job_id in selected_ids:
+            source_job = self.store.get(job_id)
+            if source_job is None:
+                raise ValueError("선택한 작업을 찾을 수 없습니다.")
+            if source_job.options.get("comparison_id"):
+                raise ValueError(
+                    "전사 비교 결과는 비교 상세 화면에서 먼저 선택하세요."
+                )
+            source_generation_id: str | None = None
+            if stage == "draft":
+                if (
+                    source_job.operation != "transcribe"
+                    or source_job.status != "transcription_completed"
+                    or not source_job.transcript_path
+                ):
+                    raise ValueError(
+                        f"{source_job.source_rel}: 완료된 전사 작업만 "
+                        "1차 번역할 수 있습니다."
+                    )
+            else:
+                prompt = source_job.options.get(TRANSLATION_PROMPT_OPTION)
+                is_legacy_draft = (
+                    source_job.operation in {"translate", "full"}
+                    and isinstance(prompt, Mapping)
+                    and self._translation_mode(prompt) == "draft_only"
+                )
+                if (
+                    source_job.status != "completed"
+                    or (
+                        source_job.operation != "draft_translate"
+                        and not is_legacy_draft
+                    )
+                ):
+                    raise ValueError(
+                        f"{source_job.source_rel}: 완료된 1차 번역 작업만 "
+                        "2차 번역할 수 있습니다."
+                    )
+                generation = self.store.latest_translation_generation(
+                    source_job.id
+                )
+                if generation is None and is_legacy_draft:
+                    transcript_payload, segments, _transcript_job_id = (
+                        self._load_translation_transcript(
+                            Path(source_job.transcript_path or "")
+                        )
+                    )
+                    generation = self._capture_legacy_translation_generation(
+                        source_job,
+                        transcript_payload,
+                        segments,
+                        prompt,
+                    )
+                if generation is None or generation["state"] != "completed":
+                    raise ValueError("완료된 1차 번역 세대가 없습니다.")
+                source_generation_id = str(generation["id"])
+            prepared.append((source_job, source_generation_id))
+
+        operation = (
+            "draft_translate" if stage == "draft" else "review_translate"
+        )
+        with self._phase_creation_lock:
+            existing_jobs = self.store.list_jobs(limit=None)
+            for source_job, source_generation_id in prepared:
+                duplicate = next(
+                    (
+                        candidate
+                        for candidate in existing_jobs
+                        if candidate.operation == operation
+                        and str(
+                            candidate.options.get(
+                                "pipeline_parent_job_id",
+                                "",
+                            )
+                            or ""
+                        )
+                        == source_job.id
+                        and str(
+                            candidate.options.get(
+                                "input_translation_generation_id",
+                                "",
+                            )
+                            or ""
+                        )
+                        == str(source_generation_id or "")
+                    ),
+                    None,
+                )
+                if duplicate is not None:
+                    phase_label = "1차" if stage == "draft" else "2차"
+                    raise ValueError(
+                        f"동일한 입력의 {phase_label} 번역 작업이 이미 "
+                        f"있습니다: {duplicate.id}. 기존 작업을 사용하거나 "
+                        "실패한 작업을 재시도하세요."
+                    )
+
+            created_jobs: list[PipelineJob] = []
+            for source_job, source_generation_id in prepared:
+                prompt_snapshot = self._prompt_snapshot_for_mode(
+                    base_prompt,
+                    mode,
+                    review_source_generation_id=source_generation_id,
+                )
+                created = self._create_independent_translation_job(
+                    source_job,
+                    operation=operation,
+                    prompt_snapshot=prompt_snapshot,
+                    execution_mode=execution_mode,
+                    input_translation_generation_id=source_generation_id,
+                )
+                created_jobs.append(created)
+                existing_jobs.append(created)
+        return created_jobs
+
+    def create_external_review_jobs(
+        self,
+        job_ids: Sequence[str],
+        *,
+        provider: str,
+        model: str,
+    ) -> list[PipelineJob]:
+        """Create external review jobs that remain unpublished until approved."""
+
+        profile = self.store.get_external_model_profile(provider)
+        requested_model = model.strip()
+        selected_model = (
+            str(profile.get("selected_model", "")).strip()
+            if profile is not None
+            else ""
+        )
+        if (
+            profile is None
+            or profile["status"] != "ready"
+            or not profile["credential"]
+            or not selected_model
+            or selected_model not in profile["models"]
+        ):
+            raise ValueError(
+                "외부 모델 제공자를 점검하고 사용 가능한 모델을 선택하세요."
+            )
+        if requested_model != selected_model:
+            raise ValueError(
+                "요청 모델이 설정에 저장된 외부 검토 모델과 일치하지 않습니다."
+            )
+        selected_ids = list(dict.fromkeys(value for value in job_ids if value))
+        if not selected_ids:
+            raise ValueError("완료된 2차 번역 작업을 하나 이상 선택하세요.")
+        prepared: list[tuple[PipelineJob, str, str, str]] = []
+        for job_id in selected_ids:
+            source_job = self.store.get(job_id)
+            if (
+                source_job is None
+                or source_job.operation != "review_translate"
+                or source_job.status != "completed"
+            ):
+                raise ValueError("완료된 2차 번역 작업만 외부 검토할 수 있습니다.")
+            generation = self.store.latest_translation_generation(source_job.id)
+            if generation is None or generation["state"] != "completed":
+                raise ValueError("완료된 2차 번역 세대가 없습니다.")
+            prior_generation_id = str(
+                source_job.options.get(
+                    "input_translation_generation_id",
+                    "",
+                )
+                or ""
+            ).strip()
+            prior_job_id = str(
+                source_job.options.get("pipeline_parent_job_id", "") or ""
+            ).strip()
+            prior_generation = self.store.get_translation_generation(
+                prior_generation_id
+            )
+            if (
+                not prior_generation_id
+                or not prior_job_id
+                or prior_generation is None
+                or prior_generation["state"] != "completed"
+                or str(prior_generation["job_id"]) != prior_job_id
+            ):
+                raise ValueError(
+                    "외부 교정에서 비교할 완료된 1차 번역 세대가 없습니다."
+                )
+            prepared.append(
+                (
+                    source_job,
+                    str(generation["id"]),
+                    prior_generation_id,
+                    prior_job_id,
+                )
+            )
+
+        with self._phase_creation_lock:
+            existing_jobs = self.store.list_jobs(limit=None)
+            for (
+                source_job,
+                generation_id,
+                _prior_generation_id,
+                _prior_job_id,
+            ) in prepared:
+                duplicate = next(
+                    (
+                        candidate
+                        for candidate in existing_jobs
+                        if candidate.operation == "external_review"
+                        and str(
+                            candidate.options.get(
+                                "pipeline_parent_job_id",
+                                "",
+                            )
+                            or ""
+                        )
+                        == source_job.id
+                        and str(
+                            candidate.options.get(
+                                "input_translation_generation_id",
+                                "",
+                            )
+                            or ""
+                        )
+                        == generation_id
+                    ),
+                    None,
+                )
+                if duplicate is not None:
+                    raise ValueError(
+                        "동일한 입력의 외부 모델 검토 작업이 이미 "
+                        f"있습니다: {duplicate.id}. 기존 작업을 사용하거나 "
+                        "실패한 작업을 재시도하세요."
+                    )
+
+            created_jobs: list[PipelineJob] = []
+            for (
+                source_job,
+                generation_id,
+                prior_generation_id,
+                prior_job_id,
+            ) in prepared:
+                source_prompt = source_job.options.get(
+                    TRANSLATION_PROMPT_OPTION
+                )
+                base_prompt = (
+                    dict(source_prompt)
+                    if isinstance(source_prompt, Mapping)
+                    else self._legacy_prompt_snapshot()
+                )
+                base_prompt["review_prompt"] = {
+                    "jav": KOREAN_JAV_EXTERNAL_EDITOR_PROMPT,
+                    "variety": KOREAN_VARIETY_EXTERNAL_EDITOR_PROMPT,
+                }.get(
+                    str(base_prompt.get("category_id", "")).strip(),
+                    KOREAN_EXTERNAL_EDITOR_PROMPT,
+                )
+                prompt_snapshot = self._prompt_snapshot_for_mode(
+                    base_prompt,
+                    "review_existing",
+                    review_source_generation_id=generation_id,
+                )
+                created = self._create_independent_translation_job(
+                    source_job,
+                    operation="external_review",
+                    prompt_snapshot=prompt_snapshot,
+                    execution_mode=(
+                        "batch" if len(prepared) > 1 else "live"
+                    ),
+                    input_translation_generation_id=generation_id,
+                    comparison_translation_generation_id=(
+                        prior_generation_id
+                    ),
+                    comparison_translation_job_id=prior_job_id,
+                    external_model={
+                        "provider": provider,
+                        "model": selected_model,
+                    },
+                )
+                created_jobs.append(created)
+                existing_jobs.append(created)
+        return created_jobs
+
     def _continue_completed_transcription(
         self,
         job: PipelineJob,
@@ -2608,7 +3209,10 @@ class SubtitleOrchestrator:
         if len(selected_ids) > self.settings.maximum_listed_files:
             raise ValueError("한 번에 등록할 수 있는 파일 수를 초과했습니다.")
 
-        prompt_snapshot = self._prompt_snapshot(prompt_category_id)
+        prompt_snapshot = self._prompt_snapshot_for_mode(
+            self._prompt_snapshot(prompt_category_id),
+            "draft_only",
+        )
         selected_transcripts: list[tuple[PipelineJob, dict[str, Any]]] = []
         selected_sources: set[str] = set()
         for job_id in selected_ids:
@@ -2679,12 +3283,16 @@ class SubtitleOrchestrator:
                 "job_id": reusable.id,
                 "backend": str(reusable.options.get("backend", "")),
             }
+            options["pipeline_parent_job_id"] = reusable.id
+            options["input_transcript_revision_id"] = (
+                reusable.transcript_revision_id
+            )
             created = self.store.create(
                 job_id=uuid4().hex,
                 source_rel=reusable.source_rel,
                 force_overwrite=True,
                 options=options,
-                operation="translate",
+                operation="draft_translate",
                 audio_path=reusable.audio_path,
                 audio_sha256=reusable.audio_sha256,
                 audio_revision_id=reusable.audio_revision_id,
@@ -3180,7 +3788,25 @@ class SubtitleOrchestrator:
             generation = self.store.latest_translation_generation(job.id)
         else:
             generation = self.store.get_translation_generation(generation_id)
-        if generation is None or generation["job_id"] != job.id:
+        input_generation_id = str(
+            job.options.get("input_translation_generation_id", "") or ""
+        ).strip()
+        parent_job_id = str(
+            job.options.get("pipeline_parent_job_id", "") or ""
+        ).strip()
+        owns_generation = bool(
+            generation is not None
+            and (
+                generation["job_id"] == job.id
+                or (
+                    input_generation_id
+                    and parent_job_id
+                    and generation["id"] == input_generation_id
+                    and generation["job_id"] == parent_job_id
+                )
+            )
+        )
+        if generation is None or not owns_generation:
             raise ValueError("2차 보정에 사용할 1차 번역 결과가 없습니다.")
         if generation["state"] != "completed":
             raise ValueError("완료된 1차 번역 결과만 2차 보정할 수 있습니다.")
@@ -3215,6 +3841,70 @@ class SubtitleOrchestrator:
                 "없습니다."
             )
         return generation, {
+            str(item["id"]): str(item["text"]) for item in validated
+        }
+
+    def _external_comparison_translations(
+        self,
+        job: PipelineJob,
+        segments: Sequence[Mapping[str, Any]],
+    ) -> dict[str, str]:
+        """Load the transcript-matched first pass for final adjudication."""
+
+        if not job.transcript_path:
+            raise ValueError("외부 교정에 사용할 전사 결과가 없습니다.")
+        generation_id = str(
+            job.options.get("comparison_translation_generation_id", "")
+            or ""
+        ).strip()
+        owner_job_id = str(
+            job.options.get("comparison_translation_job_id", "") or ""
+        ).strip()
+        generation = self.store.get_translation_generation(generation_id)
+        if (
+            not generation_id
+            or not owner_job_id
+            or generation is None
+            or str(generation["job_id"]) != owner_job_id
+        ):
+            raise ValueError(
+                "외부 교정에서 비교할 1차 번역 결과가 없습니다."
+            )
+        if generation["state"] != "completed":
+            raise ValueError(
+                "완료된 1차 번역 결과만 외부 교정에 사용할 수 있습니다."
+            )
+        if generation["transcript_hash"] != sha256_file(
+            Path(job.transcript_path)
+        ):
+            raise ValueError(
+                "1차 번역과 현재 전사 결과가 달라 외부 교정할 수 없습니다."
+            )
+        stored_items = self.store.translation_items(generation["id"])
+        expected_ids = [str(segment["id"]) for segment in segments]
+        try:
+            validated = validate_translation_items(
+                self._translation_snapshot_items(stored_items),
+                expected_ids,
+            )
+        except ValueError as error:
+            raise ValueError(
+                "1차 번역 결과가 완전하지 않아 외부 교정할 수 없습니다."
+            ) from error
+        source_hashes = {
+            str(item["id"]): str(item["source_hash"])
+            for item in stored_items
+        }
+        if any(
+            source_hashes.get(str(segment["id"]))
+            != _canonical_payload_hash(dict(segment))
+            for segment in segments
+        ):
+            raise ValueError(
+                "1차 번역 구간과 현재 전사 구간이 달라 외부 교정할 수 "
+                "없습니다."
+            )
+        return {
             str(item["id"]): str(item["text"]) for item in validated
         }
 
@@ -3657,6 +4347,8 @@ class SubtitleOrchestrator:
         job_id: str,
         kind: str,
         content: str,
+        *,
+        publish_subtitle: bool = True,
     ) -> Path:
         job = self.store.get(job_id)
         if job is None:
@@ -3828,15 +4520,82 @@ class SubtitleOrchestrator:
                     or bool(refreshed.srt_path)
                     or bool(refreshed.ass_path)
                 ),
+                publish=publish_subtitle,
             )
             self.store.add_event(
                 job.id,
                 "info",
-                f"{kind} JSON edited; subtitle regenerated",
+                (
+                    f"{kind} JSON edited; subtitle regenerated"
+                    if publish_subtitle
+                    else f"{kind} JSON edited; subtitle generation saved unpublished"
+                ),
             )
         else:
             self.store.add_event(job.id, "info", f"{kind} JSON edited")
         return artifact
+
+    def edit_translation_item(
+        self,
+        job_id: str,
+        *,
+        generation_id: str,
+        segment_id: str,
+        text: str,
+    ) -> dict[str, Any]:
+        """Create an immutable manual generation with one translated cue edited."""
+
+        job = self.store.get(job_id)
+        if job is None:
+            raise ValueError("job not found")
+        generation = self.store.get_translation_generation(generation_id)
+        if generation is None or generation["job_id"] != job_id:
+            raise ValueError("translation generation not found")
+        edited_text = text.strip()
+        if not edited_text:
+            raise ValueError("자막 문장은 비워 둘 수 없습니다.")
+        items = self.store.translation_items(generation_id)
+        if not any(str(item["id"]) == segment_id for item in items):
+            raise ValueError("translation segment not found")
+        translations = [
+            {
+                "id": str(item["id"]),
+                "text": (
+                    edited_text
+                    if str(item["id"]) == segment_id
+                    else str(item["text"])
+                ),
+            }
+            for item in items
+        ]
+        self.save_artifact(
+            job_id,
+            "translation",
+            json.dumps(
+                {
+                    "schema_version": TRANSLATION_SCHEMA_VERSION,
+                    "status": "completed",
+                    "translations": translations,
+                },
+                ensure_ascii=False,
+            ),
+            publish_subtitle=False,
+        )
+        manual_generation = self.store.list_translation_generations(job_id)[-1]
+        subtitle_generation = next(
+            (
+                item
+                for item in reversed(self.store.list_subtitle_generations(job_id))
+                if item.get("translation_generation_id")
+                == manual_generation["id"]
+            ),
+            None,
+        )
+        return {
+            "generation": manual_generation,
+            "subtitle_generation": subtitle_generation,
+            "item": {"id": segment_id, "text": edited_text},
+        }
 
     def _scheduler_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -3941,40 +4700,167 @@ class SubtitleOrchestrator:
         return dispatched
 
     def _dispatch_translations(self) -> int:
-        if self.translation_circuit_state != "ready":
-            return 0
-        if self.store.ids_with_status("translation_running"):
-            return 0
-
-        def has_route(job: PipelineJob) -> bool:
+        def execution_mode(job: PipelineJob) -> str:
             mode = str(
                 job.options.get(TRANSLATION_EXECUTION_MODE_OPTION, "live")
             ).strip()
-            if mode not in {"live", "batch"}:
-                mode = "live"
+            return mode if mode in {"live", "batch"} else "live"
+
+        def local_stages(job: PipelineJob) -> tuple[str, ...]:
+            if job.operation == "draft_translate":
+                return ("draft",)
+            if job.operation == "review_translate":
+                return ("review",)
+            if job.operation == "external_review":
+                return ()
             prompt_snapshot = job.options.get(TRANSLATION_PROMPT_OPTION)
             if not isinstance(prompt_snapshot, Mapping):
                 prompt_snapshot = self._legacy_prompt_snapshot()
-            required_stage = (
-                "review"
-                if self._translation_mode(prompt_snapshot) == "review_existing"
-                else "draft"
-            )
-            return not self._translation_routing.route_suspended_by_stt(
-                required_stage,
-                mode,
+            translation_mode = self._translation_mode(prompt_snapshot)
+            if translation_mode == "review_existing":
+                return ("review",)
+            if translation_mode == "draft_and_review":
+                return ("draft", "review")
+            return ("draft",)
+
+        def running_jobs() -> list[PipelineJob]:
+            return [
+                job
+                for job_id in self.store.ids_with_status(
+                    "translation_running"
+                )
+                if (job := self.store.get(job_id)) is not None
+            ]
+
+        def active_local_routes() -> list[tuple[str, str]]:
+            return [
+                (stage, execution_mode(job))
+                for job in running_jobs()
+                for stage in local_stages(job)
+            ]
+
+        current_running = running_jobs()
+        external_running = any(
+            job.operation == "external_review" for job in current_running
+        )
+        dispatched = 0
+        if not external_running and self._dispatch_one(
+            "transcribed",
+            "translation_running",
+            "external review",
+            self._translation_executor,
+            self._translate,
+            job_filter=lambda job: job.operation == "external_review",
+        ):
+            dispatched += 1
+
+        if self.translation_circuit_state != "ready":
+            return dispatched
+
+        def has_route(job: PipelineJob, stages: Sequence[str]) -> bool:
+            mode = execution_mode(job)
+            return all(
+                self._translation_routing.is_configured(stage, mode)
+                and not self._translation_routing.route_suspended_by_stt(
+                    stage,
+                    mode,
+                )
+                for stage in stages
             )
 
-        return int(
-            self._dispatch_one(
+        def conflicts_with_active_route(
+            job: PipelineJob,
+            stages: Sequence[str],
+        ) -> bool:
+            mode = execution_mode(job)
+            active_routes = active_local_routes()
+            for stage in stages:
+                occupied_hosts: set[str] = set()
+                for active_stage, active_mode in active_routes:
+                    if stage == active_stage:
+                        return True
+                    occupied_hosts.update(
+                        self._translation_routing.configured_hosts(
+                            active_stage,
+                            active_mode,
+                        )
+                    )
+                candidate_hosts = self._translation_routing.configured_hosts(
+                    stage,
+                    mode,
+                )
+                if candidate_hosts and not (
+                    set(candidate_hosts) - occupied_hosts
+                ):
+                    return True
+            return False
+
+        waiting_jobs = [
+            job
+            for job_id in self.store.dispatchable_ids_with_status("transcribed")
+            if (job := self.store.get(job_id)) is not None
+        ]
+        independent_operations = {"draft_translate", "review_translate"}
+        for selected_operation, selected_stage in (
+            ("draft_translate", "draft"),
+            ("review_translate", "review"),
+        ):
+            if not any(
+                job.operation == selected_operation for job in waiting_jobs
+            ):
+                continue
+            if self._dispatch_one(
                 "transcribed",
                 "translation_running",
                 "translation",
                 self._translation_executor,
                 self._translate,
-                job_filter=has_route,
-            )
+                job_filter=lambda job: (
+                    job.operation == selected_operation
+                    and has_route(job, (selected_stage,))
+                    and not conflicts_with_active_route(
+                        job,
+                        (selected_stage,),
+                    )
+                ),
+            ):
+                dispatched += 1
+        independent_active = any(
+            job.operation in independent_operations for job in running_jobs()
         )
+        independent_paused = any(
+            (job := self.store.get(job_id)) is not None
+            and job.operation in independent_operations
+            for job_id in self.store.ids_with_status("translation_paused")
+        )
+        independent_waiting = any(
+            job.operation in independent_operations for job in waiting_jobs
+        )
+        if independent_active or independent_paused or independent_waiting:
+            return dispatched
+
+        if self._dispatch_one(
+            "transcribed",
+            "translation_running",
+            "translation",
+            self._translation_executor,
+            self._translate,
+            job_filter=lambda job: (
+                job.operation
+                not in {
+                    "draft_translate",
+                    "review_translate",
+                    "external_review",
+                }
+                and has_route(job, local_stages(job))
+                and not conflicts_with_active_route(
+                    job,
+                    local_stages(job),
+                )
+            ),
+        ):
+            dispatched += 1
+        return dispatched
 
     def _dispatch_one(
         self,
@@ -4248,15 +5134,30 @@ class SubtitleOrchestrator:
                     message=message,
                 )
                 return
+            translation_reason = {
+                "draft_translate": JobReason.DRAFT_TRANSLATION_UNAVAILABLE,
+                "review_translate": JobReason.REVIEW_TRANSLATION_UNAVAILABLE,
+                "external_review": (
+                    JobReason.EXTERNAL_MODEL_UNAVAILABLE
+                ),
+            }.get(job.operation, JobReason.LM_UNAVAILABLE)
+            reason_code = (
+                translation_reason.value
+                if stage in {"translation", "external review"}
+                else JobReason.STT_UNAVAILABLE.value
+            )
+            phase_label = {
+                "draft_translate": "1차 번역 서버",
+                "review_translate": "2차 번역 서버",
+                "external_review": "외부 검토 모델",
+            }.get(job.operation)
+            if phase_label:
+                message = f"{phase_label} 연결 불가: {message}"
             if not self._update_stage_job(
                 job,
                 status="blocked",
                 blocked_stage=stage,
-                reason_code=(
-                    JobReason.LM_UNAVAILABLE.value
-                    if stage == "translation"
-                    else JobReason.STT_UNAVAILABLE.value
-                ),
+                reason_code=reason_code,
                 error=message,
             ):
                 self._record_lease_fencing_rejection(
@@ -4264,7 +5165,7 @@ class SubtitleOrchestrator:
                     "terminal_transition",
                 )
                 return
-            if stage == "translation":
+            if stage == "translation" and job.operation != "external_review":
                 self._set_translation_circuit(
                     "lost",
                     reason_code=JobReason.LM_UNAVAILABLE.value,
@@ -4278,11 +5179,8 @@ class SubtitleOrchestrator:
                 from_state=JobState.RUNNING.value,
                 phase=EVENT_PHASE_BY_STAGE[stage],
                 payload={
-                    "reason_code": (
-                        JobReason.LM_UNAVAILABLE.value
-                        if stage == "translation"
-                        else JobReason.STT_UNAVAILABLE.value
-                    )
+                    "reason_code": reason_code,
+                    "operation": job.operation,
                 },
             )
             LOGGER.warning("job %s %s blocked: %s", job_id, stage, message)
@@ -4935,6 +5833,11 @@ class SubtitleOrchestrator:
                 "prompt_hash": prompt_hash,
                 "endpoint_key": selected_endpoint,
                 "model": selected_model,
+                "request_options": (
+                    self._translation_routing.request_options_contract()
+                    if model is None
+                    else "external-provider-defaults"
+                ),
                 "source_language": "ja",
                 "target_language": "ko",
                 "batch_segments": self.settings.translation_batch_segments,
@@ -5197,11 +6100,34 @@ class SubtitleOrchestrator:
         ).strip()
         if execution_mode not in {"live", "batch"}:
             execution_mode = "live"
-        self._require_translation_mode_routes(
-            translation_mode,
-            execution_mode,
-            error_type=ExternalServiceError,
-        )
+        external_profile: Mapping[str, Any] | None = None
+        external_selection = job.options.get("external_model")
+        if job.operation == "external_review":
+            if not isinstance(external_selection, Mapping):
+                raise ValueError("외부 모델 선택 정보가 없습니다.")
+            provider = str(external_selection.get("provider", "")).strip()
+            selected_model = str(
+                external_selection.get("model", "")
+            ).strip()
+            external_profile = self.store.get_external_model_profile(
+                provider
+            )
+            if (
+                external_profile is None
+                or external_profile["status"] != "ready"
+                or not external_profile["credential"]
+                or selected_model not in external_profile["models"]
+            ):
+                raise ExternalServiceError(
+                    "외부 모델 제공자 인증 또는 선택 모델을 다시 "
+                    "점검하세요."
+                )
+        else:
+            self._require_translation_mode_routes(
+                translation_mode,
+                execution_mode,
+                error_type=ExternalServiceError,
+            )
         draft_pass = translation_mode != "review_existing"
         review_rounds = (
             0
@@ -5324,9 +6250,21 @@ class SubtitleOrchestrator:
                         "translation pass timing event write failed"
                     )
 
-        lm_client = self._make_translation_client(
-            request_observer=observe_translation_request,
-        )
+        if external_profile is not None:
+            lm_client = external_review_client(
+                provider=str(external_profile["provider"]),
+                base_url=str(external_profile["base_url"]),
+                credential=str(external_profile["credential"]),
+                model=str(external_selection["model"]),
+                region=str(external_profile["region"]),
+                max_segments=self.settings.translation_batch_segments,
+                max_characters=self.settings.translation_batch_characters,
+                request_observer=observe_translation_request,
+            )
+        else:
+            lm_client = self._make_translation_client(
+                request_observer=observe_translation_request,
+            )
         self.store.add_event(
             job.id,
             "info",
@@ -5352,6 +6290,7 @@ class SubtitleOrchestrator:
         )
         segments = validate_transcript(transcript_payload)
         draft_translations: dict[str, str] = {}
+        comparison_translations: dict[str, str] | None = None
         if not draft_pass:
             review_source_generation_id = str(
                 prompt_snapshot.get("review_source_generation_id", "")
@@ -5365,6 +6304,10 @@ class SubtitleOrchestrator:
                     generation_id=review_source_generation_id or None,
                 )
             )
+            if job.operation == "external_review":
+                comparison_translations = (
+                    self._external_comparison_translations(job, segments)
+                )
         translation_path = (
             Path(job.translation_path)
             if job.translation_path
@@ -5384,6 +6327,16 @@ class SubtitleOrchestrator:
             transcript_payload,
             prompt_snapshot,
             origin="automatic",
+            model=(
+                str(external_selection["model"])
+                if external_profile is not None
+                else None
+            ),
+            endpoint_key=(
+                f"external:{external_profile['provider']}"
+                if external_profile is not None
+                else None
+            ),
         )
         expected_id_list = [str(segment["id"]) for segment in segments]
         expected_ids = set(expected_id_list)
@@ -5553,13 +6506,17 @@ class SubtitleOrchestrator:
             )
 
         translation_outcome = "failed"
-        translation_workers = self._translation_routing.worker_limit(
-            execution_mode,
-            stage="draft" if draft_pass else "review",
+        translation_workers = (
+            1
+            if external_profile is not None
+            else self._translation_routing.worker_limit(
+                execution_mode,
+                stage="draft" if draft_pass else "review",
+            )
         )
         review_priority = (
             self._translation_routing.review_priority(execution_mode)
-            if review_rounds
+            if review_rounds and external_profile is None
             else nullcontext()
         )
         try:
@@ -5571,6 +6528,7 @@ class SubtitleOrchestrator:
                     review_rounds=review_rounds,
                     draft_pass=draft_pass,
                     draft_translations=draft_translations,
+                    comparison_translations=comparison_translations,
                     existing=existing,
                     on_batch=save_batch,
                     on_batch_started=start_batch,
@@ -6197,6 +7155,7 @@ class SubtitleOrchestrator:
         return published_job
 
     def _render(self, job: PipelineJob) -> None:
+        publish = job.operation not in {"draft_translate", "external_review"}
         self._render_artifacts(
             job,
             overwrite=(
@@ -6204,6 +7163,7 @@ class SubtitleOrchestrator:
                 or bool(job.srt_path)
                 or bool(job.ass_path)
             ),
+            publish=publish,
         )
         refreshed = self.store.get(job.id)
         if (
@@ -6224,6 +7184,7 @@ class SubtitleOrchestrator:
             payload={
                 "srt_filename": Path(refreshed.srt_path).name,
                 "ass_filename": Path(refreshed.ass_path).name,
+                "published": publish,
             },
         )
 
@@ -6232,6 +7193,7 @@ class SubtitleOrchestrator:
         job: PipelineJob,
         *,
         overwrite: bool,
+        publish: bool = True,
     ) -> None:
         if not job.transcript_path or not job.translation_path:
             raise RuntimeError("subtitle artifacts are unavailable")
@@ -6253,7 +7215,7 @@ class SubtitleOrchestrator:
         source = self.library.resolve_file(job.source_rel)
         srt_path = source.with_name(f"{source.stem}.ko.srt")
         ass_path = source.with_name(f"{source.stem}.ko.ass")
-        if not overwrite:
+        if publish and not overwrite:
             for path in (srt_path, ass_path):
                 if path.exists():
                     raise FileExistsError(f"subtitle already exists: {path}")
@@ -6302,13 +7264,36 @@ class SubtitleOrchestrator:
             ass_hash=sha256_file(ass_artifact),
             origin="rendered",
         )
-        with self._subtitle_publication_lock:
-            self._publish_subtitle_pair_locked(
-                job,
-                generation,
-                srt_path=srt_path,
-                ass_path=ass_path,
-                overwrite=overwrite,
+        if publish:
+            with self._subtitle_publication_lock:
+                self._publish_subtitle_pair_locked(
+                    job,
+                    generation,
+                    srt_path=srt_path,
+                    ass_path=ass_path,
+                    overwrite=overwrite,
+                )
+        else:
+            lease_owner = (
+                self._worker_id
+                if job.lease_owner == self._worker_id and job.lease_token > 0
+                else None
+            )
+            self.store.complete_unpublished_subtitle_generation(
+                str(generation["id"]),
+                lease_owner=lease_owner,
+                lease_token=(job.lease_token if lease_owner else None),
+            )
+            self.store.add_event(
+                job.id,
+                "info",
+                "subtitle generation awaits explicit publication",
+                event_code="subtitle.awaiting_publication",
+                phase=job.phase,
+                payload={
+                    "subtitle_generation_id": generation["id"],
+                    "operation": job.operation,
+                },
             )
         if timeline.repaired_segment_ids:
             self.store.add_event(
@@ -6321,11 +7306,16 @@ class SubtitleOrchestrator:
 
     def _sanitize_error(self, message: str) -> str:
         sanitized = message
+        external_credentials = {
+            str(profile.get("credential", ""))
+            for profile in self.store.list_external_model_profiles()
+        }
         for secret in {
             self.settings.stt_token,
             self.remote_servers.stt_token,
             self._subtitle_validator.token,
             *self._translation_routing.tokens(),
+            *external_credentials,
         }:
             if secret:
                 sanitized = sanitized.replace(secret, "[redacted]")

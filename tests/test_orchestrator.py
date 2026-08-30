@@ -43,6 +43,59 @@ def configure_translation_models(
 
 
 class SubtitleOrchestratorTests(unittest.TestCase):
+    def test_external_model_recheck_preserves_saved_selection(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            orchestrator = SubtitleOrchestrator(
+                BackendSettings(
+                    state_dir=root / "state",
+                    media_root=media_root,
+                    stt_base_url="http://stt.test",
+                    stt_token="",
+                )
+            )
+            try:
+                orchestrator.store.save_external_model_profile(
+                    provider="nvidia_build",
+                    base_url="https://integrate.api.nvidia.com/v1",
+                    credential="external-secret",
+                    region="",
+                    selected_model="nvidia/model",
+                    models=["nvidia/model", "nvidia/other"],
+                    status="ready",
+                )
+
+                updated = orchestrator.update_external_model_profile(
+                    "nvidia_build",
+                    base_url="https://integrate.api.nvidia.com/v1",
+                    credential=None,
+                    clear_credential=False,
+                    region="",
+                )
+                self.assertEqual(updated["selected_model"], "nvidia/model")
+                self.assertEqual(updated["status"], "unchecked")
+
+                with patch(
+                    "stt_to_subtitle.orchestrator.list_external_models",
+                    return_value=["nvidia/model", "nvidia/other"],
+                ):
+                    checked = orchestrator.probe_external_model_profile(
+                        "nvidia_build"
+                    )
+                self.assertEqual(checked["selected_model"], "nvidia/model")
+                self.assertTrue(checked["configured"])
+
+                with self.assertRaisesRegex(ValueError, "설정에 저장된"):
+                    orchestrator.create_external_review_jobs(
+                        [],
+                        provider="nvidia_build",
+                        model="nvidia/other",
+                    )
+            finally:
+                orchestrator.stop()
+
     def test_selecting_server_model_refreshes_translation_circuit(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1819,6 +1872,325 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                 [generation["state"] for generation in generations],
                 ["completed", "completed"],
             )
+
+    def test_independent_phases_hold_draft_publish_review_and_hold_external(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            (media_root / "movie.mkv").write_bytes(b"media")
+            media_srt = media_root / "movie.ko.srt"
+            media_ass = media_root / "movie.ko.ass"
+            media_srt.write_text("existing srt", encoding="utf-8")
+            media_ass.write_text("existing ass", encoding="utf-8")
+            orchestrator = self.make_orchestrator(root, media_root)
+            orchestrator.update_translation_endpoint_routing(
+                "review",
+                "builtin",
+                {"enabled": True, "batch_preferred": False},
+            )
+            transcript_job = orchestrator.store.create(
+                job_id="transcription-phase",
+                source_rel="movie.mkv",
+                force_overwrite=False,
+                options={"backend": "hybrid"},
+                operation="transcribe",
+            )
+            transcript_path = (
+                orchestrator.settings.jobs_dir
+                / transcript_job.id
+                / "transcript.json"
+            )
+            transcript_path.parent.mkdir(parents=True)
+            transcript_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "job_id": "remote-transcription",
+                        "segments": [
+                            {
+                                "id": "segment-000001",
+                                "start": 0,
+                                "end": 1,
+                                "speaker": "SPEAKER_00",
+                                "text": "こんにちは",
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            orchestrator.store.record_transcript_revision(
+                revision_id="transcript-revision",
+                job_id=transcript_job.id,
+                audio_revision_id=None,
+                remote_job_id="remote-transcription",
+                backend="hybrid",
+                model_revision="test",
+                options_hash="options",
+                artifact_path=str(transcript_path),
+                content_hash=sha256_file(transcript_path),
+                origin="manual",
+                status="transcription_completed",
+                chunks_total=1,
+            )
+
+            try:
+                draft = orchestrator.create_phase_translation_jobs(
+                    [transcript_job.id],
+                    prompt_category_id="jav",
+                    stage="draft",
+                )[0]
+                self.assertEqual(draft.operation, "draft_translate")
+                self.assertEqual(draft.phase, "draft_translation")
+                self.assertEqual(
+                    draft.options["pipeline_parent_job_id"],
+                    transcript_job.id,
+                )
+                self.assertEqual(
+                    orchestrator.store.get(transcript_job.id).status,
+                    "transcription_completed",
+                )
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "동일한 입력의 1차 번역 작업이 이미 있습니다",
+                ):
+                    orchestrator.create_phase_translation_jobs(
+                        [transcript_job.id],
+                        prompt_category_id="jav",
+                        stage="draft",
+                    )
+
+                draft_client = Mock()
+                draft_client.translate.return_value = [
+                    {"id": "segment-000001", "text": "1차 번역"}
+                ]
+                orchestrator._make_translation_client = Mock(
+                    return_value=draft_client
+                )
+                orchestrator.store.update(draft.id, status="translation_running")
+                orchestrator._translate(orchestrator.store.get(draft.id))
+                orchestrator.store.update(draft.id, status="rendering")
+                orchestrator._render(orchestrator.store.get(draft.id))
+                draft = orchestrator.store.get(draft.id)
+                self.assertEqual(draft.status, "completed")
+                draft_generation = (
+                    orchestrator.store.list_subtitle_generations(draft.id)[-1]
+                )
+                self.assertFalse(draft_generation["is_published"])
+                self.assertIsNone(
+                    orchestrator.store.published_subtitle_generation(draft.id)
+                )
+                self.assertEqual(
+                    media_srt.read_text(encoding="utf-8"),
+                    "existing srt",
+                )
+                self.assertEqual(
+                    media_ass.read_text(encoding="utf-8"),
+                    "existing ass",
+                )
+
+                orchestrator.publish_subtitle_generation(
+                    draft.id,
+                    str(draft_generation["id"]),
+                )
+                draft_publication = (
+                    orchestrator.store.published_subtitle_generation(draft.id)
+                )
+                self.assertEqual(
+                    draft_publication["id"],
+                    draft_generation["id"],
+                )
+                self.assertIn(
+                    "1차 번역",
+                    media_srt.read_text(encoding="utf-8"),
+                )
+
+                review = orchestrator.create_phase_translation_jobs(
+                    [draft.id],
+                    prompt_category_id="jav",
+                    stage="review",
+                )[0]
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "동일한 입력의 2차 번역 작업이 이미 있습니다",
+                ):
+                    orchestrator.create_phase_translation_jobs(
+                        [draft.id],
+                        prompt_category_id="jav",
+                        stage="review",
+                    )
+                review_client = Mock()
+                review_client.translate.return_value = [
+                    {"id": "segment-000001", "text": "2차 번역"}
+                ]
+                orchestrator._make_translation_client = Mock(
+                    return_value=review_client
+                )
+                orchestrator.store.update(review.id, status="translation_running")
+                orchestrator._translate(orchestrator.store.get(review.id))
+                orchestrator.store.update(review.id, status="rendering")
+                orchestrator._render(orchestrator.store.get(review.id))
+                review = orchestrator.store.get(review.id)
+                review_publication = (
+                    orchestrator.store.published_subtitle_generation(review.id)
+                )
+                self.assertIsNotNone(review_publication)
+                self.assertNotEqual(
+                    review_publication["id"], draft_publication["id"]
+                )
+                self.assertIn(
+                    "2차 번역",
+                    media_srt.read_text(encoding="utf-8"),
+                )
+
+                orchestrator.store.save_external_model_profile(
+                    provider="nvidia_build",
+                    base_url="https://integrate.api.nvidia.com/v1",
+                    credential="external-secret",
+                    region="",
+                    selected_model="nvidia/model",
+                    models=["nvidia/model"],
+                    status="ready",
+                )
+                external = orchestrator.create_external_review_jobs(
+                    [review.id],
+                    provider="nvidia_build",
+                    model="nvidia/model",
+                )[0]
+                self.assertEqual(
+                    external.options[
+                        "comparison_translation_generation_id"
+                    ],
+                    review.options["input_translation_generation_id"],
+                )
+                self.assertIn(
+                    "ROLE — EXTERNAL SENIOR",
+                    external.options["translation_prompt"]["review_prompt"],
+                )
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "동일한 입력의 외부 모델 검토 작업이 이미 있습니다",
+                ):
+                    orchestrator.create_external_review_jobs(
+                        [review.id],
+                        provider="nvidia_build",
+                        model="nvidia/model",
+                    )
+                external_client = Mock()
+                external_client.translate.return_value = [
+                    {"id": "segment-000001", "text": "외부 교정 번역"}
+                ]
+                with patch(
+                    "stt_to_subtitle.orchestrator.external_review_client",
+                    return_value=external_client,
+                ):
+                    orchestrator.store.update(
+                        external.id,
+                        status="translation_running",
+                    )
+                    orchestrator._translate(
+                        orchestrator.store.get(external.id)
+                    )
+                external_call = external_client.translate.call_args.kwargs
+                self.assertEqual(
+                    external_call["draft_translations"],
+                    {"segment-000001": "2차 번역"},
+                )
+                self.assertEqual(
+                    external_call["comparison_translations"],
+                    {"segment-000001": "1차 번역"},
+                )
+                orchestrator.store.update(external.id, status="rendering")
+                orchestrator._render(orchestrator.store.get(external.id))
+                external = orchestrator.store.get(external.id)
+                external_generation = (
+                    orchestrator.store.list_subtitle_generations(external.id)[-1]
+                )
+
+                self.assertEqual(external.status, "completed")
+                self.assertEqual(external.phase, "external_review")
+                self.assertFalse(external_generation["is_published"])
+                self.assertEqual(
+                    orchestrator.store.published_subtitle_generation(
+                        external.id
+                    )["id"],
+                    review_publication["id"],
+                )
+                self.assertNotIn("external-secret", json.dumps(external.options))
+                self.assertNotIn(
+                    "external-secret",
+                    json.dumps(orchestrator.store.events(external.id)),
+                )
+
+                orchestrator.publish_subtitle_generation(
+                    external.id,
+                    str(external_generation["id"]),
+                )
+                self.assertTrue(
+                    orchestrator.store.get_subtitle_generation(
+                        str(external_generation["id"])
+                    )["is_published"]
+                )
+            finally:
+                orchestrator.stop()
+
+    def test_independent_translation_failures_name_the_exact_phase(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            orchestrator = self.make_orchestrator(root, media_root)
+            cases = (
+                (
+                    "draft_translate",
+                    "translation",
+                    "draft_translation_unavailable",
+                    "1차 번역 서버 연결 불가",
+                ),
+                (
+                    "review_translate",
+                    "translation",
+                    "review_translation_unavailable",
+                    "2차 번역 서버 연결 불가",
+                ),
+                (
+                    "external_review",
+                    "external review",
+                    "external_model_unavailable",
+                    "외부 검토 모델 연결 불가",
+                ),
+            )
+            try:
+                for operation, stage, reason_code, message in cases:
+                    job = orchestrator.store.create(
+                        job_id=f"failure-{operation}",
+                        source_rel=f"{operation}.mkv",
+                        force_overwrite=False,
+                        options={},
+                        operation=operation,
+                    )
+                    orchestrator.store.update(
+                        job.id,
+                        status="translation_running",
+                    )
+                    orchestrator._run_stage(
+                        job.id,
+                        stage,
+                        Mock(side_effect=ExternalServiceError("offline")),
+                    )
+
+                    blocked = orchestrator.store.get(job.id)
+                    self.assertEqual(blocked.status, "blocked")
+                    self.assertEqual(blocked.reason_code, reason_code)
+                    self.assertIn(message, blocked.error)
+            finally:
+                orchestrator.stop()
 
     def test_selects_a_historical_prompt_revision_for_a_new_job(self) -> None:
         with TemporaryDirectory() as directory:
@@ -3723,6 +4095,15 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                 generations = orchestrator.store.list_translation_generations(
                     job.id
                 )
+                manual_edit = orchestrator.edit_translation_item(
+                    job.id,
+                    generation_id=generations[-1]["id"],
+                    segment_id="segment-000001",
+                    text=" 최종 수동 수정 ",
+                )
+                edited_generations = (
+                    orchestrator.store.list_translation_generations(job.id)
+                )
             finally:
                 orchestrator.stop()
 
@@ -3749,6 +4130,19 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                     "text"
                 ],
                 "수정된 번역",
+            )
+            self.assertEqual(len(edited_generations), 3)
+            self.assertEqual(
+                orchestrator.store.translation_items(
+                    edited_generations[-1]["id"]
+                )[0]["text"],
+                "최종 수동 수정",
+            )
+            self.assertEqual(manual_edit["item"]["text"], "최종 수동 수정")
+            self.assertFalse(manual_edit["subtitle_generation"]["is_published"])
+            self.assertNotIn(
+                "최종 수동 수정",
+                (media_root / "movie.ko.srt").read_text(encoding="utf-8"),
             )
 
     def test_editing_transcript_creates_an_immutable_revision(self) -> None:
@@ -4531,6 +4925,402 @@ class SchedulerDispatchTests(unittest.TestCase):
                 self.assertEqual(
                     orchestrator._audio_executor.submitted,
                     [("audio extraction", queued.id)],
+                )
+            finally:
+                orchestrator.stop()
+
+    def test_independent_translation_phase_precedes_legacy_queue(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            orchestrator = self.make_orchestrator(root, media_root)
+            try:
+                legacy = orchestrator.store.create(
+                    job_id="older-legacy-translation",
+                    source_rel="legacy.mkv",
+                    force_overwrite=False,
+                    options={},
+                    operation="full",
+                )
+                orchestrator.store.update(legacy.id, status="transcribed")
+                independent = orchestrator.store.create(
+                    job_id="newer-independent-draft",
+                    source_rel="independent.mkv",
+                    force_overwrite=False,
+                    options={},
+                    operation="draft_translate",
+                )
+                orchestrator.store.update(
+                    independent.id,
+                    status="transcribed",
+                )
+
+                dispatched = orchestrator._dispatch_translations()
+
+                self.assertEqual(dispatched, 1)
+                self.assertEqual(
+                    orchestrator._translation_executor.submitted,
+                    [("translation", independent.id)],
+                )
+                self.assertEqual(
+                    orchestrator.store.get(legacy.id).status,
+                    "transcribed",
+                )
+            finally:
+                orchestrator.stop()
+
+    def test_draft_phase_drains_before_review_phase(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            orchestrator = self.make_orchestrator(root, media_root)
+            try:
+                review_server = orchestrator._translation_routing.stores[
+                    "review"
+                ].get("builtin")
+                assert review_server is not None
+                orchestrator._translation_routing.stores["review"].update(
+                    review_server.id,
+                    name=review_server.name,
+                    base_url=review_server.base_url,
+                    token=review_server.token,
+                    enabled=True,
+                    capacity=1,
+                )
+                orchestrator._translation_routing.stores["draft"].create(
+                    name="alternate draft host",
+                    base_url="http://alternate-draft.test:11434/v1",
+                    token="",
+                    enabled=True,
+                    capacity=1,
+                    selected_model="alternate-draft-model",
+                    models=("alternate-draft-model",),
+                )
+                orchestrator._refresh_translation_circuit_from_routing()
+                review = orchestrator.store.create(
+                    job_id="older-independent-review",
+                    source_rel="review.mkv",
+                    force_overwrite=False,
+                    options={},
+                    operation="review_translate",
+                )
+                draft = orchestrator.store.create(
+                    job_id="newer-independent-draft",
+                    source_rel="draft.mkv",
+                    force_overwrite=False,
+                    options={},
+                    operation="draft_translate",
+                )
+                orchestrator.store.update(review.id, status="transcribed")
+                orchestrator.store.update(draft.id, status="transcribed")
+
+                first_dispatched = orchestrator._dispatch_translations()
+                orchestrator.store.update(draft.id, status="translated")
+                second_dispatched = orchestrator._dispatch_translations()
+
+                self.assertEqual(first_dispatched, 1)
+                self.assertEqual(second_dispatched, 1)
+                self.assertEqual(
+                    orchestrator._translation_executor.submitted,
+                    [
+                        ("translation", draft.id),
+                        ("translation", review.id),
+                    ],
+                )
+                self.assertEqual(
+                    orchestrator.store.get(review.id).status,
+                    "translation_running",
+                )
+            finally:
+                orchestrator.stop()
+
+    def test_draft_and_review_run_together_on_distinct_hosts(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            orchestrator = self.make_orchestrator(root, media_root)
+            try:
+                review_server = orchestrator._translation_routing.stores[
+                    "review"
+                ].get("builtin")
+                assert review_server is not None
+                orchestrator._translation_routing.stores["review"].update(
+                    review_server.id,
+                    name=review_server.name,
+                    base_url="http://review-only.test:1234/v1",
+                    token=review_server.token,
+                    enabled=True,
+                    capacity=1,
+                )
+                orchestrator._translation_routing.stores[
+                    "review"
+                ].save_models(review_server.id, ["review-model"])
+                orchestrator._refresh_translation_circuit_from_routing()
+                draft = orchestrator.store.create(
+                    job_id="draft-on-first-host",
+                    source_rel="draft.mkv",
+                    force_overwrite=False,
+                    options={},
+                    operation="draft_translate",
+                )
+                review = orchestrator.store.create(
+                    job_id="review-on-second-host",
+                    source_rel="review.mkv",
+                    force_overwrite=False,
+                    options={},
+                    operation="review_translate",
+                )
+                orchestrator.store.update(draft.id, status="transcribed")
+                orchestrator.store.update(review.id, status="transcribed")
+
+                dispatched = orchestrator._dispatch_translations()
+
+                self.assertEqual(dispatched, 2)
+                self.assertEqual(
+                    orchestrator._translation_executor.submitted,
+                    [
+                        ("translation", draft.id),
+                        ("translation", review.id),
+                    ],
+                )
+            finally:
+                orchestrator.stop()
+
+    def test_review_blocks_only_shared_draft_host(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            orchestrator = self.make_orchestrator(root, media_root)
+            try:
+                orchestrator._translation_routing.stores["draft"].create(
+                    name="shared draft",
+                    base_url="http://shared.test:1234/v1",
+                    token="",
+                    enabled=True,
+                    capacity=1,
+                    selected_model="shared-draft-model",
+                    models=("shared-draft-model",),
+                )
+                review_server = orchestrator._translation_routing.stores[
+                    "review"
+                ].get("builtin")
+                assert review_server is not None
+                orchestrator._translation_routing.stores["review"].update(
+                    review_server.id,
+                    name=review_server.name,
+                    base_url="http://shared.test:1234/v1",
+                    token=review_server.token,
+                    enabled=True,
+                    capacity=1,
+                )
+                orchestrator._translation_routing.stores[
+                    "review"
+                ].save_models(review_server.id, ["review-model"])
+                orchestrator._refresh_translation_circuit_from_routing()
+                review = orchestrator.store.create(
+                    job_id="running-shared-review",
+                    source_rel="review.mkv",
+                    force_overwrite=False,
+                    options={},
+                    operation="review_translate",
+                )
+                draft = orchestrator.store.create(
+                    job_id="waiting-multi-host-draft",
+                    source_rel="draft.mkv",
+                    force_overwrite=False,
+                    options={},
+                    operation="draft_translate",
+                )
+                orchestrator.store.update(
+                    review.id,
+                    status="translation_running",
+                )
+                orchestrator.store.update(draft.id, status="transcribed")
+
+                dispatched = orchestrator._dispatch_translations()
+
+                self.assertEqual(dispatched, 1)
+                self.assertEqual(
+                    orchestrator._translation_executor.submitted,
+                    [("translation", draft.id)],
+                )
+            finally:
+                orchestrator.stop()
+
+    def test_second_job_in_same_translation_lane_waits(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            orchestrator = self.make_orchestrator(root, media_root)
+            try:
+                running = orchestrator.store.create(
+                    job_id="running-draft",
+                    source_rel="running.mkv",
+                    force_overwrite=False,
+                    options={},
+                    operation="draft_translate",
+                )
+                waiting = orchestrator.store.create(
+                    job_id="waiting-draft",
+                    source_rel="waiting.mkv",
+                    force_overwrite=False,
+                    options={},
+                    operation="draft_translate",
+                )
+                orchestrator.store.update(
+                    running.id,
+                    status="translation_running",
+                )
+                orchestrator.store.update(waiting.id, status="transcribed")
+
+                dispatched = orchestrator._dispatch_translations()
+
+                self.assertEqual(dispatched, 0)
+                self.assertEqual(
+                    orchestrator.store.get(waiting.id).status,
+                    "transcribed",
+                )
+            finally:
+                orchestrator.stop()
+
+    def test_paused_draft_releases_local_lane_for_review(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            orchestrator = self.make_orchestrator(root, media_root)
+            try:
+                review_server = orchestrator._translation_routing.stores[
+                    "review"
+                ].get("builtin")
+                assert review_server is not None
+                orchestrator._translation_routing.stores["review"].update(
+                    review_server.id,
+                    name=review_server.name,
+                    base_url=review_server.base_url,
+                    token=review_server.token,
+                    enabled=True,
+                    capacity=1,
+                )
+                orchestrator._refresh_translation_circuit_from_routing()
+                paused = orchestrator.store.create(
+                    job_id="paused-draft",
+                    source_rel="paused.mkv",
+                    force_overwrite=False,
+                    options={},
+                    operation="draft_translate",
+                )
+                review = orchestrator.store.create(
+                    job_id="waiting-review",
+                    source_rel="review.mkv",
+                    force_overwrite=False,
+                    options={},
+                    operation="review_translate",
+                )
+                orchestrator.store.update(
+                    paused.id,
+                    status="translation_paused",
+                )
+                orchestrator.store.update(review.id, status="transcribed")
+
+                dispatched = orchestrator._dispatch_translations()
+
+                self.assertEqual(dispatched, 1)
+                self.assertEqual(
+                    orchestrator.store.get(review.id).status,
+                    "translation_running",
+                )
+            finally:
+                orchestrator.stop()
+
+    def test_external_and_review_use_independent_lanes(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            orchestrator = self.make_orchestrator(root, media_root)
+            try:
+                review_server = orchestrator._translation_routing.stores[
+                    "review"
+                ].get("builtin")
+                assert review_server is not None
+                orchestrator._translation_routing.stores["review"].update(
+                    review_server.id,
+                    name=review_server.name,
+                    base_url=review_server.base_url,
+                    token=review_server.token,
+                    enabled=True,
+                    capacity=1,
+                )
+                orchestrator._refresh_translation_circuit_from_routing()
+                external = orchestrator.store.create(
+                    job_id="older-external",
+                    source_rel="external.mkv",
+                    force_overwrite=False,
+                    options={},
+                    operation="external_review",
+                )
+                review = orchestrator.store.create(
+                    job_id="newer-review",
+                    source_rel="review.mkv",
+                    force_overwrite=False,
+                    options={},
+                    operation="review_translate",
+                )
+                orchestrator.store.update(external.id, status="transcribed")
+                orchestrator.store.update(review.id, status="transcribed")
+
+                dispatched = orchestrator._dispatch_translations()
+
+                self.assertEqual(dispatched, 2)
+                self.assertEqual(
+                    orchestrator._translation_executor.submitted,
+                    [
+                        ("external review", external.id),
+                        ("translation", review.id),
+                    ],
+                )
+            finally:
+                orchestrator.stop()
+
+    def test_external_starts_while_local_translation_is_running(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            orchestrator = self.make_orchestrator(root, media_root)
+            try:
+                local = orchestrator.store.create(
+                    job_id="running-local",
+                    source_rel="local.mkv",
+                    force_overwrite=False,
+                    options={},
+                    operation="draft_translate",
+                )
+                external = orchestrator.store.create(
+                    job_id="waiting-external",
+                    source_rel="external.mkv",
+                    force_overwrite=False,
+                    options={},
+                    operation="external_review",
+                )
+                orchestrator.store.update(
+                    local.id,
+                    status="translation_running",
+                )
+                orchestrator.store.update(external.id, status="transcribed")
+
+                dispatched = orchestrator._dispatch_translations()
+
+                self.assertEqual(dispatched, 1)
+                self.assertEqual(
+                    orchestrator._translation_executor.submitted,
+                    [("external review", external.id)],
                 )
             finally:
                 orchestrator.stop()

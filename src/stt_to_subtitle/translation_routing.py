@@ -423,6 +423,7 @@ class BackendTranslationRouting:
             "token_configured": bool(server.token),
             "enabled": server.enabled,
             "capacity": server.capacity,
+            "thinking_enabled": server.thinking_enabled,
             "builtin": server.builtin,
             "batch_preferred": server.batch_preferred,
             "selected_model": server.selected_model,
@@ -490,6 +491,9 @@ class BackendTranslationRouting:
                 token=str(payload.get("token", "")),
                 enabled=bool(payload.get("enabled", True)),
                 capacity=capacity,
+                thinking_enabled=bool(
+                    payload.get("thinking_enabled", False)
+                ),
             )
         except sqlite3.IntegrityError as error:
             raise ValueError("같은 주소의 번역 서버가 이미 등록되어 있습니다.") from error
@@ -524,6 +528,11 @@ class BackendTranslationRouting:
                 token=token,
                 enabled=bool(payload.get("enabled", True)),
                 capacity=capacity,
+                thinking_enabled=(
+                    bool(payload["thinking_enabled"])
+                    if payload.get("thinking_enabled") is not None
+                    else None
+                ),
             )
         except sqlite3.IntegrityError as error:
             raise ValueError("같은 주소의 번역 서버가 이미 등록되어 있습니다.") from error
@@ -651,6 +660,33 @@ class BackendTranslationRouting:
     def is_configured(self, stage: str = "draft", mode: str = "live") -> bool:
         return bool(self._configured_candidates(stage, mode))
 
+    def configured_hosts(
+        self,
+        stage: str,
+        mode: str = "live",
+    ) -> frozenset[str]:
+        """Return enabled model-server hosts for one translation stage."""
+
+        return frozenset(
+            host
+            for server in self._configured_candidates(stage, mode)
+            if (host := self._server_host(server))
+        )
+
+    def routes_share_host(
+        self,
+        first_stage: str,
+        first_mode: str,
+        second_stage: str,
+        second_mode: str,
+    ) -> bool:
+        """Report whether two stage routes can contend for one host."""
+
+        return bool(
+            self.configured_hosts(first_stage, first_mode)
+            & self.configured_hosts(second_stage, second_mode)
+        )
+
     def has_routable_server(
         self,
         stage: str = "draft",
@@ -772,6 +808,17 @@ class BackendTranslationRouting:
             for stage in TRANSLATION_STAGES
         ]
         return f"backend-direct:{mode}:" + ";".join(server_ids)
+
+    def request_options_contract(self) -> str:
+        """Return non-secret request options that affect model output."""
+
+        return "+".join(
+            f"{stage}:" + ",".join(
+                f"{server.id}=thinking:{'on' if server.thinking_enabled else 'off'}"
+                for server in self._configured_candidates(stage, "live")
+            )
+            for stage in TRANSLATION_STAGES
+        )
 
     def tokens(self) -> set[str]:
         return {
@@ -940,6 +987,10 @@ class BackendTranslationRouting:
                 if key in OPENAI_COMPLETION_FIELDS
             }
             upstream_payload["model"] = server.selected_model
+            if server.thinking_enabled:
+                upstream_payload.pop("reasoning_effort", None)
+            else:
+                upstream_payload["reasoning_effort"] = "none"
             try:
                 response = client.request(
                     "POST",

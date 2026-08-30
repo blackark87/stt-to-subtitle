@@ -954,8 +954,8 @@ class JobStoreTests(unittest.TestCase):
             self.assertEqual(
                 snapshot["database"]["migrations"],
                 {
-                    "applied_count": 13,
-                    "latest_sequence": 57,
+                    "applied_count": 15,
+                    "latest_sequence": 59,
                     "unsequenced_count": 0,
                 },
             )
@@ -1433,7 +1433,7 @@ class JobStoreTests(unittest.TestCase):
                     )
                 connection.execute(
                     "DELETE FROM schema_migrations "
-                    "WHERE name = 'builtin_translation_prompts_v3'"
+                    "WHERE name = 'builtin_translation_prompts_v4'"
                 )
 
             upgraded = JobStore(database_path)
@@ -1474,7 +1474,7 @@ class JobStoreTests(unittest.TestCase):
             with sqlite3.connect(database_path) as connection:
                 connection.execute(
                     "DELETE FROM schema_migrations "
-                    "WHERE name = 'builtin_translation_prompts_v3'"
+                    "WHERE name = 'builtin_translation_prompts_v4'"
                 )
 
             restarted = JobStore(database_path)
@@ -2042,6 +2042,48 @@ class JobStoreTests(unittest.TestCase):
                     "region": "",
                 },
             )
+
+    def test_persists_external_model_profiles_and_independent_phases(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            database_path = Path(directory) / "jobs.sqlite3"
+            store = JobStore(database_path)
+
+            for operation, phase in (
+                ("transcribe", "transcription"),
+                ("draft_translate", "draft_translation"),
+                ("review_translate", "review_translation"),
+                ("external_review", "external_review"),
+            ):
+                job = store.create(
+                    job_id=operation,
+                    source_rel=f"{operation}.mkv",
+                    force_overwrite=False,
+                    options={},
+                    operation=operation,
+                )
+                self.assertEqual(job.phase, phase)
+                self.assertEqual(job.state, "waiting")
+
+            store.save_external_model_profile(
+                provider="nvidia_build",
+                base_url="https://integrate.api.nvidia.com/v1",
+                credential="secret-value",
+                region="",
+                selected_model="nvidia/model",
+                models=["nvidia/model"],
+                status="ready",
+                message="ok",
+                checked_at=123.0,
+            )
+
+            profile = JobStore(database_path).get_external_model_profile(
+                "nvidia_build"
+            )
+            self.assertEqual(profile["credential"], "secret-value")
+            self.assertEqual(profile["models"], ["nvidia/model"])
+            self.assertEqual(profile["selected_model"], "nvidia/model")
 
     def test_versions_and_updates_subtitle_validation(self) -> None:
         with TemporaryDirectory() as directory:

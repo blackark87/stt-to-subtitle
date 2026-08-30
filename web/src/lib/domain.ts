@@ -22,22 +22,45 @@ export const JOB_PHASES = [
   "extraction",
   "transcription",
   "translation",
+  "draft_translation",
+  "review_translation",
+  "external_review",
   "render",
   "complete",
 ] as const;
 export type JobPhase = (typeof JOB_PHASES)[number];
+
+export const PUBLIC_JOB_PHASES: readonly JobPhase[] = [
+  "transcription",
+  "draft_translation",
+  "review_translation",
+  "external_review",
+];
 
 export const JOB_OPERATIONS = [
   "extract",
   "transcribe",
   "translate",
   "full",
+  "draft_translate",
+  "review_translate",
+  "external_review",
 ] as const;
 export type JobOperation = (typeof JOB_OPERATIONS)[number];
+
+export const PUBLIC_JOB_OPERATIONS: readonly JobOperation[] = [
+  "transcribe",
+  "draft_translate",
+  "review_translate",
+  "external_review",
+];
 
 export const JOB_REASONS = [
   "user_stop",
   "lm_unavailable",
+  "draft_translation_unavailable",
+  "review_translation_unavailable",
+  "external_model_unavailable",
   "stt_unavailable",
   "service_restarted",
   "artifact_missing",
@@ -94,6 +117,9 @@ export const PHASE_LABEL: Record<JobPhase, string> = {
   extraction: "추출",
   transcription: "전사",
   translation: "번역",
+  draft_translation: "1차 번역",
+  review_translation: "2차 번역",
+  external_review: "외부 모델 검토",
   render: "자막 생성",
   complete: "작업 종료",
 };
@@ -103,6 +129,9 @@ export const OPERATION_LABEL: Record<JobOperation, string> = {
   transcribe: "전사",
   translate: "번역·자막 생성",
   full: "전체 자막 생성",
+  draft_translate: "1차 번역",
+  review_translate: "2차 번역",
+  external_review: "외부 모델 검토",
 };
 
 export const OPERATION_COMPLETION_LABEL: Record<JobOperation, string> = {
@@ -110,6 +139,9 @@ export const OPERATION_COMPLETION_LABEL: Record<JobOperation, string> = {
   transcribe: "전사 완료",
   translate: "번역·자막 생성 완료",
   full: "자막 생성 완료",
+  draft_translate: "1차 번역 완료",
+  review_translate: "2차 번역 완료",
+  external_review: "외부 모델 검토 완료",
 };
 
 export const TRANSCRIPTION_STAGE_LABEL: Record<string, string> = {
@@ -128,6 +160,9 @@ export const TRANSCRIPTION_STAGE_LABEL: Record<string, string> = {
 export const REASON_LABEL: Record<JobReason, string> = {
   user_stop: "사용자 정지",
   lm_unavailable: "번역 서버 연결 불가",
+  draft_translation_unavailable: "1차 번역 서버 연결 불가",
+  review_translation_unavailable: "2차 번역 서버 연결 불가",
+  external_model_unavailable: "외부 검토 모델 연결 불가",
   stt_unavailable: "전사 서버 연결 불가",
   service_restarted: "서비스 재시작으로 중단",
   artifact_missing: "산출물 누락",
@@ -230,7 +265,12 @@ export function canStopJob(state: JobState | null): boolean {
 }
 
 export function canPauseTranslation(state: JobState | null, phase: string): boolean {
-  return state === "running" && phase === "translation";
+  return state === "running" && [
+    "translation",
+    "draft_translation",
+    "review_translation",
+    "external_review",
+  ].includes(phase);
 }
 
 export function canResumeTranslation(state: JobState | null): boolean {

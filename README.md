@@ -15,13 +15,13 @@ Docker Compose 프로젝트로 빌드하고 실행합니다. 애플리케이션 
                                   ▼
                                 backend:8080 (FastAPI + Uvicorn)
                                   ├─ FFmpeg 오디오 추출
-                                  ├─ 작업·번역·자막 렌더링
+                                  ├─ 단계별 작업·번역·자막 렌더링
                                   ├──▶ Runtime 풀 (HTTP + 진행 상태 SSE)
                                   │      ├─ runtime:8100 (기본)
                                   │      └─ 외부 GPU Runtime 1..N
                                   ├──▶ 1차(초벌) OpenAI 호환 API 0..N
                                   ├──▶ 2차(검증) OpenAI 호환 API 0..N
-                                  └──▶ 선택형 상용 검증 Provider
+                                  └──▶ 선택형 외부 모델 API
 ```
 
 Compose 프로젝트에는 세 실행 컨테이너가 있습니다.
@@ -31,22 +31,37 @@ Compose 프로젝트에는 세 실행 컨테이너가 있습니다.
 - `runtime`: WhisperJAV, Kotoba, WhisperX, 하이브리드 전사를 제공하는 CUDA
   FastAPI 서버
 
-Backend와 Runtime은 Compose 내부 네트워크의 `http://runtime:8100`으로
-연결됩니다. Backend와 Runtime 포트는 호스트에 직접 게시하지 않습니다. Web만 기존
-Traefik 외부 네트워크에 연결되고 HTTPS 라우터를 통해 제공됩니다.
-기본 Runtime을 포함한 All-in-One 구성이 기본값이며, 외부 호스트의 Runtime은
+Web, Backend와 Runtime은 하나의 Compose `app` 네트워크를 공유하며 Backend는
+`http://runtime:8100`으로 Runtime에 연결됩니다. Backend와 Runtime 포트는
+호스트에 직접 게시하지 않습니다. Web만 이 네트워크에 더해 기존 Traefik 외부
+네트워크에도 연결되고 HTTPS 라우터를 통해 제공됩니다.
+Backend는 Runtime이나 GPU 관측 서비스의 기동 상태와 무관하게 단독으로 빌드하고
+시작할 수 있습니다. 연결되지 않은 Runtime과 GPU 메트릭은 각각 사용 불가 상태로
+표시되지만 Backend 상태 확인에는 영향을 주지 않습니다.
+기본 Runtime을 포함한 Compose 구성이 기본값이며, 외부 호스트의 Runtime은
 Web UI에서 주소를 추가해 같은 전사 작업 풀로 확장할 수 있습니다. 번역 LLM
 서버는 전사 Runtime 풀과 분리됩니다. 1차(초벌)와 2차(검증) 번역도 서로 다른
 서버 레지스트리와 모델 설정을 가집니다. 각 그룹에서 기본 서버와 추가 서버를
 독립적으로 켜고 끄며 이름·주소·토큰·동시 요청 수·일괄 우선 서버를 설정합니다.
+Thinking 사용 여부도 서버별로 저장합니다. 미사용 서버에는
+`reasoning_effort: none`을 보내고, 사용 서버에는 이 강제 비활성 값을 보내지 않아
+해당 모델 서버의 thinking 설정을 따릅니다.
 Backend가 두 번역 서버 레지스트리를 직접 소유하고 각 OpenAI 호환 API를
-호출합니다. 번역 요청에는 구간 ID·원문·문맥과 2차 검증에 필요한 초벌 번역문만
-전달하며, 전사 Runtime·GPU·워커·STT 모델 정보는 전달하지 않습니다.
+호출합니다. 번역 요청에는 구간 ID·원문·시작/종료 시각·신뢰할 수 없는 화자
+힌트만 허용 목록으로 전달합니다. 2차에는 1차 번역을, 외부 교정에는 1차와 2차
+번역을 함께 전달합니다. 전사 Runtime·GPU·워커·STT 모델 정보는 전달하지
+않습니다.
+전사, 1차 번역, 2차 번역, 외부 모델 검토는 각각 별도 작업으로만 요청합니다.
+앞 단계가 성공해야 다음 단계를 만들 수 있지만 완료 후 다음 단계가 자동으로
+시작되지는 않습니다.
 기본 Runtime과 같은 메모리를 쓰는 Ollama 호스트는
 `TRANSLATION_STT_HARD_BREAKER_HOSTS`에 등록할 수 있습니다. 이 호스트들은
 기본 Runtime 전사 중 번역 라우팅에서 제외되며, 전사 시작 전에 진행 중 요청을
 비우고 상주 LLM이 모두 언로드됐는지 확인합니다. 확인에 실패하면 메모리 경합을
 감수하지 않고 해당 Runtime의 전사 시작을 차단합니다.
+호스트에서 Ollama를 실행하는 경우 호스트 방화벽은 `APP_NETWORK_SUBNET`에서
+Ollama 포트로 들어오는 연결을 허용해야 합니다. 세 애플리케이션 컨테이너는
+같은 고정 대역을 사용하므로 별도 Runtime 네트워크 규칙은 필요하지 않습니다.
 
 Kotoba, WhisperX, WhisperJAV는 요구하는 PyTorch·모델 의존성이 다르므로
 STT 이미지 안에서도 각각 `/opt/venvs/kotoba`, `/opt/venvs/whisperx`,
@@ -136,6 +151,14 @@ WhisperX, WhisperJAV 환경을 포함합니다. 애플리케이션 `runtime` 이
 ./scripts/compose.sh --env-file .env.compose ps
 ```
 
+Backend 이미지만 변경한 경우에는 다른 이미지를 빌드하거나 다른 서비스를 먼저
+실행할 필요가 없습니다.
+
+```bash
+./scripts/compose.sh --env-file .env.compose build backend
+./scripts/compose.sh --env-file .env.compose up -d backend
+```
+
 `scripts/compose.sh`는 현재 실행 계정의 UID/GID를 Runtime에 주입하며
 root 실행은 거부합니다. 따라서 `.env.compose`에 UID/GID를 설정할 필요가
 없고, 마운트 경로를 소유한 일반 사용자로 실행해야 합니다.
@@ -162,8 +185,8 @@ curl https://stt.example.com/healthz
 Compose의 전사 API 주소는 내부 서비스 `http://runtime:8100`으로 고정되므로
 환경 파일에서 설정하지 않습니다. 설정은 Backend 상태 디렉터리의
 `jobs.sqlite3`에 저장되며 컨테이너를 다시 만들어도
-유지됩니다. 번역 작업은 전사가 완료되어 번역 대기 상태가 되었을 때만 외부
-서버를 호출하며, 별도의 시작 동작이나 주기적인 상태 확인은 수행하지 않습니다.
+유지됩니다. 번역 작업은 사용자가 완료된 앞 단계에서 다음 단계를 명시적으로
+요청했을 때만 해당 서버를 호출하며, 주기적인 상태 확인은 수행하지 않습니다.
 연결 실패 시 해당 작업을 중단하고 뒤의 대기 작업은 보존합니다. 번역 PC와
 모델을 준비한 뒤 작업 목록에서 번역 작업만 선택해 재시도할 수 있습니다.
 
@@ -209,6 +232,10 @@ Backend는 Runtime의 작업별 SSE 스트림으로 장시간 전사 진행 상�
 | `BACKEND_WORK_PATH` | `/data/work/stt-to-subtitle/web-jobs` | 작업 WAV와 재생성 가능한 JSON 체크포인트 |
 | `BACKEND_PUID` | `1026` | Backend 프로세스 UID |
 | `BACKEND_PGID` | `100` | Backend 프로세스 GID |
+| `APP_NETWORK_SUBNET` | `172.24.0.0/16` | Web·Backend·Runtime 공용 Docker 네트워크 대역 |
+| `BACKEND_APP_IPV4` | `172.24.0.2` | Backend 고정 주소 |
+| `WEB_APP_IPV4` | `172.24.0.3` | Web 고정 주소 |
+| `RUNTIME_APP_IPV4` | `172.24.0.4` | Runtime 고정 주소 |
 | `TRAEFIK_HOST` | 필수 | 웹 HTTPS 라우터의 DNS 호스트명 |
 | `TRAEFIK_NETWORK` | `proxy` | Traefik이 연결된 외부 Docker 네트워크 |
 | `TRAEFIK_ENTRYPOINT` | `websecure` | Traefik HTTPS entrypoint |
@@ -219,7 +246,7 @@ Backend는 Runtime의 작업별 SSE 스트림으로 장시간 전사 진행 상�
 | `GPU_PROMETHEUS_TOKEN` | 빈 값 | 외부 Prometheus 프록시가 요구할 때만 사용하는 Bearer 토큰 |
 | `GPU_METRICS_REFRESH_SECONDS` | `10` | STT 화면의 GPU 메트릭 갱신 및 서버 캐시 간격 |
 | `GPU_METRICS_TIMEOUT_SECONDS` | `3` | Prometheus 조회 제한 시간 |
-| `GPU_MONITORING_NETWORK` | `gpu-monitoring` | 두 Compose 프로젝트가 공유하는 내부 Docker 네트워크 |
+| `STT_BASE_URL` | `http://runtime:8100` | 선택적인 기본 전사 Runtime API 주소 |
 
 ### CUDA 전사
 
@@ -271,21 +298,22 @@ DCGM Exporter, Prometheus와 Grafana를 함께 실행합니다. Backend는 Grafa
 이동하지 않고 Prometheus의 현재 GPU 사용률, 메모리, 온도와 전력을 조회해
 API로 제공합니다.
 
-관측 스택을 먼저 실행해 `gpu-monitoring` 네트워크를 만든 뒤, 메인 프로젝트에
-전용 Compose 오버레이를 함께 적용합니다.
+GPU 관측은 Backend의 선택 기능입니다. Backend 이미지 빌드와 기동은
+`gpu-observability`의 컨테이너나 네트워크를 검사하지 않습니다. 관측 스택의
+Prometheus 포트를 Docker host gateway에 게시하고 `.env.compose`에 URL만
+설정합니다.
 
 ```bash
-./scripts/compose-gpu.sh up -d --build web backend
+GPU_PROMETHEUS_URL=http://host.docker.internal:9090
+./scripts/compose.sh --env-file .env.compose up -d backend
 ```
 
-이 구성에서는 기본 `GPU_PROMETHEUS_URL`이 `http://prometheus:9090`입니다.
-`compose-gpu.sh`는 공유 네트워크가 실제로 존재하는지 먼저 확인하고 두 Compose
-파일을 항상 함께 적용합니다. 일반 `compose.sh`만 사용하면 Backend가 관측
-네트워크에 연결되지 않으므로 내부 호스트명 `prometheus`를 해석할 수 없습니다.
-Prometheus와 DCGM Exporter는 호스트 포트를 공개하지 않으며 두 프로젝트는
-공유 내부 네트워크로만 통신합니다. `GPU_PROMETHEUS_TOKEN`은 별도 리버스
-프록시를 통해 Prometheus에 접속할 때만 필요합니다. 자세한 실행 및 Grafana
-계정 설명은 `gpu-observability/README.md`를 참고하십시오.
+`GPU_PROMETHEUS_URL`을 비워 두어도 `build backend`와 Backend 기동은 그대로
+동작합니다. 실행 중 설정된 Prometheus가 응답하지 않아도 Backend는 계속
+서비스하며 GPU 카드에 수집 실패만 표시합니다.
+`GPU_PROMETHEUS_TOKEN`은 별도 리버스 프록시를 통해 Prometheus에 접속할 때만
+필요합니다. 자세한 게시 주소와 Grafana 계정 설명은
+`gpu-observability/README.md`를 참고하십시오.
 
 ## 전사 백엔드
 
@@ -329,6 +357,11 @@ Kotoba를 WhisperX가 끝난 뒤에 적재하므로 두 모델이 동시에 GPU�
 WhisperJAV의 모델과 상류 코드 리비전은 이미지·결과 메타데이터에 고정되며,
 상용 사용 전에는 각 상류 모델의 라이선스를 별도로 확인해야 합니다. 번역은
 기존 OpenAI 호환 번역 모델 설정을 그대로 사용하며 Qwen으로 바뀌지 않습니다.
+현재 WhisperJAV 설정에서 바꿀 수 있는 값은 두 ASR 패스의 그룹 길이이며 ASR과
+강제 정렬 모델은 고정된 recipe입니다. Ollama의 Gemma 같은 텍스트 전용 번역
+모델은 음성 인코더나 강제 정렬기를 제공하지 않으므로 Qwen ASR을 대신할 수
+없습니다. 이런 모델은 별도 전사문 교정 단계에는 쓸 수 있지만, 정답 전사본이
+없는 경우 그럴듯한 오교정을 만들 수 있어 기본 전사 경로에는 포함하지 않습니다.
 
 WhisperX는 alignment 이후 word 시각, 화자, score를 보존하고 화자 변경을
 기준으로 자막 세그먼트를 재구성합니다. 하이브리드는 반복 폭주, 잘못된
@@ -346,11 +379,28 @@ WhisperX는 alignment 이후 word 시각, 화자, score를 보존하고 화자 �
 ## 처리 흐름과 결과
 
 ```text
-queued → extracting → audio_ready
-       → transcription_running → transcribed
-       → translation_running → translated
-       → rendering → completed
+전사 작업:         영상 → WhisperJAV | Hybrid(WhisperX + Kotoba) | WhisperX → 전사본
+1차 번역 작업:    완료된 전사본 → 1차 번역 generation → 내부 SRT/ASS 보존
+2차 번역 작업:    전사본 + 1차 generation → 2차 generation → SRT/ASS 자동 게시
+외부 모델 검토:   전사본 + 1차·2차 generation → 교정 generation → 수동 게시 대기
 ```
+
+각 행은 독립적으로 생성·대기·실행·재시도되는 작업입니다. 단계 요청에는 앞 작업,
+전사 revision, 입력 번역 generation, 입력 자막 generation 식별자를 고정하여 이후
+설정이나 게시 자막이 바뀌어도 실행 입력이 달라지지 않습니다. Kotoba 단독 실행은
+전사 비교 기능에서만 사용합니다. 동일한 부모 작업과 입력 generation에서는 같은
+번역 단계를 두 번 생성할 수 없으며, 작업 상세는 이미 생성된 다음 단계로 이동하는
+링크를 표시합니다. 실패한 단계는 새 작업을 추가하지 않고 기존 작업을 재시도합니다.
+1차와 2차는 별도 작업 lane이지만 활성 라우트의 호스트가 겹치면 같은 호스트에서
+동시에 실행하지 않습니다. 실행 가능한 1차 작업을 먼저 배정하며, 1차를
+일시정지하면 해당 lane을 양보하므로 2차를 먼저 확인할 수 있습니다. 두 단계의
+활성 호스트가 겹치지 않으면 서로 독립적으로 진행할 수 있습니다. 외부 검토는
+로컬 모델 호스트를 사용하지 않는 별도 lane이므로 완료된 2차 입력이 있으면 로컬
+번역 상태와 관계없이 실행합니다. 전사와 번역의 충돌도 모든 번역 서버가 아니라
+`TRANSLATION_STT_HARD_BREAKER_HOSTS`에 지정한 공유 호스트에만 적용합니다. 같은
+단계에서는 한 영상만 실행하고, 그 영상 안의 논리 배치만 선택 서버의 동시 요청
+수만큼 병렬 처리합니다. OpenAI 호환 API에 공통 모델 수명주기 계약은 없으므로
+모델 언로드와 사전 적재는 해당 모델 서버의 정책 또는 운영 절차를 따릅니다.
 
 원격 번역 서버가 응답하지 않거나 처리 단계가 실패하면 작업은 `blocked`가
 됩니다. 원인을 해결한 뒤 웹에서 수동 재시도하면 정상인 마지막 WAV·전사
@@ -360,6 +410,11 @@ JSON·번역 체크포인트부터 이어집니다.
 SQLite에 저장합니다. 부분 JSON은 DB 결과에서 다시 만들 수 있고, 프롬프트 변경
 재번역과 JSON 직접 편집은 이전 결과를 보존한 새 generation으로 기록됩니다.
 작업 상세의 **번역 이력**에서 generation별 JSON을 내려받을 수 있습니다.
+작업 상세의 **1차/2차/3차** 스위치는 우측 자막 스크립트만 바꾸며 재생 중인
+자막이나 미디어 옆 파일을 변경하지 않습니다. 기본 표시는 완료된 마지막 차수입니다.
+선택한 결과를 실제 `.ko.srt/.ko.ass`로 반영하려면 별도의 **자막 파일 생성**을
+눌러야 합니다. 2차 완료 결과만 기본 자막으로 자동 게시되고, 1차와 3차 결과는
+사용자가 명시적으로 생성할 때까지 내부 generation으로 보존됩니다.
 
 설정 화면의 **1차(초벌) 번역**과 **2차(검증) 번역**은 각각 모델 드롭다운과
 독립 서버 목록을 가집니다. 한 그룹에 등록한 서버는 다른 그룹이나 전사 Runtime에
@@ -368,22 +423,36 @@ SQLite에 저장합니다. 부분 JSON은 DB 결과에서 다시 만들 수 있�
 일괄 번역은 해당 그룹에서 `일괄 작업 우선`으로 지정한 서버만 사용합니다.
 
 프롬프트 카테고리는 장르별 **1차(초벌) 번역 프롬프트**와 **2차(검사·교정)
-프롬프트**를 하나의 revision 쌍으로 보존합니다. 1차는 일본어 원문에서 완결된
-한국어 자막을 만들고, 2차는 같은 원문과 초벌 번역을 대조하여 정확한 문장은
-유지하면서 오류만 교정합니다. 기본 파이프라인은 강한 검증 모델을 한 번 호출하며,
-검증 실패 시에는 해당 배치에서 마지막으로 성공한 번역을 보존합니다.
+프롬프트**를 하나의 revision 쌍으로 보존합니다. 1차는 인접 원문과 시간·화자
+힌트를 이용해 잘못 잘린 발화를 논리적으로 재구성하고, ID와 시간을 바꾸지 않은
+채 보수적인 직역 초안을 만듭니다. 2차는 원문과 1차 초안을 독립적으로 대조해
+문맥·뉘앙스·어휘·말투와 한국어 자막 가독성을 편집합니다. 외부 교정은 원문,
+현재 2차 결과와 1차 결과를 ID별로 비교해 2차의 개선과 회귀를 판정한 뒤 필요한
+최소 수정만 적용합니다. 세 단계는 한 요청에서 연속 실행되지 않습니다. 각
+단계의 검증 실패 시 해당 배치에서 마지막으로 성공한 번역을 보존합니다.
 
 큰 검증 모델을 적재할 수 없는 기본 서버는 2차 그룹에서 OFF로 두면 모델 로드와
 요청 자체가 발생하지 않습니다. 현재 예시 설정의 1차 모델은
 `gemma-4-12b-coder-fable5-composer2.5-v1-uncensored-heretic`이며, 2차 모델은
-`gemma-4-26b-a4b-it-ultra-uncensored-heretic`를 선택할 수 있습니다. 상용 검증은
-이 로컬 2단계와 분리되어 있으며 설정된 경우에도 사용자가 명시적으로 요청할
-때만 실행합니다.
+`gemma-4-26b-a4b-it-ultra-uncensored-heretic`를 선택할 수 있습니다. 외부 모델
+검토는 로컬 2단계와 분리되어 있으며 설정된 경우에도 사용자가 명시적으로 요청할
+때만 실행합니다. 설정 화면에서 OpenRouter, AWS Bedrock, NVIDIA Build 프로필에
+API 키 또는 credential을 저장하고 연결 점검으로 인증과 모델 목록을 확인한 뒤
+사용할 모델을 선택합니다. 외부 모델 검토 결과는 별도 generation으로 보존하며
+자동 게시하지 않습니다. 작업 상세에서 결과를 확인한 뒤 명시적으로 게시합니다.
 
 렌더된 SRT/ASS도 자막 generation으로 보존합니다. 미디어 옆 `.ko.srt/.ko.ass`는
 현재 게시 generation의 복사본이며, 작업 상세의 **자막 이력**에서 이전 버전을
 내려받거나 두 파일을 함께 다시 게시할 수 있습니다. 게시 전에는 저장된 파일
 해시를 검증합니다.
+
+작업 상세의 자막 스크립트는 항상 완료된 마지막 번역 차수를 기본으로 표시합니다.
+자막 문장을 누르면 인접 차수의 변경 내용을 펼쳐 보고 선택한 차수의 문장을 직접
+수정할 수 있습니다. 수동 수정은 새 immutable translation/subtitle generation으로
+저장되며 다음 차수를 자동 재실행하거나 미디어 옆 파일을 자동 교체하지 않습니다.
+실제 파일 반영은 **자막 파일 생성**을 명시적으로 눌렀을 때만 수행합니다. 웹
+재생용 VTT는 SRT의 화자 색상을 WebVTT cue class로 변환하므로 SRT의 `<font>`
+태그를 화면 텍스트로 노출하지 않습니다.
 
 최종 결과는 원본 영상 옆의 `<이름>.ko.srt`와 `<이름>.ko.ass`입니다.
 실제 다른 화자의 동시 발화는 유지하고 같은 화자의 겹친 행은 새 발화로
@@ -393,9 +462,15 @@ SQLite에 저장합니다. 부분 JSON은 DB 결과에서 다시 만들 수 있�
 같은 위치의 `<이름>.srt`, `<이름>.vtt`, `<이름>.ass`는 한국어 **외부
 자막**으로 구분합니다. 외부 자막은 생성 자막보다 먼저 재생되며 미디어의 작업
 완료 수에는 포함되지 않습니다. 작업 화면에서 생성 자막과 시간 coverage·문장
-유사도를 비교할 수 있습니다. 상용 LLM 검증은 설정 화면에 별도 API와 모델을
+유사도를 비교할 수 있습니다. 외부 모델 검증은 설정 화면에 별도 API와 모델을
 저장한 뒤 사용자가 요청한 경우에만 1회 호출하며, 같은 파일 해시·모델 입력은
 저장된 결과를 재사용합니다.
+
+작업 상세의 결과 플레이어는 일반 보기와 **180° 단안 미리보기**를 같은 화면에서
+전환합니다. 데스크톱 단안 미리보기는 좌우(SBS) 원본의 왼쪽 눈 영상을 반구에
+투영하며, 양안 분할 화면을 그대로 표시하지 않습니다. WebXR 헤드셋 모드에서만
+좌우 눈 영상을 각각 해당 눈에 출력합니다. 헤드셋 재생에는 HTTPS와
+`immersive-vr`를 지원하는 브라우저·기기가 필요합니다.
 
 마운트 용도는 다음과 같습니다.
 

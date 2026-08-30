@@ -227,7 +227,7 @@ def compare_subtitles(
 def build_subtitle_validator_payload(
     metrics: dict[str, object],
 ) -> dict[str, object]:
-    """Build a bounded, deterministic payload for an explicit paid review."""
+    """Build a bounded, deterministic payload for an explicit model review."""
     raw_alignments = metrics.get("alignments", [])
     raw_issues = metrics.get("issues", [])
     if not isinstance(raw_alignments, list) or not isinstance(raw_issues, list):

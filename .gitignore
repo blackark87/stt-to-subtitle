@@ -1387,3 +1387,8 @@ tags
 
 # 2026-08-25 세션 캔버스 시안 복원본. 로컬 참조용이며 저장소에 올리지 않는다.
 /design/mockup/
+
+# Repository-local agent state and Python virtual environments.
+# Keep these after the allow-list rules above so they stay ignored.
+/.claude/
+/.venv/

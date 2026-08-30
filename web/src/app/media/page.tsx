@@ -6,12 +6,15 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { Icon } from "@/components/Icon";
 import { Freshness } from "@/components/Freshness";
 import { LoadingOverlay } from "@/components/LoadingOverlay";
+import { Pagination } from "@/components/Pagination";
 import { api, type MediaFile, type MediaFolder } from "@/lib/api";
 import { useLiveQuery } from "@/lib/useLiveQuery";
 
 const MEDIA_INTERVAL_MS = 15000;
+const FOLDER_PAGE_SIZE = 20;
 type SubtitleFilter = "all" | "none" | "done";
-type Operation = "full" | "compare";
+type Operation = "transcribe" | "compare";
+type TranscriptionBackend = "whisperjav" | "hybrid" | "whisperx";
 type FolderSort = "name" | "modified_desc" | "modified_asc";
 type FileSort = "filename" | "created_desc" | "modified_desc" | "nfo_title" | "nfo_release_desc";
 
@@ -41,7 +44,11 @@ export default function MediaPage() {
   const subtitle: SubtitleFilter = subtitleValue === "none" || subtitleValue === "done"
     ? subtitleValue
     : "all";
-  const operation: Operation = searchParams.get("operation") === "compare" ? "compare" : "full";
+  const operation: Operation = searchParams.get("operation") === "compare" ? "compare" : "transcribe";
+  const backendValue = searchParams.get("backend");
+  const backend: TranscriptionBackend = backendValue === "whisperjav" || backendValue === "whisperx"
+    ? backendValue
+    : "hybrid";
   const folderSortValue = searchParams.get("folder_sort");
   const folderSort: FolderSort = folderSortValue === "modified_desc" || folderSortValue === "modified_asc"
     ? folderSortValue
@@ -53,17 +60,30 @@ export default function MediaPage() {
     || fileSortValue === "nfo_release_desc"
     ? fileSortValue
     : "filename";
+  const folderPageValue = Number(searchParams.get("folder_page") ?? "1");
+  const folderPage = Number.isSafeInteger(folderPageValue) && folderPageValue > 0
+    ? folderPageValue
+    : 1;
+  const folderOffset = (folderPage - 1) * FOLDER_PAGE_SIZE;
   const [selected, setSelected] = useState<ReadonlySet<string>>(new Set());
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
-  const [promptId, setPromptId] = useState("");
 
   const updateLocation = (
     changes: Record<string, string | null>,
     { push = false }: { push?: boolean } = {},
   ) => {
     const params = new URLSearchParams(searchParams.toString());
+    const resetsFolderPage = ["folder", "q", "folder_sort"].some((key) => (
+      Object.prototype.hasOwnProperty.call(changes, key)
+    ));
+    if (
+      resetsFolderPage
+      && !Object.prototype.hasOwnProperty.call(changes, "folder_page")
+    ) {
+      params.delete("folder_page");
+    }
     Object.entries(changes).forEach(([key, value]) => {
       if (value) params.set(key, value);
       else params.delete(key);
@@ -77,11 +97,17 @@ export default function MediaPage() {
   };
 
   const fetcher = useCallback(
-    () => api.media({ folder, q: query, folderSort, fileSort, folderLimit: 20 }),
-    [fileSort, folder, folderSort, query],
+    () => api.media({
+      folder,
+      q: query,
+      folderSort,
+      fileSort,
+      folderOffset,
+      folderLimit: FOLDER_PAGE_SIZE,
+    }),
+    [fileSort, folder, folderOffset, folderSort, query],
   );
   const { data, status, error, updatedAt, refreshing, refresh } = useLiveQuery(fetcher, MEDIA_INTERVAL_MS);
-  const prompts = useLiveQuery(useCallback(() => api.promptCategories(), []), 60000);
 
   const files = useMemo(() => {
     const list = data?.files ?? [];
@@ -111,6 +137,17 @@ export default function MediaPage() {
   const folders = useMemo(() => {
     return data?.folders ?? [];
   }, [data?.folders]);
+  const folderTotal = data?.folder_total ?? folders.length;
+  const folderPageCount = Math.max(1, Math.ceil(folderTotal / FOLDER_PAGE_SIZE));
+
+  useEffect(() => {
+    if (!data || folderPage <= folderPageCount) return;
+    const params = new URLSearchParams(searchParams.toString());
+    if (folderPageCount <= 1) params.delete("folder_page");
+    else params.set("folder_page", String(folderPageCount));
+    const suffix = params.toString();
+    router.replace(suffix ? `/media?${suffix}` : "/media", { scroll: false });
+  }, [data, folderPage, folderPageCount, router, searchParams]);
 
   const toggle = (path: string) => {
     setSelected((current) => {
@@ -131,9 +168,9 @@ export default function MediaPage() {
       await api.createJobs({
         source_rels: rels,
         operation,
-        prompt_category_id: operation === "full" ? (promptId || null) : null,
+        options: operation === "transcribe" ? { backend } : {},
       });
-      setNotice(`${rels.length}건의 ${operation === "compare" ? "전사 비교" : "자막 작업"}을 시작했습니다.`);
+      setNotice(`${rels.length}건의 ${operation === "compare" ? "전사 비교" : "전사 작업"}을 시작했습니다.`);
       setSelected(new Set());
       await refresh();
     } catch (reason) {
@@ -147,17 +184,24 @@ export default function MediaPage() {
     updateLocation({ folder: path || null }, { push: true });
   };
 
+  const goToFolderPage = (nextPage: number) => {
+    updateLocation(
+      { folder_page: nextPage <= 1 ? null : String(nextPage) },
+      { push: true },
+    );
+  };
+
   return (
     <>
       <LoadingOverlay
-        active={refreshing || prompts.refreshing || busy}
+        active={refreshing || busy}
         message={busy ? "작업 요청을 처리하는 중입니다" : "미디어 파일을 스캔하는 중입니다"}
         detail={busy ? "선택한 파일을 작업 목록에 등록하고 있습니다." : "폴더의 파일과 메타데이터를 확인하고 있습니다. 잠시만 기다려 주세요."}
       />
       <header className="topbar">
         <div className="page-title">
           <h1>미디어</h1>
-          <p>원본을 찾고 자막 작업 또는 전사 비교를 시작합니다.</p>
+          <p>원본을 찾고 독립된 전사 작업 또는 전사 비교를 시작합니다.</p>
         </div>
         <span className="topbar-spacer" />
         <Freshness status={status} updatedAt={updatedAt} error={error} refreshing={refreshing} />
@@ -216,12 +260,14 @@ export default function MediaPage() {
           </div>
         </section>
 
-        {folders.length > 0 ? (
+        {folderTotal > 0 ? (
           <section className="card" aria-labelledby="folder-title">
             <div className="card-head">
               <div>
                 <h2 id="folder-title">하위 폴더</h2>
-                <span className="sub m" title={`최대 20개 표시 · 전체 ${data?.folder_total ?? folders.length}개`}>최대 20개 표시 · 전체 {data?.folder_total ?? folders.length}개</span>
+                <span className="sub m" title={`${folders.length}개 표시 · 전체 ${folderTotal}개`}>
+                  {folders.length}개 표시 · 전체 {folderTotal}개
+                </span>
               </div>
               <label className="compact-field folder-sort-control">
                 <span>정렬</span>
@@ -255,6 +301,13 @@ export default function MediaPage() {
                 </button>
               ))}
             </div>
+            <Pagination
+              currentPage={folderPage}
+              pageSize={FOLDER_PAGE_SIZE}
+              totalItems={folderTotal}
+              onPageChange={goToFolderPage}
+              ariaLabel="하위 폴더 페이지 이동"
+            />
           </section>
         ) : null}
 
@@ -284,18 +337,17 @@ export default function MediaPage() {
               <label className="compact-field">
                 <span>작업</span>
                 <select className="ctl" value={operation} onChange={(event) => updateLocation({ operation: event.target.value === "compare" ? "compare" : null })}>
-                  <option value="full">자막 생성</option>
+                  <option value="transcribe">전사</option>
                   <option value="compare">전사 비교</option>
                 </select>
               </label>
-              {operation === "full" && prompts.data?.items?.length ? (
+              {operation === "transcribe" ? (
                 <label className="compact-field">
-                  <span>번역 프롬프트</span>
-                  <select className="ctl" value={promptId} onChange={(event) => setPromptId(event.target.value)}>
-                    <option value="">기본 프롬프트</option>
-                    {prompts.data.items.filter((item) => !item.archived).map((item) => (
-                      <option key={item.id} value={item.id}>{item.name}</option>
-                    ))}
+                  <span>전사 모델</span>
+                  <select className="ctl" value={backend} onChange={(event) => updateLocation({ backend: event.target.value === "hybrid" ? null : event.target.value })}>
+                    <option value="whisperjav">WhisperJAV</option>
+                    <option value="hybrid">Hybrid (WhisperX + Kotoba)</option>
+                    <option value="whisperx">WhisperX</option>
                   </select>
                 </label>
               ) : null}

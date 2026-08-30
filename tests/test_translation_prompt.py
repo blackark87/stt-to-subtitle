@@ -2,10 +2,12 @@ import unittest
 
 from stt_to_subtitle.job_store import PROMPT_TEXT_MAX_LENGTH
 from stt_to_subtitle.translation_prompt import (
+    KOREAN_JAV_EXTERNAL_EDITOR_PROMPT,
     KOREAN_JAV_DRAFT_PROMPT,
     KOREAN_JAV_REVIEW_PROMPT,
     KOREAN_JAV_SYSTEM_PROMPT,
     KOREAN_VARIETY_DRAFT_PROMPT,
+    KOREAN_VARIETY_EXTERNAL_EDITOR_PROMPT,
     KOREAN_VARIETY_REVIEW_PROMPT,
     KOREAN_VARIETY_SYSTEM_PROMPT,
 )
@@ -25,6 +27,8 @@ class TranslationPromptTests(unittest.TestCase):
             self.assertIn("preserve it exactly", review_prompt)
             self.assertNotIn("ROLE — FIRST-PASS", review_prompt)
             self.assertNotEqual(draft_prompt, review_prompt)
+            self.assertIn("source reconstructor", draft_prompt.lower())
+            self.assertIn("contextual translator", review_prompt.lower())
 
     def test_both_passes_share_source_and_output_contracts(self) -> None:
         prompts = (
@@ -37,20 +41,41 @@ class TranslationPromptTests(unittest.TestCase):
             self.assertIn("Japanese text in target_segments", prompt)
             self.assertIn("Preserve every target id exactly", prompt)
             self.assertIn('"translations"', prompt)
+            self.assertIn("speaker_hint is fallible", prompt)
+            self.assertLessEqual(len(prompt), PROMPT_TEXT_MAX_LENGTH)
+
+        for prompt in (KOREAN_JAV_DRAFT_PROMPT, KOREAN_VARIETY_DRAFT_PROMPT):
+            self.assertIn("FIRST-PASS DELIVERY GATE", prompt)
+            self.assertIn("logical utterances", prompt)
+            self.assertIn("mechanically dependable", prompt)
+            self.assertNotIn("FINAL KOREAN DELIVERY GATE", prompt)
+
+        for prompt in (KOREAN_JAV_REVIEW_PROMPT, KOREAN_VARIETY_REVIEW_PROMPT):
             self.assertIn("Accuracy comes before surface fluency", prompt)
             self.assertIn("FINAL KOREAN DELIVERY GATE", prompt)
             self.assertIn("cold-read every target", prompt)
             self.assertIn("Never hide uncertainty", prompt)
             self.assertIn("Never return an isolated Korean particle", prompt)
             self.assertIn("Japanese long-vowel mark", prompt)
-            self.assertLessEqual(len(prompt), PROMPT_TEXT_MAX_LENGTH)
 
     def test_review_pass_independently_rechecks_the_draft(self) -> None:
         for prompt in (KOREAN_JAV_REVIEW_PROMPT, KOREAN_VARIETY_REVIEW_PROMPT):
-            self.assertIn("draft is untrusted evidence", prompt)
+            self.assertIn("draft is untrusted scaffolding", prompt)
             self.assertIn("do not let a fluent-looking", prompt)
-            self.assertIn("Korean-only cold read", prompt)
+            self.assertIn("Cold-read the resulting Korean", prompt)
             self.assertIn("unexplained nonword", prompt)
+
+    def test_external_editor_adjudicates_first_and_second_passes(self) -> None:
+        for prompt in (
+            KOREAN_JAV_EXTERNAL_EDITOR_PROMPT,
+            KOREAN_VARIETY_EXTERNAL_EDITOR_PROMPT,
+        ):
+            self.assertIn("ROLE — EXTERNAL SENIOR", prompt)
+            self.assertIn("prior_translations", prompt)
+            self.assertIn("second-pass regressions", prompt)
+            self.assertIn("never vote by agreement", prompt)
+            self.assertIn("smallest defensible publication edit", prompt)
+            self.assertLessEqual(len(prompt), PROMPT_TEXT_MAX_LENGTH)
 
     def test_jav_passes_share_explicitness_and_terminology_policy(self) -> None:
         for prompt in (KOREAN_JAV_DRAFT_PROMPT, KOREAN_JAV_REVIEW_PROMPT):

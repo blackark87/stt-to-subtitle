@@ -59,6 +59,22 @@ class MediaPreviewTests(unittest.TestCase):
         )
         self.assertIn("안녕하세요 &lt;script&gt;", webvtt)
 
+    def test_converts_generated_speaker_colors_to_webvtt_classes(self) -> None:
+        webvtt = srt_to_webvtt(
+            "1\n"
+            "00:00:01,250 --> 00:00:03,500\n"
+            '<font color="#67E8F9">안녕 &amp; 반가워요</font>\n'
+            '<font color="#FDE047">네</font>\n'
+        )
+
+        self.assertIn(
+            '<c.speaker-1>안녕 &amp; 반가워요</c>',
+            webvtt,
+        )
+        self.assertIn('<c.speaker-2>네</c>', webvtt)
+        self.assertNotIn("&lt;font", webvtt)
+        self.assertNotIn("<font", webvtt)
+
 
 if __name__ == "__main__":
     unittest.main()

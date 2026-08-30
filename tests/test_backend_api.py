@@ -61,6 +61,19 @@ class BackendAPIBoundaryTests(unittest.TestCase):
             paths,
         )
         self.assertIn("/api/v1/settings/subtitle-validator", paths)
+        self.assertIn("/api/v1/settings/external-models", paths)
+        self.assertIn(
+            "/api/v1/settings/external-models/{provider}/probe",
+            paths,
+        )
+        self.assertIn("/api/v1/jobs/actions/draft-translate", paths)
+        self.assertIn("/api/v1/jobs/actions/review-translate", paths)
+        self.assertIn("/api/v1/jobs/actions/external-review", paths)
+        self.assertIn(
+            "/api/v1/jobs/{job_id}/translation-generations/"
+            "{generation_id}/items/{segment_id}",
+            paths,
+        )
         self.assertIn("/api/v1/settings/path-display-rules", paths)
         self.assertIn("/api/v1/settings/prompt-categories", paths)
         self.assertIn("/api/v1/comparisons", paths)
@@ -83,12 +96,51 @@ class BackendAPIBoundaryTests(unittest.TestCase):
             "TranslationSelectionRequest"
         ]
         translation_mode = selection_schema["properties"]["translation_mode"]
-        self.assertEqual(translation_mode["default"], "draft_and_review")
+        self.assertEqual(translation_mode["default"], "draft_only")
         self.assertEqual(
             translation_mode["enum"],
             ["draft_only", "review_existing", "draft_and_review"],
         )
         self.assertIn("target_stage", selection_schema["properties"])
+
+    def test_public_api_rejects_combined_pipeline_requests(self) -> None:
+        from fastapi.testclient import TestClient
+
+        from stt_to_subtitle.backend_api import create_backend_app
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            settings = BackendSettings(
+                state_dir=root / "state",
+                media_root=media_root,
+                stt_base_url="http://runtime:8100",
+                stt_token="",
+            )
+            with TestClient(create_backend_app(settings)) as client:
+                client.app.state.orchestrator.stop()
+
+                create_response = client.post(
+                    "/api/v1/jobs",
+                    json={"operation": "full"},
+                )
+                combined_response = client.post(
+                    "/api/v1/jobs/actions/translate",
+                    json={
+                        "job_ids": ["previous-phase"],
+                        "prompt_category_id": "jav",
+                        "translation_mode": "draft_and_review",
+                    },
+                )
+                reprocess_response = client.post(
+                    "/api/v1/jobs/previous-phase/reprocess",
+                    json={"operation": "full"},
+                )
+
+            self.assertEqual(create_response.status_code, 409)
+            self.assertEqual(combined_response.status_code, 409)
+            self.assertEqual(reprocess_response.status_code, 422)
 
     def test_health_and_job_list_run_without_html_application(self) -> None:
         from fastapi.testclient import TestClient
@@ -188,6 +240,65 @@ class BackendAPIBoundaryTests(unittest.TestCase):
         )
         self.assertIsNone(jobs["missing-media"]["nfo_title"])
         self.assertIsNone(jobs["missing-media"]["poster_path"])
+
+    def test_job_detail_groups_independent_phase_runs_as_one_workflow(self) -> None:
+        from fastapi.testclient import TestClient
+
+        from stt_to_subtitle.backend_api import create_backend_app
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            (media_root / "sample.mp4").write_bytes(b"media")
+            settings = BackendSettings(
+                state_dir=root / "state",
+                media_root=media_root,
+                stt_base_url="http://runtime:8100",
+                stt_token="",
+            )
+            with TestClient(create_backend_app(settings)) as client:
+                service = client.app.state.orchestrator
+                service.stop()
+                service.store.create(
+                    job_id="transcription-root",
+                    source_rel="sample.mp4",
+                    force_overwrite=False,
+                    options={},
+                    operation="transcribe",
+                )
+                service.store.create(
+                    job_id="draft-phase",
+                    source_rel="sample.mp4",
+                    force_overwrite=False,
+                    options={"pipeline_parent_job_id": "transcription-root"},
+                    operation="draft_translate",
+                )
+                service.store.create(
+                    job_id="review-phase",
+                    source_rel="sample.mp4",
+                    force_overwrite=False,
+                    options={"pipeline_parent_job_id": "draft-phase"},
+                    operation="review_translate",
+                )
+                service.store.create(
+                    job_id="unrelated-run",
+                    source_rel="sample.mp4",
+                    force_overwrite=False,
+                    options={},
+                    operation="transcribe",
+                )
+                response = client.get("/api/v1/jobs/review-phase")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["workflow_root_job_id"], "transcription-root")
+        self.assertEqual(
+            [item["id"] for item in payload["workflow_jobs"]],
+            ["transcription-root", "draft-phase", "review-phase"],
+        )
+        self.assertEqual(payload["parent_job"]["id"], "draft-phase")
+        self.assertEqual(payload["child_jobs"], [])
 
     def test_dashboard_returns_recent_samples_for_each_large_state(self) -> None:
         from fastapi.testclient import TestClient
@@ -480,6 +591,37 @@ class BackendAPIBoundaryTests(unittest.TestCase):
         self.assertEqual(
             media_listing.json()["files"][0]["display_path"],
             "av/japan/Actor/ABC-001.mp4",
+        )
+
+    def test_media_api_pages_folders_without_hiding_the_total(self) -> None:
+        from fastapi.testclient import TestClient
+
+        from stt_to_subtitle.backend_api import create_backend_app
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            for name in ("alpha", "bravo", "charlie"):
+                (media_root / name).mkdir(parents=True)
+            settings = BackendSettings(
+                state_dir=root / "state",
+                media_root=media_root,
+                stt_base_url="http://runtime:8100",
+                stt_token="",
+            )
+            with TestClient(create_backend_app(settings)) as client:
+                response = client.get(
+                    "/api/v1/media",
+                    params={"folder_offset": 1, "folder_limit": 1},
+                )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["folder_total"], 3)
+        self.assertEqual(response.json()["folder_offset"], 1)
+        self.assertEqual(response.json()["folder_limit"], 1)
+        self.assertEqual(
+            [folder["name"] for folder in response.json()["folders"]],
+            ["bravo"],
         )
 
 

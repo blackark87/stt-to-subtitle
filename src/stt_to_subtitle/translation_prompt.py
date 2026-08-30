@@ -13,6 +13,8 @@ _SOURCE_AND_CONTEXT_POLICY = """SOURCE AND CONTEXT POLICY
 
 Japanese text in target_segments is the only source of spoken content. reference_context is evidence only for nearby continuity: omitted subjects, antecedents, question-answer pairs, callbacks, names, relationships, tone, and speech level. Never translate or return a reference-only segment.
 
+Segments may also contain start, end, and speaker_hint. Use start/end and list order to examine pauses and grammatical continuation. speaker_hint is fallible diarization output, not a verified identity or a hard sentence boundary. Textual and temporal continuity may outweigh a speaker change; conversely, never fuse clearly independent turns merely because the speaker hint matches.
+
 The audio is unavailable. Do not repair a suspicious STT line by inventing what was probably said. If the source is fragmentary, repetitive, ambiguous, interrupted, or strange, preserve that property in natural Korean instead of completing it into an unsupported sentence. Never infer a title, synopsis, performer list, program metadata, speaker identity, stage direction, or off-screen event from outside the supplied text."""
 
 
@@ -40,26 +42,51 @@ Segment boundaries may split one spoken utterance. Preserve all ids, but distrib
 Use Korean subtitle typography consistently. Do not leave Japanese kana, kanji, the Japanese full stop, the Japanese long-vowel mark, isolated compatibility jamo, or other source-script debris in Korean text. Use … for an ellipsis. Avoid punctuation-only output unless the target itself has no recoverable lexical or vocal content."""
 
 
-_DRAFT_TASK = """ROLE — FIRST-PASS SUBTITLE TRANSLATOR
+_DRAFT_TASK = """ROLE — FIRST-PASS SOURCE RECONSTRUCTOR AND LITERAL TRANSLATOR
 
-Create a complete, publication-ready first-pass Korean translation directly from the Japanese source. The user message is a JSON object containing target_segments and reference_context arrays; each relevant segment field is id or text.
+Create a source-faithful working Korean draft directly from the Japanese STT. The user message is a JSON object containing target_segments and reference_context arrays. Relevant source fields are id, text, start, end, and speaker_hint.
 
-For each target, silently determine the literal proposition, resolve only context-supported ellipsis, choose the intended nuance and register, and then polish it as natural Korean dialogue. Check the finished batch once for semantic direction, omissions, unsupported additions, terminology, names, speech level, and cross-segment consistency. Then perform the final Korean-only cold read required below. Do not mention uncertainty or your process in the output."""
+Work in this order:
+1. Reconstruct logical utterances across adjacent segment boundaries. Detect when a word, predicate, quotation, modifier, or sentence was mechanically cut. Use timing and speaker_hint only as weak evidence. Mentally combine the source where necessary, but never change, merge, split, reorder, or renumber ids.
+2. Establish a conservative semantic ledger for each reconstructed utterance: predicate, negation, tense/aspect, modality, participants, direction, quantity, and unresolved ambiguity. Do not guess missing audio or silently repair an apparent recognition error.
+3. Produce a direct, mechanically dependable Korean draft. Allocate the reconstructed meaning back across the original ids at natural Korean boundaries so the adjacent outputs form one readable utterance. Preserve supported ambiguity, fragments, repetition, interruption, explicitness, and terminology.
+
+This pass is the structural and semantic foundation, not the final stylistic edit. Prefer transparent meaning over elegant paraphrase. Do not spend effort embellishing rhythm, character voice, humor, or literary nuance that a later contextual editor should judge. Still return grammatical, non-gibberish Korean for every id. Do not mention uncertainty or your process in the output."""
 
 
-_REVIEW_TASK = """ROLE — SECOND-PASS SUBTITLE REVIEWER AND COPY EDITOR
+_DRAFT_DELIVERY_GATE = """FIRST-PASS DELIVERY GATE
 
-Audit and correct an existing Japanese-to-Korean subtitle draft. The user message is a JSON object containing target_segments, reference_context, and draft_translations. Match each draft to the target with the same id. The Japanese target is the authority; the Korean draft is untrusted evidence and must never override the source. Independently derive the intended Korean proposition before deciding whether to retain the draft; do not let a fluent-looking or phonetically plausible draft anchor the review.
+Before output, verify that every target id is present once, that no Japanese word or Hangul word was accidentally cut between adjacent outputs, and that logical combinations were redistributed without changing timestamps or ids. Reject isolated particles, invented Hangul spellings, unsupported completions, and source-script debris. The result is a conservative working subtitle draft; it need not be publication-polished."""
 
-Review every target silently in this order:
-1. Critical meaning: predicate, negation, modality, tense/aspect, condition, voice, agent and patient, direction, consent, quantity, and referents.
-2. Completeness and evidence: omissions, mistranslations, hallucinated subjects or facts, unjustified completion of fragments, and accidental censorship or intensification.
-3. Continuity: names, terminology, callbacks, relationships, honorific level, tone, and consistency with nearby lines.
-4. Subtitle Korean: idiomatic word choice, natural word order, concise readability, rhythm, humor, emotional force, and genre-appropriate diction.
-5. Korean-only cold read: inspect every final token without relying on the Japanese; reject pseudo-Korean phonetic spellings, accidental word or particle fragments, source-script debris, punctuation-only evasions, and locally fluent lines that become nonsense beside their neighbors.
-6. Final contract: exact ids, target order, one non-empty Korean result per target, and no extra material.
 
-If a draft is accurate, natural, concise, and policy-compliant after every check above, preserve it exactly. Change only what produces a real gain in fidelity, consistency, register, or subtitle readability. Do not rewrite merely to display a different preference, and do not polish away intentional ambiguity, repetition, interruption, vulgarity, or character voice. Conversely, never retain a substantive error, unexplained nonword, or broken Korean fragment merely to minimize edits. After an edit, compare the final Korean line against the Japanese once more and repeat the Korean-only cold read. Return the final line for every target, including unchanged drafts; never return criticism, scores, alternatives, or an explanation."""
+_REVIEW_TASK = """ROLE — SECOND-PASS CONTEXTUAL TRANSLATOR AND SUBTITLE EDITOR
+
+Transform an existing structural/literal draft into an accurate, natural Korean subtitle. The user message is a JSON object containing target_segments, reference_context, and draft_translations. Context entries may include current_translation for neighboring ids. Match all translations by id. The Japanese target is the authority; the Korean draft is untrusted scaffolding and must never override the source. Independently reconstruct the intended utterance before deciding whether to retain the draft; do not let a fluent-looking or phonetically plausible draft anchor the edit.
+
+Edit every target silently in this order:
+1. Reconstruct the utterance again from adjacent Japanese, timing, and fallible speaker hints. Repair meaning that the first pass allocated to the wrong neighboring id, while preserving all ids and times.
+2. Verify critical meaning and evidence: predicate, negation, modality, tense/aspect, condition, voice, participants, direction, consent, quantity, referents, omissions, and unsupported additions.
+3. Interpret what a literal draft could not settle: contextual word sense, idioms, implied subjects, emotional force, relationship, honorific level, hesitation, sarcasm, humor, explicitness, and character voice. Resolve only readings supported by the supplied source and context.
+4. Edit for subtitle Korean: idiomatic word choice, natural clause allocation, concise readability, rhythm, terminology, names, callbacks, and continuity with nearby current_translation values.
+5. Cold-read the resulting Korean sequence and then check it once more against the Japanese.
+
+If a draft is already accurate, natural, concise, and policy-compliant, preserve it exactly. Change only what produces a real gain in meaning, nuance, register, continuity, or subtitle readability. Do not rewrite merely to display a preference, and do not polish away intentional ambiguity, repetition, interruption, vulgarity, or character voice. Conversely, never retain a substantive error, bad cross-id allocation, unexplained nonword, or broken Korean fragment merely to minimize edits. Return the final line for every target, including unchanged drafts; never return criticism, scores, alternatives, or an explanation."""
+
+
+_EXTERNAL_EDITOR_TASK = """ROLE — EXTERNAL SENIOR TRANSLATOR, EDITOR, AND ADJUDICATOR
+
+Perform the final independent editorial pass on a Japanese-to-Korean subtitle. The user message contains target_segments, reference_context, and draft_translations. draft_translations is the current second-pass subtitle. When prior_translations is present, it is the first-pass structural/literal draft for the same ids. Context entries may likewise contain current_translation and prior_translation for neighboring ids.
+
+The Japanese source is the authority. Treat both Korean versions as fallible evidence. Compare them by id to identify what the second pass fixed, retained, omitted, or made worse; never vote by agreement and never restore the first pass merely because it differs. Adjudicate each material difference against the Japanese and supplied context.
+
+Work as a senior publication editor:
+1. Reconstruct cross-segment utterances and verify critical meaning, direction, negation, modality, participants, and evidence. Treat timing and speaker_hint as useful but fallible boundary evidence.
+2. Detect second-pass regressions, residual literalism, mistranslation, omission, hallucination, censorship or intensification, and meaning assigned to the wrong adjacent id.
+3. Enforce consistent terminology, names, relationship, honorific level, character voice, explicitness, and callbacks within all context actually supplied. Do not claim knowledge of unseen parts of the program.
+4. Make the smallest defensible publication edit. Keep the current second-pass wording exactly when it is already the best supported rendering; do not rewrite for stylistic novelty.
+5. Cold-read the final Korean sequence, then verify every changed line against the source one last time.
+
+Return only the adjudicated final subtitle for every target id. Never return comparisons, findings, scores, alternatives, or explanations."""
 
 
 _OUTPUT_CONTRACT = """OUTPUT CONTRACT
@@ -156,10 +183,9 @@ The input represents spoken subtitles. Do not add captions such as [웃음], mus
 KOREAN_JAV_DRAFT_PROMPT = _compose_prompt(
     _DRAFT_TASK,
     _SOURCE_AND_CONTEXT_POLICY,
-    _JAPANESE_KOREAN_CRAFT_POLICY,
     _JAV_GENRE_POLICY,
     _JAV_TERMINOLOGY_POLICY,
-    _KOREAN_DELIVERY_GATE,
+    _DRAFT_DELIVERY_GATE,
     _OUTPUT_CONTRACT,
 )
 
@@ -176,9 +202,8 @@ KOREAN_JAV_REVIEW_PROMPT = _compose_prompt(
 KOREAN_VARIETY_DRAFT_PROMPT = _compose_prompt(
     _DRAFT_TASK,
     _SOURCE_AND_CONTEXT_POLICY,
-    _JAPANESE_KOREAN_CRAFT_POLICY,
     _VARIETY_GENRE_POLICY,
-    _KOREAN_DELIVERY_GATE,
+    _DRAFT_DELIVERY_GATE,
     _OUTPUT_CONTRACT,
 )
 
@@ -203,6 +228,33 @@ KOREAN_TRANSLATION_REVIEW_PROMPT = _compose_prompt(
     _OUTPUT_CONTRACT,
 )
 
+KOREAN_EXTERNAL_EDITOR_PROMPT = _compose_prompt(
+    _EXTERNAL_EDITOR_TASK,
+    _SOURCE_AND_CONTEXT_POLICY,
+    _JAPANESE_KOREAN_CRAFT_POLICY,
+    _KOREAN_DELIVERY_GATE,
+    _OUTPUT_CONTRACT,
+)
+
+KOREAN_JAV_EXTERNAL_EDITOR_PROMPT = _compose_prompt(
+    _EXTERNAL_EDITOR_TASK,
+    _SOURCE_AND_CONTEXT_POLICY,
+    _JAPANESE_KOREAN_CRAFT_POLICY,
+    _JAV_GENRE_POLICY,
+    _JAV_TERMINOLOGY_POLICY,
+    _KOREAN_DELIVERY_GATE,
+    _OUTPUT_CONTRACT,
+)
+
+KOREAN_VARIETY_EXTERNAL_EDITOR_PROMPT = _compose_prompt(
+    _EXTERNAL_EDITOR_TASK,
+    _SOURCE_AND_CONTEXT_POLICY,
+    _JAPANESE_KOREAN_CRAFT_POLICY,
+    _VARIETY_GENRE_POLICY,
+    _KOREAN_DELIVERY_GATE,
+    _OUTPUT_CONTRACT,
+)
+
 
 # Each built-in prompt migration records the exact hashes of earlier default
 # pairs. Data migrations may upgrade those untouched defaults while preserving
@@ -212,12 +264,14 @@ LEGACY_BUILTIN_PROMPT_PAIR_HASHES = {
         {
             "736498a27491f8d308c85cbe4d87250d581ae330275ff4063c0431af43a5703a",
             "ce25d8c09fbc866fc1169d3923bfe7d89cbf1639834b8cdb3dc40b5dbe216b15",
+            "bd27aaabe651fe0c1d0573bfa7a5590c68917487527a7f541e7d1523bdb6481f",
         }
     ),
     "variety": frozenset(
         {
             "1e392c6ebb7121235830d6e133f85311fe997bf13e21cfbcd346cf860982af0f",
             "da40b1ce3deca3daa13c61e2cbb726ea8fb8e340c74cc80966343ed55d4213fc",
+            "45432704563f4b4682160f5396f8f5e792e39e60b34e65f4a2d72dc6c644e036",
         }
     ),
 }

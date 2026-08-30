@@ -10,7 +10,13 @@ from fastapi.responses import FileResponse, StreamingResponse
 
 from .backend_common import public_value, service_from_request
 from .media_display import decorate_media_listing, flatten_media_display_folders
-from .media_preview import guess_media_type, iter_file_range, parse_byte_range
+from .media_preview import (
+    guess_media_type,
+    iter_file_range,
+    parse_byte_range,
+    read_subtitle_text,
+    srt_to_webvtt,
+)
 from .subtitle_validation import parse_subtitle, render_webvtt
 from .backend_config import group_multipart_media
 
@@ -26,6 +32,7 @@ def browse_media(
     actor: str = "",
     folder_sort: str = "name",
     file_sort: str = "filename",
+    folder_offset: int = Query(default=0, ge=0),
     folder_limit: int | None = Query(default=None, ge=1, le=100),
 ) -> dict[str, Any]:
     service = service_from_request(request)
@@ -54,6 +61,7 @@ def browse_media(
             listing,
             service.path_display_rules,
             folder_sort=folder_sort,
+            folder_offset=folder_offset,
             folder_limit=folder_limit,
             file_sort=file_sort,
         )
@@ -138,7 +146,11 @@ def external_subtitles(request: Request, path: str) -> Response:
         subtitles = service_from_request(request).library.external_subtitles(path)
         if not subtitles:
             raise FileNotFoundError("external subtitle not found")
-        content = render_webvtt(parse_subtitle(subtitles[0]))
+        content = (
+            srt_to_webvtt(read_subtitle_text(subtitles[0]))
+            if subtitles[0].suffix.lower() == ".srt"
+            else render_webvtt(parse_subtitle(subtitles[0]))
+        )
     except (OSError, UnicodeError, ValueError) as error:
         raise HTTPException(status_code=404, detail="external subtitle not found") from error
     return Response(content, media_type="text/vtt")

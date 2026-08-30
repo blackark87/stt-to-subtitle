@@ -7,10 +7,12 @@ import { Icon } from "@/components/Icon";
 import { Freshness } from "@/components/Freshness";
 import { LoadingOverlay } from "@/components/LoadingOverlay";
 import { Pagination } from "@/components/Pagination";
-import { api } from "@/lib/api";
+import { api, type ExternalModelProvider } from "@/lib/api";
 import {
   JOB_PHASES,
   JOB_OPERATIONS,
+  PUBLIC_JOB_PHASES,
+  PUBLIC_JOB_OPERATIONS,
   OPERATION_LABEL,
   PHASE_LABEL,
   STATE_LABEL,
@@ -73,6 +75,7 @@ export default function JobsPage() {
   const [actionError, setActionError] = useState<string | null>(null);
   const [actionNotice, setActionNotice] = useState<string | null>(null);
   const [translationPromptId, setTranslationPromptId] = useState("");
+  const [externalModelKey, setExternalModelKey] = useState("");
 
   const fetcher = useCallback(
     () => api.jobs({
@@ -87,6 +90,7 @@ export default function JobsPage() {
   const { data, status, error, updatedAt, refreshing, refresh } = useLiveQuery(fetcher, JOBS_INTERVAL_MS);
   const runtimes = useLiveQuery(useCallback(() => api.runtimes(), []), 60000);
   const prompts = useLiveQuery(useCallback(() => api.promptCategories(), []), 60000);
+  const settings = useLiveQuery(useCallback(() => api.settings(), []), 60000);
   const jobs = useMemo(() => data?.items ?? [], [data?.items]);
   const runtimeNames = useMemo(
     () => new Map((runtimes.data?.items ?? []).map((runtime) => [runtime.id, runtime.name])),
@@ -152,16 +156,39 @@ export default function JobsPage() {
     .filter((job) => canPauseTranslation(asJobState(job.state), job.phase))
     .map((job) => job.id);
   const draftTranslationIds = selectedJobs
-    .filter((job) => job.status === "transcription_completed" && !job.options.comparison_id)
+    .filter((job) => job.operation === "transcribe" && job.status === "transcription_completed" && !job.options.comparison_id)
     .map((job) => job.id);
   const reviewTranslationIds = selectedJobs
     .filter((job) => (
       job.status === "completed"
-      && (job.operation === "translate" || job.operation === "full")
+      && (
+        job.operation === "draft_translate"
+        || (["translate", "full"].includes(job.operation) && jobTranslationMode(job) === "draft_only")
+      )
       && !job.options.comparison_id
-      && jobTranslationMode(job) === "draft_only"
     ))
     .map((job) => job.id);
+  const externalReviewIds = selectedJobs
+    .filter((job) => job.status === "completed" && job.operation === "review_translate")
+    .map((job) => job.id);
+  const externalModels = (settings.data?.external_models ?? []).flatMap((profile) =>
+    profile.configured && profile.selected_model
+      ? [{
+        key: `${profile.provider}\u0000${profile.selected_model}`,
+        provider: profile.provider,
+        model: profile.selected_model,
+      }]
+      : [],
+  );
+  const effectiveExternalModelKey = externalModels.some(
+    (item) => item.key === externalModelKey,
+  )
+    ? externalModelKey
+    : externalModels.length === 1
+      ? externalModels[0]?.key ?? ""
+      : "";
+  const [externalProvider = "", externalModel = ""] =
+    effectiveExternalModelKey.split("\u0000");
   const stopIds = selectedJobs
     .filter((job) => canStopJob(asJobState(job.state)))
     .map((job) => job.id);
@@ -198,7 +225,7 @@ export default function JobsPage() {
   return (
     <>
       <LoadingOverlay
-        active={refreshing || runtimes.refreshing || prompts.refreshing || busy}
+        active={refreshing || runtimes.refreshing || prompts.refreshing || settings.refreshing || busy}
         message={busy ? "선택한 작업을 처리하는 중입니다" : "작업 목록을 불러오는 중입니다"}
       />
       <header className="topbar">
@@ -226,7 +253,7 @@ export default function JobsPage() {
               <div className="job-filter-row">
                 <strong>작업 종류</strong>
                 <div className="rail">
-                  {JOB_OPERATIONS.map((operation) => {
+                  {PUBLIC_JOB_OPERATIONS.map((operation) => {
                     const on = operationFilter.includes(operation);
                     return <button key={operation} type="button" aria-pressed={on} className={on ? "chip on" : "chip"} onClick={() => {
                       setSelected(new Set());
@@ -238,7 +265,7 @@ export default function JobsPage() {
               <div className="job-filter-row">
                 <strong>처리 단계</strong>
                 <div className="rail">
-                  {JOB_PHASES.map((phase) => {
+                  {PUBLIC_JOB_PHASES.map((phase) => {
                     const on = phaseFilter.includes(phase);
                     return <button key={phase} type="button" aria-pressed={on} className={on ? "chip on" : "chip"} onClick={() => {
                       setSelected(new Set());
@@ -303,7 +330,7 @@ export default function JobsPage() {
                 title={!draftTranslationIds.length ? "전사 완료 작업을 선택하세요." : !translationPromptId ? "번역 프롬프트를 선택하세요." : "1차 초벌 번역까지만 실행합니다."}
                 onClick={() => void run(
                   draftTranslationIds,
-                  (ids) => api.translateJobs(ids, translationPromptId, "draft_only"),
+                  (ids) => api.draftTranslateJobs(ids, translationPromptId),
                   `${draftTranslationIds.length}건의 1차 번역을 시작했습니다.`,
                 )}
               >
@@ -317,26 +344,42 @@ export default function JobsPage() {
                 title={!reviewTranslationIds.length ? "1차 자막 완료 작업을 선택하세요." : !translationPromptId ? "번역 프롬프트를 선택하세요." : "기존 1차 번역을 다시 번역하지 않고 검수·교정합니다."}
                 onClick={() => void run(
                   reviewTranslationIds,
-                  (ids) => api.translateJobs(ids, translationPromptId, "review_existing"),
+                  (ids) => api.reviewTranslateJobs(ids, translationPromptId),
                   `${reviewTranslationIds.length}건의 2차 보정을 시작했습니다.`,
                 )}
               >
                 <Icon name="play" size={13} />
                 2차 보정 {reviewTranslationIds.length || ""}
               </button>
+              <select
+                className="ctl sm job-translation-prompt"
+                aria-label="외부 검토 모델"
+                value={effectiveExternalModelKey}
+                disabled={busy || settings.status === "loading"}
+                onChange={(event) => setExternalModelKey(event.target.value)}
+              >
+                <option value="">설정된 외부 모델 선택</option>
+                {externalModels.map((item) => (
+                  <option key={item.key} value={item.key}>{item.provider} · {item.model}</option>
+                ))}
+              </select>
               <button
                 type="button"
                 className="btn sm"
-                disabled={!draftTranslationIds.length || !translationPromptId || busy}
-                title={!draftTranslationIds.length ? "전사 완료 작업을 선택하세요." : !translationPromptId ? "번역 프롬프트를 선택하세요." : "1차 초벌 번역 후 2차 검수·교정을 연속 실행합니다."}
+                disabled={!externalReviewIds.length || !externalProvider || !externalModel || busy}
+                title={!externalReviewIds.length ? "2차 번역 완료 작업을 선택하세요." : !externalModel ? "외부 모델을 선택하세요." : "외부 모델 검토 결과는 수동 게시 전까지 공개되지 않습니다."}
                 onClick={() => void run(
-                  draftTranslationIds,
-                  (ids) => api.translateJobs(ids, translationPromptId, "draft_and_review"),
-                  `${draftTranslationIds.length}건의 1+2차 번역을 시작했습니다.`,
+                  externalReviewIds,
+                  (ids) => api.externalReviewJobs(
+                    ids,
+                    externalProvider as ExternalModelProvider,
+                    externalModel,
+                  ),
+                  `${externalReviewIds.length}건의 외부 모델 검토를 시작했습니다.`,
                 )}
               >
                 <Icon name="play" size={13} />
-                1+2차 번역 {draftTranslationIds.length || ""}
+                외부 모델 검토 {externalReviewIds.length || ""}
               </button>
               <button type="button" className="btn sec sm" disabled={!retryIds.length || busy} onClick={() => void run(retryIds, api.retryJobs)}>
                 <Icon name="refresh" size={13} />

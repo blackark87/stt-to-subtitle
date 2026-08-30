@@ -324,7 +324,7 @@ class SubtitleValidatorSettings:
         provider = self.provider.strip().lower()
         region = self.region.strip().lower()
         if provider not in {"openrouter", "bedrock", "openai_compatible"}:
-            raise ValueError("지원하지 않는 상용 LLM 제공자입니다.")
+            raise ValueError("지원하지 않는 외부 모델 제공자입니다.")
         required = [("검증 모델", self.model)]
         if provider == "openrouter":
             required.append(("OpenRouter API 키", self.token))

@@ -44,6 +44,38 @@ def completion_response(text: str = "ok") -> Mock:
 
 
 class TranslationServerGroupStoreTests(unittest.TestCase):
+    def test_thinking_mode_is_stored_per_server(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = TranslationServerGroupStore(Path(directory) / "draft.sqlite3")
+            disabled = store.create(
+                name="literal",
+                base_url="http://literal.test/v1",
+                token="",
+                enabled=True,
+                capacity=1,
+                thinking_enabled=False,
+            )
+            enabled = store.create(
+                name="contextual",
+                base_url="http://contextual.test/v1",
+                token="",
+                enabled=True,
+                capacity=1,
+                thinking_enabled=True,
+            )
+
+            self.assertFalse(disabled.thinking_enabled)
+            self.assertTrue(enabled.thinking_enabled)
+            preserved = store.update(
+                enabled.id,
+                name=enabled.name,
+                base_url=enabled.base_url,
+                token=enabled.token,
+                enabled=True,
+                capacity=2,
+            )
+            self.assertTrue(preserved.thinking_enabled)
+
     def test_groups_own_server_model_selections_independently(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -302,6 +334,7 @@ class BackendTranslationRoutingTests(unittest.TestCase):
             self.assertEqual(groups[1]["servers"][0]["selected_model"], REVIEW_MODEL)
             self.assertTrue(groups[0]["servers"][0]["enabled"])
             self.assertFalse(groups[1]["servers"][0]["enabled"])
+            self.assertFalse(groups[0]["servers"][0]["thinking_enabled"])
             self.assertNotIn("token", groups[0]["servers"][0])
 
     def test_worker_limit_uses_the_requested_translation_stage(self) -> None:
@@ -321,6 +354,43 @@ class BackendTranslationRoutingTests(unittest.TestCase):
 
             self.assertEqual(routing.worker_limit("live", stage="draft"), 1)
             self.assertEqual(routing.worker_limit("live", stage="review"), 3)
+
+    def test_route_overlap_is_scoped_to_model_server_host(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            routing = self.routing(root, review_enabled=True)
+
+            self.assertTrue(
+                routing.routes_share_host(
+                    "draft",
+                    "live",
+                    "review",
+                    "batch",
+                )
+            )
+            review = routing.stores["review"].get("builtin")
+            assert review is not None
+            routing.stores["review"].update(
+                review.id,
+                name=review.name,
+                base_url="http://separate-review.test:1234/v1",
+                token=review.token,
+                enabled=True,
+                capacity=review.capacity,
+            )
+            routing.stores["review"].save_models(
+                review.id,
+                [REVIEW_MODEL],
+            )
+
+            self.assertFalse(
+                routing.routes_share_host(
+                    "draft",
+                    "live",
+                    "review",
+                    "batch",
+                )
+            )
 
     def test_builtin_address_is_editable_per_group_and_survives_restart(self) -> None:
         with TemporaryDirectory() as directory, patch(
@@ -427,6 +497,40 @@ class BackendTranslationRoutingTests(unittest.TestCase):
                 set(request.call_args.kwargs["json"]),
                 {"model", "max_tokens", "messages", "reasoning_effort"},
             )
+
+    def test_thinking_server_omits_reasoning_disable_flag(self) -> None:
+        with TemporaryDirectory() as directory:
+            routing = self.routing(Path(directory))
+            builtin = routing.stores["draft"].get("builtin")
+            assert builtin is not None
+            routing.stores["draft"].update(
+                builtin.id,
+                name=builtin.name,
+                base_url=builtin.base_url,
+                token=builtin.token,
+                enabled=builtin.enabled,
+                capacity=builtin.capacity,
+                thinking_enabled=True,
+            )
+            response = completion_response()
+            with patch.object(
+                RetryingJSONClient,
+                "request",
+                return_value=response,
+            ) as request:
+                routing.request_completion(
+                    "draft",
+                    "live",
+                    {
+                        "max_tokens": 4096,
+                        "messages": [],
+                        "reasoning_effort": "none",
+                    },
+                )
+
+            payload = request.call_args.kwargs["json"]
+            self.assertNotIn("reasoning_effort", payload)
+            self.assertEqual(payload["model"], DRAFT_MODEL)
 
     def test_explicit_probe_checks_a_disabled_server(self) -> None:
         with TemporaryDirectory() as directory, patch(

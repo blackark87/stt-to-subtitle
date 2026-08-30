@@ -7,7 +7,16 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 
-JobOperation = Literal["extract", "transcribe", "translate", "full", "compare"]
+JobOperation = Literal[
+    "extract",
+    "transcribe",
+    "translate",
+    "full",
+    "draft_translate",
+    "review_translate",
+    "external_review",
+    "compare",
+]
 TranslationStage = Literal["draft", "review"]
 TranslationMode = Literal["draft_only", "review_existing", "draft_and_review"]
 
@@ -16,7 +25,7 @@ class JobCreateRequest(BaseModel):
     source_rels: list[str] = Field(default_factory=list)
     folder_rels: list[str] = Field(default_factory=list)
     force_overwrite: bool = False
-    operation: JobOperation = "full"
+    operation: JobOperation = "transcribe"
     prompt_category_id: str | None = None
     options: dict[str, Any] = Field(default_factory=dict)
 
@@ -27,12 +36,35 @@ class JobIdsRequest(BaseModel):
 
 class TranslationSelectionRequest(JobIdsRequest):
     prompt_category_id: str
-    translation_mode: TranslationMode = "draft_and_review"
+    translation_mode: TranslationMode = "draft_only"
     target_stage: TranslationStage | None = None
 
 
+ExternalModelProvider = Literal[
+    "openrouter",
+    "bedrock",
+    "nvidia_build",
+]
+
+
+class ExternalReviewSelectionRequest(JobIdsRequest):
+    provider: ExternalModelProvider
+    model: str = Field(min_length=1)
+
+
+class ExternalModelProfileRequest(BaseModel):
+    base_url: str = ""
+    credential: str | None = None
+    clear_credential: bool = False
+    region: str = ""
+
+
+class ExternalModelSelectionRequest(BaseModel):
+    model: str = Field(min_length=1)
+
+
 class ReprocessRequest(BaseModel):
-    operation: Literal["extract", "transcribe", "translate", "full"]
+    operation: Literal["transcribe"]
     prompt_category_id: str | None = None
 
 
@@ -43,6 +75,10 @@ class RestartTranslationRequest(BaseModel):
 
 class ArtifactUpdateRequest(BaseModel):
     content: str
+
+
+class TranslationItemUpdateRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=10_000)
 
 
 class ServerSettingsUpdateRequest(BaseModel):
@@ -57,6 +93,7 @@ class TranslationEndpointCreateRequest(BaseModel):
     token: str = ""
     enabled: bool = True
     capacity: int = Field(default=1, ge=1, le=8)
+    thinking_enabled: bool = False
 
 
 class TranslationEndpointUpdateRequest(BaseModel):
@@ -66,6 +103,7 @@ class TranslationEndpointUpdateRequest(BaseModel):
     clear_token: bool = False
     enabled: bool = True
     capacity: int = Field(default=1, ge=1, le=8)
+    thinking_enabled: bool | None = None
 
 
 class TranslationEndpointRoutingRequest(BaseModel):

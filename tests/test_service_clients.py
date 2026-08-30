@@ -21,6 +21,7 @@ from stt_to_subtitle.service_clients import (
     TranslationResponseFormatError,
     TranslationResponseIDError,
     batch_segments,
+    list_external_models,
     list_openai_compatible_models,
     normalize_translation_response,
 )
@@ -169,6 +170,76 @@ class OpenAICompatibleModelTests(unittest.TestCase):
 
     def test_legacy_client_name_is_a_backward_compatible_alias(self) -> None:
         self.assertIs(LMStudioClient, OpenAICompatibleClient)
+
+    def test_openrouter_authenticates_before_listing_external_models(
+        self,
+    ) -> None:
+        authentication = Mock(status_code=200)
+        models_response = Mock(status_code=200)
+        models_response.json.return_value = {"data": [{"id": "model-a"}]}
+
+        with patch.object(
+            RetryingJSONClient,
+            "request",
+            side_effect=[authentication, models_response],
+        ) as request:
+            models = list_external_models(
+                provider="openrouter",
+                base_url="",
+                credential="secret",
+            )
+
+        self.assertEqual(models, ["model-a"])
+        self.assertEqual(request.call_args_list[0].args[1], "https://openrouter.ai/api/v1/key")
+        self.assertEqual(request.call_args_list[1].args[1], "https://openrouter.ai/api/v1/models")
+
+    def test_lists_active_bedrock_text_models(self) -> None:
+        response = Mock(status_code=200)
+        response.json.return_value = {
+            "modelSummaries": [
+                {"modelId": "active", "modelLifecycle": {"status": "ACTIVE"}},
+                {"modelId": "legacy", "modelLifecycle": {"status": "LEGACY"}},
+            ]
+        }
+
+        with patch.object(
+            RetryingJSONClient,
+            "request",
+            return_value=response,
+        ) as request:
+            models = list_external_models(
+                provider="bedrock",
+                base_url="",
+                credential="secret",
+                region="ap-northeast-2",
+            )
+
+        self.assertEqual(models, ["active"])
+        self.assertEqual(
+            request.call_args.args[1],
+            "https://bedrock.ap-northeast-2.amazonaws.com/foundation-models",
+        )
+
+    def test_uses_nvidia_build_openai_compatible_model_endpoint(self) -> None:
+        response = Mock(status_code=200)
+        response.json.return_value = {"data": [{"id": "nvidia/model"}]}
+
+        with patch.object(
+            RetryingJSONClient,
+            "request",
+            return_value=response,
+        ) as request:
+            models = list_external_models(
+                provider="nvidia_build",
+                base_url="",
+                credential="secret",
+            )
+
+        self.assertEqual(models, ["nvidia/model"])
+        self.assertEqual(
+            request.call_args.args[1],
+            "https://integrate.api.nvidia.com/v1/models",
+        )
 
 
 class SubtitleValidationClientTests(unittest.TestCase):
@@ -1314,7 +1385,7 @@ class TranslationResponseTests(unittest.TestCase):
         client = LMStudioClient("http://lm.test/v1", "", "model")
         seen_drafts: list[list[str]] = []
 
-        def review_batch(segments, _context, drafts, _prompt):
+        def review_batch(segments, _context, drafts, _prompt, **_kwargs):
             seen_drafts.append([str(item["id"]) for item in drafts])
             if len(segments) > 1:
                 raise ExternalServiceError(
@@ -1547,10 +1618,10 @@ class TranslationResponseTests(unittest.TestCase):
         )
         self.assertEqual(
             user_payload["reference_context"],
-            [{"text": "文脈"}],
+            [{"id": "segment-0", "text": "文脈"}],
         )
 
-    def test_translation_payload_excludes_transcription_metadata(self) -> None:
+    def test_translation_payload_allows_only_boundary_metadata(self) -> None:
         client = OpenAICompatibleClient(
             "http://translation.test/v1",
             "",
@@ -1580,6 +1651,8 @@ class TranslationResponseTests(unittest.TestCase):
                 {
                     "id": "segment-1",
                     "text": "翻訳",
+                    "start": 1.25,
+                    "end": 2.5,
                     "speaker": "SPEAKER_00",
                     "runtime": {"id": "gpu-3080", "worker": "worker-7"},
                     "stt_model": "whisperjav",
@@ -1593,11 +1666,95 @@ class TranslationResponseTests(unittest.TestCase):
             user_payload,
             {
                 "target_segments": [
-                    {"id": "segment-1", "text": "翻訳"}
+                    {
+                        "id": "segment-1",
+                        "text": "翻訳",
+                        "start": 1.25,
+                        "end": 2.5,
+                        "speaker_hint": "SPEAKER_00",
+                    }
                 ],
                 "reference_context": [],
             },
         )
         serialized = json.dumps(request_payload, ensure_ascii=False)
-        for forbidden in ("gpu-3080", "worker-7", "whisperjav", "SPEAKER_00"):
+        for forbidden in ("gpu-3080", "worker-7", "whisperjav"):
             self.assertNotIn(forbidden, serialized)
+        self.assertIn("SPEAKER_00", serialized)
+
+    def test_external_review_compares_prior_and_current_context(self) -> None:
+        calls: list[tuple[str, str, dict[str, object]]] = []
+        response = Mock(status_code=200)
+        response.json.return_value = {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "translations": [
+                                    {"id": "segment-1", "text": "최종"}
+                                ]
+                            },
+                            ensure_ascii=False,
+                        )
+                    }
+                }
+            ]
+        }
+
+        def completion_request(stage, mode, payload):
+            calls.append((stage, mode, payload))
+            return response
+
+        client = OpenAICompatibleClient(
+            "",
+            "",
+            "",
+            completion_request=completion_request,
+        )
+        client._review_batch(
+            [
+                {
+                    "id": "segment-1",
+                    "text": "対象",
+                    "start": 1.0,
+                    "end": 2.0,
+                    "speaker": "SPEAKER_00",
+                }
+            ],
+            [
+                {
+                    "id": "segment-0",
+                    "text": "文脈",
+                    "start": 0.0,
+                    "end": 1.0,
+                    "speaker": "SPEAKER_01",
+                }
+            ],
+            [{"id": "segment-1", "text": "2차"}],
+            "external editor",
+            all_draft_translations={"segment-0": "문맥 2차"},
+            comparison_translations={
+                "segment-0": "문맥 1차",
+                "segment-1": "1차",
+            },
+        )
+
+        request_payload = calls[0][2]
+        user_payload = json.loads(request_payload["messages"][1]["content"])
+        self.assertEqual(
+            user_payload["prior_translations"],
+            [{"id": "segment-1", "text": "1차"}],
+        )
+        self.assertEqual(
+            user_payload["reference_context"][0]["current_translation"],
+            "문맥 2차",
+        )
+        self.assertEqual(
+            user_payload["reference_context"][0]["prior_translation"],
+            "문맥 1차",
+        )
+        self.assertEqual(
+            user_payload["target_segments"][0]["speaker_hint"],
+            "SPEAKER_00",
+        )
