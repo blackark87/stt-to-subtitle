@@ -27,7 +27,7 @@ import {
   type JobState,
 } from "@/lib/domain";
 import { clock, fileName, parentPath } from "@/lib/format";
-import { jobStateLabel, jobTranslationMode } from "@/lib/jobPresentation";
+import { jobTranslationMode } from "@/lib/jobPresentation";
 import { useLiveQuery } from "@/lib/useLiveQuery";
 
 const JOBS_INTERVAL_MS = 5000;
@@ -439,7 +439,7 @@ export default function JobsPage() {
                     ? runtimeNames.get(job.stt_runtime_id) ?? job.stt_runtime_id
                     : null;
                   const phase = PHASE_LABEL[job.phase as JobPhase] ?? job.phase;
-                  const stateText = jobStateLabel(job);
+                  const stateText = state ? STATE_LABEL[state] : job.state;
                   const filename = fileName(job.source_rel);
                   const nfoTitle = job.nfo_title?.trim() || null;
                   const displayTitle = nfoTitle ?? filename;
