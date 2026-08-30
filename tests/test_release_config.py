@@ -243,6 +243,7 @@ class ReleaseConfigurationTests(unittest.TestCase):
             "\nnetworks:\n", 1
         )[0]
         networks = compose.rsplit("\nnetworks:\n", 1)[1]
+        self.assertNotIn("depends_on:", web)
         self.assertNotIn("depends_on:", backend)
         self.assertIn("host.docker.internal:host-gateway", backend)
         self.assertIn(
