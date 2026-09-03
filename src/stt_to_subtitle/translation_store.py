@@ -22,6 +22,7 @@ class TranslationServer:
     token: str
     enabled: bool
     capacity: int
+    resource_group_id: str
     thinking_enabled: bool
     builtin: bool
     batch_preferred: bool
@@ -48,6 +49,7 @@ class TranslationServerGroupStore:
                     token TEXT NOT NULL DEFAULT '',
                     enabled INTEGER NOT NULL DEFAULT 1,
                     capacity INTEGER NOT NULL DEFAULT 1,
+                    resource_group_id TEXT NOT NULL DEFAULT 'local-gpu',
                     thinking_enabled INTEGER NOT NULL DEFAULT 0,
                     builtin INTEGER NOT NULL DEFAULT 0,
                     batch_preferred INTEGER NOT NULL DEFAULT 0,
@@ -86,6 +88,11 @@ class TranslationServerGroupStore:
                     "ALTER TABLE translation_servers "
                     "ADD COLUMN thinking_enabled INTEGER NOT NULL DEFAULT 0 "
                     "CHECK (thinking_enabled IN (0, 1))"
+                )
+            if "resource_group_id" not in columns:
+                connection.execute(
+                    "ALTER TABLE translation_servers ADD COLUMN "
+                    "resource_group_id TEXT NOT NULL DEFAULT 'local-gpu'"
                 )
             connection.execute("DROP TABLE IF EXISTS translation_group_settings")
 
@@ -150,6 +157,7 @@ class TranslationServerGroupStore:
             token=str(row["token"]),
             enabled=bool(row["enabled"]),
             capacity=int(row["capacity"]),
+            resource_group_id=str(row["resource_group_id"]),
             thinking_enabled=bool(row["thinking_enabled"]),
             builtin=bool(row["builtin"]),
             batch_preferred=bool(row["batch_preferred"]),
@@ -181,6 +189,7 @@ class TranslationServerGroupStore:
         capacity: int,
         batch_preferred: bool,
         thinking_enabled: bool = False,
+        resource_group_id: str = "local-gpu",
         legacy_names: Sequence[str] = (),
     ) -> None:
         now = time.time()
@@ -190,8 +199,9 @@ class TranslationServerGroupStore:
                 """
                 INSERT INTO translation_servers (
                     id, name, base_url, token, enabled, capacity, builtin,
-                    batch_preferred, thinking_enabled, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+                    resource_group_id, batch_preferred, thinking_enabled,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO NOTHING
                 """,
                 (
@@ -201,6 +211,7 @@ class TranslationServerGroupStore:
                     token,
                     int(enabled),
                     capacity,
+                    resource_group_id,
                     int(resolved_batch_preferred),
                     int(thinking_enabled),
                     now,
@@ -252,6 +263,7 @@ class TranslationServerGroupStore:
         server_id: str | None = None,
         batch_preferred: bool = False,
         thinking_enabled: bool = False,
+        resource_group_id: str = "local-gpu",
         selected_model: str = "",
         models: tuple[str, ...] = (),
         checked_at: float | None = None,
@@ -272,9 +284,9 @@ class TranslationServerGroupStore:
                 """
                 INSERT INTO translation_servers (
                     id, name, base_url, token, enabled, capacity, builtin,
-                    batch_preferred, thinking_enabled, selected_model,
+                    resource_group_id, batch_preferred, thinking_enabled, selected_model,
                     models_json, checked_at, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     resolved_id,
@@ -283,6 +295,7 @@ class TranslationServerGroupStore:
                     token,
                     int(enabled),
                     capacity,
+                    resource_group_id,
                     int(resolved_batch_preferred),
                     int(thinking_enabled),
                     resolved_selected_model,
@@ -307,6 +320,7 @@ class TranslationServerGroupStore:
         enabled: bool,
         capacity: int,
         thinking_enabled: bool | None = None,
+        resource_group_id: str = "local-gpu",
     ) -> TranslationServer:
         with self._connect() as connection:
             cursor = connection.execute(
@@ -319,6 +333,7 @@ class TranslationServerGroupStore:
                     base_url = ?, token = ?, enabled = ?,
                     batch_preferred = CASE WHEN ? THEN batch_preferred ELSE 0 END,
                     capacity = ?,
+                    resource_group_id = ?,
                     thinking_enabled = COALESCE(?, thinking_enabled),
                     updated_at = ?
                 WHERE id = ?
@@ -333,6 +348,7 @@ class TranslationServerGroupStore:
                     int(enabled),
                     int(enabled),
                     capacity,
+                    resource_group_id,
                     (
                         int(thinking_enabled)
                         if thinking_enabled is not None

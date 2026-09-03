@@ -66,6 +66,9 @@ def create_backend_app(settings: BackendSettings | None = None) -> FastAPI:
             "media_root": service.library.root.is_dir(),
             "state_store": service.settings.state_dir.is_dir(),
             "work_directory": service.settings.jobs_dir.is_dir(),
+            "transcription_audio_directory": (
+                service.settings.transcription_audio_dir.is_dir()
+            ),
         }
         ready = all(checks.values())
         return JSONResponse(

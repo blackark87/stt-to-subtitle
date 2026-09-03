@@ -100,6 +100,7 @@ NONNEGATIVE_JOB_FIELDS = {
 }
 BOOLEAN_JOB_FIELDS = {
     "force_overwrite",
+    "is_test",
     "translation_pause_requested",
     "job_stop_requested",
 }
@@ -205,6 +206,7 @@ class RuntimeEndpoint:
     token: str
     enabled: bool
     capacity: int
+    resource_group_id: str
     created_at: float
     updated_at: float
 
@@ -215,6 +217,7 @@ class PipelineJob:
     source_rel: str
     status: str
     force_overwrite: bool
+    is_test: bool
     operation: str
     phase: str
     state: str
@@ -337,6 +340,7 @@ class JobStore:
     _UPDATABLE_FIELDS = {
         "status",
         "force_overwrite",
+        "is_test",
         "operation",
         "phase",
         "state",
@@ -387,9 +391,11 @@ class JobStore:
         *,
         previous_root: Path,
         current_root: Path,
+        current_audio_root: Path | None = None,
     ) -> int:
         """Repoint persisted work artifacts after their storage root moves."""
-        if previous_root == current_root:
+        audio_root = current_audio_root or current_root
+        if previous_root == current_root and previous_root == audio_root:
             return 0
         changed = 0
         fields = ("audio_path", "transcript_path", "translation_path")
@@ -402,13 +408,28 @@ class JobStore:
             ).fetchall()
             for row in rows:
                 original = tuple(row[field] for field in fields)
-                rebased = tuple(
+                rebased = (
                     rebase_stored_path(
-                        str(value) if value is not None else None,
+                        str(row["audio_path"])
+                        if row["audio_path"] is not None
+                        else None,
+                        previous_root=previous_root,
+                        current_root=audio_root,
+                    ),
+                    rebase_stored_path(
+                        str(row["transcript_path"])
+                        if row["transcript_path"] is not None
+                        else None,
                         previous_root=previous_root,
                         current_root=current_root,
-                    )
-                    for value in original
+                    ),
+                    rebase_stored_path(
+                        str(row["translation_path"])
+                        if row["translation_path"] is not None
+                        else None,
+                        previous_root=previous_root,
+                        current_root=current_root,
+                    ),
                 )
                 if rebased == original:
                     continue
@@ -431,7 +452,11 @@ class JobStore:
                     rebased = rebase_stored_path(
                         original,
                         previous_root=previous_root,
-                        current_root=current_root,
+                        current_root=(
+                            audio_root
+                            if table == "audio_revisions"
+                            else current_root
+                        ),
                     )
                     if rebased == original:
                         continue
@@ -622,6 +647,8 @@ class JobStore:
                     source_rel TEXT NOT NULL,
                     status TEXT NOT NULL,
                     force_overwrite INTEGER NOT NULL,
+                    is_test INTEGER NOT NULL DEFAULT 0
+                        CHECK (is_test IN (0, 1)),
                     operation TEXT NOT NULL DEFAULT 'full',
                     phase TEXT NOT NULL DEFAULT 'extraction',
                     state TEXT NOT NULL DEFAULT 'waiting',
@@ -693,6 +720,7 @@ class JobStore:
                     id INTEGER PRIMARY KEY CHECK (id = 1),
                     stt_base_url TEXT NOT NULL,
                     stt_token TEXT NOT NULL,
+                    resource_group_id TEXT NOT NULL DEFAULT 'local-gpu',
                     updated_at REAL NOT NULL
                 );
 
@@ -703,6 +731,7 @@ class JobStore:
                     token TEXT NOT NULL DEFAULT '',
                     enabled INTEGER NOT NULL DEFAULT 1,
                     capacity INTEGER NOT NULL DEFAULT 1,
+                    resource_group_id TEXT NOT NULL DEFAULT 'local-gpu',
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL,
                     CHECK (enabled IN (0, 1)),
@@ -907,6 +936,64 @@ class JobStore:
                         REFERENCES translation_generations(id)
                 );
 
+                CREATE TABLE IF NOT EXISTS translation_feedback (
+                    id TEXT PRIMARY KEY,
+                    job_id TEXT NOT NULL,
+                    category_id TEXT NOT NULL,
+                    base_revision_id TEXT NOT NULL,
+                    stage TEXT NOT NULL,
+                    source_generation_id TEXT NOT NULL,
+                    manual_generation_id TEXT NOT NULL,
+                    segment_id TEXT NOT NULL,
+                    source_text TEXT NOT NULL,
+                    model_text TEXT NOT NULL,
+                    edited_text TEXT NOT NULL,
+                    context_json TEXT NOT NULL DEFAULT '{}',
+                    included INTEGER NOT NULL DEFAULT 1,
+                    supersedes_feedback_id TEXT,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    FOREIGN KEY (job_id) REFERENCES jobs(id),
+                    FOREIGN KEY (base_revision_id)
+                        REFERENCES prompt_revisions(id),
+                    FOREIGN KEY (source_generation_id)
+                        REFERENCES translation_generations(id),
+                    FOREIGN KEY (manual_generation_id)
+                        REFERENCES translation_generations(id),
+                    FOREIGN KEY (supersedes_feedback_id)
+                        REFERENCES translation_feedback(id),
+                    UNIQUE (manual_generation_id, segment_id),
+                    CHECK (stage IN ('translation', 'review')),
+                    CHECK (included IN (0, 1))
+                );
+
+                CREATE TABLE IF NOT EXISTS prompt_improvement_runs (
+                    id TEXT PRIMARY KEY,
+                    category_id TEXT NOT NULL,
+                    stage TEXT NOT NULL,
+                    base_revision_id TEXT NOT NULL,
+                    train_feedback_ids_json TEXT NOT NULL,
+                    holdout_feedback_ids_json TEXT NOT NULL,
+                    endpoint_contract TEXT NOT NULL,
+                    model_contract TEXT NOT NULL,
+                    proposed_prompt TEXT,
+                    evaluation_json TEXT,
+                    status TEXT NOT NULL,
+                    error TEXT,
+                    activated_revision_id TEXT,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    FOREIGN KEY (base_revision_id)
+                        REFERENCES prompt_revisions(id),
+                    FOREIGN KEY (activated_revision_id)
+                        REFERENCES prompt_revisions(id),
+                    CHECK (stage IN ('translation', 'review')),
+                    CHECK (status IN (
+                        'queued', 'running', 'ready', 'failed',
+                        'cancelled', 'rejected', 'activated'
+                    ))
+                );
+
                 CREATE TABLE IF NOT EXISTS subtitle_generations (
                     id TEXT PRIMARY KEY,
                     job_id TEXT NOT NULL,
@@ -978,6 +1065,14 @@ class JobStore:
                     ON translation_generations(job_id, generation_number DESC);
                 CREATE INDEX IF NOT EXISTS translation_items_generation_idx
                     ON translation_items(generation_id, segment_index);
+                CREATE INDEX IF NOT EXISTS translation_feedback_scope_idx
+                    ON translation_feedback(
+                        category_id, stage, included, created_at DESC
+                    );
+                CREATE INDEX IF NOT EXISTS prompt_improvement_runs_scope_idx
+                    ON prompt_improvement_runs(
+                        category_id, stage, created_at DESC
+                    );
                 CREATE INDEX IF NOT EXISTS subtitle_generations_job_idx
                     ON subtitle_generations(job_id, generation_number DESC);
                 """
@@ -1066,6 +1161,10 @@ class JobStore:
             "chunks_created": (
                 "ALTER TABLE jobs ADD COLUMN "
                 "chunks_created INTEGER NOT NULL DEFAULT 0"
+            ),
+            "is_test": (
+                "ALTER TABLE jobs ADD COLUMN "
+                "is_test INTEGER NOT NULL DEFAULT 0"
             ),
             "chunks_completed": (
                 "ALTER TABLE jobs ADD COLUMN "
@@ -1375,7 +1474,154 @@ class JobStore:
                     "builtin_translation_prompts_v4",
                     self._upgrade_builtin_translation_prompts,
                 ),
+                Migration(
+                    60,
+                    "test_job_flag_v1",
+                    self._migrate_test_job_flag,
+                ),
+                Migration(
+                    61,
+                    "transcriber_resource_groups_v1",
+                    self._migrate_transcriber_resource_groups,
+                ),
+                Migration(
+                    62,
+                    "translation_prompt_feedback_v1",
+                    self._migrate_translation_prompt_feedback,
+                ),
+                Migration(
+                    63,
+                    "builtin_transcriber_resource_group_v1",
+                    self._migrate_builtin_transcriber_resource_group,
+                ),
             ),
+        )
+
+    @staticmethod
+    def _migrate_transcriber_resource_groups(
+        connection: sqlite3.Connection,
+    ) -> None:
+        columns = {
+            str(row["name"])
+            for row in connection.execute(
+                "PRAGMA table_info(runtime_endpoints)"
+            ).fetchall()
+        }
+        if "resource_group_id" not in columns:
+            connection.execute(
+                "ALTER TABLE runtime_endpoints ADD COLUMN "
+                "resource_group_id TEXT NOT NULL DEFAULT 'local-gpu'"
+            )
+
+    @staticmethod
+    def _migrate_builtin_transcriber_resource_group(
+        connection: sqlite3.Connection,
+    ) -> None:
+        columns = {
+            str(row["name"])
+            for row in connection.execute(
+                "PRAGMA table_info(builtin_runtime_settings)"
+            ).fetchall()
+        }
+        if "resource_group_id" not in columns:
+            connection.execute(
+                "ALTER TABLE builtin_runtime_settings ADD COLUMN "
+                "resource_group_id TEXT NOT NULL DEFAULT 'local-gpu'"
+            )
+
+    @staticmethod
+    def _migrate_translation_prompt_feedback(
+        connection: sqlite3.Connection,
+    ) -> None:
+        execute_sql_statements(
+            connection,
+            """
+            CREATE TABLE IF NOT EXISTS translation_feedback (
+                id TEXT PRIMARY KEY,
+                job_id TEXT NOT NULL,
+                category_id TEXT NOT NULL,
+                base_revision_id TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                source_generation_id TEXT NOT NULL,
+                manual_generation_id TEXT NOT NULL,
+                segment_id TEXT NOT NULL,
+                source_text TEXT NOT NULL,
+                model_text TEXT NOT NULL,
+                edited_text TEXT NOT NULL,
+                context_json TEXT NOT NULL DEFAULT '{}',
+                included INTEGER NOT NULL DEFAULT 1,
+                supersedes_feedback_id TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                FOREIGN KEY (job_id) REFERENCES jobs(id),
+                FOREIGN KEY (base_revision_id) REFERENCES prompt_revisions(id),
+                FOREIGN KEY (source_generation_id)
+                    REFERENCES translation_generations(id),
+                FOREIGN KEY (manual_generation_id)
+                    REFERENCES translation_generations(id),
+                FOREIGN KEY (supersedes_feedback_id)
+                    REFERENCES translation_feedback(id),
+                UNIQUE (manual_generation_id, segment_id),
+                CHECK (stage IN ('translation', 'review')),
+                CHECK (included IN (0, 1))
+            );
+            CREATE TABLE IF NOT EXISTS prompt_improvement_runs (
+                id TEXT PRIMARY KEY,
+                category_id TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                base_revision_id TEXT NOT NULL,
+                train_feedback_ids_json TEXT NOT NULL,
+                holdout_feedback_ids_json TEXT NOT NULL,
+                endpoint_contract TEXT NOT NULL,
+                model_contract TEXT NOT NULL,
+                proposed_prompt TEXT,
+                evaluation_json TEXT,
+                status TEXT NOT NULL,
+                error TEXT,
+                activated_revision_id TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                FOREIGN KEY (base_revision_id) REFERENCES prompt_revisions(id),
+                FOREIGN KEY (activated_revision_id)
+                    REFERENCES prompt_revisions(id),
+                CHECK (stage IN ('translation', 'review')),
+                CHECK (status IN (
+                    'queued', 'running', 'ready', 'failed',
+                    'cancelled', 'rejected', 'activated'
+                ))
+            );
+            CREATE INDEX IF NOT EXISTS translation_feedback_scope_idx
+                ON translation_feedback(
+                    category_id, stage, included, created_at DESC
+                );
+            CREATE INDEX IF NOT EXISTS prompt_improvement_runs_scope_idx
+                ON prompt_improvement_runs(
+                    category_id, stage, created_at DESC
+                );
+            """,
+        )
+
+    @staticmethod
+    def _migrate_test_job_flag(connection: sqlite3.Connection) -> None:
+        columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(jobs)").fetchall()
+        }
+        if "is_test" not in columns:
+            connection.execute(
+                "ALTER TABLE jobs ADD COLUMN "
+                "is_test INTEGER NOT NULL DEFAULT 0"
+            )
+        connection.execute(
+            """
+            UPDATE jobs
+            SET is_test = 1
+            WHERE json_extract(options_json, '$.comparison_id') IS NOT NULL
+               OR json_extract(
+                    options_json,
+                    '$.comparison_transcript_source.comparison_id'
+               ) IS NOT NULL
+            """
         )
 
     @staticmethod
@@ -2026,6 +2272,7 @@ class JobStore:
               OR NEW.translation_chunks_completed < 0
               OR NEW.lease_token < 0
               OR NEW.force_overwrite NOT IN (0, 1)
+              OR NEW.is_test NOT IN (0, 1)
               OR NEW.translation_pause_requested NOT IN (0, 1)
               OR NEW.job_stop_requested NOT IN (0, 1)
             BEGIN
@@ -2038,7 +2285,8 @@ class JobStore:
                              chunks_total_estimate, chunk_progress_every,
                              translation_chunks_total,
                              translation_chunks_completed, lease_token,
-                             force_overwrite, translation_pause_requested,
+                             force_overwrite, is_test,
+                             translation_pause_requested,
                              job_stop_requested
             ON jobs
             WHEN NEW.operation NOT IN (
@@ -2083,6 +2331,7 @@ class JobStore:
               OR NEW.translation_chunks_completed < 0
               OR NEW.lease_token < 0
               OR NEW.force_overwrite NOT IN (0, 1)
+              OR NEW.is_test NOT IN (0, 1)
               OR NEW.translation_pause_requested NOT IN (0, 1)
               OR NEW.job_stop_requested NOT IN (0, 1)
             BEGIN
@@ -2612,6 +2861,470 @@ class JobStore:
             "created_at": float(row["created_at"]),
         }
 
+    def prompt_revision_by_id(
+        self,
+        revision_id: str,
+    ) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM prompt_revisions WHERE id = ?",
+                (revision_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "id": str(row["id"]),
+            "category_id": str(row["category_id"]),
+            "revision_number": int(row["revision_number"]),
+            "translation_prompt": str(row["translation_prompt"]),
+            "review_prompt": str(row["review_prompt"]),
+            "content_hash": str(row["content_hash"]),
+            "created_at": float(row["created_at"]),
+        }
+
+    @staticmethod
+    def _translation_feedback_from_row(row: sqlite3.Row) -> dict[str, Any]:
+        try:
+            context = json.loads(str(row["context_json"]))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            context = {}
+        return {
+            "id": str(row["id"]),
+            "job_id": str(row["job_id"]),
+            "category_id": str(row["category_id"]),
+            "base_revision_id": str(row["base_revision_id"]),
+            "stage": str(row["stage"]),
+            "source_generation_id": str(row["source_generation_id"]),
+            "manual_generation_id": str(row["manual_generation_id"]),
+            "segment_id": str(row["segment_id"]),
+            "source_text": str(row["source_text"]),
+            "model_text": str(row["model_text"]),
+            "edited_text": str(row["edited_text"]),
+            "context": context if isinstance(context, Mapping) else {},
+            "included": bool(row["included"]),
+            "supersedes_feedback_id": (
+                str(row["supersedes_feedback_id"])
+                if row["supersedes_feedback_id"] is not None
+                else None
+            ),
+            "created_at": float(row["created_at"]),
+            "updated_at": float(row["updated_at"]),
+        }
+
+    def record_translation_feedback(
+        self,
+        *,
+        job_id: str,
+        category_id: str,
+        base_revision_id: str,
+        stage: str,
+        source_generation_id: str,
+        manual_generation_id: str,
+        segment_id: str,
+        source_text: str,
+        model_text: str,
+        edited_text: str,
+        context: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        if stage not in {"translation", "review"}:
+            raise ValueError("invalid translation feedback stage")
+        if model_text == edited_text:
+            return None
+        now = time.time()
+        feedback_id = uuid4().hex
+        with self._connect() as connection:
+            existing = connection.execute(
+                """
+                SELECT * FROM translation_feedback
+                WHERE manual_generation_id = ? AND segment_id = ?
+                """,
+                (manual_generation_id, segment_id),
+            ).fetchone()
+            if existing is not None:
+                return self._translation_feedback_from_row(existing)
+            previous = connection.execute(
+                """
+                SELECT feedback.*
+                FROM translation_feedback AS feedback
+                WHERE feedback.job_id = ? AND feedback.segment_id = ?
+                  AND feedback.stage = ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM translation_feedback AS newer
+                      WHERE newer.supersedes_feedback_id = feedback.id
+                  )
+                ORDER BY feedback.created_at DESC
+                LIMIT 1
+                """,
+                (job_id, segment_id, stage),
+            ).fetchone()
+            supersedes = str(previous["id"]) if previous is not None else None
+            included = bool(previous["included"]) if previous is not None else True
+            if previous is not None:
+                category_id = str(previous["category_id"])
+                base_revision_id = str(previous["base_revision_id"])
+                source_generation_id = str(previous["source_generation_id"])
+                source_text = str(previous["source_text"])
+                model_text = str(previous["model_text"])
+            connection.execute(
+                """
+                INSERT INTO translation_feedback (
+                    id, job_id, category_id, base_revision_id, stage,
+                    source_generation_id, manual_generation_id, segment_id,
+                    source_text, model_text, edited_text, context_json,
+                    included, supersedes_feedback_id, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    feedback_id,
+                    job_id,
+                    category_id,
+                    base_revision_id,
+                    stage,
+                    source_generation_id,
+                    manual_generation_id,
+                    segment_id,
+                    source_text,
+                    model_text,
+                    edited_text,
+                    json.dumps(context, ensure_ascii=False, sort_keys=True),
+                    int(included),
+                    supersedes,
+                    now,
+                    now,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM translation_feedback WHERE id = ?",
+                (feedback_id,),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("translation feedback could not be read")
+        return self._translation_feedback_from_row(row)
+
+    def list_translation_feedback(
+        self,
+        *,
+        category_id: str | None = None,
+        stage: str | None = None,
+        included: bool | None = None,
+        current_only: bool = True,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        conditions: list[str] = []
+        parameters: list[Any] = []
+        if category_id is not None:
+            conditions.append("feedback.category_id = ?")
+            parameters.append(category_id)
+        if stage is not None:
+            conditions.append("feedback.stage = ?")
+            parameters.append(stage)
+        if included is not None:
+            conditions.append("feedback.included = ?")
+            parameters.append(int(included))
+        if current_only:
+            conditions.append(
+                "NOT EXISTS (SELECT 1 FROM translation_feedback AS newer "
+                "WHERE newer.supersedes_feedback_id = feedback.id)"
+            )
+        where = " WHERE " + " AND ".join(conditions) if conditions else ""
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT feedback.* FROM translation_feedback AS feedback"
+                + where
+                + " ORDER BY feedback.created_at DESC LIMIT ?",
+                (*parameters, max(1, min(limit, 1000))),
+            ).fetchall()
+        return [self._translation_feedback_from_row(row) for row in rows]
+
+    def set_translation_feedback_included(
+        self,
+        feedback_id: str,
+        *,
+        included: bool,
+    ) -> dict[str, Any]:
+        with self._connect() as connection:
+            result = connection.execute(
+                "UPDATE translation_feedback SET included = ?, updated_at = ? "
+                "WHERE id = ?",
+                (int(included), time.time(), feedback_id),
+            )
+            row = connection.execute(
+                "SELECT * FROM translation_feedback WHERE id = ?",
+                (feedback_id,),
+            ).fetchone()
+        if result.rowcount != 1 or row is None:
+            raise ValueError("번역 피드백을 찾을 수 없습니다.")
+        return self._translation_feedback_from_row(row)
+
+    @staticmethod
+    def _prompt_improvement_run_from_row(
+        row: sqlite3.Row,
+    ) -> dict[str, Any]:
+        def decoded(name: str, default: Any) -> Any:
+            value = row[name]
+            if value is None:
+                return default
+            try:
+                return json.loads(str(value))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return default
+
+        return {
+            "id": str(row["id"]),
+            "category_id": str(row["category_id"]),
+            "stage": str(row["stage"]),
+            "base_revision_id": str(row["base_revision_id"]),
+            "train_feedback_ids": decoded("train_feedback_ids_json", []),
+            "holdout_feedback_ids": decoded("holdout_feedback_ids_json", []),
+            "endpoint_contract": str(row["endpoint_contract"]),
+            "model_contract": str(row["model_contract"]),
+            "proposed_prompt": row["proposed_prompt"],
+            "evaluation": decoded("evaluation_json", None),
+            "status": str(row["status"]),
+            "error": row["error"],
+            "activated_revision_id": row["activated_revision_id"],
+            "created_at": float(row["created_at"]),
+            "updated_at": float(row["updated_at"]),
+        }
+
+    def create_prompt_improvement_run(
+        self,
+        *,
+        category_id: str,
+        stage: str,
+        base_revision_id: str,
+        train_feedback_ids: Sequence[str],
+        holdout_feedback_ids: Sequence[str],
+        endpoint_contract: str,
+        model_contract: str,
+    ) -> dict[str, Any]:
+        if stage not in {"translation", "review"}:
+            raise ValueError("invalid prompt improvement stage")
+        run_id = uuid4().hex
+        now = time.time()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO prompt_improvement_runs (
+                    id, category_id, stage, base_revision_id,
+                    train_feedback_ids_json, holdout_feedback_ids_json,
+                    endpoint_contract, model_contract, status,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
+                """,
+                (
+                    run_id,
+                    category_id,
+                    stage,
+                    base_revision_id,
+                    json.dumps(list(train_feedback_ids)),
+                    json.dumps(list(holdout_feedback_ids)),
+                    endpoint_contract,
+                    model_contract,
+                    now,
+                    now,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM prompt_improvement_runs WHERE id = ?",
+                (run_id,),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("prompt improvement run could not be read")
+        return self._prompt_improvement_run_from_row(row)
+
+    def get_prompt_improvement_run(
+        self,
+        run_id: str,
+    ) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM prompt_improvement_runs WHERE id = ?",
+                (run_id,),
+            ).fetchone()
+        return self._prompt_improvement_run_from_row(row) if row else None
+
+    def list_prompt_improvement_runs(
+        self,
+        *,
+        category_id: str | None = None,
+        stage: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        conditions: list[str] = []
+        parameters: list[Any] = []
+        if category_id is not None:
+            conditions.append("category_id = ?")
+            parameters.append(category_id)
+        if stage is not None:
+            conditions.append("stage = ?")
+            parameters.append(stage)
+        where = " WHERE " + " AND ".join(conditions) if conditions else ""
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM prompt_improvement_runs"
+                + where
+                + " ORDER BY created_at DESC LIMIT ?",
+                (*parameters, max(1, min(limit, 1000))),
+            ).fetchall()
+        return [self._prompt_improvement_run_from_row(row) for row in rows]
+
+    def claim_prompt_improvement_run(self, run_id: str) -> bool:
+        with self._connect() as connection:
+            result = connection.execute(
+                "UPDATE prompt_improvement_runs SET status = 'running', "
+                "updated_at = ? WHERE id = ? AND status = 'queued'",
+                (time.time(), run_id),
+            )
+        return result.rowcount == 1
+
+    def complete_prompt_improvement_run(
+        self,
+        run_id: str,
+        *,
+        proposed_prompt: str,
+        evaluation: Mapping[str, Any],
+    ) -> bool:
+        with self._connect() as connection:
+            result = connection.execute(
+                """
+                UPDATE prompt_improvement_runs
+                SET status = 'ready', proposed_prompt = ?,
+                    evaluation_json = ?, error = NULL, updated_at = ?
+                WHERE id = ? AND status = 'running'
+                """,
+                (
+                    proposed_prompt,
+                    json.dumps(evaluation, ensure_ascii=False, sort_keys=True),
+                    time.time(),
+                    run_id,
+                ),
+            )
+        return result.rowcount == 1
+
+    def fail_prompt_improvement_run(self, run_id: str, error: str) -> bool:
+        with self._connect() as connection:
+            result = connection.execute(
+                "UPDATE prompt_improvement_runs SET status = 'failed', "
+                "error = ?, updated_at = ? "
+                "WHERE id = ? AND status = 'running'",
+                (error[:2000], time.time(), run_id),
+            )
+        return result.rowcount == 1
+
+    def set_prompt_improvement_run_status(
+        self,
+        run_id: str,
+        *,
+        from_statuses: Collection[str],
+        status: str,
+    ) -> dict[str, Any]:
+        placeholders = ", ".join("?" for _ in from_statuses)
+        with self._connect() as connection:
+            result = connection.execute(
+                "UPDATE prompt_improvement_runs SET status = ?, updated_at = ? "
+                f"WHERE id = ? AND status IN ({placeholders})",
+                (status, time.time(), run_id, *from_statuses),
+            )
+        if result.rowcount != 1:
+            raise ValueError("프롬프트 개선 작업 상태를 변경할 수 없습니다.")
+        run = self.get_prompt_improvement_run(run_id)
+        if run is None:
+            raise RuntimeError("prompt improvement run could not be read")
+        return run
+
+    def activate_prompt_improvement_run(
+        self,
+        run_id: str,
+    ) -> tuple[PromptCategory, dict[str, Any]]:
+        now = time.time()
+        with self._connect() as connection:
+            run = connection.execute(
+                "SELECT * FROM prompt_improvement_runs WHERE id = ?",
+                (run_id,),
+            ).fetchone()
+            if run is None or str(run["status"]) != "ready":
+                raise ValueError("승인 가능한 프롬프트 개선안이 아닙니다.")
+            category = connection.execute(
+                "SELECT * FROM prompt_categories WHERE id = ?",
+                (str(run["category_id"]),),
+            ).fetchone()
+            if category is None:
+                raise ValueError("프롬프트 카테고리를 찾을 수 없습니다.")
+            if str(category["active_revision_id"]) != str(
+                run["base_revision_id"]
+            ):
+                raise ValueError(
+                    "기준 프롬프트가 변경되어 이 개선안을 승인할 수 없습니다."
+                )
+            proposed_prompt = str(run["proposed_prompt"] or "").strip()
+            if not proposed_prompt or len(proposed_prompt) > PROMPT_TEXT_MAX_LENGTH:
+                raise ValueError("개선 프롬프트 내용이 올바르지 않습니다.")
+            latest = connection.execute(
+                "SELECT COALESCE(MAX(revision_number), 0) AS latest "
+                "FROM prompt_revisions WHERE category_id = ?",
+                (str(run["category_id"]),),
+            ).fetchone()
+            revision_id = uuid4().hex
+            translation_prompt = str(category["translation_prompt"])
+            review_prompt = str(category["review_prompt"])
+            if str(run["stage"]) == "translation":
+                translation_prompt = proposed_prompt
+            else:
+                review_prompt = proposed_prompt
+            content_hash = _canonical_json_hash(
+                {
+                    "translation_prompt": translation_prompt,
+                    "review_prompt": review_prompt,
+                }
+            )
+            connection.execute(
+                """
+                INSERT INTO prompt_revisions (
+                    id, category_id, revision_number,
+                    translation_prompt, review_prompt, content_hash, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    revision_id,
+                    str(run["category_id"]),
+                    int(latest["latest"]) + 1,
+                    translation_prompt,
+                    review_prompt,
+                    content_hash,
+                    now,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE prompt_categories
+                SET translation_prompt = ?, review_prompt = ?,
+                    active_revision_id = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    translation_prompt,
+                    review_prompt,
+                    revision_id,
+                    now,
+                    str(run["category_id"]),
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE prompt_improvement_runs
+                SET status = 'activated', activated_revision_id = ?,
+                    updated_at = ?
+                WHERE id = ? AND status = 'ready'
+                """,
+                (revision_id, now, run_id),
+            )
+        category_result = self.get_prompt_category(str(run["category_id"]))
+        run_result = self.get_prompt_improvement_run(run_id)
+        if category_result is None or run_result is None:
+            raise RuntimeError("activated prompt revision could not be read")
+        return category_result, run_result
+
     def set_prompt_category_archived(
         self,
         category_id: str,
@@ -2760,6 +3473,7 @@ class JobStore:
             token=str(row["token"]),
             enabled=bool(row["enabled"]),
             capacity=int(row["capacity"]),
+            resource_group_id=str(row["resource_group_id"]),
             created_at=float(row["created_at"]),
             updated_at=float(row["updated_at"]),
         )
@@ -2791,6 +3505,7 @@ class JobStore:
         token: str,
         enabled: bool,
         capacity: int,
+        resource_group_id: str = "local-gpu",
     ) -> RuntimeEndpoint:
         runtime_id = uuid4().hex
         now = time.time()
@@ -2800,8 +3515,8 @@ class JobStore:
                     """
                     INSERT INTO runtime_endpoints (
                         id, name, base_url, token, enabled, capacity,
-                        created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        resource_group_id, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         runtime_id,
@@ -2810,15 +3525,16 @@ class JobStore:
                         token,
                         int(enabled),
                         capacity,
+                        resource_group_id,
                         now,
                         now,
                     ),
                 )
         except sqlite3.IntegrityError as error:
-            raise ValueError("같은 주소의 Runtime이 이미 등록되어 있습니다.") from error
+            raise ValueError("같은 주소의 전사 서버가 이미 등록되어 있습니다.") from error
         created = self.get_runtime_endpoint(runtime_id)
         if created is None:
-            raise RuntimeError("created Runtime endpoint could not be read")
+            raise RuntimeError("created Transcriber endpoint could not be read")
         return created
 
     def update_runtime_endpoint(
@@ -2830,6 +3546,7 @@ class JobStore:
         token: str,
         enabled: bool,
         capacity: int,
+        resource_group_id: str = "local-gpu",
     ) -> RuntimeEndpoint:
         try:
             with self._connect() as connection:
@@ -2837,7 +3554,7 @@ class JobStore:
                     """
                     UPDATE runtime_endpoints
                     SET name = ?, base_url = ?, token = ?, enabled = ?,
-                        capacity = ?, updated_at = ?
+                        capacity = ?, resource_group_id = ?, updated_at = ?
                     WHERE id = ?
                     """,
                     (
@@ -2846,17 +3563,18 @@ class JobStore:
                         token,
                         int(enabled),
                         capacity,
+                        resource_group_id,
                         time.time(),
                         runtime_id,
                     ),
                 )
         except sqlite3.IntegrityError as error:
-            raise ValueError("같은 주소의 Runtime이 이미 등록되어 있습니다.") from error
+            raise ValueError("같은 주소의 전사 서버가 이미 등록되어 있습니다.") from error
         if result.rowcount != 1:
-            raise ValueError("Runtime을 찾을 수 없습니다.")
+            raise ValueError("전사 서버를 찾을 수 없습니다.")
         updated = self.get_runtime_endpoint(runtime_id)
         if updated is None:
-            raise RuntimeError("updated Runtime endpoint could not be read")
+            raise RuntimeError("updated Transcriber endpoint could not be read")
         return updated
 
     def delete_runtime_endpoint(self, runtime_id: str) -> None:
@@ -2870,7 +3588,7 @@ class JobStore:
                 (runtime_id,),
             )
         if result.rowcount != 1:
-            raise ValueError("Runtime을 찾을 수 없습니다.")
+            raise ValueError("전사 서버를 찾을 수 없습니다.")
 
     def runtime_batch_settings(self) -> dict[str, dict[str, int | None]]:
         with self._connect() as connection:
@@ -2962,7 +3680,7 @@ class JobStore:
         with self._connect() as connection:
             row = connection.execute(
                 """
-                SELECT stt_base_url, stt_token
+                SELECT stt_base_url, stt_token, resource_group_id
                 FROM builtin_runtime_settings
                 WHERE id = 1
                 """
@@ -2972,6 +3690,7 @@ class JobStore:
         return {
             "stt_base_url": str(row["stt_base_url"]),
             "stt_token": str(row["stt_token"]),
+            "resource_group_id": str(row["resource_group_id"]),
         }
 
     def get_dependency_state(self, dependency: str) -> dict[str, Any] | None:
@@ -3040,21 +3759,25 @@ class JobStore:
         *,
         stt_base_url: str,
         stt_token: str,
+        resource_group_id: str = "local-gpu",
     ) -> None:
         with self._connect() as connection:
             connection.execute(
                 """
                 INSERT INTO builtin_runtime_settings (
-                    id, stt_base_url, stt_token, updated_at
-                ) VALUES (1, ?, ?, ?)
+                    id, stt_base_url, stt_token,
+                    resource_group_id, updated_at
+                ) VALUES (1, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     stt_base_url = excluded.stt_base_url,
                     stt_token = excluded.stt_token,
+                    resource_group_id = excluded.resource_group_id,
                     updated_at = excluded.updated_at
                 """,
                 (
                     stt_base_url,
                     stt_token,
+                    resource_group_id,
                     time.time(),
                 ),
             )
@@ -3231,6 +3954,7 @@ class JobStore:
             source_rel=str(row["source_rel"]),
             status=str(row["status"]),
             force_overwrite=bool(row["force_overwrite"]),
+            is_test=bool(row["is_test"]),
             operation=str(row["operation"]),
             phase=str(row["phase"]),
             state=str(row["state"]),
@@ -3308,6 +4032,7 @@ class JobStore:
         job_id: str,
         source_rel: str,
         force_overwrite: bool,
+        is_test: bool = False,
         options: Mapping[str, Any],
         operation: str = "full",
         status: str = "queued",
@@ -3341,14 +4066,14 @@ class JobStore:
             connection.execute(
                 """
                 INSERT INTO jobs (
-                    id, source_rel, status, force_overwrite, operation,
+                    id, source_rel, status, force_overwrite, is_test, operation,
                     phase, state, reason_code, attempt,
                     options_json, audio_path, audio_sha256, audio_revision_id,
                     transcript_path, transcript_revision_id,
                     chunks_total_estimate,
                     created_at, status_updated_at, updated_at
                 ) VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 )
                 """,
                 (
@@ -3356,6 +4081,7 @@ class JobStore:
                     source_rel,
                     status,
                     int(force_overwrite),
+                    int(is_test),
                     operation,
                     projected.phase.value,
                     projected.state.value,
@@ -4320,6 +5046,24 @@ class JobStore:
                     (job_id,),
                 ).fetchall()
             ]
+            feedback_ids = [
+                str(row["id"])
+                for row in connection.execute(
+                    "SELECT id FROM translation_feedback WHERE job_id = ?",
+                    (job_id,),
+                ).fetchall()
+            ]
+            if feedback_ids:
+                placeholders = ", ".join("?" for _ in feedback_ids)
+                connection.execute(
+                    "UPDATE translation_feedback SET supersedes_feedback_id = NULL "
+                    f"WHERE supersedes_feedback_id IN ({placeholders})",
+                    feedback_ids,
+                )
+                connection.execute(
+                    f"DELETE FROM translation_feedback WHERE id IN ({placeholders})",
+                    feedback_ids,
+                )
             connection.execute(
                 """
                 DELETE FROM subtitle_publications
@@ -5245,6 +5989,30 @@ class JobStore:
             ).fetchall()
         return [self._subtitle_generation_from_row(row) for row in rows]
 
+    def list_subtitle_generations_for_source(
+        self,
+        source_rel: str,
+    ) -> list[dict[str, Any]]:
+        """Return every rendered subtitle generation for one media source."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT generation.*,
+                       publication.subtitle_generation_id IS NOT NULL
+                           AS is_published
+                FROM subtitle_generations AS generation
+                JOIN jobs AS job ON job.id = generation.job_id
+                LEFT JOIN subtitle_publications AS publication
+                  ON publication.subtitle_generation_id = generation.id
+                WHERE job.source_rel = ?
+                ORDER BY generation.created_at DESC,
+                         generation.generation_number DESC,
+                         generation.id DESC
+                """,
+                (source_rel,),
+            ).fetchall()
+        return [self._subtitle_generation_from_row(row) for row in rows]
+
     def published_subtitle_generation(
         self,
         job_id: str,
@@ -6001,7 +6769,7 @@ class JobStore:
                                 str(runtime_row["name"])
                                 if runtime_row is not None
                                 else (
-                                    "기본 Runtime"
+                                    "기본 전사 서버"
                                     if str(runtime_id) == "builtin"
                                     else str(runtime_id)
                                 )
@@ -6320,7 +7088,7 @@ class JobStore:
                 (resolved_start, resolved_end),
             ).fetchall()
             runtime_names = {
-                "builtin": "기본 Runtime",
+                "builtin": "기본 전사 서버",
                 **{
                     str(row["id"]): str(row["name"])
                     for row in connection.execute(

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "stt-to-subtitle"
-version = "5.0.0"
+version = "6.0.0"
 description = "Distributed local transcription, translation, and styled subtitle pipeline"
 readme = "README.md"
 requires-python = ">=3.11,<3.12"
@@ -13,8 +13,9 @@ dependencies = []
 [project.scripts]
 stt-transcribe = "stt_to_subtitle.cli:main"
 stt-backend = "stt_to_subtitle.backend_api:main"
+# Primary endpoint name; the two older names remain CLI compatibility aliases.
+stt-transcriber = "stt_to_subtitle.runtime_api:main"
 stt-runtime = "stt_to_subtitle.runtime_api:main"
-# Compatibility alias for exported host runtimes and existing operators.
 stt-api = "stt_to_subtitle.runtime_api:main"
 stt-check-migrations = "stt_to_subtitle.migration_check:main"
 

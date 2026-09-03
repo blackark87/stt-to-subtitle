@@ -24,6 +24,65 @@ from .backend_config import group_multipart_media
 router = APIRouter(prefix="/api/v1/media")
 
 
+def _decorate_subtitle_provenance(
+    service: Any,
+    listing: dict[str, object],
+) -> dict[str, object]:
+    """Attach system-subtitle ownership without treating sidecars as jobs."""
+    publications = {
+        str(item["source_rel"]): item
+        for item in service.store.list_subtitle_publications()
+    }
+    completed_jobs = service.store.latest_completed_subtitle_jobs()
+    files: list[dict[str, object]] = []
+    for raw_media in listing.get("files", ()):
+        if not isinstance(raw_media, dict):
+            continue
+        media = dict(raw_media)
+        raw_paths = media.get("paths")
+        source_paths = (
+            [str(path) for path in raw_paths]
+            if isinstance(raw_paths, list)
+            else [str(media.get("path", ""))]
+        )
+        candidates: list[tuple[float, str]] = []
+        for source_rel in source_paths:
+            publication = publications.get(source_rel)
+            if publication is not None:
+                candidates.append(
+                    (
+                        float(
+                            publication.get("published_at")
+                            or publication.get("created_at")
+                            or 0
+                        ),
+                        str(publication["job_id"]),
+                    )
+                )
+                continue
+            legacy_job = completed_jobs.get(source_rel)
+            if legacy_job is not None:
+                candidates.append(
+                    (
+                        float(legacy_job.updated_at),
+                        str(legacy_job.id),
+                    )
+                )
+        has_localized_subtitle = bool(media.get("has_subtitle"))
+        has_system_subtitle = has_localized_subtitle and bool(candidates)
+        media["has_system_subtitle"] = has_system_subtitle
+        media["has_untracked_subtitle"] = (
+            has_localized_subtitle and not candidates
+        )
+        media["latest_subtitle_job_id"] = (
+            max(candidates)[1]
+            if has_system_subtitle
+            else None
+        )
+        files.append(media)
+    return {**listing, "files": files}
+
+
 @router.get("")
 def browse_media(
     request: Request,
@@ -67,6 +126,7 @@ def browse_media(
         )
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
+    listing = _decorate_subtitle_provenance(service, listing)
     return public_value(listing)
 
 

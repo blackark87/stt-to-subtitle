@@ -25,6 +25,7 @@ class ServicePackageBoundaryTests(unittest.TestCase):
             self.assertIn("backend_api", selected)
             self.assertIn("translation_routing", selected)
             self.assertIn("translation_store", selected)
+            self.assertIn("storage_migration", selected)
             for module in (
                 "web_app",
                 "runtime_api",
@@ -49,8 +50,13 @@ class ServicePackageBoundaryTests(unittest.TestCase):
             )
 
             self.assertIn("runtime_api", selected)
+            self.assertIn("owsm_audit_worker", selected)
             self.assertIn("speaker_worker", selected)
+            self.assertIn("stable_ts_worker", selected)
+            self.assertTrue((destination / "owsm_audit_worker.py").is_file())
+            self.assertFalse((destination / "candidate_asr_worker.py").exists())
             self.assertTrue((destination / "speaker_worker.py").is_file())
+            self.assertTrue((destination / "stable_ts_worker.py").is_file())
             for module in (
                 "web_app",
                 "backend_api",

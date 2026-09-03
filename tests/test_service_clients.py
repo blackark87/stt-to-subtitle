@@ -9,6 +9,7 @@ from unittest.mock import Mock, patch
 
 from stt_to_subtitle.service_clients import (
     ExternalServiceError,
+    ExternalStructuredCompletionClient,
     LMStudioClient,
     OpenAICompatibleClient,
     OperationStopped,
@@ -119,6 +120,109 @@ class AuthenticationHeaderTests(unittest.TestCase):
             )
         )
         unavailable.close.assert_called_once()
+
+
+class ExternalStructuredCompletionClientTests(unittest.TestCase):
+    def test_uses_the_explicit_external_model_for_openai_compatible_request(
+        self,
+    ) -> None:
+        response = Mock(status_code=200)
+        response.json.return_value = {
+            "choices": [
+                {
+                    "message": {"content": '{"value":"generated"}'},
+                    "finish_reason": "stop",
+                }
+            ]
+        }
+        client = ExternalStructuredCompletionClient(
+            provider="nvidia_build",
+            base_url="https://integrate.api.nvidia.com/v1",
+            credential="secret",
+            model="nvidia/model",
+        )
+
+        with patch.object(
+            RetryingJSONClient,
+            "request",
+            return_value=response,
+        ) as request:
+            result = client.complete(
+                {
+                    "temperature": 0,
+                    "max_tokens": 1024,
+                    "messages": [{"role": "user", "content": "input"}],
+                    "response_format": {
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "sample",
+                            "strict": True,
+                            "schema": {"type": "object"},
+                        },
+                    },
+                }
+            )
+
+        self.assertEqual(result, {"value": "generated"})
+        self.assertEqual(
+            request.call_args.args[1],
+            "https://integrate.api.nvidia.com/v1/chat/completions",
+        )
+        sent = request.call_args.kwargs["json"]
+        self.assertEqual(sent["model"], "nvidia/model")
+        self.assertNotIn("credential", sent)
+        response.close.assert_called_once()
+
+    def test_converts_the_structured_request_for_bedrock_converse(self) -> None:
+        response = Mock(status_code=200)
+        response.json.return_value = {
+            "output": {
+                "message": {
+                    "content": [{"text": '{"value":"generated"}'}]
+                }
+            }
+        }
+        client = ExternalStructuredCompletionClient(
+            provider="bedrock",
+            base_url="",
+            credential="secret",
+            model="provider/model",
+            region="ap-northeast-2",
+        )
+        payload = {
+            "temperature": 0,
+            "max_tokens": 1024,
+            "messages": [
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": "input"},
+            ],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "sample",
+                    "strict": True,
+                    "schema": {"type": "object"},
+                },
+            },
+        }
+
+        with patch.object(
+            RetryingJSONClient,
+            "request",
+            return_value=response,
+        ) as request:
+            result = client.complete(payload)
+
+        self.assertEqual(result, {"value": "generated"})
+        self.assertIn(
+            "/model/provider%2Fmodel/converse",
+            request.call_args.args[1],
+        )
+        self.assertEqual(
+            request.call_args.kwargs["json"]["system"],
+            [{"text": "system"}],
+        )
+        response.close.assert_called_once()
 
 
 class OpenAICompatibleModelTests(unittest.TestCase):

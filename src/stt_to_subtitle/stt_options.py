@@ -15,11 +15,23 @@ WHISPERX_MIN_BATCH_SIZE = 1
 WHISPERX_MAX_BATCH_SIZE = 64
 DEFAULT_SUBTITLE_SEGMENTATION = {
     "split_on_speaker_change": True,
+    "split_on_parent_change": False,
     "max_gap_sec": 0.8,
     "max_duration_sec": 8.0,
     "max_chars": 36,
     "prefer_punctuation_boundary": True,
+    "punctuation_boundary_mode": "all",
 }
+HYBRID_STABLE_SUBTITLE_SEGMENTATION = {
+    "split_on_speaker_change": False,
+    "split_on_parent_change": True,
+    "max_gap_sec": 1.5,
+    "max_duration_sec": 8.0,
+    "max_chars": 80,
+    "prefer_punctuation_boundary": True,
+    "punctuation_boundary_mode": "sentence",
+}
+PUNCTUATION_BOUNDARY_MODES = {"all", "sentence", "none"}
 
 WHISPERJAV_RECIPE = "whisperjav-domain-ensemble-v1"
 DEFAULT_ANIME_MAX_GROUP_SECONDS = 2.0
@@ -83,10 +95,12 @@ class WhisperXSegmentationOptions:
     """Configurable word-level subtitle boundaries."""
 
     split_on_speaker_change: bool = True
+    split_on_parent_change: bool = False
     max_gap_sec: float | None = None
     max_duration_sec: float | None = None
     max_chars: int | None = None
     prefer_punctuation_boundary: bool = True
+    punctuation_boundary_mode: str = "all"
 
     @classmethod
     def from_options(
@@ -95,17 +109,20 @@ class WhisperXSegmentationOptions:
         *,
         defaults: Mapping[str, Any] | None = None,
     ) -> WhisperXSegmentationOptions:
-        raw = options.get("subtitle_segmentation", {})
-        if not isinstance(raw, Mapping):
+        provided = options.get("subtitle_segmentation", {})
+        if not isinstance(provided, Mapping):
             raise ValueError("subtitle_segmentation must be a JSON object")
+        raw = dict(provided)
         if defaults is not None:
             raw = {**defaults, **raw}
         allowed = {
             "split_on_speaker_change",
+            "split_on_parent_change",
             "max_gap_sec",
             "max_duration_sec",
             "max_chars",
             "prefer_punctuation_boundary",
+            "punctuation_boundary_mode",
         }
         unknown = set(raw) - allowed
         if unknown:
@@ -126,17 +143,45 @@ class WhisperXSegmentationOptions:
         max_chars = int(max_chars_value) if max_chars_value is not None else None
         if max_chars is not None and max_chars < 1:
             raise ValueError("max_chars must be positive or null")
-        for name in ("split_on_speaker_change", "prefer_punctuation_boundary"):
+        for name in (
+            "split_on_speaker_change",
+            "split_on_parent_change",
+            "prefer_punctuation_boundary",
+        ):
             if name in raw and not isinstance(raw[name], bool):
                 raise ValueError(f"{name} must be a JSON boolean")
+        prefer_punctuation = raw.get("prefer_punctuation_boundary", True)
+        raw_punctuation_mode = provided.get("punctuation_boundary_mode")
+        if raw_punctuation_mode is not None:
+            punctuation_mode = str(raw_punctuation_mode).strip().lower()
+        elif "prefer_punctuation_boundary" in provided:
+            punctuation_mode = "all" if prefer_punctuation else "none"
+        else:
+            punctuation_mode = str(
+                raw.get("punctuation_boundary_mode", "all")
+            )
+        if punctuation_mode not in PUNCTUATION_BOUNDARY_MODES:
+            raise ValueError(
+                "punctuation_boundary_mode must be one of "
+                f"{sorted(PUNCTUATION_BOUNDARY_MODES)}"
+            )
+        if (
+            "prefer_punctuation_boundary" in provided
+            and "punctuation_boundary_mode" in provided
+            and prefer_punctuation != (punctuation_mode != "none")
+        ):
+            raise ValueError(
+                "prefer_punctuation_boundary conflicts with "
+                "punctuation_boundary_mode"
+            )
         return cls(
             split_on_speaker_change=raw.get("split_on_speaker_change", True),
+            split_on_parent_change=raw.get("split_on_parent_change", False),
             max_gap_sec=optional_float("max_gap_sec"),
             max_duration_sec=optional_float("max_duration_sec"),
             max_chars=max_chars,
-            prefer_punctuation_boundary=raw.get(
-                "prefer_punctuation_boundary", True
-            ),
+            prefer_punctuation_boundary=punctuation_mode != "none",
+            punctuation_boundary_mode=punctuation_mode,
         )
 
 
@@ -207,6 +252,7 @@ class HybridRescueOptions:
     kotoba_chunk_length_seconds: int = 15
     whisperx_chunk_length_seconds: int = 30
     rescue_scope: str = "windows"
+    stable_ts_regroup_enabled: bool = True
 
     @classmethod
     def from_options(cls, options: Mapping[str, Any]) -> HybridRescueOptions:
@@ -223,6 +269,7 @@ class HybridRescueOptions:
             "kotoba_chunk_length_seconds",
             "whisperx_chunk_length_seconds",
             "rescue_scope",
+            "stable_ts_regroup_enabled",
         }
         unknown = set(raw) - allowed
         if unknown:
@@ -243,6 +290,14 @@ class HybridRescueOptions:
             return value
 
         defaults = cls()
+        stable_ts_regroup_enabled = raw.get(
+            "stable_ts_regroup_enabled",
+            defaults.stable_ts_regroup_enabled,
+        )
+        if not isinstance(stable_ts_regroup_enabled, bool):
+            raise ValueError(
+                "stable_ts_regroup_enabled must be a JSON boolean"
+            )
         normalized = cls(
             window_padding_sec=positive_float(
                 "window_padding_sec", defaults.window_padding_sec
@@ -275,6 +330,7 @@ class HybridRescueOptions:
                 defaults.whisperx_chunk_length_seconds,
             ),
             rescue_scope=str(raw.get("rescue_scope", defaults.rescue_scope)),
+            stable_ts_regroup_enabled=stable_ts_regroup_enabled,
         )
         if normalized.rescue_scope not in RESCUE_SCOPES:
             raise ValueError(
@@ -289,3 +345,67 @@ class HybridRescueOptions:
                 f"{WHISPERX_MAX_CHUNK_LENGTH_SECONDS}"
             )
         return normalized
+
+
+@dataclass(frozen=True)
+class OWSMAuditOptions:
+    """Thresholds for finding clean WhisperX omissions with OWSM."""
+
+    window_seconds: float = 30.0
+    overlap_seconds: float = 5.0
+    minimum_extra_characters: int = 20
+    minimum_length_ratio: float = 1.35
+
+    @classmethod
+    def from_options(cls, options: Mapping[str, Any]) -> OWSMAuditOptions:
+        raw = options.get("owsm_audit", {})
+        if not isinstance(raw, Mapping):
+            raise ValueError("owsm_audit must be a JSON object")
+        allowed = {
+            "window_seconds",
+            "overlap_seconds",
+            "minimum_extra_characters",
+            "minimum_length_ratio",
+        }
+        unknown = set(raw) - allowed
+        if unknown:
+            raise ValueError(
+                f"unsupported owsm_audit options: {sorted(unknown)}"
+            )
+        defaults = cls()
+        window_seconds = float(
+            raw.get("window_seconds", defaults.window_seconds)
+        )
+        overlap_seconds = float(
+            raw.get("overlap_seconds", defaults.overlap_seconds)
+        )
+        minimum_extra_characters = int(
+            raw.get(
+                "minimum_extra_characters",
+                defaults.minimum_extra_characters,
+            )
+        )
+        minimum_length_ratio = float(
+            raw.get("minimum_length_ratio", defaults.minimum_length_ratio)
+        )
+        if not isfinite(window_seconds) or window_seconds <= 0:
+            raise ValueError("window_seconds must be positive")
+        if (
+            not isfinite(overlap_seconds)
+            or overlap_seconds < 0
+            or overlap_seconds >= window_seconds
+        ):
+            raise ValueError(
+                "overlap_seconds must be non-negative and smaller than "
+                "window_seconds"
+            )
+        if minimum_extra_characters < 1:
+            raise ValueError("minimum_extra_characters must be positive")
+        if not isfinite(minimum_length_ratio) or minimum_length_ratio <= 1:
+            raise ValueError("minimum_length_ratio must be greater than 1")
+        return cls(
+            window_seconds=window_seconds,
+            overlap_seconds=overlap_seconds,
+            minimum_extra_characters=minimum_extra_characters,
+            minimum_length_ratio=minimum_length_ratio,
+        )

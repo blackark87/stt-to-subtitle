@@ -324,6 +324,62 @@ class TranscriptionStoreTests(unittest.TestCase):
 
 
 class JobStoreTests(unittest.TestCase):
+    def test_persists_and_updates_test_job_flag(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = JobStore(Path(directory) / "jobs.sqlite3")
+            created = store.create(
+                job_id="comparison-job",
+                source_rel="movie.mkv",
+                force_overwrite=False,
+                is_test=True,
+                options={"comparison_id": "comparison-1"},
+            )
+
+            self.assertTrue(created.is_test)
+            self.assertTrue(store.get(created.id).is_test)
+
+            store.update(created.id, is_test=False)
+
+            self.assertFalse(store.get(created.id).is_test)
+
+    def test_backfills_test_flag_for_existing_comparison_jobs(self) -> None:
+        with TemporaryDirectory() as directory:
+            database_path = Path(directory) / "jobs.sqlite3"
+            store = JobStore(database_path)
+            regular = store.create(
+                job_id="regular-job",
+                source_rel="regular.mkv",
+                force_overwrite=False,
+                options={},
+            )
+            comparison = store.create(
+                job_id="comparison-job",
+                source_rel="comparison.mkv",
+                force_overwrite=False,
+                options={"comparison_id": "comparison-1"},
+            )
+            translation = store.create(
+                job_id="comparison-translation",
+                source_rel="comparison.mkv",
+                force_overwrite=False,
+                options={
+                    "comparison_transcript_source": {
+                        "comparison_id": "comparison-1",
+                    }
+                },
+            )
+            with store._connect() as connection:
+                connection.execute(
+                    "UPDATE jobs SET is_test = 0 WHERE id IN (?, ?, ?)",
+                    (regular.id, comparison.id, translation.id),
+                )
+                JobStore._migrate_test_job_flag(connection)
+                JobStore._migrate_test_job_flag(connection)
+
+            self.assertFalse(store.get(regular.id).is_test)
+            self.assertTrue(store.get(comparison.id).is_test)
+            self.assertTrue(store.get(translation.id).is_test)
+
     def test_normalizes_media_duration_to_nearest_fifteen_minutes(self) -> None:
         self.assertEqual(media_duration_bucket_minutes(14 * 60), 15)
         self.assertEqual(media_duration_bucket_minutes(16 * 60), 15)
@@ -545,13 +601,14 @@ class JobStoreTests(unittest.TestCase):
             changed = store.rebase_artifact_paths(
                 previous_root=Path("/var/lib/stt/jobs"),
                 current_root=Path("/var/lib/stt-work"),
+                current_audio_root=Path("/var/lib/stt-audio"),
             )
 
             rebased = store.get(job.id)
             self.assertEqual(changed, 3)
             self.assertEqual(
                 rebased.audio_path,
-                "/var/lib/stt-work/job-1/audio.16k.wav",
+                "/var/lib/stt-audio/job-1/audio.16k.wav",
             )
             self.assertEqual(
                 rebased.transcript_path,
@@ -954,8 +1011,8 @@ class JobStoreTests(unittest.TestCase):
             self.assertEqual(
                 snapshot["database"]["migrations"],
                 {
-                    "applied_count": 15,
-                    "latest_sequence": 59,
+                    "applied_count": 19,
+                    "latest_sequence": 63,
                     "unsequenced_count": 0,
                 },
             )
@@ -1822,6 +1879,7 @@ class JobStoreTests(unittest.TestCase):
             store.save_remote_server_settings(
                 stt_base_url="http://stt.test",
                 stt_token="stt-token",
+                resource_group_id="gpu-main",
             )
 
             self.assertEqual(
@@ -1829,6 +1887,7 @@ class JobStoreTests(unittest.TestCase):
                 {
                     "stt_base_url": "http://stt.test",
                     "stt_token": "stt-token",
+                    "resource_group_id": "gpu-main",
                 },
             )
 
@@ -1870,6 +1929,7 @@ class JobStoreTests(unittest.TestCase):
                 {
                     "stt_base_url": "http://stt.test",
                     "stt_token": "stt-token",
+                    "resource_group_id": "local-gpu",
                 },
             )
             with sqlite3.connect(database_path) as connection:
@@ -1886,7 +1946,13 @@ class JobStoreTests(unittest.TestCase):
             self.assertIsNone(legacy)
             self.assertEqual(
                 columns,
-                {"id", "stt_base_url", "stt_token", "updated_at"},
+                {
+                    "id",
+                    "stt_base_url",
+                    "stt_token",
+                    "resource_group_id",
+                    "updated_at",
+                },
             )
 
     def test_runs_runtime_settings_split_after_older_migrations(self) -> None:
@@ -1922,7 +1988,11 @@ class JobStoreTests(unittest.TestCase):
 
             self.assertEqual(
                 store.get_remote_server_settings(),
-                {"stt_base_url": "http://runtime:8100", "stt_token": ""},
+                {
+                    "stt_base_url": "http://runtime:8100",
+                    "stt_token": "",
+                    "resource_group_id": "local-gpu",
+                },
             )
             with sqlite3.connect(database_path) as connection:
                 legacy = connection.execute(
@@ -1978,6 +2048,10 @@ class JobStoreTests(unittest.TestCase):
             self.assertEqual(
                 reloaded.list_runtime_endpoints()[0].token,
                 "runtime-token",
+            )
+            self.assertEqual(
+                reloaded.list_runtime_endpoints()[0].resource_group_id,
+                "local-gpu",
             )
             self.assertEqual(
                 reloaded.runtime_batch_settings()[endpoint.id],
@@ -2659,6 +2733,17 @@ class JobStoreTests(unittest.TestCase):
             self.assertEqual(
                 store.published_subtitle_generation("job-1")["id"],
                 third["id"],
+            )
+            source_generations = store.list_subtitle_generations_for_source(
+                "movie.mkv"
+            )
+            self.assertEqual(
+                [item["id"] for item in source_generations],
+                ["subtitle-3", "subtitle-2", "subtitle-1"],
+            )
+            self.assertEqual(
+                [item["is_published"] for item in source_generations],
+                [True, False, False],
             )
 
     def test_superseded_worker_cannot_publish_subtitles(self) -> None:

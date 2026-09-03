@@ -195,6 +195,15 @@ def group_multipart_media(
                 "has_external_subtitle": all(
                     bool(item.get("has_external_subtitle")) for item in members
                 ),
+                "external_subtitle_formats": sorted(
+                    {
+                        str(format_name)
+                        for item in members
+                        for format_name in (
+                            item.get("external_subtitle_formats") or ()
+                        )
+                    }
+                ),
                 "has_nfo": any(bool(item.get("has_nfo")) for item in members),
                 "poster_path": poster_path,
                 "actors": list(
@@ -283,6 +292,7 @@ def _host_list_env(name: str) -> tuple[str, ...]:
 class RemoteServerSettings:
     stt_base_url: str
     stt_token: str
+    resource_group_id: str = "local-gpu"
 
     @property
     def stt_is_complete(self) -> bool:
@@ -301,6 +311,7 @@ class RemoteServerSettings:
                 "STT_BASE_URL",
             ),
             stt_token=self.stt_token,
+            resource_group_id=self.resource_group_id,
         )
 
 
@@ -378,6 +389,7 @@ class BackendSettings:
     translation_batch_characters: int = 6000
     audio_workers: int = 1
     work_dir: Path | None = None
+    audio_dir: Path | None = None
     translation_state_dir: Path | None = None
     translation_builtin_name: str = "기본 서버"
     translation_builtin_base_url: str = ""
@@ -406,6 +418,11 @@ class BackendSettings:
             work_dir=(
                 Path(os.environ["BACKEND_WORK_DIR"]).expanduser()
                 if os.environ.get("BACKEND_WORK_DIR", "").strip()
+                else None
+            ),
+            audio_dir=(
+                Path(os.environ["BACKEND_AUDIO_DIR"]).expanduser()
+                if os.environ.get("BACKEND_AUDIO_DIR", "").strip()
                 else None
             ),
             gpu_prometheus_url=os.environ.get(
@@ -494,6 +511,10 @@ class BackendSettings:
     @property
     def translation_dir(self) -> Path:
         return self.translation_state_dir or self.state_dir / "translation"
+
+    @property
+    def transcription_audio_dir(self) -> Path:
+        return self.audio_dir or self.jobs_dir
 
     def validate(self) -> None:
         if self.maximum_listed_files < 1:

@@ -17,7 +17,6 @@ import platform
 import queue
 import signal
 import subprocess
-import tempfile
 import threading
 import time
 from typing import Any, AsyncIterator, Callable, Mapping, Sequence
@@ -34,8 +33,10 @@ from .files import write_json_atomic
 from .hybrid_stt import (
     HYBRID_POLICY_VERSION,
     HybridRescueOptions,
+    build_recall_union_segments,
     debounce_word_speakers,
     detect_hybrid_issues,
+    detect_owsm_coverage_issues,
     fuse_hybrid_segments,
     map_fallback_speakers,
     mark_rescued_words,
@@ -63,6 +64,10 @@ from .stt_quality import (
     short_span_diagnostics,
 )
 from .stt_trace import TRACE_SCHEMA_VERSION
+from .stt_options import (
+    HYBRID_STABLE_SUBTITLE_SEGMENTATION,
+    OWSMAuditOptions,
+)
 from .whisperx_worker import (
     DEFAULT_SUBTITLE_SEGMENTATION,
     DEFAULT_WHISPERX_COMPUTE_TYPE,
@@ -77,7 +82,7 @@ from .whisperx_worker import (
 from .whisperjav_worker import WhisperJAVOptions
 
 LOGGER = logging.getLogger(__name__)
-STT_BACKENDS = {"hybrid", "kotoba", "whisperjav", "whisperx"}
+STT_BACKENDS = {"hybrid", "whisperjav"}
 
 
 class TranscriptionCancelled(RuntimeError):
@@ -169,8 +174,9 @@ class STTAPISettings:
     state_dir: Path
     api_token: str
     hf_token: str
-    runtime_id: str = "runtime"
-    runtime_name: str = "STT Runtime"
+    runtime_id: str = "transcriber"
+    runtime_name: str = "Transcriber"
+    enabled_backends: frozenset[str] = frozenset(STT_BACKENDS)
     device: str = "mps"
     diarization_device: str = "cpu"
     batch_size: int = 1
@@ -181,8 +187,10 @@ class STTAPISettings:
     chunk_progress_every: int = 10
     model_idle_timeout_seconds: float = 900.0
     noise_filter_trigger_level: float = DEFAULT_NOISE_FILTER_TRIGGER_LEVEL
+    kotoba_python: Path = Path(".venv-kotoba/bin/python")
     whisperx_python: Path = Path(".venv-whisperx/bin/python")
     whisperjav_python: Path = Path(".venv-whisperjav/bin/python")
+    owsm_python: Path = Path(".venv-owsm/bin/python")
     whisperx_model: str = DEFAULT_WHISPERX_MODEL
     whisperx_language: str = DEFAULT_WHISPERX_LANGUAGE
     whisperx_compute_type: str = DEFAULT_WHISPERX_COMPUTE_TYPE
@@ -200,10 +208,22 @@ class STTAPISettings:
             ).expanduser(),
             api_token=os.environ.get("STT_API_TOKEN", ""),
             hf_token=os.environ.get("HF_TOKEN", ""),
-            runtime_id=os.environ.get("STT_RUNTIME_ID", "runtime").strip(),
-            runtime_name=os.environ.get(
-                "STT_RUNTIME_NAME", "STT Runtime"
+            runtime_id=os.environ.get(
+                "TRANSCRIBER_ID",
+                os.environ.get("STT_RUNTIME_ID", "transcriber"),
             ).strip(),
+            runtime_name=os.environ.get(
+                "TRANSCRIBER_NAME",
+                os.environ.get("STT_RUNTIME_NAME", "Transcriber"),
+            ).strip(),
+            enabled_backends=frozenset(
+                backend.strip().lower()
+                for backend in os.environ.get(
+                    "STT_ENABLED_BACKENDS",
+                    ",".join(sorted(STT_BACKENDS)),
+                ).split(",")
+                if backend.strip()
+            ),
             work_dir=(
                 Path(os.environ["STT_WORK_DIR"]).expanduser()
                 if os.environ.get("STT_WORK_DIR", "").strip()
@@ -239,6 +259,12 @@ class STTAPISettings:
                     str(DEFAULT_NOISE_FILTER_TRIGGER_LEVEL),
                 )
             ),
+            kotoba_python=Path(
+                os.environ.get(
+                    "KOTOBA_PYTHON",
+                    ".venv-kotoba/bin/python",
+                )
+            ).expanduser(),
             whisperx_python=Path(
                 os.environ.get(
                     "WHISPERX_PYTHON",
@@ -249,6 +275,12 @@ class STTAPISettings:
                 os.environ.get(
                     "WHISPERJAV_PYTHON",
                     ".venv-whisperjav/bin/python",
+                )
+            ).expanduser(),
+            owsm_python=Path(
+                os.environ.get(
+                    "OWSM_PYTHON",
+                    ".venv-owsm/bin/python",
                 )
             ).expanduser(),
             whisperx_model=os.environ.get(
@@ -289,10 +321,20 @@ class STTAPISettings:
         if not self.hf_token.strip():
             raise ValueError("HF_TOKEN is required")
         if not self.runtime_id or len(self.runtime_id) > 80:
-            raise ValueError("STT_RUNTIME_ID must be between 1 and 80 characters")
+            raise ValueError(
+                "TRANSCRIBER_ID must be between 1 and 80 characters"
+            )
         if not self.runtime_name or len(self.runtime_name) > 80:
             raise ValueError(
-                "STT_RUNTIME_NAME must be between 1 and 80 characters"
+                "TRANSCRIBER_NAME must be between 1 and 80 characters"
+            )
+        if not self.enabled_backends:
+            raise ValueError("STT_ENABLED_BACKENDS must not be empty")
+        unknown_backends = self.enabled_backends - STT_BACKENDS
+        if unknown_backends:
+            raise ValueError(
+                "STT_ENABLED_BACKENDS contains unsupported backends: "
+                f"{sorted(unknown_backends)}"
             )
         validate_device(self.device, setting="STT_DEVICE")
         validate_device(
@@ -347,6 +389,96 @@ def _device_unavailable_reason(torch: Any, device: str) -> str | None:
     return None
 
 
+def _device_unavailable_reason_from_probe(
+    probe: Mapping[str, Any],
+    device: str,
+) -> str | None:
+    if device == "cpu":
+        return None
+    if device == "mps":
+        if not bool(probe.get("mps_available")):
+            return "PyTorch MPS is not available"
+        return None
+    if not bool(probe.get("cuda_available")):
+        return "PyTorch CUDA is not available"
+    if ":" not in device:
+        return None
+    index = int(device.split(":", maxsplit=1)[1])
+    count = int(probe.get("cuda_device_count", 0))
+    if index >= count:
+        return (
+            f"CUDA device {device} is not available; "
+            f"found {count} CUDA device(s)"
+        )
+    return None
+
+
+def _readiness_python(settings: STTAPISettings) -> Path:
+    enabled = settings.enabled_backends
+    candidates: list[Path] = []
+    if "hybrid" in enabled:
+        candidates.append(settings.whisperx_python)
+    if "hybrid" in enabled:
+        candidates.append(settings.kotoba_python)
+    if "hybrid" in enabled:
+        candidates.append(settings.owsm_python)
+    if "whisperjav" in enabled:
+        candidates.append(settings.whisperjav_python)
+    candidates.extend(
+        (
+            settings.kotoba_python,
+            settings.whisperx_python,
+            settings.whisperjav_python,
+            settings.owsm_python,
+        )
+    )
+    return next((path for path in candidates if path.is_file()), candidates[0])
+
+
+def _probe_worker_torch(settings: STTAPISettings) -> dict[str, Any]:
+    python = _readiness_python(settings)
+    if not python.is_file():
+        raise RuntimeError(f"model Python was not found: {python}")
+    environment = os.environ.copy()
+    nvidia_paths = _venv_nvidia_library_paths(python)
+    existing = environment.get("LD_LIBRARY_PATH", "").strip()
+    if existing:
+        nvidia_paths.append(existing)
+    if nvidia_paths:
+        environment["LD_LIBRARY_PATH"] = os.pathsep.join(nvidia_paths)
+    completed = subprocess.run(
+        [
+            str(python),
+            "-c",
+            (
+                "import json, torch; "
+                "mps = getattr(getattr(torch, 'backends', None), 'mps', None); "
+                "print(json.dumps({"
+                "'cuda_available': bool(torch.cuda.is_available()), "
+                "'cuda_device_count': int(torch.cuda.device_count()), "
+                "'mps_available': bool(mps is not None and mps.is_available())"
+                "}))"
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=20,
+        env=environment,
+    )
+    if completed.returncode != 0:
+        detail = completed.stderr.strip().splitlines()
+        message = detail[-1] if detail else "unknown import error"
+        raise RuntimeError(f"model PyTorch probe failed: {message}")
+    try:
+        payload = json.loads(completed.stdout.strip().splitlines()[-1])
+    except (IndexError, json.JSONDecodeError) as error:
+        raise RuntimeError("model PyTorch probe returned invalid output") from error
+    if not isinstance(payload, dict):
+        raise RuntimeError("model PyTorch probe returned invalid output")
+    return payload
+
+
 def _whisperx_unavailable_reason(settings: STTAPISettings) -> str | None:
     if settings.device == "mps" or settings.diarization_device == "mps":
         return "WhisperX backend supports only cpu or CUDA devices"
@@ -355,6 +487,20 @@ def _whisperx_unavailable_reason(settings: STTAPISettings) -> str | None:
             "WhisperX Python was not found: "
             f"{settings.whisperx_python}"
         )
+    return None
+
+
+def _kotoba_unavailable_reason(settings: STTAPISettings) -> str | None:
+    if not settings.kotoba_python.is_file():
+        return f"Kotoba Python was not found: {settings.kotoba_python}"
+    return None
+
+
+def _owsm_unavailable_reason(settings: STTAPISettings) -> str | None:
+    if settings.device == "mps":
+        return "OWSM audit supports only cpu or CUDA devices"
+    if not settings.owsm_python.is_file():
+        return f"OWSM Python was not found: {settings.owsm_python}"
     return None
 
 
@@ -401,7 +547,7 @@ def _resolve_batch_size(
     if decoded.get("batch_size") is not None:
         if backend == "whisperjav":
             raise ValueError(
-                "whisperjav does not support the common batch_size option"
+                f"{backend} does not support the common batch_size option"
             )
         raw_value = decoded["batch_size"]
         if isinstance(raw_value, bool) or not isinstance(raw_value, int):
@@ -414,7 +560,7 @@ def _resolve_batch_size(
                 f"{WHISPERX_MIN_BATCH_SIZE} and {WHISPERX_MAX_BATCH_SIZE}"
             )
         return raw_value
-    if backend in {"whisperx", "hybrid"}:
+    if backend == "hybrid":
         return settings.whisperx_batch_size
     return settings.batch_size
 
@@ -442,31 +588,27 @@ def _parse_options(raw_options: str, settings: STTAPISettings) -> dict[str, Any]
         "repetition_policy",
         "repetition_min_count",
         "hybrid_rescue",
+        "owsm_audit",
         "whisperjav",
     }
     unknown = set(decoded) - allowed
     if unknown:
         raise ValueError(f"unsupported transcription options: {sorted(unknown)}")
-    backend = str(decoded.get("backend", "kotoba")).strip().lower()
+    backend = str(decoded.get("backend", "hybrid")).strip().lower()
     if backend not in STT_BACKENDS:
-        raise ValueError(
-            "backend must be 'kotoba', 'whisperx', 'hybrid', or "
-            "'whisperjav'"
-        )
+        raise ValueError("backend must be 'hybrid' or 'whisperjav'")
     noise_filter = decoded.get("noise_filter", True)
     if not isinstance(noise_filter, bool):
         raise ValueError("noise_filter must be a JSON boolean")
-    if backend in {"hybrid", "whisperjav", "whisperx"} and not noise_filter:
-        if backend == "whisperx":
-            raise ValueError(
-                "WhisperX backend requires noise_filter=true for VAD"
-            )
+    if backend in {"hybrid", "whisperjav"} and not noise_filter:
         raise ValueError(
             f"{backend} backend requires noise_filter=true for VAD"
         )
     batch_size = _resolve_batch_size(decoded, backend, settings)
     if decoded.get("kotoba_batch_size") is not None and backend != "hybrid":
-        raise ValueError("kotoba_batch_size requires backend='hybrid'")
+        raise ValueError(
+            "kotoba_batch_size requires a Hybrid backend"
+        )
     options = TranscriptionOptions(
         batch_size=batch_size,
         chunk_length_seconds=int(
@@ -511,13 +653,17 @@ def _parse_options(raw_options: str, settings: STTAPISettings) -> dict[str, Any]
             f"{WHISPERX_MAX_CHUNK_LENGTH_SECONDS}"
         )
     parsed = {"backend": backend, **asdict(options)}
-    if backend in {"hybrid", "whisperx"}:
-        if backend == "whisperx" and "hybrid_rescue" in decoded:
-            raise ValueError("hybrid_rescue requires backend='hybrid'")
+    if backend == "hybrid":
+        hybrid = HybridRescueOptions.from_options(decoded)
         segmentation = WhisperXSegmentationOptions.from_options(
             decoded,
             defaults=(
-                DEFAULT_SUBTITLE_SEGMENTATION
+                (
+                    HYBRID_STABLE_SUBTITLE_SEGMENTATION
+                    if hybrid is not None
+                    and hybrid.stable_ts_regroup_enabled
+                    else DEFAULT_SUBTITLE_SEGMENTATION
+                )
                 if backend == "hybrid"
                 else None
             ),
@@ -560,8 +706,12 @@ def _parse_options(raw_options: str, settings: STTAPISettings) -> dict[str, Any]
                     f"{WHISPERX_MIN_BATCH_SIZE} and "
                     f"{WHISPERX_MAX_BATCH_SIZE}"
                 )
-            hybrid = HybridRescueOptions.from_options(decoded)
+            if hybrid is None:
+                raise RuntimeError("hybrid options were not initialized")
             parsed["hybrid_rescue"] = asdict(hybrid)
+            parsed["owsm_audit"] = asdict(
+                OWSMAuditOptions.from_options(decoded)
+            )
             parsed["kotoba_batch_size"] = raw_kotoba_batch_size
             parsed["chunk_length_seconds"] = (
                 hybrid.kotoba_chunk_length_seconds
@@ -571,6 +721,7 @@ def _parse_options(raw_options: str, settings: STTAPISettings) -> dict[str, Any]
             "repetition_policy",
             "repetition_min_count",
             "hybrid_rescue",
+            "owsm_audit",
         } & set(decoded)
         if forbidden:
             raise ValueError(
@@ -593,6 +744,7 @@ def _parse_options(raw_options: str, settings: STTAPISettings) -> dict[str, Any]
             "repetition_policy",
             "repetition_min_count",
             "hybrid_rescue",
+            "owsm_audit",
             "whisperjav",
         )
     ):
@@ -600,30 +752,6 @@ def _parse_options(raw_options: str, settings: STTAPISettings) -> dict[str, Any]
             "WhisperX quality options require backend='whisperx' or 'hybrid'"
         )
     return parsed
-
-
-def write_wav_slice(
-    source: Path,
-    destination: Path,
-    start_seconds: float,
-    end_seconds: float,
-) -> float:
-    """Copy one time span of a PCM WAV file and return its real duration."""
-    with wave.open(str(source), "rb") as reader:
-        frame_rate = reader.getframerate()
-        total_frames = reader.getnframes()
-        first = max(0, min(total_frames, int(start_seconds * frame_rate)))
-        last = max(first, min(total_frames, int(end_seconds * frame_rate)))
-        if last <= first:
-            return 0.0
-        reader.setpos(first)
-        frames = reader.readframes(last - first)
-        with wave.open(str(destination), "wb") as writer:
-            writer.setnchannels(reader.getnchannels())
-            writer.setsampwidth(reader.getsampwidth())
-            writer.setframerate(frame_rate)
-            writer.writeframes(frames)
-    return (last - first) / float(frame_rate)
 
 
 def _validate_wav(path: Path) -> None:
@@ -707,6 +835,9 @@ class TranscriptionService:
         self._active_processes: dict[str, subprocess.Popen[str]] = {}
         self._activity_lock = threading.Lock()
         self._active_job_id: str | None = None
+        self._device_probe_lock = threading.Lock()
+        self._device_probe_checked_at = 0.0
+        self._device_probe: dict[str, Any] | None = None
         self._worker = threading.Thread(
             target=self._worker_loop,
             name="stt-runtime-worker",
@@ -845,7 +976,7 @@ class TranscriptionService:
         queue_snapshot = self.queue_snapshot()
         return {
             "status": "ok",
-            "runtime": {
+            "transcriber": {
                 "id": self.settings.runtime_id,
                 "name": self.settings.runtime_name,
                 "version": __version__,
@@ -867,7 +998,7 @@ class TranscriptionService:
 
     def readiness(self) -> tuple[bool, dict[str, Any]]:
         detail: dict[str, Any] = {
-            "runtime": {
+            "transcriber": {
                 "id": self.settings.runtime_id,
                 "name": self.settings.runtime_name,
                 "version": __version__,
@@ -881,10 +1012,8 @@ class TranscriptionService:
             "hf_token_configured": bool(self.settings.hf_token.strip()),
             "queue": self.queue_snapshot(),
             "backends": {
-                "hybrid": {"status": "ready"},
-                "kotoba": {"status": "ready"},
-                "whisperjav": {"status": "ready"},
-                "whisperx": {"status": "ready"},
+                backend: {"status": "ready"}
+                for backend in sorted(self.settings.enabled_backends)
             },
         }
         if not detail["hf_token_configured"]:
@@ -895,37 +1024,53 @@ class TranscriptionService:
         try:
             import torch
         except ImportError:
-            detail["status"] = "not_ready"
-            detail["reason"] = "PyTorch is not installed"
-            return False, detail
-        reason = _device_unavailable_reason(torch, self.settings.device)
+            try:
+                with self._device_probe_lock:
+                    if (
+                        self._device_probe is None
+                        or time.monotonic() - self._device_probe_checked_at >= 60
+                    ):
+                        self._device_probe = _probe_worker_torch(self.settings)
+                        self._device_probe_checked_at = time.monotonic()
+                    device_probe = self._device_probe
+            except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+                detail["status"] = "not_ready"
+                detail["reason"] = str(error)
+                return False, detail
+            reason_for = lambda device: _device_unavailable_reason_from_probe(
+                device_probe,
+                device,
+            )
+        else:
+            reason_for = lambda device: _device_unavailable_reason(torch, device)
+        reason = reason_for(self.settings.device)
         if reason is not None:
             detail["status"] = "not_ready"
             detail["reason"] = reason
             return False, detail
-        reason = _device_unavailable_reason(
-            torch,
-            self.settings.diarization_device,
-        )
+        reason = reason_for(self.settings.diarization_device)
         if reason is not None:
             detail["status"] = "not_ready"
             detail["reason"] = (
                 f"{reason} for STT_DIARIZATION_DEVICE"
             )
             return False, detail
-        whisperx_reason = _whisperx_unavailable_reason(self.settings)
-        if whisperx_reason is not None:
-            for backend in ("hybrid", "whisperx"):
+        for backend in self.settings.enabled_backends:
+            backend_reason = self.backend_unavailable_reason(backend)
+            if backend_reason is not None:
                 detail["backends"][backend] = {
                     "status": "unavailable",
-                    "reason": whisperx_reason,
+                    "reason": backend_reason,
                 }
-        whisperjav_reason = _whisperjav_unavailable_reason(self.settings)
-        if whisperjav_reason is not None:
-            detail["backends"]["whisperjav"] = {
-                "status": "unavailable",
-                "reason": whisperjav_reason,
-            }
+        unavailable = [
+            value
+            for value in detail["backends"].values()
+            if value.get("status") == "unavailable"
+        ]
+        if len(unavailable) == len(self.settings.enabled_backends):
+            detail["status"] = "not_ready"
+            detail["reason"] = str(unavailable[0]["reason"])
+            return False, detail
         detail["status"] = "ready"
         return True, detail
 
@@ -941,10 +1086,17 @@ class TranscriptionService:
         }
 
     def backend_unavailable_reason(self, backend: str) -> str | None:
-        if backend == "kotoba":
-            return None
-        if backend in {"hybrid", "whisperx"}:
-            return _whisperx_unavailable_reason(self.settings)
+        if backend not in self.settings.enabled_backends:
+            return (
+                f"transcription backend {backend!r} is not enabled on "
+                f"transcriber {self.settings.runtime_id!r}"
+            )
+        if backend == "hybrid":
+            return (
+                _whisperx_unavailable_reason(self.settings)
+                or _kotoba_unavailable_reason(self.settings)
+                or _owsm_unavailable_reason(self.settings)
+            )
         if backend == "whisperjav":
             return _whisperjav_unavailable_reason(self.settings)
         return f"unsupported transcription backend: {backend}"
@@ -1034,6 +1186,173 @@ class TranscriptionService:
         self._pipeline_idle_since = time.monotonic()
         return self._pipeline
 
+    def _run_kotoba_worker(
+        self,
+        job: TranscriptionJob,
+        options: TranscriptionOptions,
+        *,
+        windows: Sequence[Mapping[str, Any]] | None = None,
+        artifact_dir: Path | None = None,
+    ) -> Mapping[str, Any]:
+        """Run Kotoba in an isolated process after other GPU workers exit."""
+        reason = _kotoba_unavailable_reason(self.settings)
+        if reason is not None:
+            raise RuntimeError(reason)
+        worker_result = self.result_dir / f".{job.id}.kotoba.json"
+        progress_path = self.result_dir / f".{job.id}.kotoba.progress.json"
+        worker_result.unlink(missing_ok=True)
+        progress_path.unlink(missing_ok=True)
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "HF_TOKEN": self.settings.hf_token,
+                "STT_DEVICE": self.settings.device,
+                "STT_DIARIZATION_DEVICE": self.settings.diarization_device,
+                "PYTHONIOENCODING": "utf-8",
+            }
+        )
+        nvidia_library_paths = _venv_nvidia_library_paths(
+            self.settings.kotoba_python
+        )
+        if nvidia_library_paths:
+            existing_library_path = environment.get("LD_LIBRARY_PATH", "")
+            environment["LD_LIBRARY_PATH"] = ":".join(
+                [
+                    *nvidia_library_paths,
+                    *([existing_library_path] if existing_library_path else []),
+                ]
+            )
+        command = [
+            str(self.settings.kotoba_python),
+            "-m",
+            "stt_to_subtitle.kotoba_worker",
+            "--audio",
+            job.audio_path,
+            "--output",
+            str(worker_result),
+            "--options",
+            json.dumps(asdict(options), sort_keys=True),
+            "--windows",
+            json.dumps(
+                [dict(window) for window in windows]
+                if windows is not None
+                else None,
+                sort_keys=True,
+            ),
+            "--progress",
+            str(progress_path),
+        ]
+        if artifact_dir is not None:
+            command.extend(["--debug-dir", str(artifact_dir)])
+        try:
+            completed = self._run_worker_process(
+                job.id,
+                command,
+                environment=environment,
+                progress_path=progress_path,
+                on_stage_progress=lambda stage, index, total: (
+                    self._record_stage_progress(
+                        job.id,
+                        stage=stage,
+                        index=index,
+                        total=total,
+                    )
+                ),
+            )
+            if completed.returncode != 0:
+                detail = (completed.stderr or completed.stdout).strip()
+                raise RuntimeError(
+                    "Kotoba worker failed"
+                    + (f": {detail[-2000:]}" if detail else "")
+                )
+            try:
+                payload = json.loads(worker_result.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as error:
+                raise InvalidTranscriptionOutput(
+                    "Kotoba worker returned an invalid result"
+                ) from error
+            if not isinstance(payload, Mapping):
+                raise InvalidTranscriptionOutput(
+                    "Kotoba worker result must be an object"
+                )
+            return payload
+        finally:
+            worker_result.unlink(missing_ok=True)
+            progress_path.unlink(missing_ok=True)
+
+    def _run_owsm_audit_worker(
+        self,
+        job: TranscriptionJob,
+        options: OWSMAuditOptions,
+    ) -> Mapping[str, Any]:
+        """Run the OWSM omission audit after WhisperX has exited."""
+        reason = _owsm_unavailable_reason(self.settings)
+        if reason is not None:
+            raise RuntimeError(reason)
+        worker_result = self.result_dir / f".{job.id}.owsm-audit.json"
+        worker_result.unlink(missing_ok=True)
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "HF_TOKEN": self.settings.hf_token,
+                "PYTHONIOENCODING": "utf-8",
+            }
+        )
+        nvidia_library_paths = _venv_nvidia_library_paths(
+            self.settings.owsm_python
+        )
+        if nvidia_library_paths:
+            existing_library_path = environment.get("LD_LIBRARY_PATH", "")
+            environment["LD_LIBRARY_PATH"] = ":".join(
+                [
+                    *nvidia_library_paths,
+                    *([existing_library_path] if existing_library_path else []),
+                ]
+            )
+        command = [
+            str(self.settings.owsm_python),
+            "-m",
+            "stt_to_subtitle.owsm_audit_worker",
+            "--audio",
+            job.audio_path,
+            "--output",
+            str(worker_result),
+            "--device",
+            self.settings.device,
+            "--window-seconds",
+            str(options.window_seconds),
+            "--overlap-seconds",
+            str(options.overlap_seconds),
+        ]
+        try:
+            completed = self._run_worker_process(
+                job.id,
+                command,
+                environment=environment,
+            )
+            if completed.returncode != 0:
+                detail = (completed.stderr or completed.stdout).strip()
+                raise RuntimeError(
+                    "OWSM audit worker failed"
+                    + (f": {detail[-2000:]}" if detail else "")
+                )
+            try:
+                payload = json.loads(worker_result.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as error:
+                raise InvalidTranscriptionOutput(
+                    "OWSM audit worker returned an invalid result"
+                ) from error
+            if not isinstance(payload, Mapping) or not isinstance(
+                payload.get("windows"),
+                list,
+            ):
+                raise InvalidTranscriptionOutput(
+                    "OWSM audit worker result has no windows list"
+                )
+            return payload
+        finally:
+            worker_result.unlink(missing_ok=True)
+
     def _run_kotoba_rescue_windows(
         self,
         job: TranscriptionJob,
@@ -1049,8 +1368,6 @@ class TranscriptionService:
         the window and are reconciled at the transcript-normalization
         boundary.
         """
-        pipeline = self._get_pipeline(options.batch_size)
-        source = Path(job.audio_path)
         segments: list[dict[str, Any]] = []
         removed_spans: list[dict[str, Any]] = []
         encoding_warning: Mapping[str, Any] | None = None
@@ -1059,103 +1376,97 @@ class TranscriptionService:
         executed = 0
         created_base = 0
         completed_base = 0
-        with tempfile.TemporaryDirectory(prefix="hybrid-rescue-") as scratch:
-            work_dir = Path(scratch)
-            for index, window in enumerate(windows):
-                start = float(window["start"])
-                slice_path = work_dir / f"window-{index:03d}.wav"
-                duration = write_wav_slice(
-                    source,
-                    slice_path,
-                    start,
-                    float(window["end"]),
+        worker_payload = self._run_kotoba_worker(
+            job,
+            options,
+            windows=windows,
+            artifact_dir=(
+                artifact_dir / "kotoba"
+                if artifact_dir is not None
+                else None
+            ),
+        )
+        raw_windows = worker_payload.get("windows")
+        if not isinstance(raw_windows, list):
+            raise InvalidTranscriptionOutput(
+                "Kotoba rescue worker result has no windows list"
+            )
+        for index, window_result in enumerate(raw_windows):
+            if not isinstance(window_result, Mapping):
+                raise InvalidTranscriptionOutput(
+                    "Kotoba rescue worker returned an invalid window"
                 )
-                if duration <= 0.0:
-                    slice_path.unlink(missing_ok=True)
-                    continue
-
-                def report(
-                    progress: ChunkProgress,
-                    *,
-                    created_base: int = created_base,
-                    completed_base: int = completed_base,
-                ) -> None:
-                    self._record_chunk_progress(
-                        job.id,
-                        ChunkProgress(
-                            created=created_base + progress.created,
-                            completed=completed_base + progress.completed,
-                            final=False,
-                        ),
+            window = window_result.get("window")
+            window_segments = window_result.get("segments")
+            if not isinstance(window, Mapping) or not isinstance(
+                window_segments,
+                list,
+            ):
+                raise InvalidTranscriptionOutput(
+                    "Kotoba rescue worker window is incomplete"
+                )
+            start = float(window["start"])
+            duration = float(window_result.get("duration", 0.0))
+            executed += 1
+            decoded_seconds += duration
+            normalized_window_segments = [
+                dict(segment)
+                for segment in window_segments
+                if isinstance(segment, Mapping)
+            ]
+            speaker_mapping = map_fallback_speakers(
+                primary_segments,
+                normalized_window_segments,
+            )
+            window_id = str(
+                window.get("window_id", f"rescue-window-{index + 1:06d}")
+            )
+            speaker_namespace = window_id.upper().replace("-", "_")
+            for segment in normalized_window_segments:
+                local_speaker = str(segment.get("speaker", "UNKNOWN"))
+                mapped_speaker = speaker_mapping.get(
+                    local_speaker,
+                    f"KOTOBA_{local_speaker}",
+                )
+                if mapped_speaker == f"KOTOBA_{local_speaker}":
+                    mapped_speaker = f"KOTOBA_{speaker_namespace}_{local_speaker}"
+                segment["speaker"] = mapped_speaker
+            segments.extend(normalized_window_segments)
+            chunk_count = int(window_result.get("chunk_count", 0))
+            created_base += chunk_count
+            completed_base += chunk_count
+            window_noise = window_result.get("noise_filter")
+            if isinstance(window_noise, Mapping):
+                for span in window_noise.get("removed_spans", []) or []:
+                    if not isinstance(span, Mapping):
+                        continue
+                    shifted = dict(span)
+                    shifted["start"] = round(
+                        float(span.get("start", 0.0)) + start,
+                        3,
                     )
-
-                window_result = run_pipeline(
-                    pipeline,
-                    slice_path,
-                    options,
-                    progress_callback=report,
-                    progress_every=self.settings.chunk_progress_every,
-                    debug_artifact_dir=(
-                        artifact_dir / "kotoba" / f"window-{index:03d}"
-                        if artifact_dir is not None
-                        else None
-                    ),
-                )
-                slice_path.unlink(missing_ok=True)
-                executed += 1
-                decoded_seconds += duration
-                window_segments = normalize_segments(
-                    window_result,
-                    offset_seconds=start,
-                )
-                speaker_mapping = map_fallback_speakers(
-                    primary_segments,
-                    window_segments,
-                )
-                window_id = str(
-                    window.get("window_id", f"rescue-window-{index + 1:06d}")
-                )
-                speaker_namespace = window_id.upper().replace("-", "_")
-                for segment in window_segments:
-                    local_speaker = str(
-                        segment.get("speaker", "UNKNOWN")
+                    shifted["end"] = round(
+                        float(span.get("end", 0.0)) + start,
+                        3,
                     )
-                    mapped_speaker = speaker_mapping.get(
-                        local_speaker,
-                        f"KOTOBA_{local_speaker}",
-                    )
-                    if mapped_speaker == f"KOTOBA_{local_speaker}":
-                        mapped_speaker = (
-                            f"KOTOBA_{speaker_namespace}_{local_speaker}"
-                        )
-                    segment["speaker"] = mapped_speaker
-                segments.extend(window_segments)
-                chunks = window_result.get("chunks", [])
-                if isinstance(chunks, list):
-                    created_base += len(chunks)
-                    completed_base += len(chunks)
-                window_noise = window_result.get("noise_filter")
-                if isinstance(window_noise, Mapping):
-                    for span in window_noise.get("removed_spans", []) or []:
-                        if not isinstance(span, Mapping):
-                            continue
-                        shifted = dict(span)
-                        shifted["start"] = round(
-                            float(span.get("start", 0.0)) + start, 3
-                        )
-                        shifted["end"] = round(
-                            float(span.get("end", 0.0)) + start, 3
-                        )
-                        removed_spans.append(shifted)
-                window_encoding = window_result.get("encoding_warning")
-                if isinstance(window_encoding, Mapping) and window_encoding:
-                    encoding_warning = window_encoding
-                timestamp_postprocessor = str(
-                    window_result.get(
-                        "timestamp_postprocessor",
-                        timestamp_postprocessor,
-                    )
+                    removed_spans.append(shifted)
+            window_encoding = window_result.get("encoding_warning")
+            if isinstance(window_encoding, Mapping) and window_encoding:
+                encoding_warning = window_encoding
+            timestamp_postprocessor = str(
+                window_result.get(
+                    "timestamp_postprocessor",
+                    timestamp_postprocessor,
                 )
+            )
+        self._record_chunk_progress(
+            job.id,
+            ChunkProgress(
+                created=created_base,
+                completed=completed_base,
+                final=False,
+            ),
+        )
         segments.sort(key=lambda segment: (segment["start"], segment["end"]))
         LOGGER.info(
             "hybrid job %s rescued %d window(s) covering %.1fs of audio",
@@ -1205,8 +1516,13 @@ class TranscriptionService:
         *,
         release_kotoba: bool = True,
         options: Mapping[str, Any] | None = None,
+        report_progress: bool = True,
     ) -> Mapping[str, Any]:
-        reason = self.backend_unavailable_reason("whisperx")
+        # A hybrid-only runtime intentionally does not advertise WhisperX as
+        # a public scheduling capability, but WhisperX remains its primary
+        # internal component. Check the component executable directly here;
+        # the public backend gate is enforced when the job is submitted.
+        reason = _whisperx_unavailable_reason(self.settings)
         if reason is not None:
             raise RuntimeError(reason)
         if release_kotoba:
@@ -1260,15 +1576,17 @@ class TranscriptionService:
                 job.id,
                 command,
                 environment=environment,
-                progress_path=progress_path,
-                on_stage_progress=lambda stage, index, total: (
-                    self._record_stage_progress(
+                progress_path=progress_path if report_progress else None,
+                on_stage_progress=(
+                    lambda stage, index, total: self._record_stage_progress(
                         job.id,
                         stage=stage,
                         index=index,
                         total=total,
                     )
-                ),
+                )
+                if report_progress
+                else None,
             )
             if completed.returncode != 0:
                 detail = (completed.stderr or completed.stdout).strip()
@@ -1435,6 +1753,75 @@ class TranscriptionService:
             speaker_result.unlink(missing_ok=True)
             progress_path.unlink(missing_ok=True)
 
+    def _run_stable_ts_regroup_worker(
+        self,
+        job: TranscriptionJob,
+        words: Sequence[Mapping[str, Any]],
+    ) -> Mapping[str, Any]:
+        """Regroup WhisperX words without changing text or timestamps."""
+        if not job.audio_path:
+            raise RuntimeError("Hybrid job has no audio path")
+        input_path = self.result_dir / f".{job.id}.stable-ts-input.json"
+        output_path = self.result_dir / f".{job.id}.stable-ts-output.json"
+        for path in (input_path, output_path):
+            path.unlink(missing_ok=True)
+        write_json_atomic(input_path, {"words": [dict(word) for word in words]})
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "STT_DEVICE": self.settings.device,
+                "PYTHONIOENCODING": "utf-8",
+            }
+        )
+        nvidia_library_paths = _venv_nvidia_library_paths(
+            self.settings.kotoba_python
+        )
+        if nvidia_library_paths:
+            existing_library_path = environment.get("LD_LIBRARY_PATH", "")
+            environment["LD_LIBRARY_PATH"] = ":".join(
+                [
+                    *nvidia_library_paths,
+                    *([existing_library_path] if existing_library_path else []),
+                ]
+            )
+        command = [
+            str(self.settings.kotoba_python),
+            "-m",
+            "stt_to_subtitle.stable_ts_worker",
+            "--audio",
+            job.audio_path,
+            "--input",
+            str(input_path),
+            "--output",
+            str(output_path),
+        ]
+        try:
+            completed = self._run_worker_process(
+                job.id,
+                command,
+                environment=environment,
+            )
+            if completed.returncode != 0:
+                detail = (completed.stderr or completed.stdout).strip()
+                raise RuntimeError(
+                    "stable-ts regroup worker failed"
+                    + (f": {detail[-2000:]}" if detail else "")
+                )
+            try:
+                payload = json.loads(output_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as error:
+                raise InvalidTranscriptionOutput(
+                    "stable-ts regroup worker returned an invalid result"
+                ) from error
+            if not isinstance(payload, Mapping):
+                raise InvalidTranscriptionOutput(
+                    "stable-ts regroup worker result must be an object"
+                )
+            return payload
+        finally:
+            input_path.unlink(missing_ok=True)
+            output_path.unlink(missing_ok=True)
+
     def _worker_loop(self) -> None:
         while True:
             job_id = self._queue.get()
@@ -1506,17 +1893,17 @@ class TranscriptionService:
         heartbeat.start()
         try:
             self._raise_if_cancel_requested(job_id)
-            backend = str(job.options.get("backend", "kotoba"))
+            backend = str(job.options.get("backend", "hybrid"))
             audio_duration = _wav_duration(Path(job.audio_path))
             kotoba_batch_size = int(
                 job.options.get("kotoba_batch_size", job.options["batch_size"])
             )
             warm_start = (
-                backend in {"hybrid", "kotoba"}
+                backend == "hybrid"
                 and self._pipeline is not None
                 and self._pipeline_batch_size == kotoba_batch_size
             )
-            stt_call_count = 2 if backend in {"hybrid", "whisperjav"} else 1
+            stt_call_count = 3 if backend == "hybrid" else 2
             artifact_dir = (
                 self.settings.artifacts_dir / job.id
                 if self.settings.debug_artifacts
@@ -1580,11 +1967,12 @@ class TranscriptionService:
             words: list[dict[str, Any]] = []
             backend_quality: dict[str, Any] = {}
             if backend == "whisperjav":
+                backend_label = "WhisperJAV"
                 backend_result = self._run_whisperjav_worker(job)
                 raw_segments = backend_result.get("segments")
                 if not isinstance(raw_segments, list):
                     raise InvalidTranscriptionOutput(
-                        "WhisperJAV worker result has no segments list"
+                        f"{backend_label} worker result has no segments list"
                     )
                 segments = add_segment_ids(raw_segments)
                 model = backend_result.get("model")
@@ -1599,19 +1987,19 @@ class TranscriptionService:
                     backend_quality = dict(raw_quality)
                 if not isinstance(model, Mapping):
                     raise InvalidTranscriptionOutput(
-                        "WhisperJAV worker result has no model"
+                        f"{backend_label} worker result has no model"
                     )
                 if not isinstance(timing, Mapping):
                     raise InvalidTranscriptionOutput(
-                        "WhisperJAV worker result has no timing"
+                        f"{backend_label} worker result has no timing"
                     )
                 if not isinstance(runtime, Mapping):
                     raise InvalidTranscriptionOutput(
-                        "WhisperJAV worker result has no runtime"
+                        f"{backend_label} worker result has no runtime"
                     )
                 if not isinstance(noise_filter, Mapping):
                     raise InvalidTranscriptionOutput(
-                        "WhisperJAV worker result has no noise_filter"
+                        f"{backend_label} worker result has no noise_filter"
                     )
                 runtime = {
                     **runtime,
@@ -1656,7 +2044,10 @@ class TranscriptionService:
                     "elapsed_seconds": round(time.monotonic() - started, 3),
                 }
             elif backend == "hybrid":
+                owsm_enabled = True
+                stage_total = 8
                 hybrid_options = HybridRescueOptions.from_options(job.options)
+                owsm_options = OWSMAuditOptions.from_options(job.options)
                 segmentation = WhisperXSegmentationOptions.from_options(
                     job.options
                 )
@@ -1686,12 +2077,6 @@ class TranscriptionService:
                     release_kotoba=True,
                     options=whisperx_options,
                 )
-                self._record_stage_progress(
-                    job.id,
-                    stage="quality_analysis",
-                    index=4,
-                    total=7,
-                )
                 raw_primary_segments = primary_result.get("segments")
                 if not isinstance(raw_primary_segments, list):
                     raise InvalidTranscriptionOutput(
@@ -1700,6 +2085,36 @@ class TranscriptionService:
                 raw_primary_words = primary_result.get("words", [])
                 if not isinstance(raw_primary_words, list):
                     raw_primary_words = []
+                stable_ts_regroup = {
+                    "enabled": hybrid_options.stable_ts_regroup_enabled,
+                    "provider": "stable-ts-regroup-jav-v1",
+                    "segment_count": 0,
+                }
+                if (
+                    hybrid_options.stable_ts_regroup_enabled
+                    and raw_primary_words
+                ):
+                    regrouped = self._run_stable_ts_regroup_worker(
+                        job,
+                        raw_primary_words,
+                    )
+                    regrouped_words = regrouped.get("words")
+                    regrouped_segments = regrouped.get("segments")
+                    if not isinstance(regrouped_words, list) or not isinstance(
+                        regrouped_segments,
+                        list,
+                    ):
+                        raise InvalidTranscriptionOutput(
+                            "stable-ts regroup worker result is incomplete"
+                        )
+                    if len(regrouped_words) != len(raw_primary_words):
+                        raise InvalidTranscriptionOutput(
+                            "stable-ts regroup changed the WhisperX word count"
+                        )
+                    raw_primary_words = regrouped_words
+                    stable_ts_regroup["segment_count"] = len(
+                        regrouped_segments
+                    )
                 words, speaker_debounce = debounce_word_speakers(
                     raw_primary_words,
                     maximum_flash_duration_sec=(
@@ -1730,6 +2145,43 @@ class TranscriptionService:
                     options=hybrid_options,
                     repetition_min_count=repetition_min_count,
                 )
+                owsm_result: Mapping[str, Any] = {}
+                owsm_issues: list[dict[str, Any]] = []
+                if owsm_enabled:
+                    if owsm_options is None:
+                        raise RuntimeError("OWSM audit options were not initialized")
+                    self._record_stage_progress(
+                        job.id,
+                        stage="owsm_audit",
+                        index=4,
+                        total=stage_total,
+                    )
+                    owsm_result = self._run_owsm_audit_worker(
+                        job,
+                        owsm_options,
+                    )
+                    raw_audit_windows = owsm_result.get("windows")
+                    if not isinstance(raw_audit_windows, list):
+                        raise InvalidTranscriptionOutput(
+                            "OWSM audit result has no windows list"
+                        )
+                    owsm_issues = detect_owsm_coverage_issues(
+                        [
+                            dict(window)
+                            for window in raw_audit_windows
+                            if isinstance(window, Mapping)
+                        ],
+                        words,
+                        primary_segments,
+                        options=owsm_options,
+                    )
+                    primary_issues.extend(owsm_issues)
+                self._record_stage_progress(
+                    job.id,
+                    stage="quality_analysis",
+                    index=5 if owsm_enabled else 4,
+                    total=stage_total,
+                )
                 rescue_windows = merge_issue_windows(
                     primary_issues,
                     padding_seconds=hybrid_options.window_padding_sec,
@@ -1755,8 +2207,8 @@ class TranscriptionService:
                     self._record_stage_progress(
                         job.id,
                         stage="rescue_transcription",
-                        index=5,
-                        total=7,
+                        index=6 if owsm_enabled else 5,
+                        total=stage_total,
                     )
                     (
                         window_segments,
@@ -1773,26 +2225,34 @@ class TranscriptionService:
                     self._record_stage_progress(
                         job.id,
                         stage="rescue_transcription",
-                        index=5,
-                        total=7,
+                        index=6 if owsm_enabled else 5,
+                        total=stage_total,
                     )
-                    pipeline = self._get_pipeline(kotoba_options.batch_size)
-                    fallback_result = run_pipeline(
-                        pipeline,
-                        Path(job.audio_path),
+                    worker_payload = self._run_kotoba_worker(
+                        job,
                         kotoba_options,
-                        progress_callback=lambda progress: (
-                            self._record_chunk_progress(job.id, progress)
-                        ),
-                        progress_every=self.settings.chunk_progress_every,
-                        debug_artifact_dir=(
+                        artifact_dir=(
                             artifact_dir / "kotoba"
                             if artifact_dir is not None
                             else None
                         ),
                     )
+                    raw_result = worker_payload.get("result")
+                    raw_segments = worker_payload.get("segments")
+                    if not isinstance(raw_result, Mapping) or not isinstance(
+                        raw_segments,
+                        list,
+                    ):
+                        raise InvalidTranscriptionOutput(
+                            "Kotoba full worker result is incomplete"
+                        )
+                    fallback_result = raw_result
                     fallback_segments = add_segment_ids(
-                        normalize_segments(fallback_result)
+                        [
+                            dict(segment)
+                            for segment in raw_segments
+                            if isinstance(segment, Mapping)
+                        ]
                     )
                 for segment in fallback_segments:
                     source_id = f"kotoba-{segment['id']}"
@@ -1822,8 +2282,8 @@ class TranscriptionService:
                 self._record_stage_progress(
                     job.id,
                     stage="transcription_merge",
-                    index=6,
-                    total=7,
+                    index=7 if owsm_enabled else 6,
+                    total=stage_total,
                 )
                 fused_segments, hybrid_quality = fuse_hybrid_segments(
                     primary_segments,
@@ -1835,6 +2295,11 @@ class TranscriptionService:
                     fallback_speakers_preassigned=(
                         hybrid_options.rescue_scope == "windows"
                     ),
+                )
+                fused_segments, hybrid_quality = build_recall_union_segments(
+                    primary_segments,
+                    fused_segments,
+                    hybrid_quality,
                 )
                 words = mark_rescued_words(
                     words,
@@ -1877,7 +2342,7 @@ class TranscriptionService:
                     },
                 )
                 model = {
-                    "id": "whisperx+kotoba",
+                    "id": "whisperx+owsm-audit+kotoba-recall-union",
                     "revision": (
                         f"{primary_model.get('revision', 'unknown')}+"
                         f"{MODEL_REVISION}"
@@ -1888,8 +2353,18 @@ class TranscriptionService:
                         "revision": MODEL_REVISION,
                     },
                 }
+                owsm_model = owsm_result.get("model")
+                if owsm_enabled and isinstance(owsm_model, Mapping):
+                    model["audit"] = dict(owsm_model)
                 timing = {
-                    "postprocessor": HYBRID_POLICY_VERSION,
+                    "postprocessor": (
+                        f"{HYBRID_POLICY_VERSION}+recall-union-v1"
+                        + (
+                            "+stable-ts-regroup-jav-v1"
+                            if hybrid_options.stable_ts_regroup_enabled
+                            else ""
+                        )
+                    ),
                     "primary": dict(primary_timing),
                     "rescue": {
                         "postprocessor": fallback_result.get(
@@ -1898,17 +2373,28 @@ class TranscriptionService:
                     },
                 }
                 runtime = {
-                    "backend": "hybrid",
+                    "backend": backend,
                     "device": self.settings.device,
                     "diarization_device": self.settings.diarization_device,
                     "elapsed_seconds": round(time.monotonic() - started, 3),
                     "simultaneous_model_residency": False,
                     "kotoba_skipped": kotoba_skipped,
                     "primary": dict(primary_runtime),
+                    "audit": (
+                        {
+                            **dict(owsm_result.get("runtime", {})),
+                            "backend": "owsm",
+                            "window_count": len(owsm_result.get("windows", [])),
+                        }
+                        if owsm_enabled
+                        and isinstance(owsm_result.get("runtime"), Mapping)
+                        else {"skipped": True}
+                    ),
                     "rescue": {
                         "backend": "kotoba",
                         "skipped": kotoba_skipped,
                         "scope": hybrid_options.rescue_scope,
+                        "merge_policy": "recall_union",
                         "elapsed_seconds": kotoba_elapsed,
                     },
                 }
@@ -1955,13 +2441,20 @@ class TranscriptionService:
                         "options": asdict(hybrid_options),
                         "primary_issues": primary_issues,
                         "speaker_debounce": speaker_debounce,
+                        "stable_ts_regroup": stable_ts_regroup,
                     },
                 }
+                if owsm_enabled:
+                    backend_quality["owsm_audit"] = {
+                        "options": asdict(owsm_options),
+                        "issues": owsm_issues,
+                        "window_count": len(owsm_result.get("windows", [])),
+                    }
                 self._record_stage_progress(
                     job.id,
                     stage="subtitle_normalization",
-                    index=7,
-                    total=7,
+                    index=8 if owsm_enabled else 7,
+                    total=stage_total,
                 )
             elif backend == "kotoba":
                 self._record_stage_progress(

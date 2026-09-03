@@ -35,6 +35,5 @@ class SpeakerWorkerTests(unittest.TestCase):
         self.assertEqual(words[0]["speaker_source"], "diarization_unavailable")
         self.assertEqual(fallback_count, 1)
 
-
 if __name__ == "__main__":
     unittest.main()

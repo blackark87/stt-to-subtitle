@@ -1,0 +1,6 @@
+--extra-index-url https://download.pytorch.org/whl/cu128
+
+torch==2.8.0+cu128
+torchaudio==2.8.0+cu128
+espnet==202511
+espnet-model-zoo==0.1.7

@@ -71,6 +71,5 @@ RUN apt-get update \
 COPY --from=kotoba-builder /opt/venvs/kotoba /opt/venvs/kotoba
 COPY --from=whisperx-builder /opt/venvs/whisperx /opt/venvs/whisperx
 COPY --from=whisperjav-builder /opt/venvs/whisperjav /opt/venvs/whisperjav
-
 RUN /opt/venvs/whisperjav/bin/python -c \
     "from ten_vad import TenVad; vad = TenVad()"

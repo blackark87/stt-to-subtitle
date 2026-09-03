@@ -34,6 +34,7 @@ def public_value(value: Any) -> Any:
 
 def job_payload(job: PipelineJob) -> dict[str, Any]:
     payload = asdict(job)
+    payload["transcriber_id"] = payload.pop("stt_runtime_id", None)
     payload["created_at"] = format_kst_iso(job.created_at)
     payload["updated_at"] = format_kst_iso(job.updated_at)
     return public_value(payload)

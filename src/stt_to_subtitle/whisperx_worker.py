@@ -176,10 +176,23 @@ def _joined_word_text(words: Sequence[Mapping[str, Any]]) -> str:
     return "".join(str(word.get("word", "")) for word in words).strip()
 
 
-def _ends_with_punctuation(text: str) -> bool:
-    return text.rstrip().endswith(
-        ("。", "！", "？", "!", "?", ".", "…", "、", ",")
-    )
+def _ends_with_punctuation(text: str, mode: str) -> bool:
+    if mode == "none":
+        return False
+    punctuation = ("。", "！", "？", "!", "?", ".")
+    if mode == "all":
+        punctuation += ("…", "、", ",")
+    return text.rstrip().endswith(punctuation)
+
+
+def _parent_span_ids(word: Mapping[str, Any]) -> tuple[str, ...]:
+    raw = word.get("parent_span_ids", [])
+    if not isinstance(raw, Sequence) or isinstance(
+        raw,
+        (str, bytes, bytearray),
+    ):
+        return ()
+    return tuple(str(value) for value in raw)
 
 
 def rebuild_whisperx_segments(
@@ -234,10 +247,16 @@ def rebuild_whisperx_segments(
         previous = current[-1]
         candidate_text = _joined_word_text([*current, word])
         should_split = bool(
-            config.split_on_speaker_change
+            config.split_on_parent_change
+            and _parent_span_ids(word) != _parent_span_ids(previous)
+        )
+        if (
+            not should_split
+            and config.split_on_speaker_change
             and str(word.get("speaker", "UNKNOWN"))
             != str(previous.get("speaker", "UNKNOWN"))
-        )
+        ):
+            should_split = True
         if (
             not should_split
             and config.max_gap_sec is not None
@@ -261,7 +280,10 @@ def rebuild_whisperx_segments(
         if (
             not should_split
             and config.prefer_punctuation_boundary
-            and _ends_with_punctuation(str(previous.get("word", "")))
+            and _ends_with_punctuation(
+                str(previous.get("word", "")),
+                config.punctuation_boundary_mode,
+            )
         ):
             should_split = True
         if should_split:
@@ -478,7 +500,8 @@ def run_whisperx(
         raise ValueError("repetition_min_count must be at least 2")
     started = time.monotonic()
     recorder = StageArtifactRecorder(debug_artifact_dir)
-    hybrid = str(options.get("backend", "whisperx")) == "hybrid"
+    backend = str(options.get("backend", "whisperx"))
+    hybrid = backend == "hybrid"
     stage_total = 7 if hybrid else 4
 
     report_stage_progress(
@@ -624,11 +647,15 @@ def run_whisperx(
         {
             "segmentation": {
                 "split_on_speaker_change": segmentation.split_on_speaker_change,
+                "split_on_parent_change": segmentation.split_on_parent_change,
                 "max_gap_sec": segmentation.max_gap_sec,
                 "max_duration_sec": segmentation.max_duration_sec,
                 "max_chars": segmentation.max_chars,
                 "prefer_punctuation_boundary": (
                     segmentation.prefer_punctuation_boundary
+                ),
+                "punctuation_boundary_mode": (
+                    segmentation.punctuation_boundary_mode
                 ),
             },
             "words": words,

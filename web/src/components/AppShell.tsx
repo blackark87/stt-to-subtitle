@@ -11,7 +11,6 @@ const NAV: { href: string; icon: IconName; label: string }[] = [
   { href: "/", icon: "dashboard", label: "대시보드" },
   { href: "/media", icon: "folder", label: "미디어" },
   { href: "/jobs", icon: "activity", label: "작업 목록" },
-  { href: "/comparisons", icon: "compare", label: "전사 비교" },
   { href: "/metrics", icon: "clock", label: "통계" },
   { href: "/settings", icon: "settings", label: "설정" },
 ];

@@ -291,7 +291,7 @@
       fetch(`/api/v1/media?folder_limit=${MEDIA_LIMIT}`, { headers })
         .then((result) => result.ok ? result.json() : null)
         .catch(() => null),
-      fetch("/api/v1/runtimes", { headers })
+      fetch("/api/v1/transcribers", { headers })
         .then((result) => result.ok ? result.json() : null)
         .catch(() => null),
     ]);

@@ -20,6 +20,7 @@ from stt_to_subtitle.runtime_api import (
     TranscriptionChangeHook,
     TranscriptionService,
     _device_unavailable_reason,
+    _device_unavailable_reason_from_probe,
     _parse_options,
     _validate_wav,
     create_app,
@@ -43,6 +44,63 @@ class TranscriptionChangeHookTests(unittest.IsolatedAsyncioTestCase):
 
 
 class STTAPIHelpersTests(unittest.TestCase):
+    def test_runtime_backend_capabilities_are_explicit(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "HF_TOKEN": "hf-token",
+                "STT_ENABLED_BACKENDS": "hybrid,whisperjav",
+            },
+            clear=True,
+        ):
+            settings = STTAPISettings.from_env()
+
+        self.assertEqual(
+            settings.enabled_backends,
+            frozenset({"hybrid", "whisperjav"}),
+        )
+        settings.validate()
+
+    def test_disabled_backend_is_rejected_by_runtime(self) -> None:
+        with TemporaryDirectory() as directory:
+            settings = STTAPISettings(
+                state_dir=Path(directory),
+                api_token="",
+                hf_token="hf-token",
+                enabled_backends=frozenset({"hybrid"}),
+                device="cpu",
+                diarization_device="cpu",
+            )
+            service = TranscriptionService(settings)
+
+        self.assertIn(
+            "not enabled",
+            service.backend_unavailable_reason("whisperjav") or "",
+        )
+
+    def test_hybrid_can_use_unadvertised_whisperx_component(self) -> None:
+        with TemporaryDirectory() as directory:
+            settings = STTAPISettings(
+                state_dir=Path(directory),
+                api_token="",
+                hf_token="hf-token",
+                enabled_backends=frozenset({"hybrid"}),
+                device="cpu",
+                diarization_device="cpu",
+            )
+            service = TranscriptionService(settings)
+            job = Mock()
+
+            with patch(
+                "stt_to_subtitle.runtime_api._whisperx_unavailable_reason",
+                return_value="WhisperX component unavailable",
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "WhisperX component unavailable",
+                ):
+                    service._run_whisperx_worker(job)
+
     def test_invalid_backend_output_has_structured_failure_code(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -68,14 +126,14 @@ class STTAPIHelpersTests(unittest.TestCase):
                 options=_parse_options("{}", settings),
             )
 
-            with patch.object(service, "_get_pipeline", return_value=Mock()):
-                with patch(
-                    "stt_to_subtitle.runtime_api.run_pipeline",
-                    side_effect=InvalidTranscriptionOutput(
-                        "segments must be a list"
-                    ),
-                ):
-                    service._run_job("invalid-output")
+            with patch.object(
+                service,
+                "_run_whisperx_worker",
+                side_effect=InvalidTranscriptionOutput(
+                    "segments must be a list"
+                ),
+            ):
+                service._run_job("invalid-output")
 
             failed = service.store.get("invalid-output")
             self.assertEqual(failed.status, "failed")
@@ -116,12 +174,12 @@ class STTAPIHelpersTests(unittest.TestCase):
                 options=_parse_options("{}", settings),
             )
 
-            with patch.object(service, "_get_pipeline", return_value=Mock()):
-                with patch(
-                    "stt_to_subtitle.runtime_api.run_pipeline",
-                    side_effect=RuntimeError("CUDA out of memory"),
-                ):
-                    service._run_job("oom")
+            with patch.object(
+                service,
+                "_run_whisperx_worker",
+                side_effect=RuntimeError("CUDA out of memory"),
+            ):
+                service._run_job("oom")
 
             failed = service.store.get("oom")
             self.assertEqual(failed.status, "failed")
@@ -189,7 +247,7 @@ class STTAPIHelpersTests(unittest.TestCase):
 
         self.assertEqual(app.version, __version__)
 
-    def test_parses_client_options_and_keeps_server_batch_size_for_kotoba(
+    def test_parses_client_options_with_hybrid_batch_defaults(
         self,
     ) -> None:
         settings = STTAPISettings(
@@ -204,11 +262,12 @@ class STTAPIHelpersTests(unittest.TestCase):
             settings,
         )
 
-        self.assertEqual(options["batch_size"], 2)
-        self.assertEqual(options["chunk_length_seconds"], 20)
+        self.assertEqual(options["batch_size"], 8)
+        self.assertEqual(options["kotoba_batch_size"], 2)
+        self.assertEqual(options["chunk_length_seconds"], 15)
         self.assertEqual(options["num_speakers"], 2)
         self.assertTrue(options["noise_filter"])
-        self.assertEqual(options["backend"], "kotoba")
+        self.assertEqual(options["backend"], "hybrid")
 
     def test_uses_whisperx_batch_size_default_for_whisperx_paths(self) -> None:
         settings = STTAPISettings(
@@ -219,7 +278,7 @@ class STTAPIHelpersTests(unittest.TestCase):
             whisperx_batch_size=8,
         )
 
-        for backend in ("whisperx", "hybrid"):
+        for backend in ("hybrid",):
             with self.subTest(backend=backend):
                 options = _parse_options(
                     json.dumps({"backend": backend}),
@@ -238,7 +297,7 @@ class STTAPIHelpersTests(unittest.TestCase):
             whisperx_batch_size=8,
         )
 
-        for backend in ("kotoba", "whisperx", "hybrid"):
+        for backend in ("hybrid",):
             with self.subTest(backend=backend):
                 options = _parse_options(
                     json.dumps({"backend": backend, "batch_size": 16}),
@@ -282,7 +341,7 @@ class STTAPIHelpersTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "between 1 and 64"):
                     _parse_options(
                         json.dumps(
-                            {"backend": "whisperx", "batch_size": value}
+                            {"backend": "hybrid", "batch_size": value}
                         ),
                         settings,
                     )
@@ -300,22 +359,15 @@ class STTAPIHelpersTests(unittest.TestCase):
                 settings,
             )
 
-    def test_accepts_request_level_whisperx_backend_case_insensitively(self) -> None:
+    def test_rejects_request_level_whisperx_backend(self) -> None:
         settings = STTAPISettings(
             state_dir=Path("/tmp/not-used"),
             api_token="",
             hf_token="hf-token",
         )
 
-        options = _parse_options('{"backend": "whisperX"}', settings)
-
-        self.assertEqual(options["backend"], "whisperx")
-        self.assertEqual(options["chunk_length_seconds"], 30)
-        self.assertTrue(options["noise_filter"])
-        self.assertTrue(
-            options["subtitle_segmentation"]["split_on_speaker_change"]
-        )
-        self.assertEqual(options["repetition_policy"], "flag")
+        with self.assertRaisesRegex(ValueError, "hybrid.*whisperjav"):
+            _parse_options('{"backend": "whisperX"}', settings)
 
     def test_rejects_whisperx_chunks_longer_than_native_window(self) -> None:
         settings = STTAPISettings(
@@ -324,11 +376,6 @@ class STTAPIHelpersTests(unittest.TestCase):
             hf_token="hf-token",
         )
 
-        with self.assertRaisesRegex(ValueError, "must be at most 30"):
-            _parse_options(
-                '{"backend":"whisperx","chunk_length_seconds":31}',
-                settings,
-            )
         with self.assertRaisesRegex(ValueError, "must be at most 30"):
             _parse_options(
                 json.dumps(
@@ -362,7 +409,42 @@ class STTAPIHelpersTests(unittest.TestCase):
         self.assertEqual(
             options["subtitle_segmentation"]["max_duration_sec"], 8.0
         )
+        self.assertFalse(
+            options["subtitle_segmentation"]["split_on_speaker_change"]
+        )
+        self.assertTrue(
+            options["subtitle_segmentation"]["split_on_parent_change"]
+        )
+        self.assertEqual(options["subtitle_segmentation"]["max_chars"], 80)
+        self.assertTrue(
+            options["hybrid_rescue"]["stable_ts_regroup_enabled"]
+        )
         self.assertEqual(options["repetition_policy"], "flag")
+
+    def test_hybrid_always_accepts_owsm_audit_thresholds(self) -> None:
+        settings = STTAPISettings(
+            state_dir=Path("/tmp/not-used"),
+            api_token="",
+            hf_token="hf-token",
+        )
+
+        options = _parse_options(
+            '{"backend":"hybrid","owsm_audit":'
+            '{"minimum_extra_characters":12}}',
+            settings,
+        )
+
+        self.assertEqual(options["backend"], "hybrid")
+        self.assertEqual(
+            options["owsm_audit"]["minimum_extra_characters"],
+            12,
+        )
+        self.assertEqual(options["owsm_audit"]["window_seconds"], 30.0)
+        with self.assertRaisesRegex(ValueError, "hybrid.*whisperjav"):
+            _parse_options(
+                '{"backend":"hybrid_owsm","owsm_audit":{}}',
+                settings,
+            )
 
     def test_accepts_fixed_whisperjav_recipe_with_group_overrides(self) -> None:
         settings = STTAPISettings(
@@ -426,7 +508,7 @@ class STTAPIHelpersTests(unittest.TestCase):
                 settings,
             )
 
-    def test_accepts_configurable_whisperx_segmentation_and_reject_policy(
+    def test_accepts_configurable_hybrid_segmentation(
         self,
     ) -> None:
         settings = STTAPISettings(
@@ -438,13 +520,14 @@ class STTAPIHelpersTests(unittest.TestCase):
         options = _parse_options(
             json.dumps(
                 {
-                    "backend": "whisperx",
+                    "backend": "hybrid",
                     "subtitle_segmentation": {
                         "max_gap_sec": 0.7,
                         "max_duration_sec": 8.0,
                         "max_chars": 36,
+                        "punctuation_boundary_mode": "sentence",
                     },
-                    "repetition_policy": "reject",
+                    "repetition_policy": "flag",
                     "repetition_min_count": 12,
                 }
             ),
@@ -453,8 +536,29 @@ class STTAPIHelpersTests(unittest.TestCase):
 
         self.assertEqual(options["subtitle_segmentation"]["max_gap_sec"], 0.7)
         self.assertEqual(options["subtitle_segmentation"]["max_chars"], 36)
-        self.assertEqual(options["repetition_policy"], "reject")
+        self.assertEqual(
+            options["subtitle_segmentation"]["punctuation_boundary_mode"],
+            "sentence",
+        )
+        self.assertEqual(options["repetition_policy"], "flag")
         self.assertEqual(options["repetition_min_count"], 12)
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "punctuation_boundary_mode must be one of",
+        ):
+            _parse_options(
+                '{"backend":"hybrid","subtitle_segmentation":'
+                '{"punctuation_boundary_mode":"clause"}}',
+                settings,
+            )
+        with self.assertRaisesRegex(ValueError, "conflicts"):
+            _parse_options(
+                '{"backend":"hybrid","subtitle_segmentation":'
+                '{"prefer_punctuation_boundary":false,'
+                '"punctuation_boundary_mode":"sentence"}}',
+                settings,
+            )
 
     def test_short_span_policy_is_observation_only(self) -> None:
         settings = STTAPISettings(
@@ -475,12 +579,11 @@ class STTAPIHelpersTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             ValueError,
-            "backend must be 'kotoba', 'whisperx', 'hybrid', or "
-            "'whisperjav'",
+            "backend must be 'hybrid' or 'whisperjav'",
         ):
             _parse_options('{"backend": "other"}', settings)
 
-    def test_whisperx_backend_requires_vad(self) -> None:
+    def test_hybrid_backend_requires_vad(self) -> None:
         settings = STTAPISettings(
             state_dir=Path("/tmp/not-used"),
             api_token="",
@@ -489,14 +592,14 @@ class STTAPIHelpersTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             ValueError,
-            "WhisperX backend requires noise_filter=true",
+            "hybrid backend requires noise_filter=true",
         ):
             _parse_options(
-                '{"backend": "whisperx", "noise_filter": false}',
+                '{"backend": "hybrid", "noise_filter": false}',
                 settings,
             )
 
-    def test_defaults_to_sixty_seconds_and_accepts_disabled_filter(self) -> None:
+    def test_defaults_to_hybrid_recipe_and_rejects_disabled_filter(self) -> None:
         settings = STTAPISettings(
             state_dir=Path("/tmp/not-used"),
             api_token="",
@@ -504,12 +607,11 @@ class STTAPIHelpersTests(unittest.TestCase):
         )
 
         defaults = _parse_options("{}", settings)
-        disabled = _parse_options('{"noise_filter": false}', settings)
-
-        self.assertEqual(defaults["chunk_length_seconds"], 60)
+        self.assertEqual(defaults["chunk_length_seconds"], 15)
         self.assertTrue(defaults["noise_filter"])
-        self.assertFalse(disabled["noise_filter"])
         self.assertEqual(defaults["noise_filter_trigger_level"], 7.0)
+        with self.assertRaisesRegex(ValueError, "requires noise_filter=true"):
+            _parse_options('{"noise_filter": false}', settings)
 
     def test_accepts_16khz_mono_pcm_wav(self) -> None:
         with TemporaryDirectory() as directory:
@@ -593,6 +695,56 @@ class STTAPIHelpersTests(unittest.TestCase):
         )
 
         reason = _device_unavailable_reason(torch, "cuda:1")
+
+        self.assertEqual(
+            reason,
+            "CUDA device cuda:1 is not available; found 1 CUDA device(s)",
+        )
+
+    def test_api_bridge_uses_model_python_for_cached_device_probe(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            model_python = root / "model-python"
+            model_python.write_text("placeholder", encoding="utf-8")
+            service = TranscriptionService(
+                STTAPISettings(
+                    state_dir=root / "state",
+                    api_token="",
+                    hf_token="hf-token",
+                    enabled_backends=frozenset({"hybrid"}),
+                    device="cuda",
+                    diarization_device="cuda:0",
+                    whisperx_python=model_python,
+                    kotoba_python=model_python,
+                    owsm_python=model_python,
+                )
+            )
+            probe = {
+                "cuda_available": True,
+                "cuda_device_count": 1,
+                "mps_available": False,
+            }
+
+            with patch.dict("sys.modules", {"torch": None}), patch(
+                "stt_to_subtitle.runtime_api._probe_worker_torch",
+                return_value=probe,
+            ) as worker_probe:
+                first = service.readiness()
+                second = service.readiness()
+
+            self.assertTrue(first[0])
+            self.assertTrue(second[0])
+            worker_probe.assert_called_once_with(service.settings)
+
+    def test_worker_probe_reports_out_of_range_cuda_device(self) -> None:
+        reason = _device_unavailable_reason_from_probe(
+            {
+                "cuda_available": True,
+                "cuda_device_count": 1,
+                "mps_available": False,
+            },
+            "cuda:1",
+        )
 
         self.assertEqual(
             reason,
@@ -845,7 +997,11 @@ class STTAPIHelpersTests(unittest.TestCase):
                 debug_artifacts=True,
             )
             service = TranscriptionService(settings)
-            options = _parse_options('{"backend":"hybrid"}', settings)
+            options = _parse_options(
+                '{"backend":"hybrid","hybrid_rescue":'
+                '{"stable_ts_regroup_enabled":false}}',
+                settings,
+            )
             service.store.create(
                 job_id="hybrid-job",
                 idempotency_key="hybrid-key",
@@ -874,37 +1030,74 @@ class STTAPIHelpersTests(unittest.TestCase):
                 ],
             }
             fallback_result = {
-                "chunks": [
+                "mode": "windows",
+                "windows": [
                     {
-                        "timestamp": [0.0, 1.0],
-                        "speaker_id": "K_A",
-                        "text": "はい",
+                        "window": {
+                            "start": 0.0,
+                            "end": 1.0,
+                            "window_id": "rescue-window-000001",
+                        },
+                        "duration": 1.0,
+                        "segments": [
+                            {
+                                "start": 0.0,
+                                "end": 1.0,
+                                "speaker": "K_A",
+                                "text": "はい",
+                            }
+                        ],
+                        "chunk_count": 1,
+                        "timestamp_postprocessor": "kotoba-test",
+                        "noise_filter": {
+                            "enabled": True,
+                            "provider": "kotoba-noise-filter-v1",
+                        },
                     }
                 ],
-                "timestamp_postprocessor": "kotoba-test",
-                "noise_filter": {
-                    "enabled": True,
-                    "provider": "kotoba-noise-filter-v1",
-                },
             }
+            worker_order: list[str] = []
+
+            def run_primary(*_args: object, **_kwargs: object) -> object:
+                worker_order.append("whisperx")
+                return primary_result
+
+            def run_audit(*_args: object, **_kwargs: object) -> object:
+                self.assertEqual(worker_order, ["whisperx"])
+                worker_order.append("owsm")
+                return {
+                    "model": {"id": "owsm", "revision": "test"},
+                    "runtime": {"device": "cpu"},
+                    "windows": [],
+                }
+
+            def run_rescue(*_args: object, **_kwargs: object) -> object:
+                self.assertEqual(worker_order, ["whisperx", "owsm"])
+                worker_order.append("kotoba")
+                return fallback_result
 
             with patch.object(
-                service, "_get_pipeline", return_value=Mock()
-            ) as get_pipeline:
+                service,
+                "_run_whisperx_worker",
+                side_effect=run_primary,
+            ) as run_whisperx:
                 with patch.object(
                     service,
-                    "_run_whisperx_worker",
-                    return_value=primary_result,
-                ) as run_whisperx:
-                    with patch(
-                        "stt_to_subtitle.runtime_api.run_pipeline",
-                        return_value=fallback_result,
-                    ) as run_kotoba:
-                        service._run_job("hybrid-job")
+                    "_run_owsm_audit_worker",
+                    side_effect=run_audit,
+                ) as run_owsm, patch.object(
+                    service,
+                    "_run_kotoba_worker",
+                    side_effect=run_rescue,
+                ) as run_kotoba:
+                    service._run_job("hybrid-job")
 
-                get_pipeline.assert_called_once_with(1)
             run_whisperx.assert_called_once()
-            # Kotoba must not stay resident while WhisperX batches on the GPU.
+            run_owsm.assert_called_once()
+            run_kotoba.assert_called_once()
+            self.assertEqual(worker_order, ["whisperx", "owsm", "kotoba"])
+            # Each ASR runs in a separate worker and the first call returns
+            # before the second worker is created.
             self.assertTrue(
                 run_whisperx.call_args.kwargs["release_kotoba"]
             )
@@ -915,7 +1108,7 @@ class STTAPIHelpersTests(unittest.TestCase):
                 30,
             )
             self.assertEqual(
-                run_kotoba.call_args.args[2].chunk_length_seconds,
+                run_kotoba.call_args.args[1].chunk_length_seconds,
                 15,
             )
             completed = service.store.get("hybrid-job")
@@ -949,10 +1142,172 @@ class STTAPIHelpersTests(unittest.TestCase):
             )
             self.assertEqual(
                 payload["quality"]["hybrid"]["replaced_window_count"],
+                0,
+            )
+            self.assertEqual(
+                payload["quality"]["hybrid"]["augmented_window_count"],
                 1,
             )
             self.assertEqual(
-                request_trace["option_semantics"]["stt_call_count"], 2
+                request_trace["option_semantics"]["stt_call_count"], 3
+            )
+
+    def test_hybrid_audits_with_owsm_then_preserves_primary_on_rescue(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            audio_path = root / "audio.wav"
+            with wave.open(str(audio_path), "wb") as wav_file:
+                wav_file.setnchannels(1)
+                wav_file.setsampwidth(2)
+                wav_file.setframerate(16000)
+                wav_file.writeframes(b"\x00\x00" * 16000)
+            settings = STTAPISettings(
+                state_dir=root / "state",
+                api_token="",
+                hf_token="hf-token",
+                device="cpu",
+                diarization_device="cpu",
+            )
+            service = TranscriptionService(settings)
+            options = _parse_options(
+                '{"backend":"hybrid","hybrid_rescue":'
+                '{"stable_ts_regroup_enabled":false}}',
+                settings,
+            )
+            service.store.create(
+                job_id="hybrid-owsm-job",
+                idempotency_key="hybrid-owsm-key",
+                audio_path=audio_path,
+                audio_sha256="hybrid-owsm-sha",
+                options=options,
+            )
+            primary_result = {
+                "model": {"id": "large-v3", "revision": "whisperx-test"},
+                "timing": {"postprocessor": "whisperx-align"},
+                "runtime": {"backend": "whisperx", "device": "cpu"},
+                "noise_filter": {"enabled": True, "provider": "whisperx-vad"},
+                "quality": {"encoding_warning": {"flagged": False}},
+                "words": [
+                    {
+                        "word_id": "word-1",
+                        "start": 0.1,
+                        "end": 0.9,
+                        "speaker": "WX_A",
+                        "word": "短い",
+                    }
+                ],
+                "segments": [
+                    {
+                        "start": 0.1,
+                        "end": 0.9,
+                        "speaker": "WX_A",
+                        "text": "短い",
+                    }
+                ],
+            }
+            audit_result = {
+                "model": {"id": "espnet/owsm_ctc_v4_1B", "revision": "test"},
+                "runtime": {"device": "cpu", "inference_seconds": 0.1},
+                "windows": [
+                    {
+                        "start": 0.0,
+                        "end": 1.0,
+                        "text": "短いだけではなく聞き落とした会話が十分長く続いています",
+                    }
+                ],
+            }
+            rescue_result = {
+                "mode": "windows",
+                "windows": [
+                    {
+                        "window": {
+                            "start": 0.0,
+                            "end": 1.0,
+                            "window_id": "rescue-window-000001",
+                        },
+                        "duration": 1.0,
+                        "segments": [
+                            {
+                                "start": 0.0,
+                                "end": 1.0,
+                                "speaker": "K_A",
+                                "text": "누락 복구",
+                            }
+                        ],
+                        "chunk_count": 1,
+                        "timestamp_postprocessor": "kotoba-test",
+                    }
+                ],
+            }
+            worker_order: list[str] = []
+
+            def primary(*_args: object, **_kwargs: object) -> object:
+                worker_order.append("whisperx")
+                return primary_result
+
+            def audit(*_args: object, **_kwargs: object) -> object:
+                self.assertEqual(worker_order, ["whisperx"])
+                worker_order.append("owsm")
+                return audit_result
+
+            def rescue(*_args: object, **_kwargs: object) -> object:
+                self.assertEqual(worker_order, ["whisperx", "owsm"])
+                worker_order.append("kotoba")
+                return rescue_result
+
+            with patch.object(
+                service,
+                "_run_whisperx_worker",
+                side_effect=primary,
+            ), patch.object(
+                service,
+                "_run_owsm_audit_worker",
+                side_effect=audit,
+            ), patch.object(
+                service,
+                "_run_kotoba_worker",
+                side_effect=rescue,
+            ):
+                service._run_job("hybrid-owsm-job")
+
+            self.assertEqual(worker_order, ["whisperx", "owsm", "kotoba"])
+            completed = service.store.get("hybrid-owsm-job")
+            payload = json.loads(Path(completed.result_path).read_text("utf-8"))
+            self.assertEqual(payload["runtime"]["backend"], "hybrid")
+            self.assertEqual(payload["runtime"]["audit"]["window_count"], 1)
+            self.assertEqual(
+                [segment["text"] for segment in payload["segments"]],
+                ["누락 복구", "短い"],
+            )
+            self.assertEqual(
+                payload["quality"]["owsm_audit"]["issues"][0][
+                    "reason_codes"
+                ],
+                ["OWSM_TEXT_COVERAGE_GAP"],
+            )
+            self.assertEqual(
+                payload["model"]["id"],
+                "whisperx+owsm-audit+kotoba-recall-union",
+            )
+            self.assertEqual(
+                payload["runtime"]["rescue"]["merge_policy"],
+                "recall_union",
+            )
+            self.assertEqual(
+                payload["quality"]["hybrid"]["augmented_window_count"],
+                1,
+            )
+            self.assertEqual(
+                payload["quality"]["hybrid"][
+                    "preserved_primary_segment_count"
+                ],
+                1,
+            )
+            self.assertTrue(
+                all(
+                    word.get("decision") != "superseded"
+                    for word in payload["words"]
+                )
             )
 
     def test_hybrid_window_scope_decodes_only_the_rescue_span(self) -> None:
@@ -974,8 +1329,9 @@ class STTAPIHelpersTests(unittest.TestCase):
             )
             service = TranscriptionService(settings)
             options = _parse_options(
-                '{"backend":"hybrid",'
-                '"hybrid_rescue":{"rescue_scope":"windows"}}',
+                '{"backend":"hybrid","hybrid_rescue":'
+                '{"rescue_scope":"windows",'
+                '"stable_ts_regroup_enabled":false}}',
                 settings,
             )
             service.store.create(
@@ -1003,38 +1359,63 @@ class STTAPIHelpersTests(unittest.TestCase):
                 ],
             }
             window_result = {
-                "chunks": [
+                "mode": "windows",
+                "windows": [
                     {
-                        "timestamp": [5.0, 6.0],
-                        "speaker_id": "K_A",
-                        "text": "はい",
+                        "window": {
+                            "start": 15.0,
+                            "end": 25.9,
+                            "window_id": "rescue-window-000001",
+                        },
+                        "duration": 10.9,
+                        "segments": [
+                            {
+                                "start": 20.0,
+                                "end": 21.0,
+                                "speaker": "K_A",
+                                "text": "はい",
+                            }
+                        ],
+                        "chunk_count": 1,
+                        "timestamp_postprocessor": "kotoba-test",
                     }
                 ],
-                "timestamp_postprocessor": "kotoba-test",
             }
 
-            with patch.object(service, "_get_pipeline", return_value=Mock()):
+            with patch.object(
+                service,
+                "_run_whisperx_worker",
+                return_value=primary_result,
+            ), patch.object(
+                service,
+                "_run_owsm_audit_worker",
+                return_value={
+                    "model": {"id": "owsm", "revision": "test"},
+                    "runtime": {"device": "cpu"},
+                    "windows": [],
+                },
+            ):
                 with patch.object(
                     service,
-                    "_run_whisperx_worker",
-                    return_value=primary_result,
-                ):
-                    with patch(
-                        "stt_to_subtitle.runtime_api.run_pipeline",
-                        return_value=window_result,
-                    ) as run_kotoba:
-                        service._run_job("window-job")
+                    "_run_kotoba_worker",
+                    return_value=window_result,
+                ) as run_kotoba:
+                    service._run_job("window-job")
 
             run_kotoba.assert_called_once()
-            sliced = run_kotoba.call_args.args[1]
-            self.assertNotEqual(sliced, audio_path)
-            self.assertTrue(sliced.name.startswith("window-"))
+            requested_windows = run_kotoba.call_args.kwargs["windows"]
+            self.assertEqual(len(requested_windows), 1)
+            self.assertAlmostEqual(requested_windows[0]["start"], 15.0)
 
             completed = service.store.get("window-job")
             payload = json.loads(
                 Path(completed.result_path).read_text(encoding="utf-8")
             )
-            rescued = payload["segments"][0]
+            rescued = next(
+                segment
+                for segment in payload["segments"]
+                if segment["text"] == "はい"
+            )
             self.assertEqual(rescued["text"], "はい")
             self.assertAlmostEqual(rescued["start"], 20.0, places=3)
             self.assertAlmostEqual(rescued["end"], 21.0, places=3)
@@ -1081,7 +1462,16 @@ class STTAPIHelpersTests(unittest.TestCase):
                     "provider": "whisperx-vad",
                 },
                 "quality": {"encoding_warning": {"flagged": False}},
-                "words": [],
+                "words": [
+                    {
+                        "word_id": "word-000001",
+                        "parent_span_ids": ["original-cue"],
+                        "word": "こんにちは",
+                        "start": 0.1,
+                        "end": 0.9,
+                        "speaker": "WX_A",
+                    }
+                ],
                 "segments": [
                     {
                         "start": 0.1,
@@ -1100,13 +1490,35 @@ class STTAPIHelpersTests(unittest.TestCase):
                     service,
                     "_run_whisperx_worker",
                     return_value=primary_result,
+                ), patch.object(
+                    service,
+                    "_run_owsm_audit_worker",
+                    return_value={
+                        "model": {"id": "owsm", "revision": "test"},
+                        "runtime": {"device": "cpu"},
+                        "windows": [],
+                    },
                 ):
-                    with patch(
-                        "stt_to_subtitle.runtime_api.run_pipeline",
-                    ) as run_kotoba:
-                        service._run_job("clean-hybrid-job")
+                    with patch.object(
+                        service,
+                        "_run_stable_ts_regroup_worker",
+                        return_value={
+                            "words": [
+                                {
+                                    **primary_result["words"][0],
+                                    "parent_span_ids": ["stable-ts-cue-000001"],
+                                }
+                            ],
+                            "segments": [primary_result["segments"][0]],
+                        },
+                    ) as stable_regroup:
+                        with patch(
+                            "stt_to_subtitle.runtime_api.run_pipeline",
+                        ) as run_kotoba:
+                            service._run_job("clean-hybrid-job")
 
             run_kotoba.assert_not_called()
+            stable_regroup.assert_called_once()
             get_pipeline.assert_not_called()
             completed = service.store.get("clean-hybrid-job")
             self.assertEqual(completed.status, "completed")
@@ -1133,7 +1545,14 @@ class STTAPIHelpersTests(unittest.TestCase):
             self.assertEqual(
                 payload["quality"]["hybrid"]["fallback_segment_count"], 0
             )
-
+            self.assertEqual(
+                payload["quality"]["hybrid"]["stable_ts_regroup"],
+                {
+                    "enabled": True,
+                    "provider": "stable-ts-regroup-jav-v1",
+                    "segment_count": 1,
+                },
+            )
 
     def test_whisperjav_job_persists_aligned_speaker_result(self) -> None:
         with TemporaryDirectory() as directory:
@@ -1401,7 +1820,7 @@ class STTAPIRouteTests(unittest.TestCase):
             self.assertEqual(health.status_code, 200)
             self.assertEqual(health.json()["status"], "ok")
             self.assertEqual(
-                health.json()["runtime"],
+                health.json()["transcriber"],
                 {
                     "id": "runtime-node-02",
                     "name": "GPU Runtime 02",
@@ -1431,7 +1850,7 @@ class STTAPIRouteTests(unittest.TestCase):
 
             self.assertEqual(response.status_code, 404)
 
-    def test_whisperx_request_reports_missing_isolated_python(self) -> None:
+    def test_hybrid_request_reports_missing_isolated_python(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
             wav_path = root / "audio.wav"
@@ -1454,7 +1873,7 @@ class STTAPIRouteTests(unittest.TestCase):
                     ready = client.get("/readyz")
                     response = client.post(
                         "/v1/transcriptions",
-                        headers={"Idempotency-Key": "whisperx-missing"},
+                        headers={"Idempotency-Key": "hybrid-missing"},
                         files={
                             "audio": (
                                 "audio.wav",
@@ -1462,14 +1881,10 @@ class STTAPIRouteTests(unittest.TestCase):
                                 "audio/wav",
                             )
                         },
-                        data={"options": '{"backend":"whisperx"}'},
+                        data={"options": '{"backend":"hybrid"}'},
                     )
 
-            self.assertEqual(ready.status_code, 200)
-            self.assertEqual(
-                ready.json()["backends"]["whisperx"]["status"],
-                "unavailable",
-            )
+            self.assertEqual(ready.status_code, 503)
             self.assertEqual(
                 ready.json()["backends"]["hybrid"]["status"],
                 "unavailable",

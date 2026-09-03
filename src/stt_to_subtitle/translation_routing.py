@@ -22,6 +22,7 @@ from .service_clients import (
     RetryingJSONClient,
     TranslationDeferred,
 )
+from .resource_groups import ResourceGroupLimiter
 from .translation_store import (
     TranslationServer,
     TranslationServerGroupStore,
@@ -167,6 +168,7 @@ class BackendTranslationRouting:
         *,
         stores: Mapping[str, TranslationServerGroupStore] | None = None,
         stt_hard_breaker_active: Callable[[], bool] | None = None,
+        resource_groups: ResourceGroupLimiter | None = None,
     ) -> None:
         self.defaults = defaults.normalized()
         self.stores = dict(stores or {
@@ -205,8 +207,10 @@ class BackendTranslationRouting:
         self._condition = threading.Condition(self._lock)
         self._health: dict[tuple[str, str], dict[str, Any]] = {}
         self._active_requests: dict[tuple[str, str], int] = {}
+        self._resource_group_holders: dict[tuple[str, str], int] = {}
         self._review_host_holders: dict[str, int] = {}
         self._stt_hard_breaker_active = stt_hard_breaker_active
+        self._resource_groups = resource_groups
         self._hard_breaker_holders = 0
 
     def _store(self, stage: str) -> TranslationServerGroupStore:
@@ -423,6 +427,7 @@ class BackendTranslationRouting:
             "token_configured": bool(server.token),
             "enabled": server.enabled,
             "capacity": server.capacity,
+            "resource_group_id": server.resource_group_id,
             "thinking_enabled": server.thinking_enabled,
             "builtin": server.builtin,
             "batch_preferred": server.batch_preferred,
@@ -467,7 +472,9 @@ class BackendTranslationRouting:
         return self._public_server(resolved, server)
 
     @staticmethod
-    def _server_values(payload: Mapping[str, Any]) -> tuple[str, str, int]:
+    def _server_values(
+        payload: Mapping[str, Any],
+    ) -> tuple[str, str, int, str]:
         name = str(payload.get("name", "")).strip()
         if not name or len(name) > 80:
             raise ValueError("번역 서버 이름은 1~80자여야 합니다.")
@@ -475,7 +482,12 @@ class BackendTranslationRouting:
         capacity = int(payload.get("capacity", 1))
         if not 1 <= capacity <= 8:
             raise ValueError("번역 서버 동시 요청 수는 1~8이어야 합니다.")
-        return name, base_url, capacity
+        resource_group_id = str(
+            payload.get("resource_group_id", "local-gpu")
+        ).strip()
+        if not resource_group_id or len(resource_group_id) > 80:
+            raise ValueError("리소스 그룹 ID는 1~80자여야 합니다.")
+        return name, base_url, capacity, resource_group_id
 
     def create_server(
         self,
@@ -483,7 +495,9 @@ class BackendTranslationRouting:
         payload: Mapping[str, Any],
     ) -> dict[str, Any]:
         resolved = translation_stage(stage)
-        name, base_url, capacity = self._server_values(payload)
+        name, base_url, capacity, resource_group_id = self._server_values(
+            payload
+        )
         try:
             server = self.stores[resolved].create(
                 name=name,
@@ -491,6 +505,7 @@ class BackendTranslationRouting:
                 token=str(payload.get("token", "")),
                 enabled=bool(payload.get("enabled", True)),
                 capacity=capacity,
+                resource_group_id=resource_group_id,
                 thinking_enabled=bool(
                     payload.get("thinking_enabled", False)
                 ),
@@ -515,7 +530,9 @@ class BackendTranslationRouting:
         current = store.get(server_id)
         if current is None:
             raise ValueError("번역 서버를 찾을 수 없습니다.")
-        name, base_url, capacity = self._server_values(payload)
+        name, base_url, capacity, resource_group_id = self._server_values(
+            payload
+        )
         token_value = payload.get("token")
         token = "" if bool(payload.get("clear_token")) else (
             str(token_value) if token_value is not None else current.token
@@ -528,6 +545,7 @@ class BackendTranslationRouting:
                 token=token,
                 enabled=bool(payload.get("enabled", True)),
                 capacity=capacity,
+                resource_group_id=resource_group_id,
                 thinking_enabled=(
                     bool(payload["thinking_enabled"])
                     if payload.get("thinking_enabled") is not None
@@ -853,6 +871,16 @@ class BackendTranslationRouting:
 
             self._active_requests[key] = running + 1
             if stage != "review":
+                if self._resource_groups is not None and not (
+                    self._resource_groups.try_acquire(
+                        server.resource_group_id
+                    )
+                ):
+                    self._release_request_slot_locked(stage, server)
+                    return False
+                self._resource_group_holders[key] = (
+                    self._resource_group_holders.get(key, 0) + 1
+                )
                 return True
 
             # Reserving the host before waiting prevents new draft calls from
@@ -876,6 +904,14 @@ class BackendTranslationRouting:
                         "시작할 수 없습니다."
                     )
                 self._condition.wait(timeout=min(1.0, remaining))
+            if self._resource_groups is not None and not (
+                self._resource_groups.try_acquire(server.resource_group_id)
+            ):
+                self._release_request_slot_locked(stage, server)
+                return False
+            self._resource_group_holders[key] = (
+                self._resource_group_holders.get(key, 0) + 1
+            )
             return True
 
     def _release_request_slot_locked(
@@ -884,6 +920,14 @@ class BackendTranslationRouting:
         server: TranslationServer,
     ) -> None:
         key = (stage, server.id)
+        group_holders = self._resource_group_holders.get(key, 0)
+        if group_holders:
+            if group_holders == 1:
+                self._resource_group_holders.pop(key, None)
+            else:
+                self._resource_group_holders[key] = group_holders - 1
+            if self._resource_groups is not None:
+                self._resource_groups.release(server.resource_group_id)
         self._active_requests[key] = max(
             0,
             self._active_requests.get(key, 1) - 1,

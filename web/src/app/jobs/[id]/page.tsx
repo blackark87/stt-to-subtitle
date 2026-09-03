@@ -22,6 +22,7 @@ import { EVENT_LEVEL_LABEL, eventText, jobProgressLabel, jobStateLabel, jobTrans
 import { useLiveQuery } from "@/lib/useLiveQuery";
 
 const INTERVAL_MS = 5000;
+const SUBTITLE_HISTORY_PREVIEW_LIMIT = 5;
 
 const BADGE_CLASS: Record<JobState, string> = {
   running: "b run dot",
@@ -206,17 +207,17 @@ export default function JobDetailPage({ params }: { params: Promise<{ id: string
   const { id } = use(params);
   const fetcher = useCallback(() => api.job(id), [id]);
   const { data: detail, status, error, updatedAt, refreshing, refresh } = useLiveQuery(fetcher, INTERVAL_MS);
-  const runtimes = useLiveQuery(useCallback(() => api.runtimes(), []), 60000);
+  const transcribers = useLiveQuery(useCallback(() => api.transcribers(), []), 60000);
   const prompts = useLiveQuery(useCallback(() => api.promptCategories(), []), 60000);
   const settings = useLiveQuery(useCallback(() => api.settings(), []), 60000);
   const job = detail?.job ?? null;
   const state = job ? asJobState(job.state) : null;
   const runtimeNames = useMemo(
-    () => new Map((runtimes.data?.items ?? []).map((runtime) => [runtime.id, runtime.name])),
-    [runtimes.data?.items],
+    () => new Map((transcribers.data?.items ?? []).map((transcriber) => [transcriber.id, transcriber.name])),
+    [transcribers.data?.items],
   );
-  const assignedRuntime = job?.stt_runtime_id
-    ? runtimeNames.get(job.stt_runtime_id) ?? job.stt_runtime_id
+  const assignedRuntime = job?.transcriber_id
+    ? runtimeNames.get(job.transcriber_id) ?? job.transcriber_id
     : null;
   const stateText = job ? jobStateLabel(job) : null;
 
@@ -241,6 +242,7 @@ export default function JobDetailPage({ params }: { params: Promise<{ id: string
   const [editingSegmentId, setEditingSegmentId] = useState<string | null>(null);
   const [editingText, setEditingText] = useState("");
   const [lineageRefreshToken, setLineageRefreshToken] = useState(0);
+  const [subtitleHistoryExpanded, setSubtitleHistoryExpanded] = useState(false);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const detailLayoutRef = useRef<HTMLDivElement | null>(null);
   const previewCardRef = useRef<HTMLElement | null>(null);
@@ -549,6 +551,10 @@ export default function JobDetailPage({ params }: { params: Promise<{ id: string
     effectiveExternalModelKey.split("\u0000");
   const workflowJobs = detail?.workflow_jobs ?? (job ? [job] : []);
   const workflowHistoryJobs = detail?.workflow_history_jobs ?? [];
+  const previousSubtitleWorkflows = detail?.previous_subtitle_workflows ?? [];
+  const visibleSubtitleWorkflows = subtitleHistoryExpanded
+    ? previousSubtitleWorkflows
+    : previousSubtitleWorkflows.slice(0, SUBTITLE_HISTORY_PREVIEW_LIMIT);
   const jobExternalModel = job?.options.external_model;
   const jobExternalSelection = (
     jobExternalModel
@@ -564,7 +570,7 @@ export default function JobDetailPage({ params }: { params: Promise<{ id: string
   return (
     <>
       <LoadingOverlay
-        active={refreshing || runtimes.refreshing || prompts.refreshing || settings.refreshing || artifactLoading || busy}
+        active={refreshing || transcribers.refreshing || prompts.refreshing || settings.refreshing || artifactLoading || busy}
         message={busy ? "작업 요청을 처리하는 중입니다" : artifactLoading ? "작업 산출물을 불러오는 중입니다" : "작업 정보를 불러오는 중입니다"}
       />
       <header className="topbar">
@@ -705,7 +711,7 @@ export default function JobDetailPage({ params }: { params: Promise<{ id: string
               <span className="eyebrow">현재 작업 진행</span>
               <strong>{job ? jobProgressLabel(job) : "확인 중"}</strong>
               {job ? <span className="muted">작업 종류: {operationLabel(job.operation)} · 상태: {stateText}</span> : null}
-              {assignedRuntime ? <span className="muted">전사 서버: {assignedRuntime} <span className="code">({job?.stt_runtime_id})</span></span> : null}
+              {assignedRuntime ? <span className="muted">전사 서버: {assignedRuntime} <span className="code">({job?.transcriber_id})</span></span> : null}
               {jobExternalSelection ? (
                 <span className="muted">
                   외부 검토 모델: {jobExternalSelection.provider} · <span className="code">{jobExternalSelection.model}</span>
@@ -787,6 +793,98 @@ export default function JobDetailPage({ params }: { params: Promise<{ id: string
                 );
               })}
             </div>
+          </section>
+        ) : null}
+
+        {previousSubtitleWorkflows.length ? (
+          <section className="card" aria-labelledby="subtitle-history-title">
+            <div className="card-head">
+              <h2 id="subtitle-history-title">과거 자막 생성 이력</h2>
+            </div>
+            <div className="subtitle-history-columns" aria-hidden="true">
+              <span>작업 일시</span>
+              <span>전사 모델</span>
+              <span>번역 프롬프트</span>
+              <span>산출물</span>
+            </div>
+            <ol className="subtitle-history-list" id="subtitle-history-list">
+              {visibleSubtitleWorkflows.map((history) => {
+                const modelLabel = history.transcription_model_revision
+                  ? `${history.transcription_backend} · ${history.transcription_model_revision}`
+                  : history.transcription_backend;
+                const promptLabel = history.translation_prompt_version == null
+                  ? `${history.translation_prompt_name} · 버전 미기록`
+                  : `${history.translation_prompt_name} · v${history.translation_prompt_version}`;
+                return (
+                  <li
+                    key={history.workflow_root_job_id}
+                    className="subtitle-history-row"
+                  >
+                    <div className="subtitle-history-run">
+                      <time dateTime={new Date(history.latest_generation_created_at * 1000).toISOString()}>
+                        {clock(history.latest_generation_created_at)}
+                      </time>
+                      <span className={history.is_test ? "b hold" : "b ok"}>
+                        {history.is_test ? "테스트 실행" : "일반 실행"}
+                      </span>
+                    </div>
+                    <div className="subtitle-history-value subtitle-history-model">
+                      <span className="subtitle-history-mobile-label">전사 모델</span>
+                      <span className="code">{modelLabel}</span>
+                    </div>
+                    <div className="subtitle-history-value subtitle-history-prompt">
+                      <span className="subtitle-history-mobile-label">번역 프롬프트</span>
+                      <span>{promptLabel}</span>
+                    </div>
+                    <div className="btns subtitle-history-actions">
+                      {history.transcript_job_id ? (
+                        <a
+                          className="btn sec sm"
+                          href={`/api/v1/jobs/${encodeURIComponent(history.transcript_job_id)}/artifacts/transcript?inline=true`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                        >
+                          <Icon name="captions" size={14} />전사 스크립트
+                        </a>
+                      ) : (
+                        <span className="btn sec sm off" aria-disabled="true">
+                          <Icon name="captions" size={14} />전사 없음
+                        </span>
+                      )}
+                      {history.translation_job_id ? (
+                        <a
+                          className="btn sec sm"
+                          href={`/api/v1/jobs/${encodeURIComponent(history.translation_job_id)}/artifacts/translation?inline=true`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                        >
+                          <Icon name="braces" size={14} />번역 결과
+                        </a>
+                      ) : (
+                        <span className="btn sec sm off" aria-disabled="true">
+                          <Icon name="braces" size={14} />번역 없음
+                        </span>
+                      )}
+                    </div>
+                  </li>
+                );
+              })}
+            </ol>
+            {previousSubtitleWorkflows.length > SUBTITLE_HISTORY_PREVIEW_LIMIT ? (
+              <div className="subtitle-history-disclosure">
+                <button
+                  type="button"
+                  className="btn sec sm"
+                  aria-expanded={subtitleHistoryExpanded}
+                  aria-controls="subtitle-history-list"
+                  onClick={() => setSubtitleHistoryExpanded((expanded) => !expanded)}
+                >
+                  {subtitleHistoryExpanded
+                    ? `최신 ${SUBTITLE_HISTORY_PREVIEW_LIMIT}건만 보기`
+                    : `전체 ${previousSubtitleWorkflows.length}건 보기`}
+                </button>
+              </div>
+            ) : null}
           </section>
         ) : null}
 

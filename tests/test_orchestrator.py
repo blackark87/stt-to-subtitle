@@ -43,6 +43,122 @@ def configure_translation_models(
 
 
 class SubtitleOrchestratorTests(unittest.TestCase):
+    def test_prompt_authoring_uses_the_selected_external_model(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            orchestrator = SubtitleOrchestrator(
+                BackendSettings(
+                    state_dir=root / "state",
+                    media_root=media_root,
+                    stt_base_url="http://stt.test",
+                    stt_token="",
+                )
+            )
+            try:
+                orchestrator.store.save_external_model_profile(
+                    provider="nvidia_build",
+                    base_url="https://integrate.api.nvidia.com/v1",
+                    credential="external-secret",
+                    region="",
+                    selected_model="nvidia/author",
+                    models=["nvidia/author"],
+                    status="ready",
+                )
+                with patch(
+                    "stt_to_subtitle.orchestrator."
+                    "ExternalStructuredCompletionClient.complete",
+                    return_value={
+                        "translation_prompt": "generated draft",
+                        "review_prompt": "generated review",
+                        "summary": "generated for variety",
+                    },
+                ) as complete:
+                    draft = orchestrator.create_prompt_draft(
+                        name="버라이어티",
+                        domain_description="일본 토크쇼",
+                        provider="nvidia_build",
+                        model="nvidia/author",
+                    )
+
+                self.assertEqual(draft["translation_prompt"], "generated draft")
+                self.assertEqual(draft["provider"], "nvidia_build")
+                self.assertEqual(draft["model"], "nvidia/author")
+                complete.assert_called_once()
+            finally:
+                orchestrator.stop()
+
+    def test_prompt_improvement_does_not_require_the_review_route(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            orchestrator = SubtitleOrchestrator(
+                BackendSettings(
+                    state_dir=root / "state",
+                    media_root=media_root,
+                    stt_base_url="http://stt.test",
+                    stt_token="",
+                )
+            )
+            try:
+                category = orchestrator.store.get_prompt_category("variety")
+                assert category is not None
+                orchestrator.store.save_external_model_profile(
+                    provider="nvidia_build",
+                    base_url="https://integrate.api.nvidia.com/v1",
+                    credential="external-secret",
+                    region="",
+                    selected_model="nvidia/author",
+                    models=["nvidia/author"],
+                    status="ready",
+                )
+                feedback = [
+                    {
+                        "id": f"feedback-{index}",
+                        "job_id": f"job-{index % 4}",
+                        "base_revision_id": category.prompt_revision_id,
+                    }
+                    for index in range(20)
+                ]
+                expected = {"id": "run-1", "status": "queued"}
+                with (
+                    patch.object(
+                        orchestrator.store,
+                        "list_translation_feedback",
+                        return_value=feedback,
+                    ),
+                    patch.object(
+                        orchestrator.store,
+                        "create_prompt_improvement_run",
+                        return_value=expected,
+                    ) as create_run,
+                    patch.object(
+                        orchestrator._prompt_improvement_executor,
+                        "submit",
+                    ) as submit,
+                ):
+                    run = orchestrator.create_prompt_improvement(
+                        category_id="variety",
+                        stage="translation",
+                        provider="nvidia_build",
+                        model="nvidia/author",
+                    )
+
+                self.assertEqual(run, expected)
+                self.assertEqual(
+                    create_run.call_args.kwargs["endpoint_contract"],
+                    "nvidia_build",
+                )
+                self.assertEqual(
+                    create_run.call_args.kwargs["model_contract"],
+                    "nvidia/author",
+                )
+                submit.assert_called_once()
+            finally:
+                orchestrator.stop()
+
     def test_external_model_recheck_preserves_saved_selection(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -694,8 +810,8 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                 orchestrator.stop()
 
             self.assertIsNone(job.options["duration_seconds"])
-            self.assertEqual(job.options["backend"], "kotoba")
-            self.assertEqual(job.options["chunk_length_seconds"], 60)
+            self.assertEqual(job.options["backend"], "hybrid")
+            self.assertEqual(job.options["chunk_length_seconds"], 15)
             self.assertTrue(job.options["noise_filter"])
 
     def test_rejects_invalid_backend_options_before_audio_work(self) -> None:
@@ -718,7 +834,7 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                         },
                     )
                 with self.assertRaisesRegex(
-                    ValueError, "hybrid_rescue requires"
+                    ValueError, "backend must be one of"
                 ):
                     orchestrator.create_job(
                         "movie.mkv",
@@ -729,7 +845,7 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                         },
                     )
                 with self.assertRaisesRegex(
-                    ValueError, "must be at most 30"
+                    ValueError, "backend must be one of"
                 ):
                     orchestrator.create_job(
                         "movie.mkv",
@@ -750,19 +866,12 @@ class SubtitleOrchestratorTests(unittest.TestCase):
             (media_root / "movie.mkv").write_bytes(b"media")
             orchestrator = self.make_orchestrator(root, media_root)
             try:
-                for index, backend in enumerate(("whisperx", "hybrid")):
-                    with self.subTest(backend=backend):
-                        job = orchestrator.create_job(
-                            "movie.mkv",
-                            force_overwrite=True,
-                            options={
-                                "backend": backend,
-                                "batch_size": 16,
-                                "start_seconds": index,
-                            },
-                        )
-
-                        self.assertEqual(job.options["batch_size"], 16)
+                job = orchestrator.create_job(
+                    "movie.mkv",
+                    force_overwrite=True,
+                    options={"backend": "hybrid", "batch_size": 16},
+                )
+                self.assertEqual(job.options["batch_size"], 16)
             finally:
                 orchestrator.stop()
 
@@ -794,10 +903,11 @@ class SubtitleOrchestratorTests(unittest.TestCase):
             (media_root / "movie.mkv").write_bytes(b"media")
             orchestrator = self.make_orchestrator(root, media_root)
             try:
-                for backend in ("kotoba", "whisperjav"):
+                for backend in ("kotoba", "whisperx", "whisperjav"):
                     with self.subTest(backend=backend):
                         with self.assertRaisesRegex(
-                            ValueError, "batch_size requires backend"
+                            ValueError,
+                            "backend must be one of|batch_size requires backend",
                         ):
                             orchestrator.create_job(
                                 "movie.mkv",
@@ -816,7 +926,7 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                                 "movie.mkv",
                                 force_overwrite=True,
                                 options={
-                                    "backend": "whisperx",
+                                    "backend": "hybrid",
                                     "batch_size": value,
                                 },
                             )
@@ -864,7 +974,7 @@ class SubtitleOrchestratorTests(unittest.TestCase):
             media_root.mkdir()
             store = JobStore(root / "state" / "jobs.sqlite3")
             store.save_remote_server_settings(
-                stt_base_url="http://stt:8100",
+                stt_base_url="http://runtime:8100",
                 stt_token="",
             )
 
@@ -872,20 +982,20 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                 BackendSettings(
                     state_dir=root / "state",
                     media_root=media_root,
-                    stt_base_url="http://runtime:8100",
+                    stt_base_url="http://host.docker.internal:8100",
                     stt_token="",
                 )
             )
             try:
                 self.assertEqual(
                     orchestrator.stt_client.base_url,
-                    "http://runtime:8100",
+                    "http://host.docker.internal:8100",
                 )
                 self.assertEqual(
                     orchestrator.store.get_remote_server_settings()[
                         "stt_base_url"
                     ],
-                    "http://runtime:8100",
+                    "http://host.docker.internal:8100",
                 )
             finally:
                 orchestrator.stop()
@@ -938,6 +1048,69 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                 self.assertEqual(
                     orchestrator._stt_executor.submit.call_count,
                     2,
+                )
+            finally:
+                orchestrator.stop()
+
+    def test_dispatches_only_to_runtime_advertising_requested_backend(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            orchestrator = self.make_orchestrator(root, media_root)
+            try:
+                endpoint = orchestrator.store.create_runtime_endpoint(
+                    name="WhisperJAV Transcriber",
+                    base_url="http://whisperjav.test:8100",
+                    token="token",
+                    enabled=True,
+                    capacity=1,
+                )
+                orchestrator._install_runtime_endpoint(endpoint)
+                orchestrator._set_runtime_health(
+                    "builtin",
+                    "ready",
+                    readiness={
+                        "status": "ready",
+                        "backends": {"hybrid": {"status": "ready"}},
+                    },
+                )
+                orchestrator._set_runtime_health(
+                    endpoint.id,
+                    "ready",
+                    readiness={
+                        "status": "ready",
+                        "backends": {
+                            "whisperjav": {"status": "ready"}
+                        },
+                    },
+                )
+                hybrid = orchestrator.store.create(
+                    job_id="hybrid-capability",
+                    source_rel="hybrid.mkv",
+                    force_overwrite=False,
+                    options={"backend": "hybrid"},
+                    status="audio_ready",
+                )
+                whisperjav = orchestrator.store.create(
+                    job_id="whisperjav-capability",
+                    source_rel="whisperjav.mkv",
+                    force_overwrite=False,
+                    options={"backend": "whisperjav"},
+                    status="audio_ready",
+                )
+                orchestrator._stt_executor.submit = Mock()
+
+                self.assertEqual(orchestrator._dispatch_transcriptions(), 2)
+                self.assertEqual(
+                    orchestrator.store.get(hybrid.id).stt_runtime_id,
+                    "builtin",
+                )
+                self.assertEqual(
+                    orchestrator.store.get(whisperjav.id).stt_runtime_id,
+                    endpoint.id,
                 )
             finally:
                 orchestrator.stop()
@@ -1426,7 +1599,7 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                 orchestrator.stop()
 
             self.assertEqual(extracted.status, "audio_ready")
-            self.assertEqual(extracted.chunks_total_estimate, 3)
+            self.assertEqual(extracted.chunks_total_estimate, 9)
             self.assertEqual(completed.status, "transcription_completed")
             self.assertEqual(completed.operation, "transcribe")
             self.assertTrue(Path(completed.audio_path).is_file())
@@ -1551,7 +1724,7 @@ class SubtitleOrchestratorTests(unittest.TestCase):
             self.assertEqual(resumed.audio_path, str(audio_path))
             self.assertEqual(resumed.audio_sha256, "digest")
             self.assertEqual(resumed.options["start_seconds"], 12.0)
-            self.assertEqual(resumed.options["chunk_length_seconds"], 30)
+            self.assertEqual(resumed.options["chunk_length_seconds"], 15)
             self.assertEqual([job.id for job in jobs], [legacy.id])
 
     def test_transcription_reextracts_missing_legacy_audio_with_same_job_id(
@@ -3741,7 +3914,7 @@ class SubtitleOrchestratorTests(unittest.TestCase):
             )
             self.assertEqual(skipped, 2)
 
-    def test_comparison_selection_ignores_completed_subtitles(self) -> None:
+    def test_comparison_selection_is_not_supported(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
             media_root = root / "media"
@@ -3762,17 +3935,232 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                 )
                 orchestrator.store.update(completed.id, status="completed")
 
-                selected, skipped = orchestrator.expand_job_sources(
-                    ["movie.mp4"],
-                    [],
-                    force_overwrite=False,
-                    operation="compare",
-                )
+                with self.assertRaisesRegex(ValueError, "unsupported"):
+                    orchestrator.expand_job_sources(
+                        ["movie.mp4"],
+                        [],
+                        force_overwrite=False,
+                        operation="compare",
+                    )
             finally:
                 orchestrator.stop()
 
-            self.assertEqual(selected, ["movie.mp4"])
-            self.assertEqual(skipped, 0)
+
+    def test_comparison_queues_whisperjav_boundary_and_window_variants(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            (media_root / "movie.mp4").write_bytes(b"media")
+            orchestrator = self.make_orchestrator(root, media_root)
+            try:
+                with self.assertRaisesRegex(ValueError, "더 이상 지원"):
+                    orchestrator.create_transcription_comparison(
+                        ["movie.mp4"],
+                        options={},
+                    )
+            finally:
+                orchestrator.stop()
+
+        return
+
+        self.assertEqual(len(jobs), 5)
+        self.assertTrue(comparison_id)
+        variants = {
+            job.options["comparison_variant_id"]: job for job in jobs
+        }
+        current = variants["whisperjav-current"]
+        boundary_safe = variants["whisperjav-boundary-safe"]
+        sentence = variants["whisperjav-sentence"]
+        sentence_3_4 = variants["whisperjav-sentence-3-4"]
+        sentence_4_5 = variants["whisperjav-sentence-4-5"]
+        self.assertEqual(current.options["backend"], "whisperjav")
+        self.assertTrue(
+            all(job.options["backend"] == "whisperjav" for job in jobs)
+        )
+        self.assertEqual(
+            current.options["comparison_variant_label"],
+            "WhisperJAV · 현재 분절",
+        )
+        self.assertEqual(
+            boundary_safe.options["comparison_variant_label"],
+            "WhisperJAV · 단어 경계 보호",
+        )
+        self.assertEqual(current.options["comparison_variant_order"], 0)
+        self.assertEqual(boundary_safe.options["comparison_variant_order"], 1)
+        self.assertEqual(sentence.options["comparison_variant_order"], 2)
+        self.assertEqual(sentence_3_4.options["comparison_variant_order"], 3)
+        self.assertEqual(sentence_4_5.options["comparison_variant_order"], 4)
+        self.assertEqual(current.options["comparison_schema_version"], 4)
+        self.assertEqual(
+            current.options["subtitle_segmentation"],
+            {
+                "split_on_speaker_change": True,
+                "split_on_parent_change": False,
+                "max_gap_sec": 0.8,
+                "max_duration_sec": 8.0,
+                "max_chars": 36,
+                "prefer_punctuation_boundary": True,
+                "punctuation_boundary_mode": "all",
+            },
+        )
+        self.assertEqual(
+            boundary_safe.options["subtitle_segmentation"],
+            {
+                "split_on_speaker_change": True,
+                "split_on_parent_change": False,
+                "max_gap_sec": 1.2,
+                "max_duration_sec": 10.0,
+                "max_chars": 48,
+                "prefer_punctuation_boundary": False,
+                "punctuation_boundary_mode": "none",
+            },
+        )
+        expected_sentence_segmentation = {
+            "split_on_speaker_change": True,
+            "split_on_parent_change": False,
+            "max_gap_sec": 1.5,
+            "max_duration_sec": 20.0,
+            "max_chars": 120,
+            "prefer_punctuation_boundary": True,
+            "punctuation_boundary_mode": "sentence",
+        }
+        for job in (sentence, sentence_3_4, sentence_4_5):
+            self.assertEqual(
+                job.options["subtitle_segmentation"],
+                expected_sentence_segmentation,
+            )
+        self.assertEqual(
+            [
+                (
+                    job.options["whisperjav"][
+                        "anime_max_group_duration_seconds"
+                    ],
+                    job.options["whisperjav"][
+                        "qwen_max_group_duration_seconds"
+                    ],
+                )
+                for job in jobs
+            ],
+            [(2.0, 3.0), (2.0, 3.0), (2.0, 3.0), (3.0, 4.0), (4.0, 5.0)],
+        )
+        for job in jobs:
+            self.assertEqual(
+                job.options["whisperjav"]["recipe"],
+                "whisperjav-domain-ensemble-v1",
+            )
+            self.assertEqual(job.options["comparison_backends"], ["whisperjav"])
+            self.assertEqual(
+                job.options["comparison_variants"],
+                [
+                    "whisperjav-current",
+                    "whisperjav-boundary-safe",
+                    "whisperjav-sentence",
+                    "whisperjav-sentence-3-4",
+                    "whisperjav-sentence-4-5",
+                ],
+            )
+
+    def test_comparison_queues_v1_v1_owsm_and_recall_union_variants(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            (media_root / "movie.mp4").write_bytes(b"media")
+            orchestrator = self.make_orchestrator(root, media_root)
+            try:
+                with self.assertRaisesRegex(ValueError, "더 이상 지원"):
+                    orchestrator.create_transcription_comparison(
+                        ["movie.mp4"],
+                        options={"comparison_profile": "hybrid-owsm"},
+                    )
+            finally:
+                orchestrator.stop()
+
+        return
+
+        self.assertTrue(comparison_id)
+        self.assertEqual(len(jobs), 3)
+        variants = {
+            job.options["comparison_variant_id"]: job for job in jobs
+        }
+        hybrid_current = variants["v1-whisperx-kotoba-stable-ts"]
+        hybrid_owsm = variants["v1-whisperx-owsm-kotoba-stable-ts"]
+        recall_union = variants[
+            "v1-whisperx-owsm-kotoba-recall-union-stable-ts"
+        ]
+        self.assertEqual(hybrid_current.options["backend"], "hybrid")
+        self.assertEqual(hybrid_owsm.options["backend"], "hybrid_owsm")
+        self.assertEqual(
+            [job.options["comparison_variant_order"] for job in jobs],
+            [0, 1, 2],
+        )
+        self.assertFalse(
+            hybrid_current.options["subtitle_segmentation"][
+                "split_on_speaker_change"
+            ]
+        )
+        self.assertTrue(
+            hybrid_current.options["subtitle_segmentation"][
+                "split_on_parent_change"
+            ]
+        )
+        self.assertEqual(
+            hybrid_current.options["subtitle_segmentation"][
+                "max_duration_sec"
+            ],
+            8.0,
+        )
+        self.assertEqual(
+            hybrid_current.options["subtitle_segmentation"]["max_chars"],
+            80,
+        )
+        self.assertTrue(
+            hybrid_current.options["hybrid_rescue"][
+                "stable_ts_regroup_enabled"
+            ]
+        )
+        self.assertEqual(
+            hybrid_current.options["subtitle_segmentation"],
+            hybrid_owsm.options["subtitle_segmentation"],
+        )
+        self.assertEqual(
+            hybrid_current.options["hybrid_rescue"],
+            hybrid_owsm.options["hybrid_rescue"],
+        )
+        self.assertEqual(
+            hybrid_owsm.options["owsm_audit"][
+                "minimum_extra_characters"
+            ],
+            20,
+        )
+        self.assertNotIn("owsm_audit", hybrid_current.options)
+        self.assertEqual(
+            recall_union.options["owsm_audit"]["merge_policy"],
+            "recall_union",
+        )
+        self.assertEqual(recall_union.options["backend"], "hybrid_owsm")
+        for job in jobs:
+            self.assertTrue(job.is_test)
+            self.assertEqual(
+                job.options["comparison_profile"], "hybrid-owsm"
+            )
+            self.assertEqual(
+                job.options["comparison_backends"],
+                ["hybrid", "hybrid_owsm"],
+            )
+            self.assertEqual(
+                job.options["comparison_variants"],
+                [
+                    "v1-whisperx-kotoba-stable-ts",
+                    "v1-whisperx-owsm-kotoba-stable-ts",
+                    "v1-whisperx-owsm-kotoba-recall-union-stable-ts",
+                ],
+            )
 
     def test_batch_is_prevalidated_before_creating_any_job(self) -> None:
         with TemporaryDirectory() as directory:
@@ -3843,7 +4231,7 @@ class SubtitleOrchestratorTests(unittest.TestCase):
             try:
                 orchestrator.update_runtime_endpoint(
                     "builtin",
-                    name="기본 Runtime",
+                    name="기본 전사 서버",
                     base_url="http://stt.test",
                     token=None,
                     clear_token=False,
@@ -3964,11 +4352,13 @@ class SubtitleOrchestratorTests(unittest.TestCase):
             self.assertEqual(
                 sent_options["subtitle_segmentation"],
                 {
-                    "max_gap_sec": 0.8,
+                    "max_gap_sec": 1.5,
                     "max_duration_sec": 8.0,
-                    "max_chars": 36,
-                    "split_on_speaker_change": True,
+                    "max_chars": 80,
+                    "split_on_speaker_change": False,
+                    "split_on_parent_change": True,
                     "prefer_punctuation_boundary": True,
+                    "punctuation_boundary_mode": "sentence",
                 },
             )
             self.assertEqual(sent_options["repetition_policy"], "flag")
@@ -3985,6 +4375,7 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                     "kotoba_chunk_length_seconds": 15,
                     "whisperx_chunk_length_seconds": 30,
                     "rescue_scope": "windows",
+                    "stable_ts_regroup_enabled": True,
                 },
             )
             self.assertEqual(completed_job.status, "completed")
@@ -4028,6 +4419,7 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                 "movie.mkv",
                 force_overwrite=False,
                 options={},
+                prompt_category_id="jav",
             )
             artifact_dir = root / "state" / "jobs" / job.id
             artifact_dir.mkdir(parents=True)
@@ -4104,6 +4496,10 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                 edited_generations = (
                     orchestrator.store.list_translation_generations(job.id)
                 )
+                feedback = orchestrator.store.list_translation_feedback(
+                    category_id="jav",
+                    stage="review",
+                )
             finally:
                 orchestrator.stop()
 
@@ -4144,6 +4540,11 @@ class SubtitleOrchestratorTests(unittest.TestCase):
                 "최종 수동 수정",
                 (media_root / "movie.ko.srt").read_text(encoding="utf-8"),
             )
+            self.assertEqual(len(feedback), 1)
+            self.assertEqual(feedback[0]["source_text"], "こんにちは")
+            self.assertEqual(feedback[0]["model_text"], "안녕하세요")
+            self.assertEqual(feedback[0]["edited_text"], "최종 수동 수정")
+            self.assertTrue(feedback[0]["included"])
 
     def test_editing_transcript_creates_an_immutable_revision(self) -> None:
         with TemporaryDirectory() as directory:

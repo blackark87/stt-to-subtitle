@@ -1,0 +1,126 @@
+# syntax=docker/dockerfile:1
+
+ARG PYTHON_IMAGE=python:3.11.15-slim-bookworm@sha256:b18992999dbe963a45a8a4da40ac2b1975be1a776d939d098c647482bcad5cba
+
+FROM ${PYTHON_IMAGE} AS service-source
+WORKDIR /build
+COPY src ./src
+COPY scripts/build_service_package.py ./scripts/build_service_package.py
+RUN python scripts/build_service_package.py \
+    runtime src/stt_to_subtitle /service/stt_to_subtitle
+
+FROM ${PYTHON_IMAGE} AS api-builder
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1
+RUN python -m venv /opt/venvs/api
+WORKDIR /build
+COPY requirements-api.txt ./
+RUN --mount=type=cache,id=stt-model-api-pip,target=/root/.cache/pip \
+    /opt/venvs/api/bin/python -m pip install -r requirements-api.txt
+
+FROM ${PYTHON_IMAGE} AS kotoba-builder
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/* \
+    && python -m venv /opt/venvs/kotoba
+WORKDIR /build
+COPY requirements-kotoba.txt ./
+RUN --mount=type=cache,id=stt-model-kotoba-pip,target=/root/.cache/pip \
+    /opt/venvs/kotoba/bin/python -m pip install \
+        --extra-index-url https://download.pytorch.org/whl/cu121 \
+        -r requirements-kotoba.txt \
+    && /opt/venvs/kotoba/bin/python -m pip install --no-deps \
+        "git+https://github.com/huggingface/diarizers.git@f3c8ae500f55ad2b02b719fce1495ea2794ca9fe" \
+    && /opt/venvs/kotoba/bin/python -m pip install \
+        "git+https://github.com/openai/whisper.git@c0d2f624c09dc18e709e37c2ad90c039a4eb72a2" \
+        "git+https://github.com/meizhong986/stable-ts-fix-setup.git@db1358dcc5f4ef7b252a64cdfa7f885e4d60d999"
+COPY requirements-api.txt ./
+RUN --mount=type=cache,id=stt-model-kotoba-api-pip,target=/root/.cache/pip \
+    /opt/venvs/kotoba/bin/python -m pip install -r requirements-api.txt
+
+FROM ${PYTHON_IMAGE} AS whisperx-builder
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1
+RUN python -m venv /opt/venvs/whisperx
+WORKDIR /build
+COPY requirements-whisperx-cuda.txt ./
+RUN --mount=type=cache,id=stt-model-whisperx-pip,target=/root/.cache/pip \
+    /opt/venvs/whisperx/bin/python -m pip install \
+        -r requirements-whisperx-cuda.txt
+
+FROM ${PYTHON_IMAGE} AS whisperjav-builder
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/* \
+    && python -m venv /opt/venvs/whisperjav
+WORKDIR /build
+COPY requirements-whisperjav.txt ./
+RUN --mount=type=cache,id=stt-model-whisperjav-pip,target=/root/.cache/pip \
+    /opt/venvs/whisperjav/bin/python -m pip install \
+        -r requirements-whisperjav.txt
+
+FROM ${PYTHON_IMAGE} AS owsm-builder
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends build-essential \
+    && rm -rf /var/lib/apt/lists/* \
+    && python -m venv /opt/venvs/owsm
+WORKDIR /build
+COPY requirements-owsm.txt ./
+RUN --mount=type=cache,id=stt-model-owsm-pip,target=/root/.cache/pip \
+    /opt/venvs/owsm/bin/python -m pip install \
+        -r requirements-owsm.txt
+
+FROM ${PYTHON_IMAGE} AS system
+ARG APP_UID=1000
+ARG APP_GID=1000
+ENV PYTHONUNBUFFERED=1 \
+    HOME=/tmp \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/opt/stt \
+    HF_HOME=/models/huggingface \
+    PYANNOTE_CACHE=/models/pyannote \
+    TORCH_HOME=/models/torch \
+    WHISPERX_CACHE_DIR=/models/whisperx \
+    STT_STATE_DIR=/var/lib/stt \
+    STT_WORK_DIR=/var/lib/stt-work \
+    STT_DEVICE=cuda \
+    STT_DIARIZATION_DEVICE=cuda
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends \
+        ca-certificates ffmpeg libc++1 libc++abi1 libgomp1 libportaudio2 \
+        libsndfile1 \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid "${APP_GID}" app \
+    && useradd --uid "${APP_UID}" --gid "${APP_GID}" --no-create-home app \
+    && mkdir -p /models /var/lib/transcriber/state \
+        /var/lib/transcriber/work \
+    && chown -R app:app /models /var/lib/transcriber
+COPY --from=api-builder /opt/venvs/api /opt/venvs/api
+COPY --from=service-source /service/stt_to_subtitle /opt/stt/stt_to_subtitle
+ENV PATH=/opt/venvs/api/bin:$PATH
+USER app
+WORKDIR /app
+EXPOSE 8100
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8100/readyz', timeout=3)"]
+ENTRYPOINT ["python", "-m", "stt_to_subtitle.runtime_api"]
+
+FROM system AS hybrid
+COPY --from=kotoba-builder /opt/venvs/kotoba /opt/venvs/kotoba
+COPY --from=whisperx-builder /opt/venvs/whisperx /opt/venvs/whisperx
+COPY --from=owsm-builder /opt/venvs/owsm /opt/venvs/owsm
+ENV STT_ENABLED_BACKENDS=hybrid \
+    KOTOBA_PYTHON=/opt/venvs/kotoba/bin/python \
+    WHISPERX_PYTHON=/opt/venvs/whisperx/bin/python \
+    OWSM_PYTHON=/opt/venvs/owsm/bin/python
+
+FROM system AS whisperjav
+COPY --from=whisperjav-builder \
+    /opt/venvs/whisperjav /opt/venvs/whisperjav
+COPY --from=whisperx-builder /opt/venvs/whisperx /opt/venvs/whisperx
+ENV STT_ENABLED_BACKENDS=whisperjav \
+    WHISPERJAV_PYTHON=/opt/venvs/whisperjav/bin/python \
+    WHISPERX_PYTHON=/opt/venvs/whisperx/bin/python
+RUN /opt/venvs/whisperjav/bin/python -c \
+    "from ten_vad import TenVad; TenVad()"

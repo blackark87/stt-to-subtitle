@@ -10,8 +10,9 @@ export interface PipelineJob {
   reason_code: string | null;
   attempt: number;
   force_overwrite: boolean;
+  is_test: boolean;
   options: Record<string, unknown>;
-  stt_runtime_id: string | null;
+  transcriber_id: string | null;
   blocked_stage: string | null;
   error: string | null;
   chunks_created: number;
@@ -46,13 +47,14 @@ export interface JobListItem extends PipelineJob {
   workflow_root_job_id?: string;
 }
 
-export interface RuntimeEndpoint {
+export interface TranscriberEndpoint {
   id: string;
   name: string;
   base_url: string;
   token_configured: boolean;
   enabled: boolean;
   capacity: number;
+  resource_group_id: string;
   kotoba_batch_size: number | null;
   whisperx_batch_size: number | null;
   builtin: boolean;
@@ -90,6 +92,7 @@ export interface TranslationServer {
   token_configured: boolean;
   enabled: boolean;
   capacity: number;
+  resource_group_id: string;
   thinking_enabled: boolean;
   builtin: boolean;
   batch_preferred: boolean;
@@ -183,8 +186,11 @@ export interface MediaFile {
   modified_at: number | null;
   duration_seconds: number | null;
   has_subtitle: boolean;
+  has_system_subtitle: boolean;
+  has_untracked_subtitle: boolean;
   has_external_subtitle: boolean;
   external_subtitle_formats: string[];
+  latest_subtitle_job_id: string | null;
   has_nfo: boolean;
   title: string;
   nfo_title: string | null;
@@ -216,12 +222,15 @@ export interface ServerSettings {
 
 export interface SettingsPayload {
   servers: ServerSettings;
-  runtimes: RuntimeEndpoint[];
+  transcribers: TranscriberEndpoint[];
   translation_groups: TranslationGroup[];
   translation_groups_error: string | null;
   external_models: ExternalModelProfile[];
   path_display_rules: PathDisplayRule[];
   prompt_categories: PromptCategory[];
+  prompt_authoring: PromptAuthoringSettings;
+  translation_feedback: TranslationFeedback[];
+  prompt_improvement_runs: PromptImprovementRun[];
 }
 
 export interface PathDisplayRule {
@@ -237,7 +246,62 @@ export interface PromptCategory {
   name: string;
   translation_prompt?: string;
   review_prompt?: string;
+  prompt_revision_id: string;
+  prompt_revision_number: number;
   archived?: boolean;
+}
+
+export interface PromptAuthoringSettings {
+  improvement_instruction_version: string;
+  improvement_system_prompt: string;
+  draft_instruction_version: string;
+  draft_system_prompt: string;
+}
+
+export interface TranslationFeedback {
+  id: string;
+  job_id: string;
+  category_id: string;
+  base_revision_id: string;
+  stage: "translation" | "review";
+  segment_id: string;
+  source_text: string;
+  model_text: string;
+  edited_text: string;
+  included: boolean;
+  created_at: number;
+}
+
+export interface PromptDraft {
+  translation_prompt: string;
+  review_prompt: string;
+  summary: string;
+  provider: ExternalModelProvider;
+  model: string;
+  instruction_version: string;
+}
+
+export interface PromptImprovementRun {
+  id: string;
+  category_id: string;
+  stage: "translation" | "review";
+  base_revision_id: string;
+  endpoint_contract: string;
+  model_contract: string;
+  train_feedback_ids: string[];
+  holdout_feedback_ids: string[];
+  proposed_prompt: string | null;
+  evaluation: {
+    summary: string;
+    current_score: number;
+    candidate_score: number;
+    score_delta: number;
+    regressions: { feedback_id: string; reason: string }[];
+  } | null;
+  status: "queued" | "running" | "ready" | "failed" | "cancelled" | "rejected" | "activated";
+  error: string | null;
+  activated_revision_id: string | null;
+  created_at: number;
 }
 
 export interface JobEvent {
@@ -259,12 +323,26 @@ export interface JobDetailPayload {
   workflow_root_job_id: string;
   workflow_jobs: PipelineJob[];
   workflow_history_jobs: PipelineJob[];
+  previous_subtitle_workflows: SubtitleWorkflowHistorySummary[];
   events: JobEvent[];
   transcript_revisions: Record<string, unknown>[];
   translation_generations: Record<string, unknown>[];
   subtitle_generations: Record<string, unknown>[];
   subtitle_validation: Record<string, unknown> | null;
   external_subtitles: string[];
+}
+
+export interface SubtitleWorkflowHistorySummary {
+  workflow_root_job_id: string;
+  latest_job_id: string;
+  latest_generation_created_at: number;
+  transcription_backend: string;
+  transcription_model_revision: string | null;
+  translation_prompt_name: string;
+  translation_prompt_version: number | null;
+  is_test: boolean;
+  transcript_job_id: string | null;
+  translation_job_id: string | null;
 }
 
 export interface TranslationGenerationItem {
@@ -524,6 +602,7 @@ export const api = {
     operation?: string;
     prompt_category_id?: string | null;
     force_overwrite?: boolean;
+    is_test?: boolean;
     options?: Record<string, unknown>;
   }) => request<unknown>("/jobs", { method: "POST", ...json(body) }),
 
@@ -572,6 +651,7 @@ export const api = {
     token: string;
     enabled: boolean;
     capacity: number;
+    resource_group_id: string;
     thinking_enabled: boolean;
   }) => request<TranslationServer>(`/translation-groups/${stage}/servers`, {
     method: "POST",
@@ -587,6 +667,7 @@ export const api = {
       clear_token?: boolean;
       enabled: boolean;
       capacity: number;
+      resource_group_id: string;
       thinking_enabled: boolean;
     },
   ) => request<TranslationServer>(
@@ -674,26 +755,18 @@ export const api = {
     `/api/v1/media/actors/${actorPath.split("/").map(encodeURIComponent).join("/")}`,
   subtitlesUrl: (id: string) => `/api/v1/jobs/${encodeURIComponent(id)}/subtitles.vtt`,
 
-  comparisons: () =>
-    request<ListPayload<{ id: string; source_rels: string[]; jobs: PipelineJob[]; updated_at: number }>>(
-      "/comparisons",
-    ),
-  comparison: (id: string) =>
-    request<{ id: string; jobs: PipelineJob[] }>(`/comparisons/${encodeURIComponent(id)}`),
-  retryComparison: (id: string) =>
-    request<{ updated: number }>(`/comparisons/${encodeURIComponent(id)}/retry`, { method: "POST" }),
-
-  runtimes: () => request<ListPayload<RuntimeEndpoint>>("/runtimes"),
-  createRuntime: (body: {
+  transcribers: () => request<ListPayload<TranscriberEndpoint>>("/transcribers"),
+  createTranscriber: (body: {
     name: string;
     base_url: string;
     token: string;
     enabled: boolean;
     capacity: number;
+    resource_group_id: string;
     kotoba_batch_size?: number | null;
     whisperx_batch_size?: number | null;
-  }) => request<RuntimeEndpoint>("/runtimes", { method: "POST", ...json(body) }),
-  updateRuntime: (
+  }) => request<TranscriberEndpoint>("/transcribers", { method: "POST", ...json(body) }),
+  updateTranscriber: (
     id: string,
     body: {
       name: string;
@@ -702,18 +775,54 @@ export const api = {
       clear_token?: boolean;
       enabled: boolean;
       capacity: number;
+      resource_group_id: string;
       kotoba_batch_size?: number | null;
       whisperx_batch_size?: number | null;
       clear_kotoba_batch_size?: boolean;
       clear_whisperx_batch_size?: boolean;
     },
   ) =>
-    request<RuntimeEndpoint>(`/runtimes/${encodeURIComponent(id)}`, {
+    request<TranscriberEndpoint>(`/transcribers/${encodeURIComponent(id)}`, {
       method: "PUT",
       ...json(body),
     }),
-  deleteRuntime: (id: string) =>
-    request<unknown>(`/runtimes/${encodeURIComponent(id)}`, { method: "DELETE" }),
-  probeRuntime: (id: string) =>
-    request<unknown>(`/runtimes/${encodeURIComponent(id)}/probe`, { method: "POST" }),
+  deleteTranscriber: (id: string) =>
+    request<unknown>(`/transcribers/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  probeTranscriber: (id: string) =>
+    request<unknown>(`/transcribers/${encodeURIComponent(id)}/probe`, { method: "POST" }),
+  setTranslationFeedbackIncluded: (id: string, included: boolean) =>
+    request<TranslationFeedback>(
+      `/settings/translation-feedback/${encodeURIComponent(id)}`,
+      { method: "PATCH", ...json({ included }) },
+    ),
+  createPromptImprovement: (body: {
+    category_id: string;
+    stage: "translation" | "review";
+    provider: ExternalModelProvider;
+    model: string;
+  }) => request<PromptImprovementRun>("/settings/prompt-improvements", {
+    method: "POST",
+    ...json(body),
+  }),
+  createPromptDraft: (body: {
+    name: string;
+    domain_description: string;
+    provider: ExternalModelProvider;
+    model: string;
+  }) => request<PromptDraft>("/settings/prompt-drafts", {
+    method: "POST",
+    ...json(body),
+  }),
+  cancelPromptImprovement: (id: string) => request<PromptImprovementRun>(
+    `/settings/prompt-improvements/${encodeURIComponent(id)}/cancel`,
+    { method: "POST" },
+  ),
+  rejectPromptImprovement: (id: string) => request<PromptImprovementRun>(
+    `/settings/prompt-improvements/${encodeURIComponent(id)}/reject`,
+    { method: "POST" },
+  ),
+  activatePromptImprovement: (id: string) => request<unknown>(
+    `/settings/prompt-improvements/${encodeURIComponent(id)}/activate`,
+    { method: "POST" },
+  ),
 };

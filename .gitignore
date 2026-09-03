@@ -1331,6 +1331,7 @@ tags
 !/Dockerfile.runtime
 !/Dockerfile.stt-runtime
 !/Dockerfile.web
+!/Dockerfile.model-runtime
 !/compose.yaml
 !/compose.runtime.yaml
 !/compose.gpu-monitoring.yaml
@@ -1339,6 +1340,7 @@ tags
 !/requirements-api.txt
 !/requirements-backend.txt
 !/requirements-kotoba.txt
+!/requirements-owsm.txt
 !/requirements-whisperjav.txt
 !/requirements-whisperx-cuda.in
 !/requirements-whisperx-cuda.txt

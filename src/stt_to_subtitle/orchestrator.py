@@ -10,6 +10,7 @@ import json
 import logging
 import math
 from pathlib import Path
+import re
 import sqlite3
 import threading
 import time
@@ -39,7 +40,9 @@ from .stt_options import (
     DEFAULT_CHUNK_LENGTH_SECONDS,
     DEFAULT_QWEN_MAX_GROUP_SECONDS,
     DEFAULT_SUBTITLE_SEGMENTATION,
+    HYBRID_STABLE_SUBTITLE_SEGMENTATION,
     HybridRescueOptions,
+    OWSMAuditOptions,
     TranscriptionOptions,
     WHISPERX_MAX_BATCH_SIZE,
     WHISPERX_MAX_CHUNK_LENGTH_SECONDS,
@@ -48,6 +51,18 @@ from .stt_options import (
     WhisperXSegmentationOptions,
 )
 from .path_display import PathDisplayRule
+from .prompt_improvement import (
+    PROMPT_DRAFT_INSTRUCTION_VERSION,
+    PROMPT_DRAFT_SYSTEM_PROMPT,
+    PROMPT_IMPROVEMENT_INSTRUCTION_VERSION,
+    PROMPT_IMPROVEMENT_SYSTEM_PROMPT,
+    improvement_request_payload,
+    parse_improvement_result,
+    parse_prompt_draft_result,
+    prompt_draft_request_payload,
+    split_feedback_by_job,
+)
+from .resource_groups import ResourceGroupLimiter
 from .backend_config import (
     MediaLibrary,
     BackendSettings,
@@ -69,6 +84,7 @@ from .job_store import (
 from .job_state import JobReason, JobState
 from .service_clients import (
     EXTERNAL_MODEL_DEFAULT_URLS,
+    ExternalStructuredCompletionClient,
     ExternalServiceError,
     OpenAICompatibleClient,
     OperationStopped,
@@ -132,7 +148,17 @@ MAX_RUNTIME_ENDPOINTS = 32
 LEGACY_BUILTIN_RUNTIME_URLS = {
     "http://stt:8100",
     "http://stt-backend:8100",
+    "http://runtime:8100",
 }
+
+
+def _transcriber_identity(
+    readiness: Mapping[str, Any] | object,
+) -> Mapping[str, Any] | None:
+    if not isinstance(readiness, Mapping):
+        return None
+    identity = readiness.get("transcriber") or readiness.get("runtime")
+    return identity if isinstance(identity, Mapping) else None
 
 
 def _canonical_payload_hash(value: Any) -> str:
@@ -202,18 +228,6 @@ LOCAL_TRANSLATION_OPERATIONS = {
     "draft_translate",
     "review_translate",
 }
-TRANSCRIPTION_COMPARISON_BACKENDS = (
-    "whisperjav",
-    "hybrid",
-    "whisperx",
-    "kotoba",
-)
-TRANSCRIPTION_COMPARISON_SCHEMA_VERSION = 2
-MAX_TRANSCRIPTION_COMPARISON_SOURCES = 20
-COMPARISON_PARENT_ID_OPTION = "comparison_parent_id"
-COMPARISON_AUDIO_SOURCE_JOB_ID_OPTION = "comparison_audio_source_job_id"
-
-
 def wav_duration_seconds(path: Path) -> float | None:
     """Read the exact duration represented by an extracted PCM WAV header."""
     try:
@@ -237,7 +251,7 @@ def estimate_transcription_chunks(
         "chunk_length_seconds",
         DEFAULT_CHUNK_LENGTH_SECONDS,
     )
-    if str(options.get("backend", "kotoba")) == "hybrid":
+    if str(options.get("backend", "hybrid")) == "hybrid":
         hybrid_options = options.get("hybrid_rescue")
         if isinstance(hybrid_options, Mapping):
             raw_chunk_length = hybrid_options.get(
@@ -293,7 +307,10 @@ def _audio_extraction_signature(
     )
 
 
-SUPPORTED_STT_BACKENDS = {"kotoba", "whisperx", "hybrid", "whisperjav"}
+SUPPORTED_STT_BACKENDS = {
+    "hybrid",
+    "whisperjav",
+}
 
 
 def _operation_is_completed(
@@ -322,6 +339,7 @@ class SubtitleOrchestrator:
         self.settings = settings
         self.settings.state_dir.mkdir(parents=True, exist_ok=True)
         self.settings.jobs_dir.mkdir(parents=True, exist_ok=True)
+        self.settings.transcription_audio_dir.mkdir(parents=True, exist_ok=True)
         self.library = MediaLibrary(
             settings.media_root,
             settings.maximum_listed_files,
@@ -331,10 +349,17 @@ class SubtitleOrchestrator:
         self._path_display_rules = tuple(
             self.store.list_path_display_rules()
         )
-        rebased_paths = self.store.rebase_artifact_paths(
-            previous_root=settings.state_dir / "jobs",
-            current_root=settings.jobs_dir,
-        )
+        rebased_paths = 0
+        for previous_root in (
+            settings.state_dir / "jobs",
+            Path("/var/lib/stt-work"),
+            Path("/var/lib/stt/jobs"),
+        ):
+            rebased_paths += self.store.rebase_artifact_paths(
+                previous_root=previous_root,
+                current_root=settings.jobs_dir,
+                current_audio_root=settings.transcription_audio_dir,
+            )
         if rebased_paths:
             LOGGER.info(
                 "rebased artifact paths for %d record(s)",
@@ -365,6 +390,7 @@ class SubtitleOrchestrator:
             if saved_validator is not None
             else SubtitleValidatorSettings()
         )
+        self._resource_groups = ResourceGroupLimiter()
         self._translation_routing = BackendTranslationRouting(
             TranslationRoutingDefaults(
                 state_dir=settings.translation_dir,
@@ -394,6 +420,7 @@ class SubtitleOrchestrator:
             stt_hard_breaker_active=(
                 self._builtin_transcription_uses_shared_memory
             ),
+            resource_groups=self._resource_groups,
         )
         self._remote_runtime: tuple[
             STTAPIClient | None,
@@ -460,6 +487,7 @@ class SubtitleOrchestrator:
             except ValueError as error:
                 LOGGER.warning("remote server settings are invalid: %s", error)
         self._load_external_runtimes()
+        self._refresh_resource_group_limits()
         self._stop_event = threading.Event()
         self._scheduler = threading.Thread(
             target=self._scheduler_loop,
@@ -490,6 +518,10 @@ class SubtitleOrchestrator:
             # External validation has its own lane and no local GPU lock.
             max_workers=3,
             thread_name_prefix="pipeline-translation",
+        )
+        self._prompt_improvement_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="prompt-improvement",
         )
 
     @property
@@ -541,6 +573,25 @@ class SubtitleOrchestrator:
     def translation_groups_view(self) -> list[dict[str, Any]]:
         return self._translation_routing.groups()
 
+    def _refresh_resource_group_limits(self) -> None:
+        capacities: dict[str, int] = {}
+        entries = [
+            *self._runtime_definitions(),
+            *(
+                server
+                for group in self._translation_routing.groups()
+                for server in group["servers"]
+            ),
+        ]
+        for entry in entries:
+            group_id = str(entry.get("resource_group_id", "local-gpu"))
+            capacity = max(1, int(entry.get("capacity", 1)))
+            capacities[group_id] = min(
+                capacity,
+                capacities.get(group_id, capacity),
+            )
+        self._resource_groups.configure(capacities)
+
     def update_translation_server_model(
         self,
         stage: str,
@@ -561,6 +612,7 @@ class SubtitleOrchestrator:
         payload: Mapping[str, Any],
     ) -> dict[str, Any]:
         result = self._translation_routing.create_server(stage, payload)
+        self._refresh_resource_group_limits()
         self._refresh_translation_circuit_from_routing()
         return result
 
@@ -575,11 +627,13 @@ class SubtitleOrchestrator:
             endpoint_id,
             payload,
         )
+        self._refresh_resource_group_limits()
         self._refresh_translation_circuit_from_routing()
         return result
 
     def delete_translation_endpoint(self, stage: str, endpoint_id: str) -> None:
         self._translation_routing.delete_server(stage, endpoint_id)
+        self._refresh_resource_group_limits()
         self._refresh_translation_circuit_from_routing()
 
     def probe_translation_endpoint(
@@ -624,11 +678,23 @@ class SubtitleOrchestrator:
     ) -> tuple[str, str, int]:
         normalized_name = name.strip()
         if not normalized_name or len(normalized_name) > 80:
-            raise ValueError("Runtime 이름은 1~80자여야 합니다.")
+            raise ValueError("전사 서버 이름은 1~80자여야 합니다.")
         if not 1 <= capacity <= 8:
-            raise ValueError("Runtime 동시 작업 수는 1~8이어야 합니다.")
+            raise ValueError("전사 서버 동시 작업 수는 1~8이어야 합니다.")
         normalized_url = normalize_server_url(base_url, "RUNTIME_BASE_URL")
         return normalized_name, normalized_url, capacity
+
+    @staticmethod
+    def _validate_resource_group_id(value: str) -> str:
+        normalized = value.strip()
+        if not normalized or len(normalized) > 80:
+            raise ValueError("리소스 그룹 ID는 1~80자여야 합니다.")
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", normalized):
+            raise ValueError(
+                "리소스 그룹 ID는 영문자 또는 숫자로 시작하고 "
+                "영문자, 숫자, 점, 밑줄, 하이픈만 사용할 수 있습니다."
+            )
+        return normalized
 
     @staticmethod
     def _validate_runtime_batch_size(
@@ -677,11 +743,12 @@ class SubtitleOrchestrator:
             definitions.append(
                 {
                     "id": BUILTIN_RUNTIME_ID,
-                    "name": "기본 Runtime",
+                    "name": "기본 전사 서버",
                     "base_url": servers.stt_base_url,
                     "token": servers.stt_token,
                     "enabled": True,
                     "capacity": 1,
+                    "resource_group_id": servers.resource_group_id,
                     "kotoba_batch_size": builtin_batches.get(
                         "kotoba_batch_size"
                     ),
@@ -699,6 +766,7 @@ class SubtitleOrchestrator:
                 "token": endpoint.token,
                 "enabled": endpoint.enabled,
                 "capacity": endpoint.capacity,
+                "resource_group_id": endpoint.resource_group_id,
                 "kotoba_batch_size": batch_settings.get(
                     endpoint.id, {}
                 ).get("kotoba_batch_size"),
@@ -715,7 +783,7 @@ class SubtitleOrchestrator:
         for definition in self._runtime_definitions():
             if definition["id"] == runtime_id:
                 return definition
-        raise ValueError("Runtime을 찾을 수 없습니다.")
+        raise ValueError("전사 서버를 찾을 수 없습니다.")
 
     def _runtime_client(self, runtime_id: str) -> STTAPIClient | None:
         with self._runtime_lock:
@@ -749,13 +817,13 @@ class SubtitleOrchestrator:
         elif any(status == "unavailable" for status in statuses):
             self._set_stt_gate(
                 "lost",
-                message or "사용 가능한 Runtime이 없습니다.",
+                message or "사용 가능한 전사 서버가 없습니다.",
                 reason_code=reason_code or JobReason.STT_UNAVAILABLE.value,
             )
         elif definitions:
             self._set_stt_gate("unknown", "연결 확인이 필요합니다.")
         else:
-            self._set_stt_gate("offline", "Runtime이 등록되지 않았습니다.")
+            self._set_stt_gate("offline", "전사 서버가 등록되지 않았습니다.")
 
     def _set_runtime_health(
         self,
@@ -800,6 +868,7 @@ class SubtitleOrchestrator:
                     "token_configured": bool(definition["token"]),
                     "enabled": bool(definition["enabled"]),
                     "capacity": capacity,
+                    "resource_group_id": definition["resource_group_id"],
                     "kotoba_batch_size": definition["kotoba_batch_size"],
                     "whisperx_batch_size": definition[
                         "whisperx_batch_size"
@@ -810,11 +879,7 @@ class SubtitleOrchestrator:
                     "checked_at": current.get("checked_at"),
                     "running_jobs": running,
                     "available_slots": max(0, capacity - running),
-                    "identity": (
-                        readiness.get("runtime")
-                        if isinstance(readiness, Mapping)
-                        else None
-                    ),
+                    "identity": _transcriber_identity(readiness),
                     "queue": (
                         readiness.get("queue")
                         if isinstance(readiness, Mapping)
@@ -837,6 +902,7 @@ class SubtitleOrchestrator:
         token: str,
         enabled: bool,
         capacity: int,
+        resource_group_id: str = "local-gpu",
         kotoba_batch_size: int | None = None,
         whisperx_batch_size: int | None = None,
     ) -> dict[str, Any]:
@@ -844,6 +910,9 @@ class SubtitleOrchestrator:
             name=name,
             base_url=base_url,
             capacity=capacity,
+        )
+        resource_group_id = self._validate_resource_group_id(
+            resource_group_id
         )
         kotoba_batch_size = self._validate_runtime_batch_size(
             kotoba_batch_size,
@@ -858,15 +927,16 @@ class SubtitleOrchestrator:
                 len(self.store.list_runtime_endpoints())
                 >= MAX_RUNTIME_ENDPOINTS - 1
             ):
-                raise ValueError("등록 가능한 외부 Runtime 수를 초과했습니다.")
+                raise ValueError("등록 가능한 외부 전사 서버 수를 초과했습니다.")
             if base_url == self.remote_servers.stt_base_url:
-                raise ValueError("기본 Runtime과 같은 주소는 등록할 수 없습니다.")
+                raise ValueError("기본 전사 서버와 같은 주소는 등록할 수 없습니다.")
             endpoint = self.store.create_runtime_endpoint(
                 name=name,
                 base_url=base_url,
                 token=token,
                 enabled=enabled,
                 capacity=capacity,
+                resource_group_id=resource_group_id,
             )
             self.store.save_runtime_batch_settings(
                 endpoint.id,
@@ -874,6 +944,7 @@ class SubtitleOrchestrator:
                 whisperx_batch_size=whisperx_batch_size,
             )
             self._install_runtime_endpoint(endpoint)
+            self._refresh_resource_group_limits()
         if enabled:
             self.probe_runtime_endpoint(endpoint.id)
         return self._runtime_view(endpoint.id)
@@ -912,6 +983,7 @@ class SubtitleOrchestrator:
         clear_token: bool,
         enabled: bool,
         capacity: int,
+        resource_group_id: str = "local-gpu",
         kotoba_batch_size: int | None = None,
         whisperx_batch_size: int | None = None,
         clear_kotoba_batch_size: bool = False,
@@ -921,6 +993,9 @@ class SubtitleOrchestrator:
             name=name,
             base_url=base_url,
             capacity=capacity,
+        )
+        resource_group_id = self._validate_resource_group_id(
+            resource_group_id
         )
         kotoba_batch_size = self._validate_runtime_batch_size(
             kotoba_batch_size,
@@ -958,25 +1033,36 @@ class SubtitleOrchestrator:
                     or token is not None
                 ):
                     raise ValueError(
-                        "기본 Runtime은 배치 크기만 변경할 수 있습니다."
+                        "기본 전사 서버는 GPU 공유 그룹과 배치 크기만 "
+                        "변경할 수 있습니다."
+                    )
+                if resource_group_id != definition["resource_group_id"]:
+                    self._set_remote_servers(
+                        RemoteServerSettings(
+                            stt_base_url=self.remote_servers.stt_base_url,
+                            stt_token=self.remote_servers.stt_token,
+                            resource_group_id=resource_group_id,
+                        ),
+                        persist=True,
                     )
                 self.store.save_runtime_batch_settings(
                     runtime_id,
                     kotoba_batch_size=resolved_kotoba_batch_size,
                     whisperx_batch_size=resolved_whisperx_batch_size,
                 )
+                self._refresh_resource_group_limits()
                 return self._runtime_view(runtime_id)
             current = self.store.get_runtime_endpoint(runtime_id)
             if current is None:
-                raise ValueError("Runtime을 찾을 수 없습니다.")
+                raise ValueError("전사 서버를 찾을 수 없습니다.")
             if self.store.runtime_has_active_transcriptions(runtime_id) and (
                 not enabled or base_url != current.base_url
             ):
                 raise ValueError(
-                    "진행 중인 작업이 있는 Runtime 설정은 변경할 수 없습니다."
+                    "진행 중인 작업이 있는 전사 서버 설정은 변경할 수 없습니다."
                 )
             if base_url == self.remote_servers.stt_base_url:
-                raise ValueError("기본 Runtime과 같은 주소는 등록할 수 없습니다.")
+                raise ValueError("기본 전사 서버와 같은 주소는 등록할 수 없습니다.")
             updated = self.store.update_runtime_endpoint(
                 runtime_id,
                 name=name,
@@ -990,6 +1076,7 @@ class SubtitleOrchestrator:
                 ),
                 enabled=enabled,
                 capacity=capacity,
+                resource_group_id=resource_group_id,
             )
             self.store.save_runtime_batch_settings(
                 runtime_id,
@@ -997,21 +1084,23 @@ class SubtitleOrchestrator:
                 whisperx_batch_size=resolved_whisperx_batch_size,
             )
             self._install_runtime_endpoint(updated)
+            self._refresh_resource_group_limits()
         if enabled:
             self.probe_runtime_endpoint(runtime_id)
         return self._runtime_view(runtime_id)
 
     def delete_runtime_endpoint(self, runtime_id: str) -> None:
         if runtime_id == BUILTIN_RUNTIME_ID:
-            raise ValueError("기본 Runtime은 삭제할 수 없습니다.")
+            raise ValueError("기본 전사 서버는 삭제할 수 없습니다.")
         with self._runtime_lock:
             if self.store.runtime_has_active_transcriptions(runtime_id):
                 raise ValueError(
-                    "진행 중인 작업이 있는 Runtime은 삭제할 수 없습니다."
+                    "진행 중인 작업이 있는 전사 서버는 삭제할 수 없습니다."
                 )
             self.store.delete_runtime_endpoint(runtime_id)
             self._runtime_clients.pop(runtime_id, None)
             self._runtime_health.pop(runtime_id, None)
+            self._refresh_resource_group_limits()
         self._refresh_stt_gate_from_pool()
 
     def _runtime_view(self, runtime_id: str) -> dict[str, Any]:
@@ -1024,11 +1113,11 @@ class SubtitleOrchestrator:
     def probe_runtime_endpoint(self, runtime_id: str) -> dict[str, Any]:
         definition = self._runtime_definition(runtime_id)
         if not definition["enabled"]:
-            raise ValueError("비활성화된 Runtime은 확인할 수 없습니다.")
+            raise ValueError("비활성화된 전사 서버는 확인할 수 없습니다.")
         self._set_runtime_health(runtime_id, "checking")
         client = self._runtime_client(runtime_id)
         if client is None:
-            raise ValueError("Runtime 연결 설정이 없습니다.")
+            raise ValueError("전사 서버 연결 설정이 없습니다.")
         probe_client = (
             client
             if runtime_id == BUILTIN_RUNTIME_ID
@@ -1053,7 +1142,7 @@ class SubtitleOrchestrator:
         else:
             self._record_dependency_readiness("stt", "ready")
             self._record_stt_queue_snapshot(readiness, runtime_id=runtime_id)
-            identity = readiness.get("runtime")
+            identity = _transcriber_identity(readiness)
             observed_id = (
                 str(identity.get("id", "")).strip()
                 if isinstance(identity, Mapping)
@@ -1067,11 +1156,12 @@ class SubtitleOrchestrator:
                         if other_id != runtime_id
                         and current.get("status") == "ready"
                         and isinstance(current.get("readiness"), Mapping)
-                        and isinstance(
-                            current["readiness"].get("runtime"), Mapping
-                        )
+                        and _transcriber_identity(current["readiness"])
+                        is not None
                         and str(
-                            current["readiness"]["runtime"].get("id", "")
+                            _transcriber_identity(
+                                current["readiness"]
+                            ).get("id", "")
                         ).strip()
                         == observed_id
                         and observed_id
@@ -1082,7 +1172,7 @@ class SubtitleOrchestrator:
                 self._set_runtime_health(
                     runtime_id,
                     "unavailable",
-                    message="같은 Runtime ID가 이미 등록되어 있습니다.",
+                    message="같은 전사 서버 ID가 이미 등록되어 있습니다.",
                     readiness=readiness,
                 )
             else:
@@ -1555,7 +1645,7 @@ class SubtitleOrchestrator:
                     for view in views
                     if view.get("message")
                 ),
-                "사용 가능한 Runtime이 없습니다.",
+                "사용 가능한 전사 서버가 없습니다.",
             )
             raise ExternalServiceError(message)
 
@@ -1580,6 +1670,258 @@ class SubtitleOrchestrator:
 
     def all_prompt_categories(self) -> list[PromptCategory]:
         return self.store.list_prompt_categories(include_archived=True)
+
+    def translation_feedback_view(
+        self,
+        *,
+        category_id: str | None = None,
+        stage: str | None = None,
+        included: bool | None = None,
+    ) -> list[dict[str, Any]]:
+        return self.store.list_translation_feedback(
+            category_id=category_id,
+            stage=stage,
+            included=included,
+        )
+
+    def set_translation_feedback_included(
+        self,
+        feedback_id: str,
+        *,
+        included: bool,
+    ) -> dict[str, Any]:
+        return self.store.set_translation_feedback_included(
+            feedback_id,
+            included=included,
+        )
+
+    @staticmethod
+    def prompt_authoring_view() -> dict[str, str]:
+        return {
+            "improvement_instruction_version": (
+                PROMPT_IMPROVEMENT_INSTRUCTION_VERSION
+            ),
+            "improvement_system_prompt": PROMPT_IMPROVEMENT_SYSTEM_PROMPT,
+            "draft_instruction_version": PROMPT_DRAFT_INSTRUCTION_VERSION,
+            "draft_system_prompt": PROMPT_DRAFT_SYSTEM_PROMPT,
+        }
+
+    def _external_generation_profile(
+        self,
+        *,
+        provider: str,
+        model: str,
+    ) -> dict[str, Any]:
+        profile = self.store.get_external_model_profile(provider)
+        selected_model = model.strip()
+        if (
+            profile is None
+            or profile["status"] != "ready"
+            or not profile["credential"]
+            or not selected_model
+            or selected_model not in profile["models"]
+        ):
+            raise ValueError(
+                "외부 모델 제공자를 점검하고 목록에 있는 모델을 선택하세요."
+            )
+        return profile
+
+    def _external_generation_client(
+        self,
+        *,
+        provider: str,
+        model: str,
+    ) -> ExternalStructuredCompletionClient:
+        profile = self._external_generation_profile(
+            provider=provider,
+            model=model,
+        )
+        return ExternalStructuredCompletionClient(
+            provider=provider,
+            base_url=str(profile["base_url"]),
+            credential=str(profile["credential"]),
+            model=model,
+            region=str(profile["region"]),
+            request_observer=self.record_external_request,
+        )
+
+    def create_prompt_draft(
+        self,
+        *,
+        name: str,
+        domain_description: str,
+        provider: str,
+        model: str,
+    ) -> dict[str, str]:
+        normalized_name = name.strip()
+        normalized_description = domain_description.strip()
+        if not normalized_name:
+            raise ValueError("프롬프트 이름을 입력하세요.")
+        if not normalized_description:
+            raise ValueError("도메인 설명을 입력하세요.")
+        client = self._external_generation_client(
+            provider=provider,
+            model=model,
+        )
+        result = parse_prompt_draft_result(
+            client.complete(
+                prompt_draft_request_payload(
+                    name=normalized_name,
+                    domain_description=normalized_description,
+                )
+            )
+        )
+        return {
+            **result,
+            "provider": provider,
+            "model": model,
+            "instruction_version": PROMPT_DRAFT_INSTRUCTION_VERSION,
+        }
+
+    def create_prompt_improvement(
+        self,
+        *,
+        category_id: str,
+        stage: str,
+        provider: str,
+        model: str,
+    ) -> dict[str, Any]:
+        category = self.store.get_prompt_category(category_id)
+        if category is None:
+            raise ValueError("프롬프트 카테고리를 찾을 수 없습니다.")
+        if stage not in {"translation", "review"}:
+            raise ValueError("개선 단계는 translation 또는 review여야 합니다.")
+        self._external_generation_profile(provider=provider, model=model)
+        feedback = [
+            item
+            for item in self.store.list_translation_feedback(
+                category_id=category_id,
+                stage=stage,
+                included=True,
+                limit=1000,
+            )
+            if item["base_revision_id"] == category.prompt_revision_id
+        ]
+        train, holdout = split_feedback_by_job(
+            feedback,
+            seed=f"{category_id}:{stage}:{category.prompt_revision_id}",
+        )
+        run = self.store.create_prompt_improvement_run(
+            category_id=category_id,
+            stage=stage,
+            base_revision_id=category.prompt_revision_id,
+            train_feedback_ids=[str(item["id"]) for item in train],
+            holdout_feedback_ids=[str(item["id"]) for item in holdout],
+            endpoint_contract=provider,
+            model_contract=model,
+        )
+        self._prompt_improvement_executor.submit(
+            self._run_prompt_improvement,
+            str(run["id"]),
+        )
+        return run
+
+    def _run_prompt_improvement(self, run_id: str) -> None:
+        if not self.store.claim_prompt_improvement_run(run_id):
+            return
+        try:
+            run = self.store.get_prompt_improvement_run(run_id)
+            if run is None:
+                return
+            revision = self.store.prompt_revision_by_id(
+                str(run["base_revision_id"])
+            )
+            if revision is None:
+                raise ValueError("기준 프롬프트 revision을 찾을 수 없습니다.")
+            feedback = {
+                str(item["id"]): item
+                for item in self.store.list_translation_feedback(
+                    category_id=str(run["category_id"]),
+                    stage=str(run["stage"]),
+                    included=None,
+                    current_only=False,
+                    limit=1000,
+                )
+            }
+            train = [
+                feedback[feedback_id]
+                for feedback_id in run["train_feedback_ids"]
+                if feedback_id in feedback
+            ]
+            holdout = [
+                feedback[feedback_id]
+                for feedback_id in run["holdout_feedback_ids"]
+                if feedback_id in feedback
+            ]
+            expected_count = len(run["train_feedback_ids"]) + len(
+                run["holdout_feedback_ids"]
+            )
+            if len(train) + len(holdout) != expected_count:
+                raise ValueError("선택된 번역 피드백을 모두 찾을 수 없습니다.")
+            prompt_field = (
+                "translation_prompt"
+                if run["stage"] == "translation"
+                else "review_prompt"
+            )
+            provider = str(run["endpoint_contract"])
+            model = str(run["model_contract"])
+            client = self._external_generation_client(
+                provider=provider,
+                model=model,
+            )
+            proposed_prompt, evaluation = parse_improvement_result(
+                client.complete(
+                    improvement_request_payload(
+                        stage=str(run["stage"]),
+                        current_prompt=str(revision[prompt_field]),
+                        train=train,
+                        holdout=holdout,
+                    )
+                )
+            )
+            self.store.complete_prompt_improvement_run(
+                run_id,
+                proposed_prompt=proposed_prompt,
+                evaluation=evaluation,
+            )
+        except Exception as error:
+            self.store.fail_prompt_improvement_run(
+                run_id,
+                self._sanitize_error(str(error) or error.__class__.__name__),
+            )
+            LOGGER.exception("prompt improvement run %s failed", run_id)
+
+    def prompt_improvement_runs_view(
+        self,
+        *,
+        category_id: str | None = None,
+        stage: str | None = None,
+    ) -> list[dict[str, Any]]:
+        return self.store.list_prompt_improvement_runs(
+            category_id=category_id,
+            stage=stage,
+        )
+
+    def cancel_prompt_improvement(self, run_id: str) -> dict[str, Any]:
+        return self.store.set_prompt_improvement_run_status(
+            run_id,
+            from_statuses={"queued", "running"},
+            status="cancelled",
+        )
+
+    def reject_prompt_improvement(self, run_id: str) -> dict[str, Any]:
+        return self.store.set_prompt_improvement_run_status(
+            run_id,
+            from_statuses={"ready"},
+            status="rejected",
+        )
+
+    def activate_prompt_improvement(
+        self,
+        run_id: str,
+    ) -> dict[str, Any]:
+        category, run = self.store.activate_prompt_improvement_run(run_id)
+        return {"category": asdict(category), "run": run}
 
     @property
     def path_display_rules(self) -> tuple[PathDisplayRule, ...]:
@@ -1841,7 +2183,7 @@ class SubtitleOrchestrator:
             endpoint.base_url == normalized.stt_base_url
             for endpoint in self.store.list_runtime_endpoints()
         ):
-            raise ValueError("외부 Runtime과 같은 주소를 기본값으로 설정할 수 없습니다.")
+            raise ValueError("외부 전사 서버와 같은 주소를 기본값으로 설정할 수 없습니다.")
         stt_client = STTAPIClient(
             normalized.stt_base_url,
             normalized.stt_token,
@@ -1851,6 +2193,7 @@ class SubtitleOrchestrator:
             self.store.save_remote_server_settings(
                 stt_base_url=normalized.stt_base_url,
                 stt_token=normalized.stt_token,
+                resource_group_id=normalized.resource_group_id,
             )
         self._remote_runtime = (stt_client, normalized)
         with self._runtime_lock:
@@ -1909,6 +2252,17 @@ class SubtitleOrchestrator:
                 self._runtime_probe_executor.submit(
                     self.probe_runtime_endpoint,
                     str(view["id"]),
+                )
+        for run in self.store.list_prompt_improvement_runs(limit=1000):
+            if run["status"] == "running":
+                self.store.fail_prompt_improvement_run(
+                    str(run["id"]),
+                    "서비스 재시작으로 개선 작업이 중단되었습니다. 다시 요청하세요.",
+                )
+            elif run["status"] == "queued":
+                self._prompt_improvement_executor.submit(
+                    self._run_prompt_improvement,
+                    str(run["id"]),
                 )
         self._scheduler.start()
 
@@ -2117,6 +2471,7 @@ class SubtitleOrchestrator:
             self._stt_executor,
             self._runtime_probe_executor,
             self._translation_executor,
+            self._prompt_improvement_executor,
         ):
             executor.shutdown(wait=False, cancel_futures=True)
         with self._stage_futures_lock:
@@ -2134,6 +2489,7 @@ class SubtitleOrchestrator:
         source_rel: str,
         *,
         force_overwrite: bool,
+        is_test: bool = False,
         options: Mapping[str, Any],
         operation: str = "full",
         prompt_category_id: str | None = None,
@@ -2141,6 +2497,7 @@ class SubtitleOrchestrator:
         return self.create_jobs(
             [source_rel],
             force_overwrite=force_overwrite,
+            is_test=is_test,
             options=options,
             operation=operation,
             prompt_category_id=prompt_category_id,
@@ -2154,6 +2511,8 @@ class SubtitleOrchestrator:
         force_overwrite: bool,
         operation: str,
     ) -> tuple[list[str], int]:
+        if operation not in SUPPORTED_OPERATIONS:
+            raise ValueError("unsupported job operation")
         recursive = self.library.list_media_recursive(folder_rels)
         candidates = list(dict.fromkeys([*source_rels, *recursive]))
         if not candidates:
@@ -2169,12 +2528,6 @@ class SubtitleOrchestrator:
             latest = latest_jobs.get(source_rel)
             if latest is not None and latest.status not in SUCCESS_STATUSES:
                 skipped += 1
-                continue
-            # A comparison is an explicitly repeatable, transcription-only
-            # operation. Completed jobs and rendered subtitles do not collide
-            # with its per-job artifacts, so they must not filter the source.
-            if operation == "compare":
-                selected.append(source_rel)
                 continue
             has_subtitle = any(
                 path.exists()
@@ -2205,6 +2558,7 @@ class SubtitleOrchestrator:
         source_rels: Sequence[str],
         *,
         force_overwrite: bool,
+        is_test: bool = False,
         options: Mapping[str, Any],
         operation: str = "full",
         prompt_category_id: str | None = None,
@@ -2315,6 +2669,7 @@ class SubtitleOrchestrator:
                     reusable_audio.id,
                     status="audio_ready" if audio_available else "queued",
                     force_overwrite=int(force_overwrite),
+                    is_test=int(is_test or reusable_audio.is_test),
                     operation="transcribe",
                     options_json=json.dumps(resumed_options, sort_keys=True),
                     audio_path=(
@@ -2371,7 +2726,6 @@ class SubtitleOrchestrator:
                     reusable.status == "transcription_completed"
                     and latest is not None
                     and latest.id == reusable.id
-                    and not reusable.options.get("comparison_id")
                 ):
                     jobs.append(
                         self._continue_completed_transcription(
@@ -2403,6 +2757,7 @@ class SubtitleOrchestrator:
                     job_id=uuid4().hex,
                     source_rel=source_rel,
                     force_overwrite=force_overwrite,
+                    is_test=(is_test or reusable.is_test),
                     options=reusable_options,
                     operation="translate",
                     audio_path=reusable.audio_path,
@@ -2456,6 +2811,7 @@ class SubtitleOrchestrator:
                     job_id=uuid4().hex,
                     source_rel=source_rel,
                     force_overwrite=force_overwrite,
+                    is_test=is_test,
                     options=normalized_options,
                     operation=operation,
                 )
@@ -2470,7 +2826,8 @@ class SubtitleOrchestrator:
         reuse_audio_from: Sequence[PipelineJob] = (),
         parent_comparison_id: str | None = None,
     ) -> tuple[str, list[PipelineJob]]:
-        """Queue one transcription-only job per engine and source."""
+        """Queue one validated transcription comparison profile per source."""
+        raise ValueError("전사 비교 작업 생성은 더 이상 지원하지 않습니다.")
         if not self.transcription_server_configured:
             raise ValueError("전사 서버 설정이 필요합니다.")
         unique_source_rels = list(dict.fromkeys(source_rels))
@@ -2484,39 +2841,71 @@ class SubtitleOrchestrator:
         for source_rel in unique_source_rels:
             self.library.resolve_file(source_rel)
 
-        comparison_chunks = HybridRescueOptions.from_options(options)
-        normalized_by_backend: dict[str, dict[str, Any]] = {}
-        for backend in TRANSCRIPTION_COMPARISON_BACKENDS:
-            backend_options = dict(options)
-            backend_options["backend"] = backend
-            if backend == "kotoba":
-                backend_options["chunk_length_seconds"] = (
-                    comparison_chunks.kotoba_chunk_length_seconds
-                )
-            elif backend == "whisperx":
-                backend_options["chunk_length_seconds"] = (
-                    comparison_chunks.whisperx_chunk_length_seconds
-                )
-            if backend != "hybrid":
-                backend_options.pop("hybrid_rescue", None)
-            if backend != "whisperjav":
-                backend_options.pop("whisperjav", None)
-            if backend == "whisperjav":
-                for key in ("repetition_policy", "repetition_min_count"):
-                    backend_options.pop(key, None)
-            if backend == "kotoba":
-                for key in (
-                    "subtitle_segmentation",
-                    "repetition_policy",
-                    "repetition_min_count",
-                ):
-                    backend_options.pop(key, None)
-            normalized_by_backend[backend] = self._normalize_options(
-                backend_options
+        comparison_profile = str(
+            options.get("comparison_profile", "whisperjav")
+        ).strip().lower()
+        if comparison_profile == "whisperjav":
+            variants = TRANSCRIPTION_COMPARISON_VARIANTS
+            schema_version = TRANSCRIPTION_COMPARISON_SCHEMA_VERSION
+        elif comparison_profile == HYBRID_OWSM_COMPARISON_PROFILE:
+            variants = HYBRID_OWSM_COMPARISON_VARIANTS
+            schema_version = HYBRID_OWSM_COMPARISON_SCHEMA_VERSION
+        else:
+            raise ValueError(
+                "comparison_profile must be 'whisperjav' or "
+                f"'{HYBRID_OWSM_COMPARISON_PROFILE}'"
+            )
+
+        common_options = dict(options)
+        for key in (
+            "backend",
+            "batch_size",
+            "kotoba_batch_size",
+            "subtitle_segmentation",
+            "repetition_policy",
+            "repetition_min_count",
+            "hybrid_rescue",
+            "owsm_audit",
+            "whisperjav",
+            "comparison_id",
+            "comparison_profile",
+            "comparison_schema_version",
+            "comparison_backends",
+            "comparison_variants",
+            "comparison_variant_id",
+            "comparison_variant_label",
+            "comparison_variant_order",
+        ):
+            common_options.pop(key, None)
+
+        normalized_variants: list[
+            tuple[Mapping[str, Any], dict[str, Any]]
+        ] = []
+        for variant in variants:
+            variant_options = {
+                **common_options,
+                "backend": str(variant.get("backend", "whisperjav")),
+                "subtitle_segmentation": dict(
+                    variant["subtitle_segmentation"]
+                ),
+            }
+            for option_name in (
+                "chunk_length_seconds",
+                "hybrid_rescue",
+                "owsm_audit",
+                "whisperjav",
+            ):
+                if option_name in variant:
+                    value = variant[option_name]
+                    variant_options[option_name] = (
+                        dict(value) if isinstance(value, Mapping) else value
+                    )
+            normalized_variants.append(
+                (variant, self._normalize_options(variant_options))
             )
 
         desired_audio_signature = _audio_extraction_signature(
-            normalized_by_backend[TRANSCRIPTION_COMPARISON_BACKENDS[0]]
+            normalized_variants[0][1]
         )
         reusable_audio_by_source: dict[str, PipelineJob] = {}
         for candidate in sorted(
@@ -2542,15 +2931,32 @@ class SubtitleOrchestrator:
         jobs: list[PipelineJob] = []
         for source_rel in unique_source_rels:
             reusable_audio = reusable_audio_by_source.get(source_rel)
-            for backend in TRANSCRIPTION_COMPARISON_BACKENDS:
-                persisted_options = dict(normalized_by_backend[backend])
+            for variant_order, (variant, normalized_options) in enumerate(
+                normalized_variants
+            ):
+                persisted_options = dict(normalized_options)
                 persisted_options["comparison_id"] = comparison_id
                 persisted_options["comparison_schema_version"] = (
-                    TRANSCRIPTION_COMPARISON_SCHEMA_VERSION
+                    schema_version
                 )
+                persisted_options["comparison_profile"] = comparison_profile
                 persisted_options["comparison_backends"] = list(
-                    TRANSCRIPTION_COMPARISON_BACKENDS
+                    dict.fromkeys(
+                        str(item.get("backend", "whisperjav"))
+                        for item in variants
+                    )
                 )
+                persisted_options["comparison_variants"] = [
+                    str(item["id"])
+                    for item in variants
+                ]
+                persisted_options["comparison_variant_id"] = str(
+                    variant["id"]
+                )
+                persisted_options["comparison_variant_label"] = str(
+                    variant["label"]
+                )
+                persisted_options["comparison_variant_order"] = variant_order
                 if normalized_parent_id:
                     persisted_options[COMPARISON_PARENT_ID_OPTION] = (
                         normalized_parent_id
@@ -2575,6 +2981,7 @@ class SubtitleOrchestrator:
                     job_id=uuid4().hex,
                     source_rel=source_rel,
                     force_overwrite=False,
+                    is_test=True,
                     options=persisted_options,
                     operation="transcribe",
                     status=(
@@ -2653,11 +3060,6 @@ class SubtitleOrchestrator:
             if latest is None or latest.id != job.id:
                 raise ValueError(
                     f"{job.source_rel}: 최신 작업만 번역할 수 있습니다."
-                )
-            if job.options.get("comparison_id"):
-                raise ValueError(
-                    f"{job.source_rel}: 전사 비교 결과는 비교 상세 화면에서 "
-                    "번역할 결과를 선택하세요."
                 )
             if translation_mode == "review_existing":
                 current_prompt = job.options.get(TRANSLATION_PROMPT_OPTION)
@@ -2787,6 +3189,7 @@ class SubtitleOrchestrator:
             job_id=uuid4().hex,
             source_rel=source_job.source_rel,
             force_overwrite=True,
+            is_test=source_job.is_test,
             options=options,
             operation=operation,
             audio_path=source_job.audio_path,
@@ -2874,10 +3277,6 @@ class SubtitleOrchestrator:
             source_job = self.store.get(job_id)
             if source_job is None:
                 raise ValueError("선택한 작업을 찾을 수 없습니다.")
-            if source_job.options.get("comparison_id"):
-                raise ValueError(
-                    "전사 비교 결과는 비교 상세 화면에서 먼저 선택하세요."
-                )
             source_generation_id: str | None = None
             if stage == "draft":
                 if (
@@ -3196,6 +3595,7 @@ class SubtitleOrchestrator:
         prompt_category_id: str,
     ) -> list[PipelineJob]:
         """Create translation jobs from selected comparison transcripts."""
+        raise ValueError("전사 비교 전용 번역은 더 이상 지원하지 않습니다.")
         if not self.translation_server_configured:
             raise ValueError("번역 서버 설정이 필요합니다.")
         normalized_comparison_id = comparison_id.strip()
@@ -3263,8 +3663,13 @@ class SubtitleOrchestrator:
         created_jobs: list[PipelineJob] = []
         comparison_option_keys = {
             "comparison_id",
+            "comparison_profile",
             "comparison_schema_version",
             "comparison_backends",
+            "comparison_variants",
+            "comparison_variant_id",
+            "comparison_variant_label",
+            "comparison_variant_order",
             COMPARISON_PARENT_ID_OPTION,
             COMPARISON_AUDIO_SOURCE_JOB_ID_OPTION,
         }
@@ -3291,6 +3696,7 @@ class SubtitleOrchestrator:
                 job_id=uuid4().hex,
                 source_rel=reusable.source_rel,
                 force_overwrite=True,
+                is_test=True,
                 options=options,
                 operation="draft_translate",
                 audio_path=reusable.audio_path,
@@ -3368,7 +3774,7 @@ class SubtitleOrchestrator:
         self,
         options: Mapping[str, Any],
     ) -> dict[str, Any]:
-        backend = str(options.get("backend", "kotoba")).strip().lower()
+        backend = str(options.get("backend", "hybrid")).strip().lower()
         if backend not in SUPPORTED_STT_BACKENDS:
             supported = ", ".join(sorted(SUPPORTED_STT_BACKENDS))
             raise ValueError(f"backend must be one of: {supported}")
@@ -3392,11 +3798,7 @@ class SubtitleOrchestrator:
             chunk_length_seconds=int(
                 options.get(
                     "chunk_length_seconds",
-                    (
-                        WHISPERX_MAX_CHUNK_LENGTH_SECONDS
-                        if backend == "whisperx"
-                        else DEFAULT_CHUNK_LENGTH_SECONDS
-                    ),
+                    DEFAULT_CHUNK_LENGTH_SECONDS,
                 )
             ),
             num_speakers=(
@@ -3419,37 +3821,9 @@ class SubtitleOrchestrator:
         )
         extraction.validate()
         transcription.validate()
-        if (
-            backend == "whisperx"
-            and transcription.chunk_length_seconds
-            > WHISPERX_MAX_CHUNK_LENGTH_SECONDS
-        ):
-            raise ValueError(
-                "WhisperX chunk_length_seconds must be at most "
-                f"{WHISPERX_MAX_CHUNK_LENGTH_SECONDS}"
-            )
-        if (
-            backend in {"hybrid", "whisperjav", "whisperx"}
-            and not transcription.noise_filter
-        ):
+        if not transcription.noise_filter:
             raise ValueError(
                 f"{backend} backend requires noise_filter=true for VAD"
-            )
-        if backend == "whisperx" and "hybrid_rescue" in options:
-            raise ValueError("hybrid_rescue requires backend='hybrid'")
-        if backend == "kotoba" and any(
-            key in options
-            for key in (
-                "subtitle_segmentation",
-                "repetition_policy",
-                "repetition_min_count",
-                "hybrid_rescue",
-                "whisperjav",
-            )
-        ):
-            raise ValueError(
-                "WhisperX quality options require backend='whisperx' or "
-                "'hybrid'"
             )
         normalized_options = {
             "backend": backend,
@@ -3465,7 +3839,7 @@ class SubtitleOrchestrator:
         }
         raw_batch_size = options.get("batch_size")
         if raw_batch_size not in (None, ""):
-            if backend not in {"hybrid", "whisperx"}:
+            if backend != "hybrid":
                 raise ValueError(
                     "batch_size requires backend='whisperx' or 'hybrid'"
                 )
@@ -3489,16 +3863,19 @@ class SubtitleOrchestrator:
         if backend == "hybrid":
             if "whisperjav" in options:
                 raise ValueError("whisperjav options require backend='whisperjav'")
+            hybrid_rescue = HybridRescueOptions.from_options(options)
             segmentation = asdict(
                 WhisperXSegmentationOptions.from_options(
                     options,
-                    defaults=DEFAULT_SUBTITLE_SEGMENTATION,
+                    defaults=(
+                        HYBRID_STABLE_SUBTITLE_SEGMENTATION
+                        if hybrid_rescue.stable_ts_regroup_enabled
+                        else DEFAULT_SUBTITLE_SEGMENTATION
+                    ),
                 )
             )
 
-            rescue = asdict(
-                HybridRescueOptions.from_options(options)
-            )
+            rescue = asdict(hybrid_rescue)
             kotoba_chunk_length = rescue["kotoba_chunk_length_seconds"]
             repetition_policy = str(
                 options.get("repetition_policy", "flag")
@@ -3524,34 +3901,15 @@ class SubtitleOrchestrator:
                     "hybrid_rescue": rescue,
                 }
             )
-        elif backend == "whisperx":
-            if "whisperjav" in options:
-                raise ValueError("whisperjav options require backend='whisperjav'")
-            if isinstance(raw_segmentation, Mapping):
-                normalized_options["subtitle_segmentation"] = asdict(
-                    WhisperXSegmentationOptions.from_options(
-                        {"subtitle_segmentation": raw_segmentation}
-                    )
-                )
-            repetition_policy = str(
-                options.get("repetition_policy", "flag")
-            ).strip().lower()
-            if repetition_policy not in {"flag", "reject"}:
-                raise ValueError(
-                    "repetition_policy must be 'flag' or 'reject'"
-                )
-            repetition_min_count = int(options.get("repetition_min_count", 8))
-            if repetition_min_count < 2:
-                raise ValueError(
-                    "repetition_min_count must be at least 2"
-                )
-            normalized_options["repetition_policy"] = repetition_policy
-            normalized_options["repetition_min_count"] = repetition_min_count
+            normalized_options["owsm_audit"] = asdict(
+                OWSMAuditOptions.from_options(options)
+            )
         elif backend == "whisperjav":
             forbidden = {
                 "repetition_policy",
                 "repetition_min_count",
                 "hybrid_rescue",
+                "owsm_audit",
             } & set(options)
             if forbidden:
                 raise ValueError(
@@ -3567,8 +3925,6 @@ class SubtitleOrchestrator:
             normalized_options["whisperjav"] = asdict(
                 WhisperJAVOptions.from_options(options)
             )
-        elif "whisperjav" in options:
-            raise ValueError("whisperjav options require backend='whisperjav'")
         return normalized_options
 
     def retry(self, job_id: str) -> PipelineJob:
@@ -4168,6 +4524,7 @@ class SubtitleOrchestrator:
         return self.create_job(
             original.source_rel,
             force_overwrite=True,
+            is_test=original.is_test,
             options=original.options,
             operation=operation,
             prompt_category_id=(
@@ -4386,6 +4743,8 @@ class SubtitleOrchestrator:
             raise ValueError("JSON document must be an object")
 
         manual_generation: dict[str, Any] | None = None
+        feedback_source_generation: dict[str, Any] | None = None
+        feedback_source_items: list[dict[str, Any]] = []
         if kind == "transcript":
             segments = validate_transcript(payload)
             if job.translation_path and Path(job.translation_path).is_file():
@@ -4430,6 +4789,11 @@ class SubtitleOrchestrator:
                 segments,
                 prompt_snapshot,
             )
+            feedback_source_generation = legacy_translation
+            if feedback_source_generation is not None:
+                feedback_source_items = self.store.translation_items(
+                    str(feedback_source_generation["id"])
+                )
             self._capture_legacy_subtitle_generation(
                 job,
                 translation_generation_id=(
@@ -4458,6 +4822,16 @@ class SubtitleOrchestrator:
                 manual_generation["id"],
                 [str(segment["id"]) for segment in segments],
             )
+            if feedback_source_generation is not None:
+                self._record_translation_feedback_changes(
+                    job,
+                    prompt_snapshot=prompt_snapshot,
+                    segments=segments,
+                    source_generation=feedback_source_generation,
+                    source_items=feedback_source_items,
+                    manual_generation=manual_generation,
+                    edited_items=translations,
+                )
 
         if kind == "transcript":
             revision_id = uuid4().hex
@@ -4534,6 +4908,77 @@ class SubtitleOrchestrator:
         else:
             self.store.add_event(job.id, "info", f"{kind} JSON edited")
         return artifact
+
+    def _record_translation_feedback_changes(
+        self,
+        job: PipelineJob,
+        *,
+        prompt_snapshot: Mapping[str, Any],
+        segments: Sequence[Mapping[str, Any]],
+        source_generation: Mapping[str, Any],
+        source_items: Sequence[Mapping[str, Any]],
+        manual_generation: Mapping[str, Any],
+        edited_items: Sequence[Mapping[str, Any]],
+    ) -> None:
+        revision_id = str(
+            source_generation.get("prompt_revision_id")
+            or prompt_snapshot.get("revision_id")
+            or ""
+        ).strip()
+        revision = self.store.prompt_revision_by_id(revision_id)
+        if revision is None:
+            return
+        stage = (
+            "translation"
+            if self._translation_mode(prompt_snapshot) == "draft_only"
+            else "review"
+        )
+        source_by_id = {
+            str(item["id"]): str(item["text"])
+            for item in source_items
+        }
+        edited_by_id = {
+            str(item["id"]): str(item["text"])
+            for item in edited_items
+        }
+        segment_by_id = {
+            str(segment["id"]): (index, segment)
+            for index, segment in enumerate(segments)
+        }
+        for segment_id, model_text in source_by_id.items():
+            edited_text = edited_by_id.get(segment_id, model_text)
+            if edited_text == model_text or segment_id not in segment_by_id:
+                continue
+            index, segment = segment_by_id[segment_id]
+            previous_text = (
+                str(segments[index - 1].get("text", ""))
+                if index > 0
+                else ""
+            )
+            next_text = (
+                str(segments[index + 1].get("text", ""))
+                if index + 1 < len(segments)
+                else ""
+            )
+            self.store.record_translation_feedback(
+                job_id=job.id,
+                category_id=str(revision["category_id"]),
+                base_revision_id=revision_id,
+                stage=stage,
+                source_generation_id=str(source_generation["id"]),
+                manual_generation_id=str(manual_generation["id"]),
+                segment_id=segment_id,
+                source_text=str(segment.get("text", "")),
+                model_text=model_text,
+                edited_text=edited_text,
+                context={
+                    "previous_source_text": previous_text,
+                    "next_source_text": next_text,
+                    "start": segment.get("start"),
+                    "end": segment.get("end"),
+                    "speaker": segment.get("speaker"),
+                },
+            )
 
     def edit_translation_item(
         self,
@@ -4658,7 +5103,7 @@ class SubtitleOrchestrator:
         with self._runtime_lock:
             counts = self.store.transcription_runtime_counts()
             health = {
-                runtime_id: str(value.get("status", "unknown"))
+                runtime_id: dict(value)
                 for runtime_id, value in self._runtime_health.items()
             }
             slots: list[str] = []
@@ -4666,7 +5111,7 @@ class SubtitleOrchestrator:
                 runtime_id = str(definition["id"])
                 if (
                     not definition["enabled"]
-                    or health.get(runtime_id) != "ready"
+                    or health.get(runtime_id, {}).get("status") != "ready"
                 ):
                     continue
                 available = max(
@@ -4683,6 +5128,25 @@ class SubtitleOrchestrator:
                 ]
             dispatched = 0
             for runtime_id in slots:
+                readiness = health.get(runtime_id, {}).get("readiness")
+                advertised_backends = (
+                    readiness.get("backends")
+                    if isinstance(readiness, Mapping)
+                    else None
+                )
+
+                def supports_runtime(job: PipelineJob) -> bool:
+                    if not isinstance(advertised_backends, Mapping):
+                        # Backward compatibility for runtimes predating
+                        # capability advertisement.
+                        return True
+                    backend = str(job.options.get("backend", "kotoba"))
+                    capability = advertised_backends.get(backend)
+                    return (
+                        isinstance(capability, Mapping)
+                        and capability.get("status") == "ready"
+                    )
+
                 if not self._dispatch_one(
                     "audio_ready",
                     "transcription_running",
@@ -4690,8 +5154,9 @@ class SubtitleOrchestrator:
                     self._stt_executor,
                     self._transcribe,
                     stt_runtime_id=runtime_id,
+                    job_filter=supports_runtime,
                 ):
-                    break
+                    continue
                 dispatched += 1
             if slots:
                 self._runtime_dispatch_cursor = (
@@ -5000,7 +5465,17 @@ class SubtitleOrchestrator:
                             ),
                         },
                     )
-            operation(job)
+            resource_context = nullcontext()
+            if stage == "transcription":
+                definition = self._runtime_definition(
+                    job.stt_runtime_id or BUILTIN_RUNTIME_ID
+                )
+                resource_context = self._resource_groups.reserve(
+                    str(definition["resource_group_id"]),
+                    timeout=self.settings.translation_read_timeout_seconds,
+                )
+            with resource_context:
+                operation(job)
             self._raise_if_job_stop_requested(job_id)
         except WorkerLeaseLost:
             self._record_lease_fencing_rejection(stage, "worker_result")
@@ -5320,7 +5795,7 @@ class SubtitleOrchestrator:
         self.store.add_event(
             job.id,
             "warning",
-            "transcription Runtime unavailable; queued for another Runtime",
+            "transcription server unavailable; queued for another server",
             event_code="transcription.runtime_failover",
             from_state=JobState.RUNNING.value,
             phase="transcription",
@@ -5333,7 +5808,7 @@ class SubtitleOrchestrator:
             },
         )
         LOGGER.warning(
-            "job %s transcription Runtime %s unavailable; requeued: %s",
+            "job %s transcription server %s unavailable; requeued: %s",
             job.id,
             failed_runtime_id,
             message,
@@ -5438,7 +5913,7 @@ class SubtitleOrchestrator:
                 return
         revision_id = uuid4().hex
         audio_path = (
-            self.settings.jobs_dir
+            self.settings.transcription_audio_dir
             / job.id
             / "audio-revisions"
             / revision_id
@@ -5495,12 +5970,12 @@ class SubtitleOrchestrator:
         runtime_id = job.stt_runtime_id or BUILTIN_RUNTIME_ID
         stt_client = self._runtime_client(runtime_id)
         if stt_client is None:
-            raise ExternalServiceError("assigned Runtime is not configured")
+            raise ExternalServiceError("assigned Transcriber is not configured")
         runtime_definition = self._runtime_definition(runtime_id)
         if not job.audio_path or not Path(job.audio_path).is_file():
             raise RuntimeError("extracted WAV is unavailable")
         options = {
-            "backend": job.options.get("backend", "kotoba"),
+            "backend": job.options.get("backend", "hybrid"),
             "chunk_length_seconds": job.options["chunk_length_seconds"],
             "num_speakers": job.options["num_speakers"],
             "min_speakers": job.options["min_speakers"],
@@ -5514,6 +5989,7 @@ class SubtitleOrchestrator:
             "repetition_policy",
             "repetition_min_count",
             "hybrid_rescue",
+            "owsm_audit",
             "whisperjav",
         ):
             if key in job.options:
@@ -5537,9 +6013,7 @@ class SubtitleOrchestrator:
             if audio_duration is not None
             else None
         )
-        stt_call_count = (
-            2 if options["backend"] in {"hybrid", "whisperjav"} else 1
-        )
+        stt_call_count = 3 if options["backend"] == "hybrid" else 2
         request_metadata = {
             "job_id": job.id,
             "request_id": f"pipeline-{job.id}",

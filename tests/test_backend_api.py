@@ -48,9 +48,9 @@ class BackendAPIBoundaryTests(unittest.TestCase):
         self.assertIn("/api/v1/dashboard/library-progress", paths)
         self.assertIn("/api/v1/settings", paths)
         self.assertIn("/api/v1/settings/servers", paths)
-        self.assertIn("/api/v1/runtimes", paths)
-        self.assertIn("/api/v1/runtimes/{runtime_id}", paths)
-        self.assertIn("/api/v1/runtimes/{runtime_id}/probe", paths)
+        self.assertIn("/api/v1/transcribers", paths)
+        self.assertIn("/api/v1/transcribers/{transcriber_id}", paths)
+        self.assertIn("/api/v1/transcribers/{transcriber_id}/probe", paths)
         self.assertIn(
             "/api/v1/translation-groups/{stage}/servers/{endpoint_id}/model",
             paths,
@@ -76,7 +76,10 @@ class BackendAPIBoundaryTests(unittest.TestCase):
         )
         self.assertIn("/api/v1/settings/path-display-rules", paths)
         self.assertIn("/api/v1/settings/prompt-categories", paths)
-        self.assertIn("/api/v1/comparisons", paths)
+        self.assertIn("/api/v1/settings/translation-feedback", paths)
+        self.assertIn("/api/v1/settings/prompt-improvements", paths)
+        self.assertIn("/api/v1/settings/prompt-drafts", paths)
+        self.assertNotIn("/api/v1/comparisons", paths)
         self.assertIn("/api/v1/operations/metrics", paths)
         self.assertIn(
             "/api/v1/operations/metrics/media-durations",
@@ -141,6 +144,48 @@ class BackendAPIBoundaryTests(unittest.TestCase):
             self.assertEqual(create_response.status_code, 409)
             self.assertEqual(combined_response.status_code, 409)
             self.assertEqual(reprocess_response.status_code, 422)
+
+    def test_public_api_accepts_recall_union_hybrid_test_job(self) -> None:
+        from fastapi.testclient import TestClient
+
+        from stt_to_subtitle.backend_api import create_backend_app
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            (media_root / "sample.mp4").write_bytes(b"media")
+            settings = BackendSettings(
+                state_dir=root / "state",
+                media_root=media_root,
+                stt_base_url="http://runtime:8100",
+                stt_token="",
+            )
+            with TestClient(create_backend_app(settings)) as client:
+                client.app.state.orchestrator.stop()
+                response = client.post(
+                    "/api/v1/jobs",
+                    json={
+                        "source_rels": ["sample.mp4"],
+                        "operation": "transcribe",
+                        "is_test": True,
+                        "options": {
+                            "backend": "hybrid",
+                            "owsm_audit": {
+                                "minimum_extra_characters": 20,
+                            },
+                        },
+                    },
+                )
+
+        self.assertEqual(response.status_code, 201)
+        item = response.json()["items"][0]
+        self.assertTrue(item["is_test"])
+        self.assertEqual(item["options"]["backend"], "hybrid")
+        self.assertEqual(
+            item["options"]["owsm_audit"]["minimum_extra_characters"],
+            20,
+        )
 
     def test_health_and_job_list_run_without_html_application(self) -> None:
         from fastapi.testclient import TestClient
@@ -221,6 +266,7 @@ class BackendAPIBoundaryTests(unittest.TestCase):
                     job_id="with-metadata",
                     source_rel="with-metadata.mkv",
                     force_overwrite=False,
+                    is_test=True,
                     options={},
                 )
                 service.store.create(
@@ -234,6 +280,8 @@ class BackendAPIBoundaryTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         jobs = {item["id"]: item for item in response.json()["items"]}
         self.assertEqual(jobs["with-metadata"]["nfo_title"], "작업 목록 제목")
+        self.assertTrue(jobs["with-metadata"]["is_test"])
+        self.assertFalse(jobs["missing-media"]["is_test"])
         self.assertEqual(
             jobs["with-metadata"]["poster_path"],
             "with-metadata-poster.jpg",
@@ -443,6 +491,156 @@ class BackendAPIBoundaryTests(unittest.TestCase):
             ["review-orphan"],
         )
 
+    def test_job_detail_summarizes_previous_subtitle_runs(self) -> None:
+        from fastapi.testclient import TestClient
+
+        from stt_to_subtitle.backend_api import create_backend_app
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            (media_root / "sample.mp4").write_bytes(b"media")
+            (media_root / "sample.ko.srt").write_text(
+                "1\n00:00:00,000 --> 00:00:01,000\nsubtitle\n",
+                encoding="utf-8",
+            )
+            transcript_path = root / "old-transcript.json"
+            transcript_path.write_text('{"segments": []}', encoding="utf-8")
+            translation_path = root / "old-translation.json"
+            translation_path.write_text('{"translations": []}', encoding="utf-8")
+            settings = BackendSettings(
+                state_dir=root / "state",
+                media_root=media_root,
+                stt_base_url="http://runtime:8100",
+                stt_token="",
+            )
+            with TestClient(create_backend_app(settings)) as client:
+                service = client.app.state.orchestrator
+                service.stop()
+                old_root = service.store.create(
+                    job_id="old-root",
+                    source_rel="sample.mp4",
+                    force_overwrite=False,
+                    is_test=True,
+                    options={"backend": "whisperjav"},
+                    operation="transcribe",
+                )
+                service.store.record_transcript_revision(
+                    revision_id="old-transcript-revision",
+                    job_id=old_root.id,
+                    audio_revision_id=None,
+                    remote_job_id="remote-old",
+                    backend="whisperjav",
+                    model_revision="ensemble-v2",
+                    options_hash="options-old",
+                    artifact_path=str(transcript_path),
+                    content_hash="transcript-old",
+                    origin="automatic",
+                    status=None,
+                    chunks_total=1,
+                )
+                service.store.update(
+                    old_root.id,
+                    transcript_path=str(transcript_path),
+                    transcript_revision_id="old-transcript-revision",
+                    status="transcription_completed",
+                )
+                old_render = service.store.create(
+                    job_id="old-render",
+                    source_rel="sample.mp4",
+                    force_overwrite=False,
+                    options={
+                        "pipeline_parent_job_id": old_root.id,
+                        "translation_prompt": {
+                            "category_id": "variety",
+                            "revision_number": 7,
+                        },
+                    },
+                    operation="review_translate",
+                )
+                service.store.update(
+                    old_render.id,
+                    translation_path=str(translation_path),
+                    status="completed",
+                )
+                generation = service.store.create_subtitle_generation(
+                    generation_id="old-subtitle",
+                    job_id=old_render.id,
+                    translation_generation_id=None,
+                    transcript_hash="transcript-old",
+                    translation_hash="translation-old",
+                    renderer_version="1",
+                    render_hash="render-old",
+                    srt_artifact_path="old.srt",
+                    ass_artifact_path="old.ass",
+                    srt_hash="srt-old",
+                    ass_hash="ass-old",
+                    origin="rendered",
+                )
+                service.store.publish_subtitle_generation(
+                    generation["id"],
+                    srt_path=str(media_root / "sample.ko.srt"),
+                    ass_path=str(media_root / "sample.ko.ass"),
+                )
+                legacy = service.store.create(
+                    job_id="legacy-subtitle",
+                    source_rel="sample.mp4",
+                    force_overwrite=False,
+                    options={"backend": "whisperx"},
+                    operation="full",
+                )
+                service.store.update(
+                    legacy.id,
+                    transcript_path=str(transcript_path),
+                    translation_path=str(translation_path),
+                    srt_path=str(media_root / "sample.ko.srt"),
+                    ass_path=str(media_root / "sample.ko.ass"),
+                    status="completed",
+                )
+                service.store.create(
+                    job_id="current-root",
+                    source_rel="sample.mp4",
+                    force_overwrite=False,
+                    options={"backend": "hybrid"},
+                    operation="transcribe",
+                )
+
+                response = client.get("/api/v1/jobs/current-root")
+                transcript = client.get(
+                    "/api/v1/jobs/old-root/artifacts/transcript",
+                    params={"inline": True},
+                )
+                translation = client.get(
+                    "/api/v1/jobs/old-render/artifacts/translation",
+                    params={"inline": True},
+                )
+
+        self.assertEqual(response.status_code, 200)
+        histories = response.json()["previous_subtitle_workflows"]
+        self.assertEqual(len(histories), 2)
+        histories_by_root = {
+            item["workflow_root_job_id"]: item for item in histories
+        }
+        summary = histories_by_root["old-root"]
+        self.assertEqual(summary["workflow_root_job_id"], "old-root")
+        self.assertEqual(summary["transcription_backend"], "whisperjav")
+        self.assertEqual(summary["transcription_model_revision"], "ensemble-v2")
+        self.assertEqual(summary["translation_prompt_name"], "버라이어티")
+        self.assertEqual(summary["translation_prompt_version"], 7)
+        self.assertTrue(summary["is_test"])
+        self.assertEqual(summary["transcript_job_id"], "old-root")
+        self.assertEqual(summary["translation_job_id"], "old-render")
+        legacy_summary = histories_by_root["legacy-subtitle"]
+        self.assertEqual(legacy_summary["transcription_backend"], "whisperx")
+        self.assertIsNone(legacy_summary["transcription_model_revision"])
+        self.assertEqual(legacy_summary["transcript_job_id"], "legacy-subtitle")
+        self.assertEqual(legacy_summary["translation_job_id"], "legacy-subtitle")
+        self.assertEqual(transcript.status_code, 200)
+        self.assertTrue(transcript.headers["content-disposition"].startswith("inline;"))
+        self.assertEqual(translation.status_code, 200)
+        self.assertTrue(translation.headers["content-disposition"].startswith("inline;"))
+
     def test_dashboard_returns_recent_samples_for_each_large_state(self) -> None:
         from fastapi.testclient import TestClient
 
@@ -635,7 +833,7 @@ class BackendAPIBoundaryTests(unittest.TestCase):
         self.assertEqual(summary["processing_seconds"], 60.0)
         self.assertEqual(summary["timing_source"], "events")
 
-    def test_manages_external_runtime_without_exposing_its_token(self) -> None:
+    def test_manages_external_transcriber_without_exposing_its_token(self) -> None:
         from fastapi.testclient import TestClient
 
         from stt_to_subtitle.backend_api import create_backend_app
@@ -652,40 +850,47 @@ class BackendAPIBoundaryTests(unittest.TestCase):
             )
             with TestClient(create_backend_app(settings)) as client:
                 created = client.post(
-                    "/api/v1/runtimes",
+                    "/api/v1/transcribers",
                     json={
-                        "name": "GPU Runtime 02",
+                        "name": "GPU Transcriber 02",
                         "base_url": "http://runtime-02.test:8100",
                         "token": "secret-runtime-token",
                         "capacity": 2,
+                        "resource_group_id": "gpu-node-02",
                         "kotoba_batch_size": 4,
                         "whisperx_batch_size": 16,
                         "enabled": False,
                     },
                 )
                 runtime_id = created.json()["id"]
-                listed = client.get("/api/v1/runtimes")
+                listed = client.get("/api/v1/transcribers")
                 builtin_updated = client.put(
-                    "/api/v1/runtimes/builtin",
+                    "/api/v1/transcribers/builtin",
                     json={
-                        "name": "기본 Runtime",
+                        "name": "기본 전사 서버",
                         "base_url": "http://runtime:8100",
                         "enabled": True,
                         "capacity": 1,
+                        "resource_group_id": "gpu-main",
                         "kotoba_batch_size": 8,
                         "whisperx_batch_size": 24,
                     },
                 )
-                deleted = client.delete(f"/api/v1/runtimes/{runtime_id}")
+                deleted = client.delete(f"/api/v1/transcribers/{runtime_id}")
 
         self.assertEqual(created.status_code, 201)
         self.assertTrue(created.json()["token_configured"])
         self.assertEqual(created.json()["kotoba_batch_size"], 4)
         self.assertEqual(created.json()["whisperx_batch_size"], 16)
+        self.assertEqual(created.json()["resource_group_id"], "gpu-node-02")
         self.assertNotIn("token", created.json())
         self.assertEqual(listed.status_code, 200)
         self.assertEqual(listed.json()["total"], 2)
         self.assertEqual(builtin_updated.status_code, 200)
+        self.assertEqual(
+            builtin_updated.json()["resource_group_id"],
+            "gpu-main",
+        )
         self.assertEqual(builtin_updated.json()["kotoba_batch_size"], 8)
         self.assertEqual(builtin_updated.json()["whisperx_batch_size"], 24)
         self.assertEqual(deleted.status_code, 204)
@@ -735,6 +940,74 @@ class BackendAPIBoundaryTests(unittest.TestCase):
             media_listing.json()["files"][0]["display_path"],
             "av/japan/Actor/ABC-001.mp4",
         )
+
+    def test_media_api_distinguishes_system_and_external_subtitles(self) -> None:
+        from fastapi.testclient import TestClient
+
+        from stt_to_subtitle.backend_api import create_backend_app
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            (media_root / "sample.mp4").write_bytes(b"media")
+            (media_root / "sample.ko.srt").write_text("system", encoding="utf-8")
+            (media_root / "sample.ass").write_text("external", encoding="utf-8")
+            (media_root / "untracked.mp4").write_bytes(b"media")
+            (media_root / "untracked.ko.srt").write_text(
+                "unknown",
+                encoding="utf-8",
+            )
+            settings = BackendSettings(
+                state_dir=root / "state",
+                media_root=media_root,
+                stt_base_url="http://runtime:8100",
+                stt_token="",
+            )
+            with TestClient(create_backend_app(settings)) as client:
+                service = client.app.state.orchestrator
+                service.stop()
+                service.store.create(
+                    job_id="subtitle-job",
+                    source_rel="sample.mp4",
+                    force_overwrite=False,
+                    options={},
+                )
+                generation = service.store.create_subtitle_generation(
+                    generation_id="subtitle-generation",
+                    job_id="subtitle-job",
+                    translation_generation_id=None,
+                    transcript_hash="transcript",
+                    translation_hash="translation",
+                    renderer_version="1",
+                    render_hash="render",
+                    srt_artifact_path="subtitle.srt",
+                    ass_artifact_path="subtitle.ass",
+                    srt_hash="srt",
+                    ass_hash="ass",
+                    origin="rendered",
+                )
+                service.store.publish_subtitle_generation(
+                    generation["id"],
+                    srt_path=str(media_root / "sample.ko.srt"),
+                    ass_path=str(media_root / "sample.ko.ass"),
+                )
+                response = client.get("/api/v1/media")
+
+        self.assertEqual(response.status_code, 200)
+        files = {
+            item["path"]: item for item in response.json()["files"]
+        }
+        media = files["sample.mp4"]
+        self.assertTrue(media["has_system_subtitle"])
+        self.assertFalse(media["has_untracked_subtitle"])
+        self.assertTrue(media["has_external_subtitle"])
+        self.assertEqual(media["external_subtitle_formats"], ["ass"])
+        self.assertEqual(media["latest_subtitle_job_id"], "subtitle-job")
+        untracked = files["untracked.mp4"]
+        self.assertFalse(untracked["has_system_subtitle"])
+        self.assertTrue(untracked["has_untracked_subtitle"])
+        self.assertIsNone(untracked["latest_subtitle_job_id"])
 
     def test_media_api_pages_folders_without_hiding_the_total(self) -> None:
         from fastapi.testclient import TestClient

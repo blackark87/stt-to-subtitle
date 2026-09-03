@@ -171,6 +171,50 @@ class WhisperXWorkerTests(unittest.TestCase):
         self.assertEqual([item["text"] for item in segments], ["はい", "そう"])
         self.assertEqual(segments[0]["word_ids"], ["word-000001"])
 
+    def test_rebuild_preserves_parent_cue_across_speaker_changes(self) -> None:
+        words = [
+            {
+                "word_id": "word-000001",
+                "parent_span_ids": ["cue-000001"],
+                "word": "行きま",
+                "start": 0.0,
+                "end": 0.5,
+                "speaker": "A",
+            },
+            {
+                "word_id": "word-000002",
+                "parent_span_ids": ["cue-000001"],
+                "word": "した。",
+                "start": 0.5,
+                "end": 1.0,
+                "speaker": "B",
+            },
+            {
+                "word_id": "word-000003",
+                "parent_span_ids": ["cue-000002"],
+                "word": "次です。",
+                "start": 1.1,
+                "end": 1.6,
+                "speaker": "B",
+            },
+        ]
+
+        segments = rebuild_whisperx_segments(
+            words,
+            WhisperXSegmentationOptions(
+                split_on_speaker_change=False,
+                split_on_parent_change=True,
+                prefer_punctuation_boundary=True,
+                punctuation_boundary_mode="sentence",
+            ),
+        )
+
+        self.assertEqual(
+            [item["text"] for item in segments],
+            ["行きました。", "次です。"],
+        )
+        self.assertEqual(segments[0]["speaker"], "MULTIPLE")
+
     def test_rebuild_honors_gap_duration_and_character_limits(self) -> None:
         words = [
             {
@@ -215,6 +259,88 @@ class WhisperXWorkerTests(unittest.TestCase):
         self.assertEqual(len(by_gap), 2)
         self.assertEqual(len(by_duration), 2)
         self.assertEqual(len(by_chars), 2)
+
+    def test_sentence_punctuation_mode_ignores_commas_and_ellipses(self) -> None:
+        words = [
+            {
+                "word_id": f"word-{index:06d}",
+                "word": text,
+                "start": float(index),
+                "end": float(index) + 0.5,
+                "speaker": "A",
+            }
+            for index, text in enumerate(
+                ("まだ、", "続く…", "ここで終わる。", "次の文"),
+                start=1,
+            )
+        ]
+
+        segments = rebuild_whisperx_segments(
+            words,
+            WhisperXSegmentationOptions(
+                prefer_punctuation_boundary=True,
+                punctuation_boundary_mode="sentence",
+            ),
+        )
+
+        self.assertEqual(
+            [segment["text"] for segment in segments],
+            ["まだ、続く…ここで終わる。", "次の文"],
+        )
+
+    def test_continuity_profile_avoids_forced_mid_utterance_splits(self) -> None:
+        words = [
+            {
+                "word_id": "word-000001",
+                "word": "これは長い",
+                "start": 0.0,
+                "end": 2.8,
+                "speaker": "A",
+            },
+            {
+                "word_id": "word-000002",
+                "word": "発話として誤判定されても",
+                "start": 3.0,
+                "end": 6.0,
+                "speaker": "B",
+            },
+            {
+                "word_id": "word-000003",
+                "word": "途中では切らない",
+                "start": 6.2,
+                "end": 9.2,
+                "speaker": "A",
+            },
+        ]
+
+        current = rebuild_whisperx_segments(
+            words,
+            WhisperXSegmentationOptions(
+                split_on_speaker_change=True,
+                max_gap_sec=0.8,
+                max_duration_sec=8.0,
+                max_chars=36,
+                prefer_punctuation_boundary=True,
+            ),
+        )
+        continuity = rebuild_whisperx_segments(
+            words,
+            WhisperXSegmentationOptions(
+                split_on_speaker_change=False,
+                max_gap_sec=1.5,
+                max_duration_sec=10.0,
+                max_chars=48,
+                prefer_punctuation_boundary=False,
+            ),
+        )
+
+        self.assertEqual(len(current), 3)
+        self.assertEqual(len(continuity), 1)
+        self.assertEqual(
+            continuity[0]["text"],
+            "これは長い発話として誤判定されても途中では切らない",
+        )
+        self.assertEqual(continuity[0]["speaker"], "MULTIPLE")
 
 
 class WhisperXBatchBackoffTests(unittest.TestCase):

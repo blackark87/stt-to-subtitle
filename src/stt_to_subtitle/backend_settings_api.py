@@ -20,14 +20,17 @@ from .backend_contracts import (
     PathDisplayRuleRequest,
     PromptCategoryRequest,
     PromptCategoryStateRequest,
-    RuntimeEndpointCreateRequest,
-    RuntimeEndpointUpdateRequest,
+    PromptDraftCreateRequest,
+    PromptImprovementCreateRequest,
     ServerSettingsUpdateRequest,
     SubtitleValidatorUpdateRequest,
     TranslationEndpointCreateRequest,
     TranslationEndpointRoutingRequest,
     TranslationEndpointUpdateRequest,
+    TranslationFeedbackStateRequest,
     TranslationServerModelRequest,
+    TranscriberEndpointCreateRequest,
+    TranscriberEndpointUpdateRequest,
 )
 from .job_state import JobPhase, JobReason, JobState
 from .job_store import PipelineJob
@@ -213,9 +216,11 @@ def capabilities() -> dict[str, Any]:
             "draft_translate",
             "review_translate",
             "external_review",
-            "compare",
         ],
-        "transcription_backends": ["whisperjav", "hybrid", "whisperx"],
+        "transcription_backends": [
+            "whisperjav",
+            "hybrid",
+        ],
         "phases": [phase.value for phase in JobPhase],
         "states": [state.value for state in JobState],
         "reason_codes": [reason.value for reason in JobReason],
@@ -243,13 +248,20 @@ def settings(request: Request) -> dict[str, Any]:
         translation_groups_error = service.sanitize_external_error(str(error))
     return {
         "servers": service.remote_servers_view(),
-        "runtimes": service.runtime_endpoints_view(),
+        "transcribers": service.runtime_endpoints_view(),
         "translation_groups": translation_groups,
         "translation_groups_error": translation_groups_error,
         "subtitle_validator": service.subtitle_validator_view(),
         "external_models": service.external_model_profiles_view(),
         "path_display_rules": public_value(service.path_display_rules),
         "prompt_categories": public_value(service.all_prompt_categories()),
+        "prompt_authoring": public_value(service.prompt_authoring_view()),
+        "translation_feedback": public_value(
+            service.translation_feedback_view()
+        ),
+        "prompt_improvement_runs": public_value(
+            service.prompt_improvement_runs_view()
+        ),
     }
 
 
@@ -269,6 +281,7 @@ def update_servers(
             if payload.stt_token is not None
             else current.stt_token
         ),
+        resource_group_id=current.resource_group_id,
     )
     try:
         service.update_remote_servers(updated)
@@ -277,15 +290,15 @@ def update_servers(
     return service.remote_servers_view()
 
 
-@router.get("/runtimes")
-def runtime_endpoints(request: Request) -> dict[str, Any]:
+@router.get("/transcribers")
+def transcriber_endpoints(request: Request) -> dict[str, Any]:
     items = service_from_request(request).runtime_endpoints_view()
     return {"items": items, "total": len(items)}
 
 
-@router.post("/runtimes", status_code=201)
-def create_runtime_endpoint(
-    payload: RuntimeEndpointCreateRequest,
+@router.post("/transcribers", status_code=201)
+def create_transcriber_endpoint(
+    payload: TranscriberEndpointCreateRequest,
     request: Request,
 ) -> dict[str, Any]:
     try:
@@ -295,6 +308,7 @@ def create_runtime_endpoint(
             token=payload.token,
             enabled=payload.enabled,
             capacity=payload.capacity,
+            resource_group_id=payload.resource_group_id,
             kotoba_batch_size=payload.kotoba_batch_size,
             whisperx_batch_size=payload.whisperx_batch_size,
         )
@@ -302,21 +316,22 @@ def create_runtime_endpoint(
         raise bad_request(error) from error
 
 
-@router.put("/runtimes/{runtime_id}")
-def update_runtime_endpoint(
-    runtime_id: str,
-    payload: RuntimeEndpointUpdateRequest,
+@router.put("/transcribers/{transcriber_id}")
+def update_transcriber_endpoint(
+    transcriber_id: str,
+    payload: TranscriberEndpointUpdateRequest,
     request: Request,
 ) -> dict[str, Any]:
     try:
         return service_from_request(request).update_runtime_endpoint(
-            runtime_id,
+            transcriber_id,
             name=payload.name,
             base_url=payload.base_url,
             token=payload.token,
             clear_token=payload.clear_token,
             enabled=payload.enabled,
             capacity=payload.capacity,
+            resource_group_id=payload.resource_group_id,
             kotoba_batch_size=payload.kotoba_batch_size,
             whisperx_batch_size=payload.whisperx_batch_size,
             clear_kotoba_batch_size=payload.clear_kotoba_batch_size,
@@ -326,22 +341,27 @@ def update_runtime_endpoint(
         raise bad_request(error) from error
 
 
-@router.delete("/runtimes/{runtime_id}", status_code=204)
-def delete_runtime_endpoint(runtime_id: str, request: Request) -> Response:
+@router.delete("/transcribers/{transcriber_id}", status_code=204)
+def delete_transcriber_endpoint(
+    transcriber_id: str,
+    request: Request,
+) -> Response:
     try:
-        service_from_request(request).delete_runtime_endpoint(runtime_id)
+        service_from_request(request).delete_runtime_endpoint(transcriber_id)
     except ValueError as error:
         raise bad_request(error) from error
     return Response(status_code=204)
 
 
-@router.post("/runtimes/{runtime_id}/probe")
-def probe_runtime_endpoint(
-    runtime_id: str,
+@router.post("/transcribers/{transcriber_id}/probe")
+def probe_transcriber_endpoint(
+    transcriber_id: str,
     request: Request,
 ) -> dict[str, Any]:
     try:
-        return service_from_request(request).probe_runtime_endpoint(runtime_id)
+        return service_from_request(request).probe_runtime_endpoint(
+            transcriber_id
+        )
     except ValueError as error:
         raise bad_request(error) from error
 
@@ -667,6 +687,119 @@ def set_prompt_category_state(
     except ValueError as error:
         raise bad_request(error) from error
     return public_value(service.store.get_prompt_category(category_id))
+
+
+@router.get("/settings/translation-feedback")
+def translation_feedback(
+    request: Request,
+    category_id: str | None = None,
+    stage: str | None = Query(default=None, pattern="^(translation|review)$"),
+    included: bool | None = None,
+) -> dict[str, Any]:
+    items = service_from_request(request).translation_feedback_view(
+        category_id=category_id,
+        stage=stage,
+        included=included,
+    )
+    return {"items": public_value(items), "total": len(items)}
+
+
+@router.patch("/settings/translation-feedback/{feedback_id}")
+def set_translation_feedback_state(
+    feedback_id: str,
+    payload: TranslationFeedbackStateRequest,
+    request: Request,
+) -> dict[str, Any]:
+    try:
+        return public_value(
+            service_from_request(request).set_translation_feedback_included(
+                feedback_id,
+                included=payload.included,
+            )
+        )
+    except ValueError as error:
+        raise bad_request(error) from error
+
+
+@router.get("/settings/prompt-improvements")
+def prompt_improvements(
+    request: Request,
+    category_id: str | None = None,
+    stage: str | None = Query(default=None, pattern="^(translation|review)$"),
+) -> dict[str, Any]:
+    items = service_from_request(request).prompt_improvement_runs_view(
+        category_id=category_id,
+        stage=stage,
+    )
+    return {"items": public_value(items), "total": len(items)}
+
+
+@router.post("/settings/prompt-improvements", status_code=202)
+def create_prompt_improvement(
+    payload: PromptImprovementCreateRequest,
+    request: Request,
+) -> dict[str, Any]:
+    try:
+        return public_value(
+            service_from_request(request).create_prompt_improvement(
+                category_id=payload.category_id,
+                stage=payload.stage,
+                provider=payload.provider,
+                model=payload.model,
+            )
+        )
+    except ValueError as error:
+        raise bad_request(error) from error
+
+
+@router.post("/settings/prompt-drafts")
+def create_prompt_draft(
+    payload: PromptDraftCreateRequest,
+    request: Request,
+) -> dict[str, Any]:
+    try:
+        return public_value(
+            service_from_request(request).create_prompt_draft(
+                name=payload.name,
+                domain_description=payload.domain_description,
+                provider=payload.provider,
+                model=payload.model,
+            )
+        )
+    except ExternalServiceError as error:
+        raise HTTPException(status_code=502, detail=str(error)) from error
+    except ValueError as error:
+        raise bad_request(error) from error
+
+
+@router.post("/settings/prompt-improvements/{run_id}/cancel")
+def cancel_prompt_improvement(run_id: str, request: Request) -> dict[str, Any]:
+    try:
+        return public_value(
+            service_from_request(request).cancel_prompt_improvement(run_id)
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
+@router.post("/settings/prompt-improvements/{run_id}/reject")
+def reject_prompt_improvement(run_id: str, request: Request) -> dict[str, Any]:
+    try:
+        return public_value(
+            service_from_request(request).reject_prompt_improvement(run_id)
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
+@router.post("/settings/prompt-improvements/{run_id}/activate")
+def activate_prompt_improvement(run_id: str, request: Request) -> dict[str, Any]:
+    try:
+        return public_value(
+            service_from_request(request).activate_prompt_improvement(run_id)
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
 
 
 @router.get("/settings/artifacts/audit")

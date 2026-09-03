@@ -12,9 +12,8 @@ import { useLiveQuery } from "@/lib/useLiveQuery";
 
 const MEDIA_INTERVAL_MS = 15000;
 const FOLDER_PAGE_SIZE = 20;
-type SubtitleFilter = "all" | "none" | "done";
-type Operation = "transcribe" | "compare";
-type TranscriptionBackend = "whisperjav" | "hybrid" | "whisperx";
+type SubtitleFilter = "all" | "none" | "system" | "external" | "untracked";
+type TranscriptionBackend = "whisperjav" | "hybrid";
 type FolderSort = "name" | "modified_desc" | "modified_asc";
 type FileSort = "filename" | "created_desc" | "modified_desc" | "nfo_title" | "nfo_release_desc";
 
@@ -41,14 +40,16 @@ export default function MediaPage() {
   const folder = searchParams.get("folder") ?? "";
   const query = searchParams.get("q") ?? "";
   const subtitleValue = searchParams.get("subtitle");
-  const subtitle: SubtitleFilter = subtitleValue === "none" || subtitleValue === "done"
+  const subtitle: SubtitleFilter = subtitleValue === "none"
+    || subtitleValue === "system"
+    || subtitleValue === "external"
+    || subtitleValue === "untracked"
     ? subtitleValue
-    : "all";
-  const operation: Operation = searchParams.get("operation") === "compare" ? "compare" : "transcribe";
+    : subtitleValue === "done"
+      ? "system"
+      : "all";
   const backendValue = searchParams.get("backend");
-  const backend: TranscriptionBackend = backendValue === "whisperjav" || backendValue === "whisperx"
-    ? backendValue
-    : "hybrid";
+  const backend: TranscriptionBackend = backendValue === "whisperjav" ? "whisperjav" : "hybrid";
   const folderSortValue = searchParams.get("folder_sort");
   const folderSort: FolderSort = folderSortValue === "modified_desc" || folderSortValue === "modified_asc"
     ? folderSortValue
@@ -111,8 +112,22 @@ export default function MediaPage() {
 
   const files = useMemo(() => {
     const list = data?.files ?? [];
-    if (subtitle === "none") return list.filter((file) => !file.has_subtitle);
-    if (subtitle === "done") return list.filter((file) => file.has_subtitle);
+    if (subtitle === "none") {
+      return list.filter(
+        (file) => !file.has_system_subtitle
+          && !file.has_external_subtitle
+          && !file.has_untracked_subtitle,
+      );
+    }
+    if (subtitle === "system") {
+      return list.filter((file) => file.has_system_subtitle);
+    }
+    if (subtitle === "external") {
+      return list.filter((file) => file.has_external_subtitle);
+    }
+    if (subtitle === "untracked") {
+      return list.filter((file) => file.has_untracked_subtitle);
+    }
     return list;
   }, [data, subtitle]);
   const hasNfoTitles = files.some((file) => Boolean(file.nfo_title));
@@ -167,10 +182,10 @@ export default function MediaPage() {
     try {
       await api.createJobs({
         source_rels: rels,
-        operation,
-        options: operation === "transcribe" ? { backend } : {},
+        operation: "transcribe",
+        options: { backend },
       });
-      setNotice(`${rels.length}건의 ${operation === "compare" ? "전사 비교" : "전사 작업"}을 시작했습니다.`);
+      setNotice(`${rels.length}건의 전사 작업을 시작했습니다.`);
       setSelected(new Set());
       await refresh();
     } catch (reason) {
@@ -219,7 +234,9 @@ export default function MediaPage() {
               {([
                 ["all", "전체"],
                 ["none", "자막 없음"],
-                ["done", "자막 있음"],
+                ["system", "시스템 자막"],
+                ["external", "외부 자막"],
+                ["untracked", "출처 미확인"],
               ] as [SubtitleFilter, string][]).map(([key, label]) => (
                 <button
                   key={key}
@@ -335,22 +352,12 @@ export default function MediaPage() {
                 </select>
               </label>
               <label className="compact-field">
-                <span>작업</span>
-                <select className="ctl" value={operation} onChange={(event) => updateLocation({ operation: event.target.value === "compare" ? "compare" : null })}>
-                  <option value="transcribe">전사</option>
-                  <option value="compare">전사 비교</option>
+                <span>전사 모델</span>
+                <select className="ctl" value={backend} onChange={(event) => updateLocation({ backend: event.target.value === "hybrid" ? null : event.target.value })}>
+                  <option value="whisperjav">WhisperJAV</option>
+                  <option value="hybrid">Hybrid</option>
                 </select>
               </label>
-              {operation === "transcribe" ? (
-                <label className="compact-field">
-                  <span>전사 모델</span>
-                  <select className="ctl" value={backend} onChange={(event) => updateLocation({ backend: event.target.value === "hybrid" ? null : event.target.value })}>
-                    <option value="whisperjav">WhisperJAV</option>
-                    <option value="hybrid">Hybrid (WhisperX + Kotoba)</option>
-                    <option value="whisperx">WhisperX</option>
-                  </select>
-                </label>
-              ) : null}
               <button type="button" className="btn sec" onClick={() => setSelected(new Set(files.map((file) => file.path)))} disabled={!files.length}>
                 전체 선택
               </button>
@@ -378,39 +385,71 @@ export default function MediaPage() {
                   const on = selected.has(file.path);
                   const title = file.title || file.name;
                   return (
-                    <button
+                    <article
                       key={file.path}
-                      type="button"
                       className={on ? "mc on" : "mc"}
-                      aria-pressed={on}
-                      onClick={() => toggle(file.path)}
                     >
-                      <span className="pf">
-                        {file.poster_path ? (
-                          // eslint-disable-next-line @next/next/no-img-element
-                          <img src={api.posterUrl(file.poster_path)} alt="" loading="lazy" />
-                        ) : (
-                          <span className="poster-fallback"><Icon name="captions" size={26} /><small>포스터 없음</small></span>
-                        )}
-                        <span className="selection-mark" aria-hidden>{on ? "선택됨" : "선택"}</span>
+                      <button
+                        type="button"
+                        className="media-card-selection"
+                        aria-pressed={on}
+                        aria-label={`${title} 작업 선택`}
+                        onClick={() => toggle(file.path)}
+                      >
+                        <span className="pf">
+                          {file.poster_path ? (
+                            // eslint-disable-next-line @next/next/no-img-element
+                            <img src={api.posterUrl(file.poster_path)} alt="" loading="lazy" />
+                          ) : (
+                            <span className="poster-fallback"><Icon name="captions" size={26} /><small>포스터 없음</small></span>
+                          )}
+                          <span className="selection-mark" aria-hidden>{on ? "선택됨" : "선택"}</span>
+                        </span>
+                        <span className="mb">
+                          <strong className="mt" title={title}>{title}</strong>
+                          <span className="ml" title={file.display_path ?? file.path}>
+                            {file.display_path ?? file.display_name ?? file.name}
+                          </span>
+                          <span className="media-meta">
+                            <span title={duration(file.duration_seconds)}>{duration(file.duration_seconds)}</span>
+                            {file.nfo_release_date ? <span title={`NFO 출시일 ${file.nfo_release_date}`}>출시 {file.nfo_release_date}</span> : null}
+                            {file.actors.length ? <span title={file.actors.join(", ")}>{file.actors.slice(0, 2).join(" · ")}</span> : null}
+                          </span>
+                        </span>
+                      </button>
+                      <span className="ma media-subtitle-status">
+                        {file.has_system_subtitle && file.latest_subtitle_job_id ? (
+                          <Link
+                            className="b ok subtitle-job-link"
+                            href={`/jobs/${encodeURIComponent(file.latest_subtitle_job_id)}`}
+                            prefetch={false}
+                            aria-label={`${title}의 최근 시스템 자막 작업 상세 보기`}
+                          >
+                            시스템 자막
+                          </Link>
+                        ) : null}
+                        {file.has_external_subtitle ? (
+                          <span
+                            className="b line"
+                            title={file.external_subtitle_formats.length
+                              ? `외부 자막 형식: ${file.external_subtitle_formats.join(", ").toUpperCase()}`
+                              : "외부 자막 파일"}
+                          >
+                            외부 자막
+                          </span>
+                        ) : null}
+                        {file.has_untracked_subtitle ? (
+                          <span className="b hold" title="자막 파일은 있지만 생성 작업 기록이 없습니다">
+                            출처 미확인 자막
+                          </span>
+                        ) : null}
+                        {!file.has_system_subtitle
+                          && !file.has_external_subtitle
+                          && !file.has_untracked_subtitle ? (
+                          <span className="b">미처리</span>
+                        ) : null}
                       </span>
-                      <span className="mb">
-                        <strong className="mt" title={title}>{title}</strong>
-                        <span className="ml" title={file.display_path ?? file.path}>
-                          {file.display_path ?? file.display_name ?? file.name}
-                        </span>
-                        <span className="media-meta">
-                          <span title={duration(file.duration_seconds)}>{duration(file.duration_seconds)}</span>
-                          {file.nfo_release_date ? <span title={`NFO 출시일 ${file.nfo_release_date}`}>출시 {file.nfo_release_date}</span> : null}
-                          {file.actors.length ? <span title={file.actors.join(", ")}>{file.actors.slice(0, 2).join(" · ")}</span> : null}
-                        </span>
-                        <span className="ma">
-                          {file.has_subtitle ? <span className="b ok">자막 있음</span>
-                            : file.has_external_subtitle ? <span className="b line">외부 자막</span>
-                              : <span className="b">미처리</span>}
-                        </span>
-                      </span>
-                    </button>
+                    </article>
                   );
                 })}
               </div>

@@ -117,8 +117,8 @@ export default function MetricsPage() {
     key: `${row.media_duration_bucket_minutes}-${row.runtime_id ?? "unknown"}`,
     bucket: row.media_duration_bucket_minutes,
     mediaAverage: row.media_average_seconds,
-    contextLabel: "전사 Runtime",
-    context: row.runtime_name ?? row.runtime_id ?? "Runtime 미확인",
+    contextLabel: "전사 서버",
+    context: row.runtime_name ?? row.runtime_id ?? "전사 서버 미확인",
     sampleCount: row.sample_count,
     average: row.processing_average_seconds,
     p50: row.processing_p50_seconds,
@@ -171,7 +171,7 @@ export default function MetricsPage() {
           <div className="card-body metrics-toolbar">
             <div className="metrics-note">
               <strong>완료된 작업의 실제 처리 시간</strong>
-              <p>영상 길이는 가장 가까운 15분 구간으로 묶습니다. 전사는 Runtime별로, 번역은 전체·초벌·검증 단계별로 구분합니다.</p>
+              <p>영상 길이는 가장 가까운 15분 구간으로 묶습니다. 전사는 서버별로, 번역은 전체·초벌·검증 단계별로 구분합니다.</p>
               {excluded > 0 ? <small>실패·중지·차단 표본 {excluded}건은 완료 통계에서 제외했습니다.</small> : null}
             </div>
             <label className="compact-field metrics-window">
@@ -188,12 +188,12 @@ export default function MetricsPage() {
         ) : (
           <>
             <section className="summary-grid metrics-summary" aria-label="처리 시간 표본 요약">
-              <article className="summary-card"><span>전사 완료 표본</span><strong>{transcriptionSamples}</strong><small>Runtime별 집계</small></article>
+              <article className="summary-card"><span>전사 완료 표본</span><strong>{transcriptionSamples}</strong><small>전사 서버별 집계</small></article>
               <article className="summary-card"><span>번역 완료 표본</span><strong>{translationSamples}</strong><small>전체 번역 시간</small></article>
               <article className="summary-card"><span>단계별 번역 표본</span><strong>{passSamples}</strong><small>초벌·검증 활성 시간</small></article>
               <article className={excluded > 0 ? "summary-card attention" : "summary-card"}><span>완료 제외 표본</span><strong>{excluded}</strong><small>실패·중지·차단</small></article>
             </section>
-            <MetricsSection title="전사 소요 시간" subtitle="영상 구간 × 전사 Runtime" rows={transcriptionRows} emptyTitle="완료된 전사 표본이 없습니다" emptyText="선택한 기간에 측정된 전사 작업이 쌓이면 여기에 표시됩니다." />
+            <MetricsSection title="전사 소요 시간" subtitle="영상 구간 × 전사 서버" rows={transcriptionRows} emptyTitle="완료된 전사 표본이 없습니다" emptyText="선택한 기간에 측정된 전사 작업이 쌓이면 여기에 표시됩니다." />
             <MetricsSection title="번역 전체 소요 시간" subtitle="초벌 시작부터 검증 완료까지" rows={translationRows} emptyTitle="완료된 번역 표본이 없습니다" emptyText="선택한 기간에 완료된 번역 작업이 쌓이면 여기에 표시됩니다." />
             <MetricsSection title="번역 단계별 활성 시간" subtitle="병렬 요청이 겹친 시간은 한 번만 계산" rows={passRows} emptyTitle="단계별 번역 표본이 없습니다" emptyText="새 번역 작업부터 초벌·검증 시간이 기록됩니다." />
           </>

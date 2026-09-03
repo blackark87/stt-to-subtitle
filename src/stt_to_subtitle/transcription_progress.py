@@ -11,11 +11,13 @@ from .files import write_json_atomic
 
 TRANSCRIPTION_STAGE_LABELS = {
     "model_loading": "모델 준비",
+    "source_separation": "음원 분리",
     "scene_detection": "장면 분석",
     "primary_transcription": "1차 전사",
     "secondary_transcription": "2차 전사",
     "forced_alignment": "강제 정렬",
     "speaker_diarization": "화자 분리",
+    "owsm_audit": "OWSM 누락 감사",
     "quality_analysis": "문제 구간 분석",
     "rescue_transcription": "문제 구간 재전사",
     "transcription_merge": "전사 결과 병합",

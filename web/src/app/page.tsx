@@ -161,7 +161,7 @@ export default function DashboardPage() {
   const fetcher = useCallback(() => api.dashboard(), []);
   const { data, status, error, updatedAt, refreshing, refresh } = useLiveQuery(fetcher, DASHBOARD_INTERVAL_MS);
   const libraryProgress = useLiveQuery(useCallback(() => api.libraryProgress(), []), 60000);
-  const runtimes = useLiveQuery(useCallback(() => api.runtimes(), []), 60000);
+  const transcribers = useLiveQuery(useCallback(() => api.transcribers(), []), 60000);
   const [actingId, setActingId] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
 
@@ -178,11 +178,11 @@ export default function DashboardPage() {
   const visibleCompleted = completed.slice(0, 10);
   const gpu = data?.gpu ?? null;
   const runtimeNames = useMemo(
-    () => new Map((runtimes.data?.items ?? []).map((runtime) => [runtime.id, runtime.name])),
-    [runtimes.data?.items],
+    () => new Map((transcribers.data?.items ?? []).map((transcriber) => [transcriber.id, transcriber.name])),
+    [transcribers.data?.items],
   );
-  const runtimeLabel = (job: PipelineJob): string | null => job.stt_runtime_id
-    ? runtimeNames.get(job.stt_runtime_id) ?? job.stt_runtime_id
+  const runtimeLabel = (job: PipelineJob): string | null => job.transcriber_id
+    ? runtimeNames.get(job.transcriber_id) ?? job.transcriber_id
     : null;
 
   const act = async (id: string, task: () => Promise<unknown>) => {
@@ -201,7 +201,7 @@ export default function DashboardPage() {
   return (
     <>
       <LoadingOverlay
-        active={refreshing || libraryProgress.refreshing || runtimes.refreshing || actingId != null}
+        active={refreshing || libraryProgress.refreshing || transcribers.refreshing || actingId != null}
         message={actingId != null ? "작업 요청을 처리하는 중입니다" : "운영 현황을 불러오는 중입니다"}
       />
       <header className="topbar">

@@ -106,7 +106,7 @@ def run_speaker_assignment(
         raise ValueError("WhisperJAV result has no words list")
     hf_token = os.environ.get("HF_TOKEN", "").strip()
     if not hf_token:
-        raise ValueError("HF_TOKEN is required for WhisperJAV diarization")
+        raise ValueError("HF_TOKEN is required for speaker diarization")
     device = os.environ.get("STT_DIARIZATION_DEVICE", "cuda")
     cache_dir = Path(
         os.environ.get("WHISPERX_CACHE_DIR", "./var/cuda-cache/whisperx")

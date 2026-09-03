@@ -15,7 +15,6 @@ JobOperation = Literal[
     "draft_translate",
     "review_translate",
     "external_review",
-    "compare",
 ]
 TranslationStage = Literal["draft", "review"]
 TranslationMode = Literal["draft_only", "review_existing", "draft_and_review"]
@@ -25,6 +24,7 @@ class JobCreateRequest(BaseModel):
     source_rels: list[str] = Field(default_factory=list)
     folder_rels: list[str] = Field(default_factory=list)
     force_overwrite: bool = False
+    is_test: bool = False
     operation: JobOperation = "transcribe"
     prompt_category_id: str | None = None
     options: dict[str, Any] = Field(default_factory=dict)
@@ -93,6 +93,7 @@ class TranslationEndpointCreateRequest(BaseModel):
     token: str = ""
     enabled: bool = True
     capacity: int = Field(default=1, ge=1, le=8)
+    resource_group_id: str = Field(default="local-gpu", min_length=1, max_length=80)
     thinking_enabled: bool = False
 
 
@@ -103,6 +104,7 @@ class TranslationEndpointUpdateRequest(BaseModel):
     clear_token: bool = False
     enabled: bool = True
     capacity: int = Field(default=1, ge=1, le=8)
+    resource_group_id: str = Field(default="local-gpu", min_length=1, max_length=80)
     thinking_enabled: bool | None = None
 
 
@@ -115,23 +117,25 @@ class TranslationServerModelRequest(BaseModel):
     model: str = Field(min_length=1)
 
 
-class RuntimeEndpointCreateRequest(BaseModel):
+class TranscriberEndpointCreateRequest(BaseModel):
     name: str = Field(min_length=1, max_length=80)
     base_url: str
     token: str = ""
     enabled: bool = True
     capacity: int = Field(default=1, ge=1, le=8)
+    resource_group_id: str = Field(default="local-gpu", min_length=1, max_length=80)
     kotoba_batch_size: int | None = Field(default=None, ge=1, le=64)
     whisperx_batch_size: int | None = Field(default=None, ge=1, le=64)
 
 
-class RuntimeEndpointUpdateRequest(BaseModel):
+class TranscriberEndpointUpdateRequest(BaseModel):
     name: str = Field(min_length=1, max_length=80)
     base_url: str
     token: str | None = None
     clear_token: bool = False
     enabled: bool = True
     capacity: int = Field(default=1, ge=1, le=8)
+    resource_group_id: str = Field(default="local-gpu", min_length=1, max_length=80)
     kotoba_batch_size: int | None = Field(default=None, ge=1, le=64)
     whisperx_batch_size: int | None = Field(default=None, ge=1, le=64)
     clear_kotoba_batch_size: bool = False
@@ -162,17 +166,27 @@ class PromptCategoryStateRequest(BaseModel):
     archived: bool
 
 
+class TranslationFeedbackStateRequest(BaseModel):
+    included: bool
+
+
+class PromptImprovementCreateRequest(BaseModel):
+    category_id: str = Field(min_length=1)
+    stage: Literal["translation", "review"]
+    provider: ExternalModelProvider
+    model: str = Field(min_length=1)
+
+
+class PromptDraftCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    domain_description: str = Field(min_length=1, max_length=10_000)
+    provider: ExternalModelProvider
+    model: str = Field(min_length=1)
+
+
 class ArtifactCleanupRequest(BaseModel):
     minimum_age_days: int = Field(default=7, ge=1, le=3650)
     cleanup_token: str
-
-
-class ComparisonTranslationRequest(JobIdsRequest):
-    prompt_category_id: str
-
-
-class ComparisonRerunRequest(BaseModel):
-    options: dict[str, Any] = Field(default_factory=dict)
 
 
 class SubtitleGenerationPublishRequest(BaseModel):

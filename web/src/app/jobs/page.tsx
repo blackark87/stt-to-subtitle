@@ -90,13 +90,13 @@ export default function JobsPage() {
     [operationFilter, page, phaseFilter, stateFilter],
   );
   const { data, status, error, updatedAt, refreshing, refresh } = useLiveQuery(fetcher, JOBS_INTERVAL_MS);
-  const runtimes = useLiveQuery(useCallback(() => api.runtimes(), []), 60000);
+  const transcribers = useLiveQuery(useCallback(() => api.transcribers(), []), 60000);
   const prompts = useLiveQuery(useCallback(() => api.promptCategories(), []), 60000);
   const settings = useLiveQuery(useCallback(() => api.settings(), []), 60000);
   const jobs = useMemo(() => data?.items ?? [], [data?.items]);
   const runtimeNames = useMemo(
-    () => new Map((runtimes.data?.items ?? []).map((runtime) => [runtime.id, runtime.name])),
-    [runtimes.data?.items],
+    () => new Map((transcribers.data?.items ?? []).map((transcriber) => [transcriber.id, transcriber.name])),
+    [transcribers.data?.items],
   );
   const activePrompts = useMemo(
     () => (prompts.data?.items ?? []).filter((item) => !item.archived),
@@ -158,7 +158,7 @@ export default function JobsPage() {
     .filter((job) => canPauseTranslation(asJobState(job.state), job.phase))
     .map((job) => job.id);
   const draftTranslationIds = selectedJobs
-    .filter((job) => job.operation === "transcribe" && job.status === "transcription_completed" && !job.options.comparison_id)
+    .filter((job) => job.operation === "transcribe" && job.status === "transcription_completed")
     .map((job) => job.id);
   const reviewTranslationIds = selectedJobs
     .filter((job) => (
@@ -167,7 +167,6 @@ export default function JobsPage() {
         job.operation === "draft_translate"
         || (["translate", "full"].includes(job.operation) && jobTranslationMode(job) === "draft_only")
       )
-      && !job.options.comparison_id
     ))
     .map((job) => job.id);
   const externalReviewIds = selectedJobs
@@ -227,7 +226,7 @@ export default function JobsPage() {
   return (
     <>
       <LoadingOverlay
-        active={refreshing || runtimes.refreshing || prompts.refreshing || settings.refreshing || busy}
+        active={refreshing || transcribers.refreshing || prompts.refreshing || settings.refreshing || busy}
         message={busy ? "선택한 작업을 처리하는 중입니다" : "작업 목록을 불러오는 중입니다"}
       />
       <header className="topbar">
@@ -421,6 +420,7 @@ export default function JobsPage() {
                 </span>
                 <span role="columnheader">단계</span>
                 <span role="columnheader">상태</span>
+                <span role="columnheader">테스트</span>
                 <span role="columnheader">미디어</span>
                 <span role="columnheader">사유</span>
                 <span role="columnheader" className="r">최근 변경</span>
@@ -435,8 +435,8 @@ export default function JobsPage() {
                   const reason = reasonLabel(job.reason_code) ?? job.error ?? "—";
                   const on = selected.has(job.id);
                   const selectionId = `job-select-${job.id}`;
-                  const runtime = job.stt_runtime_id
-                    ? runtimeNames.get(job.stt_runtime_id) ?? job.stt_runtime_id
+                  const runtime = job.transcriber_id
+                    ? runtimeNames.get(job.transcriber_id) ?? job.transcriber_id
                     : null;
                   const phase = jobStageLabel(job);
                   const stateText = state ? STATE_LABEL[state] : job.state;
@@ -468,6 +468,13 @@ export default function JobsPage() {
                       <label role="cell" htmlFor={selectionId} className="job-meta-cell job-state-cell" data-label="상태">
                         <span className={state ? BADGE_CLASS[state] : "b"} title={stateText}>{stateText}</span>
                       </label>
+                      <div role="cell" className="job-meta-cell job-test-cell" data-label="테스트">
+                        {job.is_test ? (
+                          <span className="b line" title="임시 검증 작업">테스트</span>
+                        ) : (
+                          <span className="m" aria-label="일반 작업">—</span>
+                        )}
+                      </div>
                       <div role="cell" className="job-name-cell" data-label="미디어">
                         <div className={job.poster_path ? "job-identity has-poster" : "job-identity"}>
                           {job.poster_path ? (

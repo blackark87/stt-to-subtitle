@@ -2,13 +2,16 @@ import unittest
 
 from stt_to_subtitle.hybrid_stt import (
     HybridRescueOptions,
+    build_recall_union_segments,
     debounce_word_speakers,
     detect_hybrid_issues,
+    detect_owsm_coverage_issues,
     fuse_hybrid_segments,
     map_fallback_speakers,
     mark_rescued_words,
     merge_issue_windows,
 )
+from stt_to_subtitle.stt_options import OWSMAuditOptions
 
 
 class HybridRescueOptionsTests(unittest.TestCase):
@@ -20,6 +23,18 @@ class HybridRescueOptionsTests(unittest.TestCase):
         self.assertEqual(options.window_padding_sec, 5.0)
         self.assertEqual(options.max_word_duration_sec, 8.0)
         self.assertEqual(options.speaker_debounce_sec, 0.1)
+        self.assertTrue(options.stable_ts_regroup_enabled)
+
+    def test_stable_ts_regroup_requires_a_boolean(self) -> None:
+        with self.assertRaisesRegex(ValueError, "must be a JSON boolean"):
+            HybridRescueOptions.from_options(
+                {"hybrid_rescue": {"stable_ts_regroup_enabled": "yes"}}
+            )
+
+        disabled = HybridRescueOptions.from_options(
+            {"hybrid_rescue": {"stable_ts_regroup_enabled": False}}
+        )
+        self.assertFalse(disabled.stable_ts_regroup_enabled)
 
     def test_rejects_unknown_nested_option(self) -> None:
         with self.assertRaisesRegex(ValueError, "unsupported hybrid_rescue"):
@@ -59,6 +74,27 @@ class HybridRescueOptionsTests(unittest.TestCase):
                         "whisperx_chunk_length_seconds": 31,
                     }
                 }
+            )
+
+    def test_owsm_audit_defaults_and_overlap_validation(self) -> None:
+        options = OWSMAuditOptions.from_options({})
+
+        self.assertEqual(options.window_seconds, 30.0)
+        self.assertEqual(options.overlap_seconds, 5.0)
+        self.assertEqual(options.minimum_extra_characters, 20)
+        self.assertEqual(options.minimum_length_ratio, 1.35)
+        with self.assertRaisesRegex(ValueError, "smaller than"):
+            OWSMAuditOptions.from_options(
+                {
+                    "owsm_audit": {
+                        "window_seconds": 30,
+                        "overlap_seconds": 30,
+                    }
+                }
+            )
+        with self.assertRaisesRegex(ValueError, "unsupported owsm_audit"):
+            OWSMAuditOptions.from_options(
+                {"owsm_audit": {"merge_policy": "recall_union"}}
             )
 
 
@@ -313,6 +349,54 @@ class HybridDiagnosticsTests(unittest.TestCase):
 
         self.assertEqual(windows, [])
 
+    def test_owsm_audit_flags_only_materially_longer_window(self) -> None:
+        words = [
+            {
+                "word_id": "word-1",
+                "start": 0.0,
+                "end": 4.0,
+                "word": "短い文字列",
+            },
+            {
+                "word_id": "word-outside",
+                "start": 40.0,
+                "end": 41.0,
+                "word": "対象外",
+            },
+        ]
+        windows = [
+            {
+                "start": 0.0,
+                "end": 30.0,
+                "text": "短い文字列に加えて聞き落とした会話が十分に長く続いています",
+            },
+            {
+                "start": 30.0,
+                "end": 60.0,
+                "text": "対象外",
+            },
+        ]
+
+        issues = detect_owsm_coverage_issues(
+            windows,
+            words,
+            [],
+            options=OWSMAuditOptions(
+                minimum_extra_characters=10,
+                minimum_length_ratio=1.3,
+            ),
+        )
+
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(
+            issues[0]["reason_codes"], ["OWSM_TEXT_COVERAGE_GAP"]
+        )
+        self.assertEqual(issues[0]["word_ids"], ["word-1"])
+        self.assertGreater(
+            issues[0]["evidence"]["owsm_normalized_characters"],
+            issues[0]["evidence"]["primary_normalized_characters"],
+        )
+
 
 class HybridFusionTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -395,6 +479,53 @@ class HybridFusionTests(unittest.TestCase):
         )
         self.assertEqual(diagnostics["replaced_window_count"], 1)
         self.assertFalse(diagnostics["needs_review"])
+
+    def test_recall_union_preserves_primary_and_adds_rescue_segments(
+        self,
+    ) -> None:
+        fused, diagnostics = fuse_hybrid_segments(
+            self.primary,
+            self.fallback,
+            self.windows,
+        )
+
+        union, union_diagnostics = build_recall_union_segments(
+            self.primary,
+            fused,
+            diagnostics,
+        )
+
+        self.assertEqual(
+            [segment["text"] for segment in union],
+            ["앞", "반복오류", "복구 하나", "복구 둘", "뒤"],
+        )
+        augmented = [
+            segment
+            for segment in union
+            if segment.get("decision") == "augment"
+        ]
+        self.assertEqual(len(augmented), 2)
+        self.assertTrue(
+            all(
+                "HYBRID_KOTOBA_RECALL_UNION"
+                in segment["reason_codes"]
+                for segment in augmented
+            )
+        )
+        self.assertEqual(union_diagnostics["replaced_window_count"], 0)
+        self.assertEqual(union_diagnostics["augmented_window_count"], 1)
+        self.assertEqual(
+            union_diagnostics["preserved_primary_segment_count"], 3
+        )
+        self.assertEqual(
+            union_diagnostics["added_rescue_segment_count"], 2
+        )
+        decision = union_diagnostics["decisions"][0]
+        self.assertEqual(decision["outcome"], "augmented_with_kotoba")
+        self.assertEqual(decision["superseded_segment_ids"], [])
+        self.assertEqual(
+            decision["would_supersede_segment_ids"], ["whisperx-2"]
+        )
 
     def test_keeps_primary_when_fallback_has_fatal_issue(self) -> None:
         fallback_issues = [

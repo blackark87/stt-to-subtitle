@@ -50,7 +50,7 @@ def add_segment_ids(
 
 
 def validate_transcript(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
-    """Validate and normalize segments returned by a transcription Runtime."""
+    """Validate and normalize segments returned by a Transcriber."""
     if payload.get("schema_version") != TRANSCRIPT_SCHEMA_VERSION:
         raise ValueError("unsupported transcript schema_version")
     raw_segments = payload.get("segments")

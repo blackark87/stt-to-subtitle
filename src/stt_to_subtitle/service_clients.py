@@ -937,6 +937,158 @@ EXTERNAL_MODEL_DEFAULT_URLS = {
 }
 
 
+class ExternalStructuredCompletionClient(RetryingJSONClient):
+    """Run one user-selected structured generation on an external provider."""
+
+    def __init__(
+        self,
+        *,
+        provider: str,
+        base_url: str,
+        credential: str,
+        model: str,
+        region: str = "",
+        request_observer: RequestObserver | None = None,
+    ) -> None:
+        if provider not in EXTERNAL_MODEL_DEFAULT_URLS:
+            raise ValueError("지원하지 않는 외부 모델 제공자입니다.")
+        if not credential.strip():
+            raise ValueError("외부 모델 credential이 필요합니다.")
+        if not model.strip():
+            raise ValueError("외부 모델을 선택하세요.")
+        normalized_region = region.strip().lower()
+        if provider == "bedrock" and not normalized_region:
+            raise ValueError("Amazon Bedrock 리전을 입력하세요.")
+        super().__init__(
+            token=credential,
+            read_timeout=300.0,
+            attempts=1,
+            service_name=f"external_model_{provider}",
+            request_observer=request_observer,
+        )
+        self.provider = provider
+        self.base_url = (
+            base_url.strip().rstrip("/")
+            or EXTERNAL_MODEL_DEFAULT_URLS[provider]
+        )
+        self.model = model.strip()
+        self.region = normalized_region
+
+    def complete(self, request_payload: Mapping[str, Any]) -> Any:
+        """Return the decoded object requested by a JSON-schema completion."""
+
+        if self.provider == "bedrock":
+            return self._complete_bedrock(request_payload)
+        payload = {
+            key: value
+            for key, value in request_payload.items()
+            if key in {"temperature", "max_tokens", "messages", "response_format"}
+        }
+        payload["model"] = self.model
+        if self.provider == "openrouter":
+            payload["provider"] = {"require_parameters": True}
+        response = self.request(
+            "POST",
+            f"{self.base_url}/chat/completions",
+            headers={**self.headers, "Content-Type": "application/json"},
+            json=payload,
+            metric_operation="structured_completion",
+        )
+        try:
+            if response.status_code != 200:
+                raise ExternalServiceError(
+                    f"{self.provider} 구조화 생성 실패: "
+                    f"HTTP {response.status_code}: {_safe_error(response)}"
+                )
+            choice = response.json()["choices"][0]
+            if str(choice.get("finish_reason", "")).lower() == "length":
+                raise ExternalServiceError(
+                    "외부 모델의 구조화 생성 출력 한도를 초과했습니다."
+                )
+            content = choice["message"]["content"]
+            return json.loads(content) if isinstance(content, str) else content
+        except (KeyError, IndexError, TypeError, ValueError) as error:
+            raise ExternalServiceError(
+                f"{self.provider} 구조화 생성 응답이 올바르지 않습니다."
+            ) from error
+        finally:
+            response.close()
+
+    def _complete_bedrock(self, request_payload: Mapping[str, Any]) -> Any:
+        try:
+            messages = request_payload["messages"]
+            system_prompt = next(
+                str(message["content"])
+                for message in messages
+                if message.get("role") == "system"
+            )
+            user_prompt = next(
+                str(message["content"])
+                for message in messages
+                if message.get("role") == "user"
+            )
+            json_schema = request_payload["response_format"]["json_schema"]
+            schema_name = str(json_schema["name"])
+            schema = json_schema["schema"]
+            max_tokens = int(request_payload.get("max_tokens", 8192))
+        except (KeyError, StopIteration, TypeError, ValueError) as error:
+            raise ValueError("외부 구조화 생성 요청 형식이 올바르지 않습니다.") from error
+        model_path = quote(self.model, safe="")
+        response = self.request(
+            "POST",
+            (
+                f"https://bedrock-runtime.{self.region}.amazonaws.com/"
+                f"model/{model_path}/converse"
+            ),
+            headers={**self.headers, "Content-Type": "application/json"},
+            json={
+                "system": [{"text": system_prompt}],
+                "messages": [
+                    {"role": "user", "content": [{"text": user_prompt}]}
+                ],
+                "inferenceConfig": {
+                    "temperature": float(request_payload.get("temperature", 0)),
+                    "maxTokens": max_tokens,
+                },
+                "outputConfig": {
+                    "textFormat": {
+                        "type": "json_schema",
+                        "structure": {
+                            "jsonSchema": {
+                                "name": schema_name,
+                                "schema": json.dumps(
+                                    schema,
+                                    ensure_ascii=False,
+                                    separators=(",", ":"),
+                                ),
+                            }
+                        },
+                    }
+                },
+            },
+            metric_operation="structured_completion",
+        )
+        try:
+            if response.status_code != 200:
+                raise ExternalServiceError(
+                    "Amazon Bedrock 구조화 생성 실패: "
+                    f"HTTP {response.status_code}: {_safe_error(response)}"
+                )
+            blocks = response.json()["output"]["message"]["content"]
+            content = next(
+                block["text"]
+                for block in blocks
+                if isinstance(block, Mapping) and "text" in block
+            )
+            return json.loads(content) if isinstance(content, str) else content
+        except (KeyError, StopIteration, TypeError, ValueError) as error:
+            raise ExternalServiceError(
+                "Amazon Bedrock 구조화 생성 응답이 올바르지 않습니다."
+            ) from error
+        finally:
+            response.close()
+
+
 def list_external_models(
     *,
     provider: str,

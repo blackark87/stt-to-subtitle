@@ -21,9 +21,6 @@ RUN --mount=type=cache,id=stt-backend-pip,target=/root/.cache/pip \
 
 FROM ${PYTHON_IMAGE} AS runtime
 
-ARG APP_UID=1000
-ARG APP_GID=1000
-
 ENV PYTHONUNBUFFERED=1 \
     HOME=/tmp \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -34,10 +31,11 @@ RUN apt-get update \
         ca-certificates \
         ffmpeg \
     && rm -rf /var/lib/apt/lists/* \
-    && groupadd --gid "${APP_GID}" app \
-    && useradd --uid "${APP_UID}" --gid "${APP_GID}" --no-create-home app \
-    && mkdir -p /var/lib/stt /var/lib/stt-work \
-    && chown -R app:app /var/lib/stt /var/lib/stt-work
+    && groupadd --gid 1000 app \
+    && useradd --uid 1000 --gid 1000 --no-create-home app \
+    && mkdir -p /var/lib/stt-data/state /var/lib/stt-data/work \
+        /var/lib/stt-data/translation /var/lib/stt-audio \
+    && chown -R app:app /var/lib/stt-data /var/lib/stt-audio
 
 COPY --from=backend-dependencies /install /usr/local
 COPY --from=service-source /service/stt_to_subtitle /opt/stt/stt_to_subtitle

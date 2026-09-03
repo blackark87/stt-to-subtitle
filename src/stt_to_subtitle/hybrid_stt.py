@@ -9,9 +9,10 @@ from math import isfinite
 from typing import Any
 
 from .stt_quality import normalize_transcript, repetition_diagnostics
-from .stt_options import HybridRescueOptions, RESCUE_SCOPES
+from .stt_options import HybridRescueOptions, OWSMAuditOptions, RESCUE_SCOPES
 
 HYBRID_POLICY_VERSION = "hybrid-rescue-v1"
+RECALL_UNION_POLICY_VERSION = "hybrid-recall-union-v1"
 MIN_SPEAKER_MAPPING_CONFIDENCE = 0.5
 # "full" decodes the whole file with Kotoba; "windows" decodes only the
 # padded rescue spans. Window scope diarizes each span in isolation, so
@@ -23,7 +24,69 @@ FATAL_ISSUE_CODES = {
     "MISSING_WORD_TIMESTAMP",
     "REPEATED_TRANSCRIPT",
     "REPLACEMENT_CHARACTER",
+    "OWSM_TEXT_COVERAGE_GAP",
 }
+
+
+def detect_owsm_coverage_issues(
+    audit_windows: Sequence[Mapping[str, Any]],
+    primary_words: Sequence[Mapping[str, Any]],
+    primary_segments: Sequence[Mapping[str, Any]],
+    *,
+    options: OWSMAuditOptions,
+) -> list[dict[str, Any]]:
+    """Flag windows where OWSM hears materially more text than WhisperX.
+
+    OWSM is only an omission detector. Its text has no subtitle-safe word
+    timestamps, so a flagged span is sent through the existing Kotoba rescue
+    path instead of being inserted into the transcript directly.
+    """
+    primary_records = primary_words or primary_segments
+    text_key = "word" if primary_words else "text"
+    issues: list[dict[str, Any]] = []
+    for window in audit_windows:
+        span = _span(window)
+        if span is None:
+            continue
+        start, end = span
+        overlapping = [
+            record
+            for record in primary_records
+            if (record_span := _span(record)) is not None
+            and record_span[1] > start
+            and record_span[0] < end
+        ]
+        primary_text = "".join(
+            str(record.get(text_key, "")) for record in overlapping
+        )
+        audit_text = str(window.get("text", ""))
+        primary_length = len(normalize_transcript(primary_text))
+        audit_length = len(normalize_transcript(audit_text))
+        extra_characters = audit_length - primary_length
+        length_ratio = audit_length / max(primary_length, 1)
+        if (
+            extra_characters < options.minimum_extra_characters
+            or length_ratio < options.minimum_length_ratio
+        ):
+            continue
+        issues.append(
+            _issue(
+                sequence=len(issues) + 1,
+                start=start,
+                end=end,
+                reason_code="OWSM_TEXT_COVERAGE_GAP",
+                segments=([] if primary_words else overlapping),
+                words=(overlapping if primary_words else []),
+                evidence={
+                    "primary_normalized_characters": primary_length,
+                    "owsm_normalized_characters": audit_length,
+                    "extra_characters": extra_characters,
+                    "length_ratio": round(length_ratio, 6),
+                    "owsm_text": audit_text,
+                },
+            )
+        )
+    return issues
 
 
 def _timestamp(value: Any) -> float | None:
@@ -1132,3 +1195,91 @@ def fuse_hybrid_segments(
         ),
     }
     return output, diagnostics
+
+
+def build_recall_union_segments(
+    primary_segments: Sequence[Mapping[str, Any]],
+    fused_segments: Sequence[Mapping[str, Any]],
+    diagnostics: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Keep every WhisperX segment and add every accepted Kotoba rescue.
+
+    This policy intentionally optimizes recall instead of precision.  The
+    normal hybrid fusion is still used to validate Kotoba candidates and to
+    reject structurally unsafe rescue windows, but no accepted rescue is
+    allowed to supersede primary transcript content.
+    """
+    primary = [dict(segment) for segment in primary_segments]
+    primary_ids = {
+        str(segment.get("id", ""))
+        for segment in primary
+        if segment.get("id")
+    }
+    emitted_source_ids: set[str] = set()
+    additions: list[dict[str, Any]] = []
+    for segment in fused_segments:
+        if (
+            segment.get("provider") != HYBRID_POLICY_VERSION
+            or segment.get("decision") != "replace"
+        ):
+            continue
+        source_id = str(
+            segment.get(
+                "source_segment_id",
+                segment.get("id", segment.get("span_id", "unknown")),
+            )
+        )
+        if source_id in primary_ids or source_id in emitted_source_ids:
+            continue
+        emitted_source_ids.add(source_id)
+        reason_codes = list(segment.get("reason_codes", []))
+        if "HYBRID_KOTOBA_RECALL_UNION" not in reason_codes:
+            reason_codes.append("HYBRID_KOTOBA_RECALL_UNION")
+        additions.append(
+            {
+                **dict(segment),
+                "decision": "augment",
+                "reason_codes": reason_codes,
+                "fusion_policy": RECALL_UNION_POLICY_VERSION,
+            }
+        )
+
+    output = [*primary, *additions]
+    output.sort(
+        key=lambda segment: (
+            float(segment.get("start", 0.0)),
+            float(segment.get("end", 0.0)),
+            str(segment.get("speaker", "UNKNOWN")),
+            str(segment.get("text", "")),
+        )
+    )
+
+    decisions: list[dict[str, Any]] = []
+    augmented_window_count = 0
+    for source in diagnostics.get("decisions", []):
+        decision = dict(source)
+        if decision.get("outcome") == "replaced_with_kotoba":
+            decision["outcome"] = "augmented_with_kotoba"
+            decision["would_supersede_segment_ids"] = list(
+                decision.get("superseded_segment_ids", [])
+            )
+            decision["would_supersede_word_ids"] = list(
+                decision.get("superseded_word_ids", [])
+            )
+            decision["superseded_segment_ids"] = []
+            decision["superseded_word_ids"] = []
+            augmented_window_count += 1
+        decisions.append(decision)
+
+    recall_diagnostics = {
+        **dict(diagnostics),
+        "policy_version": RECALL_UNION_POLICY_VERSION,
+        "merge_policy": "recall_union",
+        "decisions": decisions,
+        "output_segment_count": len(output),
+        "replaced_window_count": 0,
+        "augmented_window_count": augmented_window_count,
+        "preserved_primary_segment_count": len(primary),
+        "added_rescue_segment_count": len(additions),
+    }
+    return output, recall_diagnostics

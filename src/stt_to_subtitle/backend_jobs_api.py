@@ -1,11 +1,11 @@
-"""Job, comparison, artifact, and playback JSON API routes."""
+"""Job, artifact, and playback JSON API routes."""
 
 from __future__ import annotations
 
 from dataclasses import asdict
 import json
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal, Mapping
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, StreamingResponse
@@ -21,8 +21,6 @@ from .backend_common import (
 )
 from .backend_contracts import (
     ArtifactUpdateRequest,
-    ComparisonRerunRequest,
-    ComparisonTranslationRequest,
     ExternalReviewSelectionRequest,
     JobCreateRequest,
     JobIdsRequest,
@@ -40,7 +38,6 @@ from .media_preview import (
     read_subtitle_text,
     srt_to_webvtt,
 )
-from .orchestrator import COMPARISON_AUDIO_SOURCE_JOB_ID_OPTION
 from .service_clients import ExternalServiceError
 from .subtitle_validation import (
     compare_subtitles,
@@ -254,6 +251,188 @@ def _workflow_list_payloads(
     return items
 
 
+def _previous_subtitle_workflow_payloads(
+    service: Any,
+    job: Any,
+    all_jobs: list[Any],
+    jobs_by_id: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Summarize subtitle-producing runs outside the current workflow."""
+    current_root_id = _workflow_root_id(job, jobs_by_id)
+    generations_by_root: dict[str, list[tuple[dict[str, Any], Any]]] = {}
+    for generation in service.store.list_subtitle_generations_for_source(
+        job.source_rel
+    ):
+        generation_job = jobs_by_id.get(str(generation["job_id"]))
+        if generation_job is None:
+            continue
+        root_id = _workflow_root_id(generation_job, jobs_by_id)
+        if root_id == current_root_id:
+            continue
+        generations_by_root.setdefault(root_id, []).append(
+            (generation, generation_job)
+        )
+
+    legacy_jobs_by_root: dict[str, list[Any]] = {}
+    for candidate in all_jobs:
+        if candidate.source_rel != job.source_rel:
+            continue
+        root_id = _workflow_root_id(candidate, jobs_by_id)
+        if root_id == current_root_id:
+            continue
+        if candidate.status == "completed" and (
+            candidate.srt_path or candidate.ass_path
+        ):
+            legacy_jobs_by_root.setdefault(root_id, []).append(candidate)
+
+    historical_root_ids = (
+        generations_by_root.keys() | legacy_jobs_by_root.keys()
+    )
+    historical_jobs = [
+        candidate
+        for candidate in all_jobs
+        if candidate.source_rel == job.source_rel
+        and _workflow_root_id(candidate, jobs_by_id) in historical_root_ids
+    ]
+    completion_summaries = service.store.job_completion_summaries(
+        [str(candidate.id) for candidate in historical_jobs]
+    )
+    summaries: list[dict[str, Any]] = []
+    for root_id in historical_root_ids:
+        generations = generations_by_root.get(root_id, [])
+        if generations:
+            latest_generation, latest_job = max(
+                generations,
+                key=lambda item: (
+                    float(item[0]["created_at"]),
+                    int(item[0]["generation_number"]),
+                    str(item[0]["id"]),
+                ),
+            )
+            generated_at = float(latest_generation["created_at"])
+        else:
+            latest_job = max(
+                legacy_jobs_by_root[root_id],
+                key=lambda candidate: (
+                    candidate.status_updated_at,
+                    candidate.updated_at,
+                    str(candidate.id),
+                ),
+            )
+            generated_at = float(latest_job.status_updated_at)
+        workflow_jobs = [
+            candidate
+            for candidate in all_jobs
+            if candidate.source_rel == job.source_rel
+            and _workflow_root_id(candidate, jobs_by_id) == root_id
+        ]
+        workflow_jobs.sort(
+            key=lambda candidate: (
+                candidate.updated_at,
+                candidate.created_at,
+                str(candidate.id),
+            ),
+            reverse=True,
+        )
+        transcript_job = next(
+            (
+                candidate
+                for candidate in workflow_jobs
+                if candidate.transcript_path
+            ),
+            None,
+        )
+        translation_job = next(
+            (
+                candidate
+                for candidate in workflow_jobs
+                if candidate.translation_path
+            ),
+            None,
+        )
+        completion = completion_summaries.get(
+            str(transcript_job.id) if transcript_job is not None else "",
+            completion_summaries.get(str(latest_job.id), {}),
+        )
+        prompt_job = next(
+            (
+                candidate
+                for candidate in workflow_jobs
+                if isinstance(
+                    candidate.options.get("translation_prompt"),
+                    Mapping,
+                )
+            ),
+            latest_job,
+        )
+        prompt_snapshot = prompt_job.options.get("translation_prompt")
+        if not isinstance(prompt_snapshot, Mapping):
+            prompt_snapshot = {}
+        prompt_revision = prompt_snapshot.get("revision_number")
+        if not isinstance(prompt_revision, int) or isinstance(
+            prompt_revision,
+            bool,
+        ):
+            prompt_revision = None
+        prompt_category_id = str(
+            prompt_snapshot.get("category_id", "")
+        ).strip()
+        prompt_name = {
+            "jav": "JAV",
+            "variety": "버라이어티",
+        }.get(prompt_category_id)
+        prompt_name = (
+            prompt_name
+            or str(prompt_snapshot.get("category_name", "")).strip()
+            or prompt_job.prompt_category_name
+            or "미기록"
+        )
+        transcription_backend = completion.get("transcription_backend")
+        summaries.append(
+            {
+                "workflow_root_job_id": root_id,
+                "latest_job_id": str(latest_job.id),
+                "latest_generation_created_at": generated_at,
+                "transcription_backend": str(
+                    transcription_backend
+                    or (
+                        transcript_job.options.get("backend")
+                        if transcript_job is not None
+                        else None
+                    )
+                    or latest_job.options.get("backend")
+                    or "기본"
+                ),
+                "transcription_model_revision": completion.get(
+                    "transcription_model_revision"
+                ),
+                "translation_prompt_name": prompt_name,
+                "translation_prompt_version": prompt_revision,
+                "is_test": any(
+                    candidate.is_test for candidate in workflow_jobs
+                ),
+                "transcript_job_id": (
+                    str(transcript_job.id)
+                    if transcript_job is not None
+                    else None
+                ),
+                "translation_job_id": (
+                    str(translation_job.id)
+                    if translation_job is not None
+                    else None
+                ),
+            }
+        )
+    summaries.sort(
+        key=lambda item: (
+            float(item["latest_generation_created_at"]),
+            str(item["workflow_root_job_id"]),
+        ),
+        reverse=True,
+    )
+    return summaries
+
+
 @router.get("/jobs")
 def list_jobs(
     request: Request,
@@ -263,7 +442,7 @@ def list_jobs(
     reason_code: list[str] | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
-    include_comparisons: bool = False,
+    include_comparisons: bool = True,
 ) -> dict[str, Any]:
     service = service_from_request(request)
     filters = {
@@ -329,10 +508,15 @@ def create_jobs(payload: JobCreateRequest, request: Request) -> dict[str, Any]:
     job_options = dict(payload.options)
     if payload.operation == "transcribe":
         backend = str(job_options.get("backend", "hybrid")).strip().lower()
-        if backend not in {"whisperjav", "hybrid", "whisperx"}:
+        if backend not in {
+            "whisperjav",
+            "hybrid",
+        }:
             raise HTTPException(
                 status_code=400,
-                detail="전사 모델은 WhisperJAV, Hybrid, WhisperX 중 하나여야 합니다.",
+                detail=(
+                    "전사 모델은 WhisperJAV 또는 Hybrid여야 합니다."
+                ),
             )
         job_options["backend"] = backend
     try:
@@ -342,27 +526,20 @@ def create_jobs(payload: JobCreateRequest, request: Request) -> dict[str, Any]:
             force_overwrite=payload.force_overwrite,
             operation=payload.operation,
         )
-        if payload.operation == "compare":
-            comparison_id, jobs = service.create_transcription_comparison(
-                sources,
-                options=job_options,
-            )
-        else:
-            comparison_id = None
-            jobs = service.create_jobs(
-                sources,
-                force_overwrite=payload.force_overwrite,
-                options=job_options,
-                operation=payload.operation,
-                prompt_category_id=payload.prompt_category_id,
-            )
+        jobs = service.create_jobs(
+            sources,
+            force_overwrite=payload.force_overwrite,
+            is_test=payload.is_test,
+            options=job_options,
+            operation=payload.operation,
+            prompt_category_id=payload.prompt_category_id,
+        )
     except (FileExistsError, OSError, ValueError) as error:
         raise bad_request(error) from error
     return {
         "items": jobs_payload(jobs),
         "created": len(jobs),
         "skipped": skipped,
-        "comparison_id": comparison_id,
     }
 
 
@@ -503,6 +680,12 @@ def get_job(job_id: str, request: Request) -> dict[str, Any]:
         ),
         key=lambda candidate: (candidate.created_at, candidate.id),
     )
+    previous_subtitle_workflows = _previous_subtitle_workflow_payloads(
+        service,
+        job,
+        all_jobs,
+        jobs_by_id,
+    )
     return {
         "job": job_payload(job),
         "parent_job": job_payload(parent) if parent is not None else None,
@@ -510,6 +693,7 @@ def get_job(job_id: str, request: Request) -> dict[str, Any]:
         "workflow_root_job_id": workflow_root_id,
         "workflow_jobs": jobs_payload(workflow_jobs),
         "workflow_history_jobs": jobs_payload(workflow_history_jobs),
+        "previous_subtitle_workflows": previous_subtitle_workflows,
         "events": public_value(service.store.events(job.id)),
         "transcript_revisions": public_value(
             service.store.transcript_revisions(job.id)
@@ -618,11 +802,24 @@ def reprocess_job(
 
 
 @router.get("/jobs/{job_id}/artifacts/{kind}")
-def download_artifact(job_id: str, kind: str, request: Request) -> FileResponse:
+def download_artifact(
+    job_id: str,
+    kind: str,
+    request: Request,
+    inline: Annotated[
+        bool,
+        Query(description="브라우저에서 JSON 산출물을 바로 표시합니다."),
+    ] = False,
+) -> FileResponse:
     service = service_from_request(request)
     job = require_job(service, job_id)
     path, filename, media_type = _job_artifact(job, kind)
-    return FileResponse(path, media_type=media_type, filename=filename)
+    return FileResponse(
+        path,
+        media_type=media_type,
+        filename=filename,
+        content_disposition_type="inline" if inline else "attachment",
+    )
 
 
 @router.put("/jobs/{job_id}/artifacts/{kind}")
@@ -973,90 +1170,3 @@ def publish_subtitle_generation(
         raise bad_request(error) from error
     generation = service.store.get_subtitle_generation(payload.generation_id)
     return public_value(generation)
-
-
-def _comparison_groups(request: Request) -> dict[str, list[Any]]:
-    groups: dict[str, list[Any]] = {}
-    for job in service_from_request(request).store.list_jobs(limit=None):
-        comparison_id = str(job.options.get("comparison_id", "")).strip()
-        if comparison_id:
-            groups.setdefault(comparison_id, []).append(job)
-    return groups
-
-
-@router.get("/comparisons")
-def list_comparisons(request: Request) -> dict[str, Any]:
-    items = []
-    for comparison_id, jobs in _comparison_groups(request).items():
-        items.append(
-            {
-                "id": comparison_id,
-                "source_rels": list(dict.fromkeys(job.source_rel for job in jobs)),
-                "jobs": jobs_payload(jobs),
-                "updated_at": max(job.updated_at for job in jobs),
-            }
-        )
-    items.sort(key=lambda item: float(item["updated_at"]), reverse=True)
-    return {"items": items, "total": len(items)}
-
-
-@router.get("/comparisons/{comparison_id}")
-def get_comparison(comparison_id: str, request: Request) -> dict[str, Any]:
-    jobs = _comparison_groups(request).get(comparison_id)
-    if not jobs:
-        raise HTTPException(status_code=404, detail="comparison not found")
-    return {"id": comparison_id, "jobs": jobs_payload(jobs)}
-
-
-@router.post("/comparisons/{comparison_id}/retry")
-def retry_comparison(comparison_id: str, request: Request) -> dict[str, int]:
-    service = service_from_request(request)
-    jobs = _comparison_groups(request).get(comparison_id)
-    if not jobs:
-        raise HTTPException(status_code=404, detail="comparison not found")
-    return {"updated": service.retry_jobs([job.id for job in jobs])}
-
-
-@router.post("/comparisons/{comparison_id}/rerun", status_code=201)
-def rerun_comparison(
-    comparison_id: str,
-    payload: ComparisonRerunRequest,
-    request: Request,
-) -> dict[str, Any]:
-    service = service_from_request(request)
-    jobs = _comparison_groups(request).get(comparison_id)
-    if not jobs:
-        raise HTTPException(status_code=404, detail="comparison not found")
-    try:
-        new_id, new_jobs = service.create_transcription_comparison(
-            list(dict.fromkeys(job.source_rel for job in jobs)),
-            options=payload.options,
-            reuse_audio_from=jobs,
-            parent_comparison_id=comparison_id,
-        )
-    except (OSError, ValueError) as error:
-        raise bad_request(error) from error
-    return {
-        "id": new_id,
-        "jobs": jobs_payload(new_jobs),
-        "reused_audio": sum(
-            COMPARISON_AUDIO_SOURCE_JOB_ID_OPTION in job.options for job in new_jobs
-        ),
-    }
-
-
-@router.post("/comparisons/{comparison_id}/translate", status_code=201)
-def translate_comparison(
-    comparison_id: str,
-    payload: ComparisonTranslationRequest,
-    request: Request,
-) -> dict[str, Any]:
-    try:
-        jobs = service_from_request(request).create_comparison_translation_jobs(
-            comparison_id,
-            payload.job_ids,
-            prompt_category_id=payload.prompt_category_id,
-        )
-    except (OSError, UnicodeError, ValueError) as error:
-        raise bad_request(error) from error
-    return {"items": jobs_payload(jobs), "created": len(jobs)}

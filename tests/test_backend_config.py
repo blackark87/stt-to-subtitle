@@ -1022,7 +1022,10 @@ class BackendSettingsTests(unittest.TestCase):
 
         self.assertTrue(normalized.stt_is_complete)
         self.assertTrue(normalized.is_complete)
-        self.assertEqual(set(vars(normalized)), {"stt_base_url", "stt_token"})
+        self.assertEqual(
+            set(vars(normalized)),
+            {"stt_base_url", "stt_token", "resource_group_id"},
+        )
 
     def test_translation_builtin_capacity_must_be_between_one_and_eight(self) -> None:
         for capacity in (0, 9):
