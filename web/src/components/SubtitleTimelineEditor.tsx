@@ -1,6 +1,6 @@
 "use client";
 
-import type { PointerEvent as ReactPointerEvent } from "react";
+import type { PointerEvent as ReactPointerEvent, ReactNode } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Icon } from "@/components/Icon";
 
@@ -22,6 +22,7 @@ interface SubtitleTimelineEditorProps {
   currentTime: number;
   duration: number;
   busy: boolean;
+  preview: ReactNode;
   onSeek: (seconds: number) => void;
   onSave: (cues: SubtitleTimelineCue[]) => Promise<void>;
   onClose: () => void;
@@ -63,6 +64,7 @@ export function SubtitleTimelineEditor({
   currentTime,
   duration,
   busy,
+  preview,
   onSeek,
   onSave,
   onClose,
@@ -74,7 +76,10 @@ export function SubtitleTimelineEditor({
   const [selectedKey, setSelectedKey] = useState<string | null>(draft[0]?.key ?? null);
   const [pixelsPerSecond, setPixelsPerSecond] = useState<number>(16);
   const [validationError, setValidationError] = useState<string | null>(null);
+  const [statusMessage, setStatusMessage] = useState<string | null>(null);
+  const [newCueKey, setNewCueKey] = useState<string | null>(null);
   const [draggingKey, setDraggingKey] = useState<string | null>(null);
+  const [viewport, setViewport] = useState({ start: 0, end: 120 });
   const timelineScrollRef = useRef<HTMLDivElement | null>(null);
   const nextCueNumber = useRef(1);
   const dragState = useRef<{
@@ -99,11 +104,16 @@ export function SubtitleTimelineEditor({
     : pixelsPerSecond >= 32
       ? 5
       : pixelsPerSecond >= 16 ? 10 : 30;
-  const ticks = useMemo(() => {
+  const visibleTicks = useMemo(() => {
     const values: number[] = [];
-    for (let value = 0; value <= totalDuration; value += tickSeconds) values.push(value);
+    const first = Math.max(
+      0,
+      Math.floor(viewport.start / tickSeconds - 1) * tickSeconds,
+    );
+    const last = Math.min(totalDuration, viewport.end + tickSeconds);
+    for (let value = first; value <= last; value += tickSeconds) values.push(value);
     return values;
-  }, [tickSeconds, totalDuration]);
+  }, [tickSeconds, totalDuration, viewport]);
   const cueLanes = useMemo(() => {
     const laneEnds: number[] = [];
     const byKey = new Map<string, number>();
@@ -117,6 +127,15 @@ export function SubtitleTimelineEditor({
   }, [draft]);
   const initialComparable = comparable(initialCues);
   const dirty = comparable(draft) !== initialComparable;
+  const visibleCueEntries = useMemo(() => {
+    const overscanSeconds = Math.max(5, 320 / pixelsPerSecond);
+    return draft.flatMap((cue, index) => (
+      cue.key === selectedKey
+      || (cue.end >= viewport.start - overscanSeconds && cue.start <= viewport.end + overscanSeconds)
+        ? [{ cue, index }]
+        : []
+    ));
+  }, [draft, pixelsPerSecond, selectedKey, viewport]);
 
   useEffect(() => {
     if (!dirty) return;
@@ -126,6 +145,37 @@ export function SubtitleTimelineEditor({
     window.addEventListener("beforeunload", warnBeforeUnload);
     return () => window.removeEventListener("beforeunload", warnBeforeUnload);
   }, [dirty]);
+
+  useEffect(() => {
+    const scroll = timelineScrollRef.current;
+    if (!scroll) return;
+    const syncViewport = () => {
+      setViewport({
+        start: scroll.scrollLeft / pixelsPerSecond,
+        end: (scroll.scrollLeft + scroll.clientWidth) / pixelsPerSecond,
+      });
+    };
+    syncViewport();
+    scroll.addEventListener("scroll", syncViewport, { passive: true });
+    const observer = new ResizeObserver(syncViewport);
+    observer.observe(scroll);
+    return () => {
+      scroll.removeEventListener("scroll", syncViewport);
+      observer.disconnect();
+    };
+  }, [pixelsPerSecond, timelineWidth]);
+
+  const revealCue = (start: number, end: number) => {
+    window.requestAnimationFrame(() => {
+      const scroll = timelineScrollRef.current;
+      if (!scroll) return;
+      const middle = ((start + end) / 2) * pixelsPerSecond;
+      scroll.scrollTo({
+        left: Math.max(0, middle - scroll.clientWidth / 2),
+        behavior: "auto",
+      });
+    });
+  };
 
   const updateCue = (key: string, fields: Partial<DraftCue>) => {
     setDraft((current) => current.map((cue) => (
@@ -154,7 +204,13 @@ export function SubtitleTimelineEditor({
     };
     setDraft((current) => [...current, cue].sort((a, b) => a.start - b.start));
     setSelectedKey(key);
+    setNewCueKey(key);
     setValidationError(null);
+    setStatusMessage(
+      `${timecode(start)} 위치에 새 세그먼트를 추가했습니다. 원문과 한국어 자막을 입력하십시오.`,
+    );
+    onSeek(start);
+    revealCue(start, cue.end);
   };
 
   const removeSelected = () => {
@@ -164,6 +220,8 @@ export function SubtitleTimelineEditor({
     setDraft(remaining);
     setSelectedKey(remaining[Math.min(index, remaining.length - 1)]?.key ?? null);
     setValidationError(null);
+    setNewCueKey(null);
+    setStatusMessage("선택한 세그먼트를 삭제했습니다.");
   };
 
   const nudgeCue = (cue: DraftCue, delta: number) => {
@@ -282,10 +340,12 @@ export function SubtitleTimelineEditor({
       </div>
 
       <div className="subtitle-editor-toolbar" aria-label="타임라인 도구">
-        <output className="code subtitle-playhead-time" aria-label="현재 재생 위치">{timecode(currentTime)}</output>
-        <button type="button" className="btn sec" disabled={busy} onClick={addCue}>
-          <Icon name="plus" size={15} />재생 위치에 세그먼트 추가
-        </button>
+        <div className="subtitle-insert-control">
+          <span>삽입 위치 <output className="code subtitle-playhead-time">{timecode(currentTime)}</output></span>
+          <button type="button" className="btn" disabled={busy} onClick={addCue}>
+            <Icon name="plus" size={15} />이 위치에 새 세그먼트 추가
+          </button>
+        </div>
         <label className="subtitle-zoom-control">
           <span>확대</span>
           <select
@@ -304,6 +364,8 @@ export function SubtitleTimelineEditor({
             setDraft(initialCues.map((cue) => ({ ...cue })));
             setSelectedKey(initialCues[0]?.key ?? null);
             setValidationError(null);
+            setNewCueKey(null);
+            setStatusMessage("편집을 시작한 상태로 되돌렸습니다.");
           }}
         >
           되돌리기
@@ -311,22 +373,26 @@ export function SubtitleTimelineEditor({
       </div>
 
       {validationError ? <p className="notice error subtitle-editor-error" role="alert">{validationError}</p> : null}
+      {statusMessage ? <p className="notice subtitle-editor-status" role="status">{statusMessage}</p> : null}
 
       <div className="subtitle-editor-workspace">
+        <div className="subtitle-editor-preview" role="region" aria-label="영상 미리보기와 재생 제어">
+          {preview}
+        </div>
         <div className="subtitle-timeline-pane">
           <div className="subtitle-timeline-scroll" ref={timelineScrollRef}>
             <div
               className="subtitle-timeline"
               style={{ width: timelineWidth }}
               onClick={(event) => {
-                if (event.target !== event.currentTarget) return;
+                if ((event.target as Element).closest("button")) return;
                 const rect = event.currentTarget.getBoundingClientRect();
                 seek((event.clientX - rect.left) / pixelsPerSecond);
               }}
               role="presentation"
             >
               <div className="subtitle-ruler" aria-hidden="true">
-                {ticks.map((tick) => (
+                {visibleTicks.map((tick) => (
                   <span key={tick} style={{ left: tick * pixelsPerSecond }}>
                     <i />{timecode(tick).slice(0, 8)}
                   </span>
@@ -342,13 +408,13 @@ export function SubtitleTimelineEditor({
                 style={{ height: cueLanes.count * 52 + 16 }}
                 aria-label="자막 세그먼트 타임라인"
               >
-                {draft.map((cue, index) => {
+                {visibleCueEntries.map(({ cue, index }) => {
                   const selectedCue = cue.key === selectedKey;
                   const width = Math.max(96, (cue.end - cue.start) * pixelsPerSecond);
                   return (
                     <div
                       key={cue.key}
-                      className={`subtitle-clip${selectedCue ? " is-selected" : ""}${draggingKey === cue.key ? " is-dragging" : ""}`}
+                      className={`subtitle-clip${selectedCue ? " is-selected" : ""}${draggingKey === cue.key ? " is-dragging" : ""}${newCueKey === cue.key ? " is-new" : ""}`}
                       style={{
                         left: cue.start * pixelsPerSecond,
                         top: (cueLanes.byKey.get(cue.key) ?? 0) * 52 + 8,
@@ -376,6 +442,7 @@ export function SubtitleTimelineEditor({
                             return;
                           }
                           setSelectedKey(cue.key);
+                          setNewCueKey(null);
                           seek(cue.start);
                         }}
                         onPointerDown={(event) => beginDrag(event, cue, "move")}
@@ -430,6 +497,11 @@ export function SubtitleTimelineEditor({
                   <Icon name="trash" size={14} />삭제
                 </button>
               </div>
+              {selected.id == null ? (
+                <p className="subtitle-new-cue-help" role="status">
+                  새 세그먼트입니다. 시간을 확인하고 아래 원문과 한국어 자막을 입력하십시오.
+                </p>
+              ) : null}
               <div className="subtitle-time-fields">
                 <label>
                   <span>시작(초)</span>
@@ -464,22 +536,24 @@ export function SubtitleTimelineEditor({
                 />
               </label>
               <label>
-                <span>원문</span>
+                <span>원문 <b aria-hidden="true">*</b></span>
                 <textarea
                   className="ctl"
                   rows={3}
                   maxLength={10_000}
+                  required
                   lang="ja"
                   value={selected.sourceText}
                   onChange={(event) => updateCue(selected.key, { sourceText: event.target.value })}
                 />
               </label>
               <label>
-                <span>한국어 자막</span>
+                <span>한국어 자막 <b aria-hidden="true">*</b></span>
                 <textarea
                   className="ctl"
                   rows={4}
                   maxLength={10_000}
+                  required
                   value={selected.text}
                   onChange={(event) => updateCue(selected.key, { text: event.target.value })}
                 />

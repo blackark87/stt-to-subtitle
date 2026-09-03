@@ -1,4 +1,5 @@
 from importlib.util import find_spec
+import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
@@ -110,6 +111,128 @@ class BackendAPIBoundaryTests(unittest.TestCase):
             ["draft_only", "review_existing", "draft_and_review"],
         )
         self.assertIn("target_stage", selection_schema["properties"])
+
+    def test_compact_editor_payloads_omit_heavy_artifact_metadata(self) -> None:
+        from fastapi.testclient import TestClient
+
+        from stt_to_subtitle.backend_api import create_backend_app
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            (media_root / "sample.mp4").write_bytes(b"media")
+            transcript_path = root / "transcript.json"
+            transcript_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "job_id": "compact-job",
+                        "words": [{"id": "word-1", "text": "heavy"}],
+                        "segments": [
+                            {
+                                "id": "segment-1",
+                                "start": 1.25,
+                                "end": 2.5,
+                                "speaker": "SPEAKER_00",
+                                "text": "こんにちは",
+                                "word_ids": ["word-1"],
+                                "decision": {"trace": "unused"},
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            settings = BackendSettings(
+                state_dir=root / "state",
+                media_root=media_root,
+                stt_base_url="http://runtime:8100",
+                stt_token="",
+            )
+            with TestClient(create_backend_app(settings)) as client:
+                service = client.app.state.orchestrator
+                service.stop()
+                job = service.store.create(
+                    job_id="compact-job",
+                    source_rel="sample.mp4",
+                    force_overwrite=False,
+                    options={},
+                    operation="translate",
+                )
+                service.store.update(
+                    job.id,
+                    transcript_path=str(transcript_path),
+                    status="translation_running",
+                )
+                service.store.create_translation_generation(
+                    generation_id="generation-1",
+                    job_id=job.id,
+                    transcript_job_id=job.id,
+                    transcript_hash="transcript-hash",
+                    prompt_hash="prompt-hash",
+                    endpoint_key="builtin",
+                    model="model-1",
+                    config_hash="config-hash",
+                    artifact_path=str(root / "translation.json"),
+                    origin="automatic",
+                )
+                service.store.save_translation_batch(
+                    "generation-1",
+                    batch_index=0,
+                    generation_attempt=0,
+                    kind="remote",
+                    items=[
+                        {
+                            "id": "segment-1",
+                            "text": "안녕하세요",
+                            "source_hash": "source-hash",
+                            "segment_index": 0,
+                        }
+                    ],
+                )
+
+                full_transcript = client.get(
+                    f"/api/v1/jobs/{job.id}/artifacts/transcript"
+                )
+                compact_transcript = client.get(
+                    f"/api/v1/jobs/{job.id}/artifacts/transcript",
+                    params={"compact": True},
+                )
+                compact_items = client.get(
+                    f"/api/v1/jobs/{job.id}/translation-generations/"
+                    "generation-1/items",
+                    params={"compact": True},
+                )
+
+        self.assertEqual(full_transcript.status_code, 200)
+        self.assertIn("words", full_transcript.json())
+        self.assertEqual(compact_transcript.status_code, 200)
+        self.assertEqual(
+            compact_transcript.json(),
+            {
+                "schema_version": 1,
+                "job_id": "compact-job",
+                "segments": [
+                    {
+                        "id": "segment-1",
+                        "start": 1.25,
+                        "end": 2.5,
+                        "speaker": "SPEAKER_00",
+                        "text": "こんにちは",
+                    }
+                ],
+            },
+        )
+        self.assertEqual(compact_items.status_code, 200)
+        payload = compact_items.json()
+        self.assertEqual(payload["generation"]["model"], "model-1")
+        self.assertEqual(
+            payload["items"],
+            [{"id": "segment-1", "text": "안녕하세요"}],
+        )
+        self.assertEqual(payload["batches"], [])
 
     def test_public_api_rejects_combined_pipeline_requests(self) -> None:
         from fastapi.testclient import TestClient

@@ -282,6 +282,12 @@ class ReleaseConfigurationTests(unittest.TestCase):
         timeline_editor = (
             ROOT / "web" / "src" / "components" / "SubtitleTimelineEditor.tsx"
         ).read_text(encoding="utf-8")
+        api_client = (
+            ROOT / "web" / "src" / "lib" / "api.ts"
+        ).read_text(encoding="utf-8")
+        live_query = (
+            ROOT / "web" / "src" / "lib" / "useLiveQuery.ts"
+        ).read_text(encoding="utf-8")
         renderer = (ROOT / "web" / "public" / "vr180-player.js").read_text(
             encoding="utf-8"
         )
@@ -296,8 +302,13 @@ class ReleaseConfigurationTests(unittest.TestCase):
         )
         self.assertIn("180° 단안 미리보기", player_component)
         self.assertIn("<SubtitleTimelineEditor", job_detail)
-        self.assertIn("재생 위치에 세그먼트 추가", timeline_editor)
+        self.assertIn("이 위치에 새 세그먼트 추가", timeline_editor)
         self.assertIn("onPointerDown", timeline_editor)
+        self.assertIn("useVirtualizer", job_detail)
+        self.assertIn("compact: true", job_detail)
+        self.assertIn("preview={(", job_detail)
+        self.assertIn("shouldPoll", live_query)
+        self.assertIn("items?compact=true", api_client)
         self.assertIn("video_u = u_eye_offset + eye_u * 0.5", renderer)
         self.assertIn("eyeOffset: 0,", renderer)
         self.assertIn(

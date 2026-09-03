@@ -32,9 +32,12 @@ export interface LiveQuery<T> {
   refresh: () => Promise<void>;
 }
 
+const ALWAYS_POLL = () => true;
+
 export function useLiveQuery<T>(
   fetcher: () => Promise<T>,
   intervalMs: number,
+  shouldPoll: (data: T | null) => boolean = ALWAYS_POLL,
 ): LiveQuery<T> {
   const [data, setData] = useState<T | null>(null);
   const [status, setStatus] = useState<LiveStatus>("loading");
@@ -44,6 +47,7 @@ export function useLiveQuery<T>(
 
   const mounted = useRef(true);
   const requestVersion = useRef(0);
+  const latestData = useRef<T | null>(null);
 
   const run = useCallback(async (silent = false) => {
     const version = ++requestVersion.current;
@@ -51,6 +55,7 @@ export function useLiveQuery<T>(
     try {
       const next = await fetcher();
       if (!mounted.current || version !== requestVersion.current) return;
+      latestData.current = next;
       setData(next);
       setUpdatedAt(new Date());
       setError(null);
@@ -76,14 +81,20 @@ export function useLiveQuery<T>(
     // 5초마다 반복해서 보여주지 않는다. 사용자가 직접 누른 새로고침만 시각
     // 피드백을 준다.
     const tick = () => {
-      if (document.visibilityState === "visible") void run(true);
+      if (
+        document.visibilityState === "visible"
+        && shouldPoll(latestData.current)
+      ) void run(true);
     };
 
     queueMicrotask(() => void run());
     const timer = window.setInterval(tick, intervalMs);
 
     const onVisibility = () => {
-      if (document.visibilityState === "visible") void run(true);
+      if (
+        document.visibilityState === "visible"
+        && shouldPoll(latestData.current)
+      ) void run(true);
     };
     document.addEventListener("visibilitychange", onVisibility);
 
@@ -93,7 +104,7 @@ export function useLiveQuery<T>(
       window.clearInterval(timer);
       document.removeEventListener("visibilitychange", onVisibility);
     };
-  }, [run, intervalMs]);
+  }, [run, intervalMs, shouldPoll]);
 
   return { data, status, error, updatedAt, refreshing, refresh: () => run() };
 }

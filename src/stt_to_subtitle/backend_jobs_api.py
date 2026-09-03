@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Annotated, Any, Literal, Mapping
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from .artifacts import artifact_filename
 from .backend_common import (
@@ -31,6 +31,7 @@ from .backend_contracts import (
     TranslationItemUpdateRequest,
     TranslationSelectionRequest,
 )
+from .contracts import TRANSCRIPT_SCHEMA_VERSION, validate_transcript
 from .files import sha256_file
 from .media_preview import (
     guess_media_type,
@@ -85,6 +86,26 @@ def _job_artifact(job: Any, kind: str) -> tuple[Path, str, str]:
     if not raw_path or not Path(raw_path).is_file():
         raise HTTPException(status_code=404, detail="artifact not found")
     return Path(raw_path), artifact_filename(job.source_rel, kind), media_type
+
+
+def _compact_transcript_artifact(path: Path) -> dict[str, Any]:
+    """Return only transcript fields required by the interactive editor."""
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, Mapping):
+            raise ValueError("transcript document must be an object")
+        segments = validate_transcript(payload)
+    except (OSError, UnicodeError, ValueError) as error:
+        raise HTTPException(
+            status_code=409,
+            detail="전사 산출물을 화면용 데이터로 읽을 수 없습니다.",
+        ) from error
+    return {
+        "schema_version": TRANSCRIPT_SCHEMA_VERSION,
+        "job_id": str(payload.get("job_id", "")),
+        "segments": segments,
+    }
 
 
 def _safe_generation_artifact(
@@ -811,10 +832,16 @@ def download_artifact(
         bool,
         Query(description="브라우저에서 JSON 산출물을 바로 표시합니다."),
     ] = False,
-) -> FileResponse:
+    compact: Annotated[
+        bool,
+        Query(description="화면 편집에 필요한 전사 필드만 반환합니다."),
+    ] = False,
+) -> Response:
     service = service_from_request(request)
     job = require_job(service, job_id)
     path, filename, media_type = _job_artifact(job, kind)
+    if compact and kind == "transcript":
+        return JSONResponse(_compact_transcript_artifact(path))
     return FileResponse(
         path,
         media_type=media_type,
@@ -1080,14 +1107,33 @@ def translation_generation_items(
     job_id: str,
     generation_id: str,
     request: Request,
+    compact: Annotated[
+        bool,
+        Query(description="화면 표시에 필요한 번역 필드만 반환합니다."),
+    ] = False,
 ) -> dict[str, Any]:
     service = service_from_request(request)
     generation = service.store.get_translation_generation(generation_id)
     if generation is None or generation["job_id"] != job_id:
         raise HTTPException(status_code=404, detail="generation not found")
+    items = service.store.translation_items(generation_id)
+    if compact:
+        return {
+            "generation": public_value(
+                {
+                    key: generation[key]
+                    for key in ("id", "model", "state", "updated_at")
+                }
+            ),
+            "items": [
+                {"id": str(item["id"]), "text": str(item["text"])}
+                for item in items
+            ],
+            "batches": [],
+        }
     return {
         "generation": public_value(generation),
-        "items": public_value(service.store.translation_items(generation_id)),
+        "items": public_value(items),
         "batches": public_value(service.store.translation_batches(generation_id)),
     }
 

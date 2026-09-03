@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { use, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useVirtualizer } from "@tanstack/react-virtual";
 import { Icon } from "@/components/Icon";
 import { Freshness } from "@/components/Freshness";
 import { LoadingOverlay } from "@/components/LoadingOverlay";
@@ -10,7 +11,7 @@ import {
   SubtitleTimelineEditor,
   type SubtitleTimelineCue,
 } from "@/components/SubtitleTimelineEditor";
-import { api, type ExternalModelProvider } from "@/lib/api";
+import { api, type ExternalModelProvider, type JobDetailPayload } from "@/lib/api";
 import {
   asJobState,
   canPauseTranslation,
@@ -211,7 +212,17 @@ function latestGenerationId(generations: Record<string, unknown>[]): string {
 export default function JobDetailPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = use(params);
   const fetcher = useCallback(() => api.job(id), [id]);
-  const { data: detail, status, error, updatedAt, refreshing, refresh } = useLiveQuery(fetcher, INTERVAL_MS);
+  const pollWhileActive = useCallback(
+    (payload: JobDetailPayload | null) => payload?.job.state !== "done",
+    [],
+  );
+  const { data: detail, status, error, updatedAt, refreshing, refresh } = useLiveQuery(
+    fetcher,
+    INTERVAL_MS,
+    pollWhileActive,
+  );
+  const detailRef = useRef<JobDetailPayload | null>(detail);
+  detailRef.current = detail;
   const transcribers = useLiveQuery(useCallback(() => api.transcribers(), []), 60000);
   const prompts = useLiveQuery(useCallback(() => api.promptCategories(), []), 60000);
   const settings = useLiveQuery(useCallback(() => api.settings(), []), 60000);
@@ -226,7 +237,15 @@ export default function JobDetailPage({ params }: { params: Promise<{ id: string
     : null;
   const stateText = job ? jobStateLabel(job) : null;
 
-  const artifactVersion = `${id}:${job?.updated_at ?? "pending"}`;
+  const transcriptRevisionId = String(
+    detail?.transcript_revisions.at(-1)?.id ?? "base",
+  );
+  const ownTranslationGenerationId = latestGenerationId(
+    detail?.translation_generations ?? [],
+  );
+  const artifactVersion = job
+    ? `${id}:${transcriptRevisionId}:${ownTranslationGenerationId || "legacy"}:${job.phase === "transcription" ? job.updated_at : "stable"}`
+    : null;
   const [artifactResult, setArtifactResult] = useState<ArtifactResult | null>(null);
   // 배경 갱신 때는 직전 산출물을 유지하고, 최초 로드만 화면 로딩으로 표시한다.
   const currentArtifact = artifactResult;
@@ -254,7 +273,7 @@ export default function JobDetailPage({ params }: { params: Promise<{ id: string
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const detailLayoutRef = useRef<HTMLDivElement | null>(null);
   const previewCardRef = useRef<HTMLElement | null>(null);
-  const cueRefs = useRef(new Map<string, HTMLLIElement>());
+  const cueScrollRef = useRef<HTMLDivElement | null>(null);
 
   const translationLineageSpec = useMemo(() => {
     if (!job || !detail) return "[]";
@@ -314,16 +333,31 @@ export default function JobDetailPage({ params }: { params: Promise<{ id: string
     }
     return JSON.stringify(refs);
   }, [detail, job]);
-  const translationLineageVersion = `${translationLineageSpec}:${job?.translation_chunks_completed ?? 0}:${job?.updated_at ?? "pending"}:${lineageRefreshToken}`;
+  const subtitleGenerationVersion = JSON.stringify(
+    (detail?.subtitle_generations ?? []).map((generation) => [
+      generation.id,
+      generation.is_published,
+    ]),
+  );
+  const translationLineageVersion = [
+    translationLineageSpec,
+    job?.translation_chunks_completed ?? 0,
+    job?.state ?? "pending",
+    subtitleGenerationVersion,
+    lineageRefreshToken,
+  ].join(":");
   const [translationLineage, setTranslationLineage] = useState<TranslationLineageResult | null>(null);
 
   useEffect(() => {
+    if (!artifactVersion) return;
     let cancelled = false;
     void (async () => {
       try {
         const [transcript, translation] = await Promise.all([
-          api.artifact(id, "transcript"),
-          api.artifact(id, "translation"),
+          api.artifact(id, "transcript", { compact: true }),
+          ownTranslationGenerationId
+            ? Promise.resolve(null)
+            : api.artifact(id, "translation"),
         ]);
         if (cancelled) return;
         const korean = new Map<string, string>();
@@ -354,7 +388,7 @@ export default function JobDetailPage({ params }: { params: Promise<{ id: string
       }
     })();
     return () => { cancelled = true; };
-  }, [artifactVersion, id]);
+  }, [artifactVersion, id, ownTranslationGenerationId]);
 
   useEffect(() => {
     let cancelled = false;
@@ -374,7 +408,10 @@ export default function JobDetailPage({ params }: { params: Promise<{ id: string
     void (async () => {
       try {
         const results = await Promise.all(refs.map(async (ref) => {
-          const phaseDetail = await api.job(ref.jobId);
+          const currentDetail = detailRef.current;
+          const phaseDetail = ref.jobId === id && currentDetail
+            ? currentDetail
+            : await api.job(ref.jobId);
           const generationId = latestGenerationId(
             phaseDetail.translation_generations,
           ) || ref.generationId;
@@ -432,11 +469,7 @@ export default function JobDetailPage({ params }: { params: Promise<{ id: string
       }
     })();
     return () => { cancelled = true; };
-  }, [translationLineageSpec, translationLineageVersion]);
-
-  useEffect(() => {
-    if (current) cueRefs.current.get(current)?.scrollIntoView({ block: "nearest" });
-  }, [current]);
+  }, [id, translationLineageSpec, translationLineageVersion]);
 
   const translated = useMemo(() => segments.filter((segment) => segment.ko).length, [segments]);
   const translationPhases = translationLineage?.phases ?? [];
@@ -466,6 +499,30 @@ export default function JobDetailPage({ params }: { params: Promise<{ id: string
     sourceText: segment.ja,
     text: selectedTranslationPhase?.texts[segment.id] ?? segment.ko,
   })), [segments, selectedTranslationPhase]);
+  const cueIndexById = useMemo(
+    () => new Map(segments.map((segment, index) => [segment.id, index])),
+    [segments],
+  );
+  const cueKey = useCallback(
+    (index: number) => segments[index]?.id ?? index,
+    [segments],
+  );
+  // TanStack Virtual exposes non-memoizable methods by design. Skipping React
+  // Compiler memoization for this hook is the supported integration path.
+  // eslint-disable-next-line react-hooks/incompatible-library
+  const cueVirtualizer = useVirtualizer({
+    count: segments.length,
+    getScrollElement: () => cueScrollRef.current,
+    estimateSize: () => 92,
+    getItemKey: cueKey,
+    overscan: 8,
+  });
+
+  useEffect(() => {
+    if (!current) return;
+    const index = cueIndexById.get(current);
+    if (index != null) cueVirtualizer.scrollToIndex(index, { align: "auto" });
+  }, [cueIndexById, cueVirtualizer, current]);
 
   useEffect(() => {
     const layout = detailLayoutRef.current;
@@ -588,6 +645,20 @@ export default function JobDetailPage({ params }: { params: Promise<{ id: string
       model: String(jobExternalModel.model),
     }
     : null;
+  const playerContent = job ? (
+    <ResultPlayer
+      sourceRel={job.source_rel}
+      subtitleJobId={publishedSubtitlePhase?.jobId}
+      videoRef={videoRef}
+      initialTime={playheadSeconds}
+      onTimeUpdate={(time) => {
+        setPlayheadSeconds(time);
+        const hit = segments.find((segment) => time >= segment.start && time < segment.end);
+        setCurrent(hit ? hit.id : null);
+      }}
+      onDurationChange={setMediaDuration}
+    />
+  ) : <div className="empty-state"><strong>표시할 작업 정보가 없습니다</strong></div>;
   return (
     <>
       <LoadingOverlay
@@ -909,7 +980,7 @@ export default function JobDetailPage({ params }: { params: Promise<{ id: string
           </section>
         ) : null}
 
-        <div className="detail-layout" ref={detailLayoutRef}>
+        <div className="detail-layout" ref={detailLayoutRef} hidden={timelineEditorOpen}>
           <section className="card preview-card" ref={previewCardRef}>
             <div className="card-head">
               <h2>결과 미리보기</h2>
@@ -923,19 +994,7 @@ export default function JobDetailPage({ params }: { params: Promise<{ id: string
               </span>
             </div>
             <div className="card-body">
-              {job ? (
-                <ResultPlayer
-                  sourceRel={job.source_rel}
-                  subtitleJobId={publishedSubtitlePhase?.jobId}
-                  videoRef={videoRef}
-                  onTimeUpdate={(t) => {
-                    setPlayheadSeconds(t);
-                    const hit = segments.find((segment) => t >= segment.start && t < segment.end);
-                    setCurrent(hit ? hit.id : null);
-                  }}
-                  onDurationChange={setMediaDuration}
-                />
-              ) : <div className="empty-state"><strong>표시할 작업 정보가 없습니다</strong></div>}
+              {!timelineEditorOpen ? playerContent : null}
             </div>
           </section>
 
@@ -1012,7 +1071,7 @@ export default function JobDetailPage({ params }: { params: Promise<{ id: string
                 </div>
               ) : null}
             </div>
-            <div className="cue-scroll">
+            <div className="cue-scroll" ref={cueScrollRef}>
               {artifactError ? <p className="notice error" role="alert">{artifactError}</p> : null}
               {translationLineage?.error ? <p className="notice error" role="alert">번역 단계 결과를 불러오지 못했습니다: {translationLineage.error}</p> : null}
               {segments.length === 0 ? (
@@ -1021,8 +1080,14 @@ export default function JobDetailPage({ params }: { params: Promise<{ id: string
                   <span>작업이 진행 중이면 완료되는 대로 자동 갱신됩니다.</span>
                 </div>
               ) : (
-                <ol className="cue-list" aria-label="자막 대사 목록">
-                  {segments.map((segment, segmentIndex) => {
+                <ol
+                  className="cue-list cue-list-virtual"
+                  aria-label="자막 대사 목록"
+                  style={{ height: cueVirtualizer.getTotalSize() }}
+                >
+                  {cueVirtualizer.getVirtualItems().map((virtualRow) => {
+                    const segmentIndex = virtualRow.index;
+                    const segment = segments[segmentIndex]!;
                     const on = current === segment.id;
                     const canShowDiff = translationPhases.length > 1;
                     const canOpenCueTools = Boolean(selectedTranslationPhase);
@@ -1069,7 +1134,14 @@ export default function JobDetailPage({ params }: { params: Promise<{ id: string
                       </>
                     );
                     return (
-                      <li key={segment.id} ref={(node) => { if (node) cueRefs.current.set(segment.id, node); else cueRefs.current.delete(segment.id); }}>
+                      <li
+                        key={segment.id}
+                        data-index={virtualRow.index}
+                        ref={cueVirtualizer.measureElement}
+                        aria-posinset={segmentIndex + 1}
+                        aria-setsize={segments.length}
+                        style={{ transform: `translateY(${virtualRow.start}px)` }}
+                      >
                         <div className={on ? "cue-row is-current" : "cue-row"}>
                           <button
                             type="button"
@@ -1236,6 +1308,15 @@ export default function JobDetailPage({ params }: { params: Promise<{ id: string
               currentTime={playheadSeconds}
               duration={mediaDuration}
               busy={busy}
+              preview={(
+                <div className="subtitle-editor-preview-content">
+                  <div className="subtitle-editor-preview-head">
+                    <strong>영상 미리보기</strong>
+                    <span>재생 위치가 아래 타임라인의 빨간 재생 헤드와 동기화됩니다.</span>
+                  </div>
+                  {playerContent}
+                </div>
+              )}
               onSeek={(seconds) => {
                 const video = videoRef.current;
                 if (!video) return;

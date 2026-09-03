@@ -725,7 +725,7 @@ export const api = {
 
   translationGenerationItems: (jobId: string, generationId: string) =>
     request<TranslationGenerationItemsPayload>(
-      `/jobs/${encodeURIComponent(jobId)}/translation-generations/${encodeURIComponent(generationId)}/items`,
+      `/jobs/${encodeURIComponent(jobId)}/translation-generations/${encodeURIComponent(generationId)}/items?compact=true`,
     ),
   updateTranslationItem: (
     jobId: string,
@@ -767,9 +767,14 @@ export const api = {
     ),
 
   /** 전사(일본어) / 번역(한국어) 산출물. 없으면 null. */
-  artifact: async (id: string, kind: "transcript" | "translation"): Promise<unknown | null> => {
+  artifact: async (
+    id: string,
+    kind: "transcript" | "translation",
+    options: { compact?: boolean } = {},
+  ): Promise<unknown | null> => {
+    const suffix = options.compact ? "?compact=true" : "";
     const response = await fetch(
-      `/api/v1/jobs/${encodeURIComponent(id)}/artifacts/${kind}`,
+      `/api/v1/jobs/${encodeURIComponent(id)}/artifacts/${kind}${suffix}`,
       { headers: { Accept: "application/json" } },
     );
     if (response.status === 404) return null;

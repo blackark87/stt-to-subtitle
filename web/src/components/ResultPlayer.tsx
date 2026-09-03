@@ -18,6 +18,7 @@ interface ResultPlayerProps {
   videoRef: RefObject<HTMLVideoElement | null>;
   onTimeUpdate: (currentTime: number) => void;
   onDurationChange?: (duration: number) => void;
+  initialTime?: number;
 }
 
 const MIME_TYPES: Record<string, string> = {
@@ -73,6 +74,7 @@ export function ResultPlayer({
   videoRef,
   onTimeUpdate,
   onDurationChange,
+  initialTime = 0,
 }: ResultPlayerProps) {
   const shellRef = useRef<HTMLDivElement | null>(null);
   const messageRef = useRef<HTMLParagraphElement | null>(null);
@@ -134,6 +136,9 @@ export function ResultPlayer({
           onLoadedMetadata={(event) => {
             const nextDuration = event.currentTarget.duration;
             if (Number.isFinite(nextDuration)) onDurationChange?.(nextDuration);
+            if (initialTime > 0 && initialTime < nextDuration) {
+              event.currentTarget.currentTime = initialTime;
+            }
           }}
         />
         <canvas
