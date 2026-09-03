@@ -32,6 +32,7 @@ export type JobPhase = (typeof JOB_PHASES)[number];
 
 export const PUBLIC_JOB_PHASES: readonly JobPhase[] = [
   "transcription",
+  "translation",
   "draft_translation",
   "review_translation",
   "external_review",

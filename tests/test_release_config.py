@@ -306,6 +306,16 @@ class ReleaseConfigurationTests(unittest.TestCase):
         )
         self.assertIn("xr-spatial-tracking=(self)", proxy)
 
+    def test_dashboard_pipeline_includes_integrated_translation_jobs(self) -> None:
+        domain = (
+            ROOT / "web" / "src" / "lib" / "domain.ts"
+        ).read_text(encoding="utf-8")
+        public_phases = domain.split(
+            "export const PUBLIC_JOB_PHASES", 1
+        )[1].split("];", 1)[0]
+
+        self.assertIn('"translation",', public_phases)
+
     def test_project_and_package_versions_are_6_0_0(self) -> None:
         project = tomllib.loads(
             (ROOT / "pyproject.toml").read_text(encoding="utf-8")

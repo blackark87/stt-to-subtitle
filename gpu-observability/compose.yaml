@@ -16,7 +16,9 @@ services:
 
   prometheus:
     image: ${PROMETHEUS_IMAGE:-prom/prometheus:v3.13.1}
-    restart: unless-stopped
+    # Prometheus must return after a host reboot even if Docker retained a
+    # previous stopped state. Other services may still be stopped manually.
+    restart: always
     depends_on:
       - dcgm-exporter
     command:
