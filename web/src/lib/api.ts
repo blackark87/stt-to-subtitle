@@ -364,6 +364,15 @@ export interface TranslationItemUpdatePayload {
   item: TranslationGenerationItem;
 }
 
+export interface SubtitleTimelineCueInput {
+  id: string | null;
+  start: number;
+  end: number;
+  speaker: string;
+  sourceText: string;
+  text: string;
+}
+
 export interface ListPayload<T> {
   items: T[];
   total: number;
@@ -726,6 +735,30 @@ export const api = {
   ) => request<TranslationItemUpdatePayload>(
     `/jobs/${encodeURIComponent(jobId)}/translation-generations/${encodeURIComponent(generationId)}/items/${encodeURIComponent(segmentId)}`,
     { method: "PUT", ...json({ text }) },
+  ),
+  updateSubtitleTimeline: (
+    jobId: string,
+    generationId: string,
+    cues: SubtitleTimelineCueInput[],
+  ) => request<{
+    transcript_revision: Record<string, unknown>;
+    generation: Record<string, unknown>;
+    subtitle_generation: Record<string, unknown> | null;
+  }>(
+    `/jobs/${encodeURIComponent(jobId)}/translation-generations/${encodeURIComponent(generationId)}/timeline`,
+    {
+      method: "PUT",
+      ...json({
+        cues: cues.map((cue) => ({
+          id: cue.id,
+          start: cue.start,
+          end: cue.end,
+          speaker: cue.speaker,
+          source_text: cue.sourceText,
+          text: cue.text,
+        })),
+      }),
+    },
   ),
 
   jobEvents: (id: string) =>

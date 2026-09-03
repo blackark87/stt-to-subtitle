@@ -168,6 +168,13 @@ TRANSCRIPTION_AUDIO_PATH=/data/work/stt-to-subtitle/web-jobs
 실제 다른 화자의 동시 발화는 유지하고 같은 화자의 겹친 행은 새 발화로
 교체합니다. 렌더링 과정에서 번역 segment ID를 변경하지 않습니다.
 
+작업 상세의 최종 번역 차수에서는 **타임라인 편집**을 열어 영상 재생 위치와
+동기화된 클립을 이동·트림하거나 세그먼트를 추가·삭제할 수 있습니다. 원문, 번역,
+화자와 시작·종료 시각을 함께 저장하며 기존 segment ID는 유지하고 새 세그먼트에만
+새 ID를 부여합니다. 저장할 때 전사 revision, 번역 generation, 자막 generation을
+불변 이력으로 만들고, 미디어의 SRT·ASS는 **자막 파일 생성**을 다시 승인할 때까지
+교체하지 않습니다.
+
 ## Transcriber HTTP 계약
 
 - `GET /healthz`, `GET /readyz`

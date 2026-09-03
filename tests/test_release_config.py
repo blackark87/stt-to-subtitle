@@ -279,6 +279,9 @@ class ReleaseConfigurationTests(unittest.TestCase):
         player_component = (
             ROOT / "web" / "src" / "components" / "ResultPlayer.tsx"
         ).read_text(encoding="utf-8")
+        timeline_editor = (
+            ROOT / "web" / "src" / "components" / "SubtitleTimelineEditor.tsx"
+        ).read_text(encoding="utf-8")
         renderer = (ROOT / "web" / "public" / "vr180-player.js").read_text(
             encoding="utf-8"
         )
@@ -292,6 +295,9 @@ class ReleaseConfigurationTests(unittest.TestCase):
             (ROOT / "web" / "src" / "app" / "vr" / "page.tsx").exists()
         )
         self.assertIn("180° 단안 미리보기", player_component)
+        self.assertIn("<SubtitleTimelineEditor", job_detail)
+        self.assertIn("재생 위치에 세그먼트 추가", timeline_editor)
+        self.assertIn("onPointerDown", timeline_editor)
         self.assertIn("video_u = u_eye_offset + eye_u * 0.5", renderer)
         self.assertIn("eyeOffset: 0,", renderer)
         self.assertIn(

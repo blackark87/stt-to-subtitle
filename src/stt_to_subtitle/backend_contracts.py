@@ -81,6 +81,19 @@ class TranslationItemUpdateRequest(BaseModel):
     text: str = Field(min_length=1, max_length=10_000)
 
 
+class SubtitleTimelineCueRequest(BaseModel):
+    id: str | None = Field(default=None, max_length=200)
+    start: float = Field(ge=0)
+    end: float = Field(gt=0)
+    speaker: str = Field(default="UNKNOWN", min_length=1, max_length=200)
+    source_text: str = Field(min_length=1, max_length=10_000)
+    text: str = Field(min_length=1, max_length=10_000)
+
+
+class SubtitleTimelineUpdateRequest(BaseModel):
+    cues: list[SubtitleTimelineCueRequest] = Field(min_length=1, max_length=20_000)
+
+
 class ServerSettingsUpdateRequest(BaseModel):
     stt_base_url: str
     stt_token: str | None = None

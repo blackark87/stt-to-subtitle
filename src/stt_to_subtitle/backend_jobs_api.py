@@ -27,6 +27,7 @@ from .backend_contracts import (
     ReprocessRequest,
     RestartTranslationRequest,
     SubtitleGenerationPublishRequest,
+    SubtitleTimelineUpdateRequest,
     TranslationItemUpdateRequest,
     TranslationSelectionRequest,
 )
@@ -1107,6 +1108,26 @@ def update_translation_generation_item(
             generation_id=generation_id,
             segment_id=segment_id,
             text=payload.text,
+        )
+    except (OSError, UnicodeError, ValueError) as error:
+        raise bad_request(error) from error
+    return public_value(result)
+
+
+@router.put(
+    "/jobs/{job_id}/translation-generations/{generation_id}/timeline"
+)
+def update_subtitle_timeline(
+    job_id: str,
+    generation_id: str,
+    payload: SubtitleTimelineUpdateRequest,
+    request: Request,
+) -> dict[str, Any]:
+    try:
+        result = service_from_request(request).edit_subtitle_timeline(
+            job_id,
+            generation_id=generation_id,
+            cues=[cue.model_dump() for cue in payload.cues],
         )
     except (OSError, UnicodeError, ValueError) as error:
         raise bad_request(error) from error

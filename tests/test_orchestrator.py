@@ -4546,6 +4546,146 @@ class SubtitleOrchestratorTests(unittest.TestCase):
             self.assertEqual(feedback[0]["edited_text"], "최종 수동 수정")
             self.assertTrue(feedback[0]["included"])
 
+    def test_timeline_edit_preserves_ids_and_adds_an_unpublished_cue(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_root = root / "media"
+            media_root.mkdir()
+            (media_root / "movie.mkv").write_bytes(b"media")
+            orchestrator = self.make_orchestrator(root, media_root)
+            job = orchestrator.create_job(
+                "movie.mkv",
+                force_overwrite=False,
+                options={},
+                prompt_category_id="jav",
+            )
+            artifact_dir = root / "state" / "jobs" / job.id
+            artifact_dir.mkdir(parents=True)
+            transcript_path = artifact_dir / "movie_translate.json"
+            translation_path = artifact_dir / "movie_result_ko.json"
+            transcript_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "job_id": "remote-job",
+                        "segments": [
+                            {
+                                "id": "segment-000001",
+                                "start": 0,
+                                "end": 1,
+                                "speaker": "SPEAKER_00",
+                                "text": "こんにちは",
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            translation_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "status": "completed",
+                        "translations": [
+                            {"id": "segment-000001", "text": "안녕하세요"}
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            orchestrator.store.update(
+                job.id,
+                status="completed",
+                transcript_path=str(transcript_path),
+                translation_path=str(translation_path),
+                srt_path=str(media_root / "movie.ko.srt"),
+            )
+            (media_root / "movie.ko.srt").write_text(
+                "published subtitle",
+                encoding="utf-8",
+            )
+            try:
+                orchestrator.save_artifact(
+                    job.id,
+                    "translation",
+                    translation_path.read_text(encoding="utf-8"),
+                    publish_subtitle=False,
+                )
+                source_generation = (
+                    orchestrator.store.list_translation_generations(job.id)[-1]
+                )
+                with self.assertRaisesRegex(ValueError, "ID가 원본에 없습니다"):
+                    orchestrator.edit_subtitle_timeline(
+                        job.id,
+                        generation_id=source_generation["id"],
+                        cues=[
+                            {
+                                "id": "invented-id",
+                                "start": 0,
+                                "end": 1,
+                                "speaker": "SPEAKER_00",
+                                "source_text": "こんにちは",
+                                "text": "안녕하세요",
+                            }
+                        ],
+                    )
+                result = orchestrator.edit_subtitle_timeline(
+                    job.id,
+                    generation_id=source_generation["id"],
+                    cues=[
+                        {
+                            "id": "segment-000001",
+                            "start": 0.2,
+                            "end": 1.4,
+                            "speaker": "SPEAKER_00",
+                            "source_text": "こんにちは",
+                            "text": "수정된 자막",
+                        },
+                        {
+                            "id": None,
+                            "start": 1.5,
+                            "end": 2.5,
+                            "speaker": "SPEAKER_01",
+                            "source_text": "追加",
+                            "text": "추가 자막",
+                        },
+                    ],
+                )
+                refreshed = orchestrator.store.get(job.id)
+                edited_transcript = json.loads(
+                    Path(refreshed.transcript_path).read_text(encoding="utf-8")
+                )
+                edited_items = orchestrator.store.translation_items(
+                    result["generation"]["id"]
+                )
+            finally:
+                orchestrator.stop()
+
+            cue_ids = [cue["id"] for cue in result["cues"]]
+            self.assertEqual(cue_ids[0], "segment-000001")
+            self.assertTrue(cue_ids[1].startswith("manual-"))
+            self.assertEqual(
+                [segment["id"] for segment in edited_transcript["segments"]],
+                cue_ids,
+            )
+            self.assertEqual(
+                [item["text"] for item in edited_items],
+                ["수정된 자막", "추가 자막"],
+            )
+            self.assertEqual(result["transcript_revision"]["origin"], "manual")
+            self.assertFalse(result["subtitle_generation"]["is_published"])
+            self.assertIn(
+                "추가 자막",
+                Path(result["subtitle_generation"]["srt_artifact_path"])
+                .read_text(encoding="utf-8"),
+            )
+            self.assertEqual(
+                (media_root / "movie.ko.srt").read_text(encoding="utf-8"),
+                "published subtitle",
+            )
+
     def test_editing_transcript_creates_an_immutable_revision(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)

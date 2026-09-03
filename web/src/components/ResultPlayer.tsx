@@ -17,6 +17,7 @@ interface ResultPlayerProps {
   subtitleJobId?: string;
   videoRef: RefObject<HTMLVideoElement | null>;
   onTimeUpdate: (currentTime: number) => void;
+  onDurationChange?: (duration: number) => void;
 }
 
 const MIME_TYPES: Record<string, string> = {
@@ -71,6 +72,7 @@ export function ResultPlayer({
   subtitleJobId = "",
   videoRef,
   onTimeUpdate,
+  onDurationChange,
 }: ResultPlayerProps) {
   const shellRef = useRef<HTMLDivElement | null>(null);
   const messageRef = useRef<HTMLParagraphElement | null>(null);
@@ -129,6 +131,10 @@ export function ResultPlayer({
           data-video-type={mediaMimeType(sourceRel)}
           data-subtitle-src={subtitleJobId ? api.subtitlesUrl(subtitleJobId) : ""}
           onTimeUpdate={(event) => onTimeUpdate(event.currentTarget.currentTime)}
+          onLoadedMetadata={(event) => {
+            const nextDuration = event.currentTarget.duration;
+            if (Number.isFinite(nextDuration)) onDurationChange?.(nextDuration);
+          }}
         />
         <canvas
           className="vr180-canvas"

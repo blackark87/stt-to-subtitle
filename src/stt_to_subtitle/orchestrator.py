@@ -25,6 +25,7 @@ from .artifact_retention import (
 from .artifacts import artifact_filename, artifact_path
 from .audio import AudioExtraction, extract_audio
 from .contracts import (
+    TRANSCRIPT_SCHEMA_VERSION,
     TRANSLATION_SCHEMA_VERSION,
     validate_transcript,
     validate_translation_items,
@@ -5040,6 +5041,254 @@ class SubtitleOrchestrator:
             "generation": manual_generation,
             "subtitle_generation": subtitle_generation,
             "item": {"id": segment_id, "text": edited_text},
+        }
+
+    def edit_subtitle_timeline(
+        self,
+        job_id: str,
+        *,
+        generation_id: str,
+        cues: Sequence[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        """Create immutable transcript, translation, and subtitle edit revisions."""
+
+        job = self.store.get(job_id)
+        if job is None:
+            raise ValueError("job not found")
+        if job.status not in {
+            "transcription_completed",
+            "completed",
+            "blocked",
+            "failed",
+        }:
+            raise ValueError("완료되거나 중단된 작업의 자막만 편집할 수 있습니다.")
+        source_generation = self.store.get_translation_generation(generation_id)
+        if source_generation is None or source_generation["job_id"] != job_id:
+            raise ValueError("translation generation not found")
+        if source_generation["state"] != "completed":
+            raise ValueError("완료된 번역 generation만 편집할 수 있습니다.")
+        if not cues:
+            raise ValueError("자막 세그먼트는 하나 이상이어야 합니다.")
+        if len(cues) > 20_000:
+            raise ValueError("자막 세그먼트가 20,000개 제한을 초과했습니다.")
+
+        transcript_path = Path(job.transcript_path or "")
+        source_revision_id = source_generation.get("transcript_revision_id")
+        if source_revision_id:
+            source_revision = self.store.get_transcript_revision(
+                job_id,
+                str(source_revision_id),
+            )
+            if source_revision is None:
+                raise ValueError("translation transcript revision not found")
+            transcript_path = Path(str(source_revision["artifact_path"]))
+        if not transcript_path.is_file():
+            raise ValueError("transcript artifact is unavailable")
+        if not job.translation_path or not Path(job.translation_path).is_file():
+            raise ValueError("translation artifact is unavailable")
+
+        transcript_payload = json.loads(transcript_path.read_text(encoding="utf-8"))
+        if not isinstance(transcript_payload, Mapping):
+            raise ValueError("transcript JSON document must be an object")
+        source_segments = validate_transcript(transcript_payload)
+        source_ids = {str(segment["id"]) for segment in source_segments}
+        source_items = self.store.translation_items(generation_id)
+        validate_translation_items(
+            self._translation_snapshot_items(source_items),
+            [str(segment["id"]) for segment in source_segments],
+        )
+
+        used_ids: set[str] = set()
+        normalized_cues: list[dict[str, Any]] = []
+        for index, cue in enumerate(cues):
+            raw_id = str(cue.get("id") or "").strip()
+            if raw_id:
+                if raw_id not in source_ids:
+                    raise ValueError(
+                        f"자막 세그먼트 {index + 1}의 ID가 원본에 없습니다."
+                    )
+                segment_id = raw_id
+            else:
+                segment_id = f"manual-{uuid4().hex}"
+            if segment_id in used_ids:
+                raise ValueError("자막 세그먼트 ID가 중복되었습니다.")
+            try:
+                start = float(cue["start"])
+                end = float(cue["end"])
+            except (KeyError, TypeError, ValueError) as error:
+                raise ValueError(
+                    f"자막 세그먼트 {index + 1}의 시간이 올바르지 않습니다."
+                ) from error
+            if (
+                not math.isfinite(start)
+                or not math.isfinite(end)
+                or start < 0
+                or end <= start
+            ):
+                raise ValueError(
+                    f"자막 세그먼트 {index + 1}의 종료 시간은 시작 시간보다 커야 합니다."
+                )
+            source_text = str(cue.get("source_text", "")).strip()
+            translated_text = str(cue.get("text", "")).strip()
+            speaker = str(cue.get("speaker", "UNKNOWN")).strip() or "UNKNOWN"
+            if not source_text or not translated_text:
+                raise ValueError("원문과 번역 자막은 비워 둘 수 없습니다.")
+            if len(source_text) > 10_000 or len(translated_text) > 10_000:
+                raise ValueError("자막 문장이 10,000자 제한을 초과했습니다.")
+            if len(speaker) > 200:
+                raise ValueError("화자 이름이 200자 제한을 초과했습니다.")
+            used_ids.add(segment_id)
+            normalized_cues.append(
+                {
+                    "id": segment_id,
+                    "start": round(start, 3),
+                    "end": round(end, 3),
+                    "speaker": speaker,
+                    "source_text": source_text,
+                    "text": translated_text,
+                }
+            )
+
+        normalized_cues.sort(
+            key=lambda cue: (cue["start"], cue["end"], cue["id"])
+        )
+        segments = validate_transcript(
+            {
+                "schema_version": TRANSCRIPT_SCHEMA_VERSION,
+                "segments": [
+                    {
+                        "id": cue["id"],
+                        "start": cue["start"],
+                        "end": cue["end"],
+                        "speaker": cue["speaker"],
+                        "text": cue["source_text"],
+                    }
+                    for cue in normalized_cues
+                ],
+            }
+        )
+        translations = validate_translation_items(
+            [
+                {"id": cue["id"], "text": cue["text"]}
+                for cue in normalized_cues
+            ],
+            [str(segment["id"]) for segment in segments],
+        )
+
+        revision_id = uuid4().hex
+        manual_transcript = {
+            **dict(transcript_payload),
+            "schema_version": TRANSCRIPT_SCHEMA_VERSION,
+            "job_id": str(transcript_payload.get("job_id") or job.stt_job_id or job.id),
+            "segments": segments,
+            "revision": {
+                "id": revision_id,
+                "supersedes_revision_id": source_revision_id or job.transcript_revision_id,
+                "origin": "manual",
+            },
+        }
+        revision_path = (
+            self.settings.jobs_dir
+            / job.id
+            / "transcript-revisions"
+            / revision_id
+            / artifact_filename(job.source_rel, "transcript")
+        )
+        write_json_atomic(revision_path, manual_transcript)
+        if not self.store.record_transcript_revision(
+            revision_id=revision_id,
+            job_id=job.id,
+            audio_revision_id=job.audio_revision_id,
+            remote_job_id=job.stt_job_id,
+            backend=str(job.options.get("backend", "manual")),
+            model_revision="manual",
+            options_hash=_canonical_payload_hash(job.options),
+            artifact_path=str(revision_path),
+            content_hash=sha256_file(revision_path),
+            origin="manual",
+            status=None,
+            chunks_total=len(segments),
+        ):
+            raise RuntimeError("manual transcript revision was not saved")
+
+        refreshed = self.store.get(job.id)
+        if refreshed is None:
+            raise RuntimeError("edited job could not be read")
+        prompt_snapshot = refreshed.options.get(TRANSLATION_PROMPT_OPTION)
+        if not isinstance(prompt_snapshot, Mapping):
+            prompt_snapshot = self._legacy_prompt_snapshot()
+        manual_generation = self._create_translation_generation(
+            refreshed,
+            manual_transcript,
+            prompt_snapshot,
+            origin="manual",
+            force_new=True,
+            model="manual",
+            endpoint_key="manual",
+        )
+        self.store.save_translation_batch(
+            str(manual_generation["id"]),
+            batch_index=0,
+            generation_attempt=0,
+            kind="manual",
+            items=self._translation_item_records(segments, translations),
+        )
+        completed_translations = self.store.complete_translation_generation(
+            str(manual_generation["id"]),
+            [str(segment["id"]) for segment in segments],
+        )
+        self._write_translation_generation_snapshot(
+            Path(refreshed.translation_path or ""),
+            manual_generation,
+            transcript_job_id=str(manual_transcript["job_id"]),
+            status="completed",
+            translations=completed_translations,
+        )
+        self._record_translation_feedback_changes(
+            refreshed,
+            prompt_snapshot=prompt_snapshot,
+            segments=segments,
+            source_generation=source_generation,
+            source_items=source_items,
+            manual_generation=manual_generation,
+            edited_items=completed_translations,
+        )
+        refreshed = self.store.get(job.id)
+        if refreshed is None:
+            raise RuntimeError("edited job could not be read")
+        self._render_artifacts(refreshed, overwrite=True, publish=False)
+        subtitle_generation = next(
+            (
+                item
+                for item in reversed(self.store.list_subtitle_generations(job.id))
+                if item.get("translation_generation_id")
+                == manual_generation["id"]
+            ),
+            None,
+        )
+        self.store.add_event(
+            job.id,
+            "info",
+            f"subtitle timeline edited ({len(segments)} segments)",
+            event_code="subtitle.timeline_edited",
+            phase=job.phase,
+            payload={
+                "transcript_revision_id": revision_id,
+                "translation_generation_id": manual_generation["id"],
+                "subtitle_generation_id": (
+                    subtitle_generation["id"] if subtitle_generation else None
+                ),
+                "segment_count": len(segments),
+            },
+        )
+        return {
+            "transcript_revision": self.store.get_transcript_revision(
+                job.id,
+                revision_id,
+            ),
+            "generation": manual_generation,
+            "subtitle_generation": subtitle_generation,
+            "cues": normalized_cues,
         }
 
     def _scheduler_loop(self) -> None:

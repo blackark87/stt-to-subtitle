@@ -6,6 +6,10 @@ import { Icon } from "@/components/Icon";
 import { Freshness } from "@/components/Freshness";
 import { LoadingOverlay } from "@/components/LoadingOverlay";
 import { ResultPlayer } from "@/components/ResultPlayer";
+import {
+  SubtitleTimelineEditor,
+  type SubtitleTimelineCue,
+} from "@/components/SubtitleTimelineEditor";
 import { api, type ExternalModelProvider } from "@/lib/api";
 import {
   asJobState,
@@ -38,6 +42,7 @@ interface Segment {
   id: string;
   start: number;
   end: number;
+  speaker: string;
   ja: string;
   ko: string;
 }
@@ -243,6 +248,9 @@ export default function JobDetailPage({ params }: { params: Promise<{ id: string
   const [editingText, setEditingText] = useState("");
   const [lineageRefreshToken, setLineageRefreshToken] = useState(0);
   const [subtitleHistoryExpanded, setSubtitleHistoryExpanded] = useState(false);
+  const [timelineEditorOpen, setTimelineEditorOpen] = useState(false);
+  const [playheadSeconds, setPlayheadSeconds] = useState(0);
+  const [mediaDuration, setMediaDuration] = useState(0);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const detailLayoutRef = useRef<HTMLDivElement | null>(null);
   const previewCardRef = useRef<HTMLElement | null>(null);
@@ -329,6 +337,7 @@ export default function JobDetailPage({ params }: { params: Promise<{ id: string
             id: key,
             start: Number(item.start ?? 0),
             end: Number(item.end ?? 0),
+            speaker: String(item.speaker ?? "UNKNOWN"),
             ja: String(item.text ?? ""),
             ko: korean.get(key) ?? "",
           };
@@ -441,10 +450,22 @@ export default function JobDetailPage({ params }: { params: Promise<{ id: string
   const selectedTranslationPhase = translationPhases.find(
     (phase) => phase.phase === effectiveTranslationPhase,
   );
+  const canEditTimeline = Boolean(
+    selectedTranslationPhase
+    && selectedTranslationPhase.phase === lastTranslationPhase?.phase,
+  );
   const publishedSubtitlePhase = translationPhases.find(
     (phase) => phase.publishedSubtitleGenerationId,
   );
   const hasSubtitle = Boolean(publishedSubtitlePhase?.publishedSubtitleGenerationId);
+  const timelineCues = useMemo<SubtitleTimelineCue[]>(() => segments.map((segment) => ({
+    id: segment.id,
+    start: segment.start,
+    end: segment.end,
+    speaker: segment.speaker,
+    sourceText: segment.ja,
+    text: selectedTranslationPhase?.texts[segment.id] ?? segment.ko,
+  })), [segments, selectedTranslationPhase]);
 
   useEffect(() => {
     const layout = detailLayoutRef.current;
@@ -908,9 +929,11 @@ export default function JobDetailPage({ params }: { params: Promise<{ id: string
                   subtitleJobId={publishedSubtitlePhase?.jobId}
                   videoRef={videoRef}
                   onTimeUpdate={(t) => {
+                    setPlayheadSeconds(t);
                     const hit = segments.find((segment) => t >= segment.start && t < segment.end);
                     setCurrent(hit ? hit.id : null);
                   }}
+                  onDurationChange={setMediaDuration}
                 />
               ) : <div className="empty-state"><strong>표시할 작업 정보가 없습니다</strong></div>}
             </div>
@@ -936,18 +959,34 @@ export default function JobDetailPage({ params }: { params: Promise<{ id: string
                         type="button"
                         role="tab"
                         aria-selected={effectiveTranslationPhase === phase.phase}
+                        disabled={timelineEditorOpen && effectiveTranslationPhase !== phase.phase}
                         className={effectiveTranslationPhase === phase.phase ? "is-active" : ""}
                         key={phase.phase}
                         onClick={() => {
                           setTranslationPhase(phase.phase);
                           setExpandedDiffId(null);
                           setEditingSegmentId(null);
+                          setTimelineEditorOpen(false);
                         }}
                       >
                         {phase.label}
                       </button>
                     ))}
                   </div>
+                  <button
+                    type="button"
+                    className="btn sec sm"
+                    disabled={busy || !canEditTimeline}
+                    title={canEditTimeline
+                      ? "최종 번역 차수의 시간·문장·세그먼트를 편집합니다."
+                      : "타임라인 구조는 최종 번역 차수에서 편집할 수 있습니다."}
+                    aria-expanded={timelineEditorOpen}
+                    aria-controls="subtitle-timeline-editor"
+                    onClick={() => setTimelineEditorOpen((open) => !open)}
+                  >
+                    <Icon name="captions" size={14} />
+                    {timelineEditorOpen ? "타임라인 닫기" : "타임라인 편집"}
+                  </button>
                   <button
                     type="button"
                     className="btn sec sm"
@@ -1188,6 +1227,36 @@ export default function JobDetailPage({ params }: { params: Promise<{ id: string
             </div>
           </section>
         </div>
+
+        {timelineEditorOpen && selectedTranslationPhase && canEditTimeline ? (
+          <div id="subtitle-timeline-editor">
+            <SubtitleTimelineEditor
+              key={`${selectedTranslationPhase.jobId}:${selectedTranslationPhase.generationId}`}
+              cues={timelineCues}
+              currentTime={playheadSeconds}
+              duration={mediaDuration}
+              busy={busy}
+              onSeek={(seconds) => {
+                const video = videoRef.current;
+                if (!video) return;
+                video.currentTime = seconds;
+                setPlayheadSeconds(seconds);
+              }}
+              onClose={() => setTimelineEditorOpen(false)}
+              onSave={(cues) => act(async () => {
+                await api.updateSubtitleTimeline(
+                  selectedTranslationPhase.jobId,
+                  selectedTranslationPhase.generationId,
+                  cues,
+                );
+                setLineageRefreshToken((value) => value + 1);
+                setActionNotice(
+                  "자막 타임라인 수정본을 저장했습니다. 미디어 자막 파일은 아직 변경하지 않았습니다.",
+                );
+              })}
+            />
+          </div>
+        ) : null}
 
         <section className="card" aria-labelledby="event-title">
           <div className="card-head">

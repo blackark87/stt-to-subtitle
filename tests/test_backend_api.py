@@ -74,6 +74,11 @@ class BackendAPIBoundaryTests(unittest.TestCase):
             "{generation_id}/items/{segment_id}",
             paths,
         )
+        self.assertIn(
+            "/api/v1/jobs/{job_id}/translation-generations/"
+            "{generation_id}/timeline",
+            paths,
+        )
         self.assertIn("/api/v1/settings/path-display-rules", paths)
         self.assertIn("/api/v1/settings/prompt-categories", paths)
         self.assertIn("/api/v1/settings/translation-feedback", paths)
