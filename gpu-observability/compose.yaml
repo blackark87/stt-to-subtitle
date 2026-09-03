@@ -39,6 +39,8 @@ services:
       - no-new-privileges:true
     networks:
       - monitoring
+      # Scrape backend metrics over the application's private Docker network.
+      - stt-app
 
   grafana:
     image: ${GRAFANA_IMAGE:-grafana/grafana:13.1.0}
@@ -69,3 +71,6 @@ volumes:
 networks:
   monitoring:
     driver: bridge
+  stt-app:
+    name: ${STT_APP_NETWORK:-stt-to-subtitle_app}
+    external: true

@@ -266,6 +266,11 @@ class ReleaseConfigurationTests(unittest.TestCase):
         self.assertIn(
             "${DOCKER_HOST_BIND_ADDRESS:-172.17.0.1}", observability
         )
+        self.assertIn("- stt-app", observability)
+        self.assertIn(
+            "name: ${STT_APP_NETWORK:-stt-to-subtitle_app}",
+            observability,
+        )
 
     def test_runtime_requirements_have_no_platform_wrapper_files(self) -> None:
         self.assertTrue((ROOT / "requirements-api.txt").is_file())
